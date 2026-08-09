@@ -1,0 +1,167 @@
+# Filtering
+
+## Enforcement Tiers
+
+Boreas applies the least invasive enforcement point that can satisfy policy:
+
+1. DNS resolution and filtering for all traffic visible to the VPN.
+2. Network blocking from destination and protocol metadata.
+3. Byte-for-byte splice for allowed opaque traffic.
+4. TLS interception only for explicitly eligible browser and WebView traffic.
+
+Native app traffic that rejects the Boreas CA still receives DNS and
+network-level filtering. Optional interception failures must demote to splice,
+not break connectivity.
+
+## Android Trust Boundary
+
+On non-rooted Android, Chrome trusts a user-installed CA for ordinary TLS
+connections. Chromium-family browsers such as Brave and Edge commonly follow
+the same model. WebViews can also use the user CA, bringing in-app browsers in
+social and news applications into the intended product scope.
+
+Modern native applications generally do not trust user-added roots. Apps
+targeting Android 6.0, API 23, and lower trusted them by default; current apps
+must opt in through network security configuration. Non-Chromium browsers vary
+and must be treated as third-party applications unless a tested configuration
+proves otherwise.
+
+Install the Boreas root only in the user store. Never move it into the Android
+system store. Chrome applies Certificate Transparency requirements to roots
+found through the system-store path. AdGuard's rooted workaround uses
+cross-signed user and system roots so Chrome can construct the shorter
+user-store path. Boreas does not need that workaround because non-rooted,
+user-store-only operation is the product boundary. This also removes all
+Conscrypt APEX bind-mount work from scope.
+
+The Android parity matrix must cover Chrome, WebView across representative
+vendors and OS versions, and one Chromium alternative. Do not advertise
+universal WebView support until that matrix passes.
+
+## DNS and ECH
+
+Intercept DNS and support encrypted upstream resolution through DoH, DoT, and
+DoQ. Apply network rules and protocol steering to A, AAAA, HTTPS, and SVCB
+answers while retaining enough provenance to explain a verdict.
+
+ECH, standardized as RFC 9849 in March 2026, blinds passive SNI inspection and
+is enabled by default in Chrome 122+, Firefox 119+, and Safari 17+. A proxy that
+terminates TLS can still observe the inner connection, but passive policy
+cannot rely on SNI. DNS is the durable no-decryption policy signal.
+
+ECH policy must stay coupled to resolver control. Do not silently disable ECH
+globally when host-level policy or steering is sufficient.
+
+## HTTP Priority
+
+Cloudflare Radar Q2 2026 reported HTTP/2 at 51.16 percent, HTTP/1.x at 27.80
+percent, and HTTP/3 at 21.04 percent, with HTTP/3 flat over the preceding year.
+Because machine traffic is a substantial part of the total, browser h2 and h3
+share exceeds the raw combined interpretation. Boreas treats:
+
+- HTTP/2 as the primary interception protocol
+- HTTP/3 as a co-primary pass-through protocol
+- HTTP/1.1 as a legacy adapter
+
+These external measurements belong to the verification ledger if refreshed.
+
+## HTTP/2 Contract
+
+- The stream is the unit of filtering, rewriting, budgeting, and cancellation.
+- Start advertised `SETTINGS_MAX_CONCURRENT_STREAMS` at 32, then tune by data.
+- Never grant a downstream flow-control window larger than bytes drained from
+  upstream.
+- Keep per-stream state independent so one stalled response cannot restore
+  connection-level head-of-line blocking.
+- Mirror negotiated ALPN into upstream pools. Never downgrade implicitly.
+- Forward RFC 9218 priority through `PRIORITY_UPDATE` where supported.
+- Construct an HTML rewriter only after a `text/html` response is confirmed.
+
+## Neutral Exchange Model
+
+quiche and `tokio-quiche` do not use the Rust `http` crate as their native
+model. The core therefore uses a protocol-neutral exchange with three wire
+adapters:
+
+```rust
+struct Exchange {
+    request: Head,
+    body_in: BodyStream,
+    body_out: BodySink,
+    protocol: Wire,
+    priority: Option<Priority>,
+    budget: StreamBudget,
+}
+```
+
+`Wire` records H1, H2, or H3 for fidelity and observability. Filter rules never
+branch on it. Each adapter preserves its protocol's native semantics and errors
+without translating a live exchange to another version.
+
+## Protocol Steering
+
+Chromium does not provide the required user-root path for HTTP/3 interception.
+Any host selected for MITM must connect over HTTP/2 instead. Clients discover
+HTTP/3 through Alt-Svc and increasingly through HTTPS or SVCB records, both of
+which Boreas can control.
+
+| Host policy | HTTPS/SVCB response | Alt-Svc response | Outcome |
+|---|---|---|---|
+| pass-through | unchanged | unchanged | full HTTP/3 |
+| MITM allowlist | remove `h3` | remove or empty | client selects HTTP/2 |
+| non-native datagrams | remove `h3` | remove or empty | client selects HTTP/2 |
+
+An HTTPS record with `alpn="h3,h2"` can enable HTTP/3 on a first visit. An empty
+Alt-Svc tells a client to stop attempting the alternative service. Serving only
+h2 prevents Firefox from initiating h3 in tested behavior.
+
+Steering has hysteresis. Alt-Svc defaults can remain cached for 24 hours,
+`persist=1` survives network changes, and production sites often advertise
+`ma=2592000`. A newly allowlisted host therefore needs a transient UDP/443
+backstop until the cached advertisement expires.
+
+Steering is a hint, not a cryptographic control. Browsers may race QUIC and TCP
+and choose QUIC if it answers within roughly 300 to 500 ms. The backstop closes
+that transition window for inspection-required hosts.
+
+## Body and Header Rewriting
+
+Use `adblock` for network rules, cosmetic rules, uBlock Origin scriptlets, and
+redirect syntax. Use `lol_html` for streaming body transformation.
+
+Rewriting pipeline:
+
+1. Confirm the host and stream are eligible.
+2. Confirm `text/html` and a supported character encoding.
+3. Decode content encoding and character encoding.
+4. Rewrite under per-stream memory and strictness budgets.
+5. Re-encode characters and recompress with the original algorithm when
+   possible, otherwise gzip.
+6. Remove `Content-Length` and emit protocol-appropriate streaming framing.
+
+Supported text must use an ASCII-compatible encoding. UTF-16LE, UTF-16BE,
+ISO-2022-JP, and `replacement` are unsupported and must splice unchanged.
+Wire `lol_html` memory settings and strict bail-out to a fail-open path.
+
+Relax CSP only as narrowly as required for injected content. Never modify an
+`integrity=` protected subresource. Preserve WebSocket upgrades and exclude
+hosts from MITM when policy or observed failures require it.
+
+## Failure Policy and Gates
+
+Pin failures, certificate errors attributable to interception, challenge pages,
+unsupported encoding, memory exhaustion, and parser strictness failures demote
+the host to splice. Challenge detection and automatic demotion belong in M3,
+not as post-launch polish.
+
+Acceptance:
+
+- Boreas block rate is at least AdGuard's on the fixed 200-site corpus using
+  identical lists.
+- The top-500 crawl has zero Boreas-attributable breakage.
+- Pin-failure automatic demotion succeeds at least 99 percent of the time.
+- The version-crossing exchange counter remains zero.
+- With 32 h2 streams and one stalled stream, other streams' p99 rises less than
+  10 percent.
+- HTTP/3 pass-through loses no more than 5 percent throughput.
+- Steering converges within one cache or backstop window.
