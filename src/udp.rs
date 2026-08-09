@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry},
+    error::Error,
+    fmt,
     net::IpAddr,
     num::NonZeroUsize,
     time::{Duration, Instant},
@@ -24,6 +26,21 @@ pub enum SendOutcome {
     Buffered,
     Dropped,
 }
+
+impl fmt::Display for FlowTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdleTimeoutTooShort => write!(
+                f,
+                "idle timeout is below the {}-second RFC 4787 REQ-5 minimum",
+                MIN_IDLE_TIMEOUT.as_secs()
+            ),
+            Self::DeadlineOverflow => f.write_str("mapping deadline overflows the clock"),
+        }
+    }
+}
+
+impl Error for FlowTableError {}
 
 pub struct DatagramBuffer<T> {
     capacity: NonZeroUsize,

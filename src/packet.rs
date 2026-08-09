@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{error::Error, fmt, net::IpAddr};
 
 use etherparse::{IpEcn, NetSlice, SlicedPacket, TransportSlice};
 
@@ -30,6 +30,25 @@ pub enum PacketError {
     Malformed(etherparse::err::packet::SliceError),
     MissingNetworkLayer,
     UnsupportedNetworkLayer,
+}
+
+impl fmt::Display for PacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed(error) => write!(f, "malformed packet: {error}"),
+            Self::MissingNetworkLayer => f.write_str("packet has no network layer"),
+            Self::UnsupportedNetworkLayer => f.write_str("unsupported network layer"),
+        }
+    }
+}
+
+impl Error for PacketError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Malformed(error) => Some(error),
+            Self::MissingNetworkLayer | Self::UnsupportedNetworkLayer => None,
+        }
+    }
 }
 
 impl IngressPacket {

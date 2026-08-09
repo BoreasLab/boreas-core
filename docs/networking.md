@@ -25,14 +25,39 @@ For an egress chain:
 inner_mtu = path_mtu - sum(egress_overhead)
 ```
 
-The subtraction is checked. A zero or negative result rejects the plan.
+The subtraction is checked, and the result must itself be a usable tunnel MTU.
+A chain that underflows rejects the plan as `OverheadExceedsPathMtu`; a
+remainder below 1280 bytes rejects it as `InnerMtu`.
+
+The floor is 1280, the IPv6 minimum link MTU of RFC 8200, because dual-stack is
+a day-one requirement (ADR-011). RFC 8200 further recommends configuring 1500 or
+greater to accommodate tunnelling without IPv6-layer fragmentation, which is
+directly the Boreas case, so 1280 is a hard floor rather than a target. RFC 791's
+68-octet IPv4 link minimum is not used: it bounds router forwarding, not tunnel
+provisioning.
 
 QUIC requires UDP datagrams that are not fragmented at the IP layer and a path
-that supports at least 1200 bytes. Initial packets are padded to 1200 bytes. If
-the effective path falls below that floor, an endpoint must stop ordinary QUIC
-transmission except path probes and `CONNECTION_CLOSE`, and may terminate the
-connection. Boreas therefore steers the client to HTTP/2 whenever inner MTU is
-below 1200 instead of creating a silent black hole.
+that supports at least 1200 bytes; initial packets are padded to 1200. RFC 9000
+section 14.1 requires an endpoint to immediately cease sending QUIC packets on a
+path that does not support 1200-byte datagrams, excepting path validation
+(`PATH_CHALLENGE`, `PATH_RESPONSE`), PMTU probes, and `CONNECTION_CLOSE` frames.
+Boreas steers the client to HTTP/2 rather than creating that silent black hole.
+
+Because 1280 exceeds 1200, every admitted packet path clears the QUIC floor by
+construction, and MTU-driven steering can only arise from an egress datagram
+ceiling on a terminated path.
+
+## MTU Is a Packet-Path Property
+
+An inner MTU exists only where whole IP packets are carried. On a locally
+terminated path the client's TCP is re-originated as a byte stream, so its
+packet size stops existing upstream and local MSS clamping governs instead.
+`TransportPath::PacketFastPath` therefore carries the inner MTU and
+`LocalTermination` does not, making the meaningless reading unrepresentable.
+
+QUIC admission on a terminated path uses the egress's declared
+`max_datagram_size`. An egress that declares none cannot be shown to clear the
+1200-byte floor, so it is steered rather than trusted.
 
 Generate ICMP Fragmentation Needed or Packet Too Big toward the client when
 appropriate. Accept an inbound PTB only when its quoted packet and path match a

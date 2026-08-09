@@ -26,6 +26,7 @@ Platforms:
 Capabilities:
 
 - one unified TUN datapath
+- IPv6-native and dual-stack operation from day one, not a later addition
 - DNS filtering with DoH, DoT, and DoQ upstreams
 - network-level blocking for all apps visible to the VPN
 - TCP and UDP parity

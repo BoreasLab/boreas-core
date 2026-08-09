@@ -11,6 +11,21 @@ used by an immediate executable path. MPL-2.0 is GPL-compatible through its
 secondary-license mechanism. Test fixtures and vendored data require their own
 license review even when crate source is compatible.
 
+Compatibility runs inbound, not outbound: an AGPL work may absorb a permissive
+dependency, but a dependency under a licence imposing further restrictions —
+GPL-2.0-only, EPL, CDDL, or any source-available licence such as SSPL, BUSL, or
+the Elastic Licence — cannot be combined and distributed. Note also that AGPL
+obligations attach on conveying the work, and section 13's network-source
+requirement attaches on running a modified version for remote users; neither
+waits for a third party to modify anything.
+
+`deny.toml` encodes the allowlist and `cargo deny` runs in CI, so a
+non-compliant dependency fails the build instead of waiting for review. The
+allowlist is narrower than the legally compatible set on purpose: adding any
+copyleft dependency requires editing that file, which forces the decision to be
+explicit. It checks the crate graph only, so vendored data such as the
+`adblock-rust` GPL test-data subtree still needs the manual packaging check.
+
 ### Current dependencies
 
 | Crate | Version | Role | License |
@@ -79,6 +94,31 @@ The design investigation reported the following as verified by 2026-08-08:
 - Certificate pinning, JA3/JA4, HTTP/2 fingerprinting, and ECH affect passive or
   intercepted policy as described in the subsystem documents.
 - QUIC has a 1200-byte path floor and restricted sub-1200 behavior.
+
+Rechecked against primary sources on 2026-08-09:
+
+- RFC 9000 section 14.1: "An endpoint MUST ensure that it can send datagrams of
+  at least 1200 bytes", and an endpoint "MUST immediately cease sending QUIC
+  packets on the affected path if the path does not support 1200 byte
+  datagrams, with the exception of packets used for path validation
+  (PATH_CHALLENGE, PATH_RESPONSE), PMTU probes, and CONNECTION_CLOSE frames."
+  Earlier internal wording omitted the path-validation exception and asserted a
+  "MAY terminate the connection" clause that this check did not confirm; the
+  subsystem text now follows the quoted rule only.
+- RFC 8200 section 5: "IPv6 requires that every link in the Internet have an MTU
+  of 1280 octets or greater", and configurable links "must be configured to have
+  an MTU of at least 1280 octets; it is recommended that they be configured with
+  an MTU of 1500 octets or greater, to accommodate possible encapsulations
+  (i.e., tunneling) without incurring IPv6-layer fragmentation." This is the
+  basis for ADR-011.
+- RFC 791's 68-octet figure is the minimum an internet module must forward
+  without further fragmentation; the 576-octet figure is the minimum every
+  destination must be able to reassemble. RFC 8085 treats 576 as the practical
+  IPv4 sending floor. Neither is a usable dual-stack tunnel MTU, so neither is
+  used as one.
+- RFC 9000 does not state a derivation for 1200 in section 14, so the common
+  explanation that it follows from 1280 minus headers remains unsourced and is
+  not asserted anywhere in these documents.
 - Forged PTB attacks represented by CVE-2024-53259 require flow validation.
 - RFC 4787 defines endpoint-independent UDP mapping, no port overloading, and a
   minimum two-minute mapping lifetime.
@@ -136,6 +176,15 @@ These are deliberate hypotheses to test, not external facts:
    explicitly excludes migration from guarantees.
 6. **Filter-list terms:** obtain legal advice for shipping compiled EasyList and
    related artifacts.
+7. **Neutral exchange model:** decide whether v1 keeps the three-adapter
+   `Exchange` core in [Filtering](filtering.md) or builds on `http`-crate types.
+   Boreas never terminates HTTP/3 in v1, so the quiche-interoperability
+   rationale does not apply. Raised by [Engineering Plan](engineering-plan.md)
+   phase P14.
+8. **smoltcp budget:** fix the socket-count, RSS, and p99 latency targets before
+   integration merges, per phase P6.
+9. **Timer-wheel granularity:** confirm that one-second buckets over a 512-bucket
+   wheel hold at 10,000 flows, per phase P7.
 
 ## Updating This Ledger
 

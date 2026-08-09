@@ -114,6 +114,37 @@ use a DNS-only VPN. Do not port the Android HTTP interception datapath.
 shares engine and lists while avoiding the packet-tunnel memory ceiling and an
 inferior partial port.
 
+## ADR-011: Dual-Stack Native from v1, with a 1280-Byte Inner MTU Floor
+
+**Decision:** IPv6-native and dual-stack operation are day-one requirements, not
+a later addition. Consequently the tunnel's inner MTU floor is 1280 bytes. A
+chain whose inner MTU falls below 1280 is a rejected configuration, not a
+degraded IPv4-only mode.
+
+**Reason:** RFC 8200 requires every link carrying IPv6 to have an MTU of at
+least 1280 octets, and recommends 1500 or greater specifically to accommodate
+tunnelling without IPv6-layer fragmentation — which is exactly the Boreas case.
+Boreas configures its own TUN MTU and the user selects the egress chain, so this
+is an admission rule over configuration we control, not a guess about a hostile
+path.
+
+RFC 791's 68-octet IPv4 link minimum is explicitly not used. It bounds what a
+router must forward without fragmenting, not what a tunnel must offer; the
+practical IPv4 floor is the 576-octet reassembly minimum, and neither value
+yields a usable dual-stack tunnel.
+
+**Consequence:** 1280 sits above RFC 9000's 1200-byte QUIC floor, so every
+admitted packet path clears QUIC by construction. MTU-driven steering can
+therefore only originate from an egress datagram ceiling on a terminated path,
+never from an admitted packet path. This is asserted at compile time.
+
+**Corollary:** on a locally terminated path the client's packet size no longer
+exists, so an inner MTU is meaningless there and local MSS clamping governs
+instead. `TransportPath::PacketFastPath` carries the inner MTU and
+`LocalTermination` does not, so the meaningless reading is unrepresentable. QUIC
+admission on a terminated path uses the egress's declared datagram ceiling; an
+egress that declares none cannot be shown to clear the floor and is steered.
+
 ## Deferred and Rejected Directions
 
 - TLS fingerprint mimicry waits for measured CDN breakage.
