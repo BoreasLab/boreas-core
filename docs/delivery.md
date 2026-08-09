@@ -38,6 +38,10 @@ packet parsing and UDP state are foundations for gaps 8 and 10, not completion.
 
 ## Milestones
 
+Milestones are product gates. The engineering phase order that reaches them,
+including the dependency edges and per-phase checks, is owned by
+[Engineering Plan](engineering-plan.md).
+
 ### M1: Datapath, weeks 1-4
 
 Build Android TUN and Wintun adapters, L3, locally terminated TCP and UDP,

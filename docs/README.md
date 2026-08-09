@@ -20,6 +20,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 |---|---|
 | [Decisions](decisions.md) | architecture decisions and rejected alternatives |
 | [Delivery](delivery.md) | gaps, acceptance gates, roadmap, constraints, risks |
+| [Engineering Plan](engineering-plan.md) | phase order, dependency edges, per-phase gates, performance budget |
 | [Verification](verification.md) | evidence status, dependencies, licensing, open questions |
 
 ## Disclosure Rules
@@ -37,6 +38,6 @@ that owns the work, then follow its links only when a boundary is crossed.
 
 | Path | Responsibility | Design owner |
 |---|---|---|
-| `src/lib.rs` | capability composition, flow planning, ingress actions | [Architecture](architecture.md) |
+| `src/lib.rs` | refined `Mtu`, error spine, capability composition, flow planning, ingress actions | [Architecture](architecture.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment quarantine; reassembly remains Gap 8 | [Networking](networking.md) |
 | `src/udp.rs` | bounded datagrams and endpoint-independent mapping state | [Networking](networking.md) |
