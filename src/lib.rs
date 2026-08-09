@@ -1,3 +1,9 @@
+mod packet;
+mod udp;
+
+pub use packet::{IngressPacket, PacketError, Transport};
+pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
+
 pub const MIN_QUIC_MTU: u16 = 1200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +93,16 @@ pub enum PlanError {
     OverheadExceedsPathMtu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressAction {
+    Reassemble,
+    ForwardPacket(FlowPlan),
+    OpenStream(FlowPlan),
+    OpenDatagram(FlowPlan),
+    HandleIcmp(FlowPlan),
+    DropUnsupported,
+}
+
 pub fn plan_flow(
     filter: FilterPolicy,
     egress: EgressCapabilities,
@@ -116,6 +132,30 @@ pub fn plan_flow(
         transport,
         quic,
         inner_mtu,
+    })
+}
+
+pub fn route_ingress(
+    packet: IngressPacket,
+    filter: FilterPolicy,
+    egress: EgressCapabilities,
+    path_mtu: u16,
+) -> Result<IngressAction, PlanError> {
+    if packet.transport == Transport::Fragment {
+        return Ok(IngressAction::Reassemble);
+    }
+
+    let plan = plan_flow(filter, egress, path_mtu)?;
+    if plan.transport == TransportPath::PacketFastPath {
+        return Ok(IngressAction::ForwardPacket(plan));
+    }
+
+    Ok(match packet.transport {
+        Transport::Tcp { .. } => IngressAction::OpenStream(plan),
+        Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
+        Transport::Icmp => IngressAction::HandleIcmp(plan),
+        Transport::Other => IngressAction::DropUnsupported,
+        Transport::Fragment => IngressAction::Reassemble,
     })
 }
 
@@ -200,6 +240,42 @@ mod tests {
         assert_eq!(
             first.chain(egress(Accepts::Flows, DatagramFidelity::Native, 0)),
             Err(CapabilityError::MixedLayers)
+        );
+    }
+
+    #[test]
+    fn ingress_routing_keeps_effects_explicit() {
+        let packet = IngressPacket {
+            source: "192.0.2.1".parse().unwrap(),
+            destination: "198.51.100.2".parse().unwrap(),
+            ecn: etherparse::IpEcn::NotEct,
+            transport: Transport::Udp {
+                source_port: 1234,
+                destination_port: 443,
+            },
+        };
+        let native_l3 = egress(Accepts::IpPackets, DatagramFidelity::Native, 60);
+        assert!(matches!(
+            route_ingress(packet, FilterPolicy::PassThrough, native_l3, 1500),
+            Ok(IngressAction::ForwardPacket(_))
+        ));
+        assert!(matches!(
+            route_ingress(
+                packet,
+                FilterPolicy::PassThrough,
+                egress(Accepts::Flows, DatagramFidelity::Native, 60),
+                1500,
+            ),
+            Ok(IngressAction::OpenDatagram(_))
+        ));
+
+        let fragment = IngressPacket {
+            transport: Transport::Fragment,
+            ..packet
+        };
+        assert_eq!(
+            route_ingress(fragment, FilterPolicy::InspectHttp, native_l3, 0),
+            Ok(IngressAction::Reassemble)
         );
     }
 }
