@@ -139,21 +139,43 @@ inverts them fails to compile rather than silently reopening the black hole.
 
 ### P2: L3 completion
 
-`Transport::Fragment` currently routes to `IngressAction::Reassemble`, and no
-reassembler exists. This is Gap 8.
+`Transport::Fragment` routes to `IngressAction::Reassemble`. This is Gap 8.
 
-- `Reassembler`: bounded pure state machine, per-key byte budget, `now`
-  parameter, eviction by the same discipline as `UdpFlowTable`. Overlapping and
-  duplicate fragments resolved by a stated policy, not by last-writer-wins.
-- ICMP PTB validation: `validate_ptb(quoted, &flows) -> Option<PathUpdate>`.
-  Pure. An unauthenticated message never lowers path state directly.
-- TCP MSS clamping on SYN.
+**Status: complete.** Delivered:
 
-**Gate:** a `cargo-fuzz` target over the reassembler runs clean, with no panic,
-no out-of-bounds read, and no premature L4 admission. A property test asserts
-that no input classified `Fragment` ever produces an action other than
-`Reassemble`. A forged-PTB corpus shaped after CVE-2024-53259 is rejected, with
-sub-1200 messages proven unable to disable QUIC for an unmatched flow.
+- `Fragment`/`Reassembler` in `src/reassembly.rs`: dual-family (IPv4 and IPv6)
+  bounded pure state machine. Boreas terminates the TUN packets addressed to
+  it, so RFC 8200 section 4.5's reassembly requirement applies in full —
+  dropping IPv6 fragments would black-hole senders already at the 1280-byte
+  minimum. Overlap policy: any overlapping block silently discards the whole
+  pending datagram (RFC 5722), applied to IPv4 as defense in depth; identical
+  retransmits are discarded too, which is safe because the sender retries from
+  a clean key. Capacity-bounded, `now`-parameterized, expiry via the
+  `UdpFlowTable` deadline discipline. The original scope said "overlapping and
+  duplicate fragments resolved by a stated policy"; discard-on-overlap is that
+  policy.
+- `validate_ptb` in `src/path.rs`: pure, actionable only when the quoted
+  transport is TCP/UDP, the quoted source endpoint matches a known flow, and
+  the offered MTU is at or above RFC 9000's 1200-byte floor.
+- `clamp_mss` in `src/path.rs`: rewrites an above-budget MSS on IPv4 or IPv6
+  SYNs and recomputes the TCP checksum in full; absence of a clampable MSS is
+  not an error. Extension headers between the IPv6 fixed header and TCP skip
+  the clamp (marked `ponytail:`).
+
+**Gate met:** the `cargo-fuzz` target `reassembler` ran 1.78M executions clean
+after fixing one real finding (empty-payload fragment underflowed the block
+arithmetic; regression test added). An exhaustive loop over every wire-
+expressible IPv4 fragment boundary asserts `Fragment` never routes anywhere
+but `Reassemble`. The forged-PTB test corpus proves sub-1200 messages and
+unmatched quotes change nothing, while a genuine 1400 PTB against a known flow
+yields `PathUpdate`. 17 tests, `cargo fmt --check`, and `cargo clippy
+--all-targets --all-features -- -D warnings` clean.
+
+Not in scope, load-bearing later: PTB generation toward the client when an
+inbound packet exceeds inner MTU, and ICMP Time Exceeded on reassembly
+timeout (RFC 8200 requires it on first-fragment-holding evictions); both need
+ICMP construction and land in P4 with the datapath. DPLPMTUD for MASQUE
+CONNECT-IP stays in P17.
 
 **Unlocks:** P4. The datapath cannot be correct while L4 can observe a fragment.
 

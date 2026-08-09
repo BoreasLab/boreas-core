@@ -108,6 +108,10 @@ impl<V> UdpFlowTable<V> {
         self.flows.is_empty()
     }
 
+    pub fn contains(&self, endpoint: &InternalEndpoint) -> bool {
+        self.flows.contains_key(endpoint)
+    }
+
     pub fn get_or_insert_with(
         &mut self,
         endpoint: InternalEndpoint,

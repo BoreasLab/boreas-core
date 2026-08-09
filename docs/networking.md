@@ -65,6 +65,15 @@ known flow. Forged sub-1200 PTB messages can disable QUIC, as demonstrated by
 CVE-2024-53259, so an unauthenticated ICMP message must never directly lower a
 flow's path state.
 
+Because fragmentation at the destination is mandatory (RFC 8200 section 4.5),
+a path MTU shortfall has exactly two recourses and both must fire at the right
+time: MSS clamping on SYN before the client's TCP ever picks a segment size,
+and validated PTB processing plus PTB generation for everything else. There is
+no third option: IPv6 cannot be re-fragmented in transit, and answering
+fragments with a sub-1280 PTB is a mandated no-op that black-holes the sender.
+Reassembly discards the whole pending datagram on any overlap (RFC 5722), in
+both families.
+
 For encapsulations with changing overhead or reachability, use packetization
 layer PMTU discovery. MASQUE CONNECT-IP normatively composes with DPLPMTUD and
 ECN tunnelling requirements.

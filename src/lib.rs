@@ -1,9 +1,13 @@
 mod packet;
+mod path;
+mod reassembly;
 mod udp;
 
 use std::{error::Error, fmt};
 
 pub use packet::{IngressPacket, PacketError, Transport};
+pub use path::{PathUpdate, clamp_mss, validate_ptb};
+pub use reassembly::{Fragment, PushOutcome, Reassembler};
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
@@ -196,8 +200,10 @@ pub fn route_ingress(
     egress: EgressCapabilities,
     path_mtu: Mtu,
 ) -> Result<IngressAction, PlanError> {
-    if packet.transport == Transport::Fragment {
-        return Ok(IngressAction::Reassemble);
+    match packet.transport {
+        Transport::Fragment => return Ok(IngressAction::Reassemble),
+        Transport::Other => return Ok(IngressAction::DropUnsupported),
+        Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => {}
     }
 
     let plan = plan_flow(filter, egress, path_mtu)?;
@@ -209,8 +215,7 @@ pub fn route_ingress(
         Transport::Tcp { .. } => IngressAction::OpenStream(plan),
         Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
         Transport::Icmp => IngressAction::HandleIcmp(plan),
-        Transport::Other => IngressAction::DropUnsupported,
-        Transport::Fragment => IngressAction::Reassemble,
+        Transport::Other | Transport::Fragment => IngressAction::DropUnsupported,
     })
 }
 
@@ -276,6 +281,52 @@ mod tests {
 
     fn mtu(bytes: u16) -> Mtu {
         Mtu::new(bytes).expect("test MTU is valid")
+    }
+
+    #[test]
+    fn fragments_never_reach_l4_admission() {
+        let native_l3 = egress(Accepts::IpPackets, DatagramFidelity::Native, 0);
+        let ipv4_udp = [
+            0x45, 0x03, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
+            0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
+        ];
+
+        // Every wire-expressible IPv4 fragment boundary (offset unit or the
+        // more-fragments flag) routes to Reassemble and nothing else.
+        for offset_units in [0_u16, 1, 8, 256, 0x1fff] {
+            for more_fragments in [true, false] {
+                let mut packet = ipv4_udp;
+                if offset_units == 0 && !more_fragments {
+                    continue; // not a fragment at all
+                }
+                let flags_offset = offset_units | if more_fragments { 0x2000 } else { 0 };
+                packet[6..8].copy_from_slice(&flags_offset.to_be_bytes());
+                let parsed = IngressPacket::parse(&packet).expect("wire-valid packet");
+                assert_eq!(parsed.transport, Transport::Fragment);
+                assert_eq!(
+                    route_ingress(parsed, FilterPolicy::PassThrough, native_l3, mtu(1500)),
+                    Ok(IngressAction::Reassemble),
+                    "offset {offset_units}, more_fragments {more_fragments}"
+                );
+            }
+        }
+
+        // An IPv6 Fragment header is source-only fragmentation (RFC 8200
+        // section 4.5), but we are the destination, so reassembly is
+        // mandatory; it routes to Reassemble like IPv4.
+        let mut ipv6_fragment = [0_u8; 56];
+        ipv6_fragment[0] = 0x60;
+        ipv6_fragment[4..6].copy_from_slice(&16_u16.to_be_bytes());
+        ipv6_fragment[6] = 44;
+        ipv6_fragment[7] = 64;
+        ipv6_fragment[40] = 6; // fragment header: next is TCP
+        ipv6_fragment[43] = 0x01; // offset 0, more fragments
+        let parsed = IngressPacket::parse(&ipv6_fragment).expect("wire-valid packet");
+        assert_eq!(parsed.transport, Transport::Fragment);
+        assert_eq!(
+            route_ingress(parsed, FilterPolicy::PassThrough, native_l3, mtu(1500)),
+            Ok(IngressAction::Reassemble)
+        );
     }
 
     #[test]
