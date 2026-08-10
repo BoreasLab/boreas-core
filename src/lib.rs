@@ -71,6 +71,18 @@ pub struct EgressCapabilities {
     pub overhead_bytes: u16,
     pub max_datagram_size: Option<u16>,
     pub preserves_ecn: bool,
+    pub nat_behavior: NatBehavior,
+}
+
+/// RFC 4787 mapping behavior of a NAT or UDP-relaying egress. Endpoint-
+/// independent mapping is the only behavior that keeps QUIC, WebRTC, and VoIP
+/// working unchanged; anything weaker is a property of the egress, not a
+/// defect to engineer around here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NatBehavior {
+    AddressAndPortDependent,
+    AddressDependent,
+    EndpointIndependent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +109,7 @@ impl EgressCapabilities {
                 (size, None) | (None, size) => size,
             },
             preserves_ecn: self.preserves_ecn && next.preserves_ecn,
+            nat_behavior: self.nat_behavior.min(next.nat_behavior),
         })
     }
 }
@@ -141,6 +154,18 @@ pub struct FlowPlan {
 pub enum PlanError {
     OverheadExceedsPathMtu,
     InnerMtu(MtuError),
+}
+
+/// The result of re-planning a live flow after an egress reports a capability
+/// change. Established flows are never dropped silently: a downgrade yields
+/// `Resteer`, and `Teardown` is reserved for a change no live flow can
+/// survive (the egress no longer accepts the layer the flow runs on, or its
+/// remaining MTU cannot carry IPv6 at all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replan {
+    Unchanged,
+    Resteer(SteeringReason),
+    Teardown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +217,44 @@ pub fn plan_flow(
     };
 
     Ok(FlowPlan { transport, quic })
+}
+
+/// Re-plans a live flow after its egress reports a capability change (MASQUE's
+/// QUIC-to-HTTP/2 fallback is the driving case). The filter policy and path
+/// MTU are session properties and pass through unchanged; only the egress
+/// moved. Errors only when the new capability cannot support the flow's layer
+/// or leaves a packet path below the IPv6 floor, and the caller answers those
+/// with `Teardown`.
+pub fn replan(
+    current: &FlowPlan,
+    filter: FilterPolicy,
+    next: EgressCapabilities,
+    path_mtu: Mtu,
+) -> Result<Replan, PlanError> {
+    let accepts = match current.transport {
+        TransportPath::PacketFastPath { .. } => Accepts::IpPackets,
+        TransportPath::LocalTermination => Accepts::Flows,
+    };
+    if next.accepts != accepts {
+        return Ok(Replan::Teardown);
+    }
+
+    let next_plan = plan_flow(filter, next, path_mtu)?;
+    // Crossing the transport boundary re-originates the flow's bytes; no live
+    // flow survives it. A PacketFastPath whose inner MTU merely moved is the
+    // same transport with a new budget, handled by MTU machinery, not teardown.
+    if std::mem::discriminant(&next_plan.transport) != std::mem::discriminant(&current.transport) {
+        return Ok(Replan::Teardown);
+    }
+
+    Ok(match (current.quic, next_plan.quic) {
+        // A PassThrough flow whose new plan steers must move to HTTP/2.
+        (QuicPolicy::PassThrough, QuicPolicy::SteerToHttp2(reason)) => Replan::Resteer(reason),
+        // Identical policies, a recovery from steering to pass-through, and a
+        // change of steering reason on an already-steered flow all need no
+        // action.
+        (_, _) => Replan::Unchanged,
+    })
 }
 
 pub fn route_ingress(
@@ -276,11 +339,163 @@ mod tests {
             overhead_bytes,
             max_datagram_size: None,
             preserves_ecn: true,
+            nat_behavior: NatBehavior::EndpointIndependent,
         }
     }
 
     fn mtu(bytes: u16) -> Mtu {
         Mtu::new(bytes).expect("test MTU is valid")
+    }
+
+    // The P3 gate asks for properties, not examples, so these tests iterate
+    // the full product of the domains that drive each law instead of naming
+    // one case per law.
+    const FIDELITIES: [DatagramFidelity; 3] = [
+        DatagramFidelity::None,
+        DatagramFidelity::Emulated,
+        DatagramFidelity::Native,
+    ];
+    const NAT_BEHAVIORS: [NatBehavior; 3] = [
+        NatBehavior::AddressAndPortDependent,
+        NatBehavior::AddressDependent,
+        NatBehavior::EndpointIndependent,
+    ];
+    const MTUS: [u16; 6] = [1280, 1300, 1400, 1500, 4000, u16::MAX];
+    const OVERHEADS: [u16; 4] = [0, 40, 60, 1000];
+
+    #[test]
+    fn chain_fidelity_is_monotone_non_increasing() {
+        for left in FIDELITIES {
+            for right in FIDELITIES {
+                for left_nat in NAT_BEHAVIORS {
+                    for right_nat in NAT_BEHAVIORS {
+                        let first = EgressCapabilities {
+                            nat_behavior: left_nat,
+                            ..egress(Accepts::Flows, left, 0)
+                        };
+                        let second = EgressCapabilities {
+                            nat_behavior: right_nat,
+                            ..egress(Accepts::Flows, right, 0)
+                        };
+                        let chained = first.chain(second).unwrap();
+                        assert_eq!(chained.datagram_fidelity, left.min(right));
+                        assert_eq!(chained.nat_behavior, left_nat.min(right_nat));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plan_flow_never_passes_quic_below_native_or_below_floor() {
+        for fidelity in FIDELITIES {
+            for &overhead in &OVERHEADS {
+                for &path in &MTUS {
+                    for max_datagram_size in [None, Some(1199), Some(1200), Some(1500)] {
+                        let capabilities = EgressCapabilities {
+                            max_datagram_size,
+                            ..egress(Accepts::IpPackets, fidelity, overhead)
+                        };
+                        let Ok(plan) =
+                            plan_flow(FilterPolicy::PassThrough, capabilities, mtu(path))
+                        else {
+                            continue; // overhead exceeded the path; not admitted
+                        };
+                        if fidelity != DatagramFidelity::Native {
+                            assert_ne!(
+                                plan.quic,
+                                QuicPolicy::PassThrough,
+                                "fidelity {fidelity:?} must steer"
+                            );
+                        }
+                        let budget = match plan.transport {
+                            TransportPath::PacketFastPath { inner_mtu } => Some(inner_mtu.get()),
+                            TransportPath::LocalTermination => max_datagram_size,
+                        };
+                        if budget.is_none_or(|bytes| bytes < MIN_QUIC_MTU) {
+                            assert_ne!(
+                                plan.quic,
+                                QuicPolicy::PassThrough,
+                                "budget {budget:?} must steer"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_native_to_emulated_transition_resteers() {
+        for fidelity in FIDELITIES {
+            let live = plan_flow(
+                FilterPolicy::PassThrough,
+                EgressCapabilities {
+                    max_datagram_size: Some(1500),
+                    ..egress(Accepts::Flows, DatagramFidelity::Native, 0)
+                },
+                mtu(1500),
+            )
+            .unwrap();
+            let next = EgressCapabilities {
+                max_datagram_size: Some(1500),
+                ..egress(Accepts::Flows, fidelity, 0)
+            };
+            let result = replan(&live, FilterPolicy::PassThrough, next, mtu(1500));
+            if fidelity == DatagramFidelity::Native {
+                assert_eq!(result, Ok(Replan::Unchanged));
+            } else {
+                assert_eq!(
+                    result,
+                    Ok(Replan::Resteer(SteeringReason::DatagramFidelity)),
+                    "Native to {fidelity:?} must re-steer, never drop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replan_tears_down_only_unsurvivable_changes() {
+        let packet_plan = plan_flow(
+            FilterPolicy::PassThrough,
+            egress(Accepts::IpPackets, DatagramFidelity::Native, 60),
+            mtu(1500),
+        )
+        .unwrap();
+
+        // The layer the flow runs on is gone: no live flow survives.
+        assert_eq!(
+            replan(
+                &packet_plan,
+                FilterPolicy::PassThrough,
+                egress(Accepts::Flows, DatagramFidelity::Native, 60),
+                mtu(1500),
+            ),
+            Ok(Replan::Teardown)
+        );
+
+        // Overhead growth that pushes the inner MTU below 1280 is an error
+        // from plan_flow, which the caller answers with Teardown.
+        assert_eq!(
+            replan(
+                &packet_plan,
+                FilterPolicy::PassThrough,
+                egress(Accepts::IpPackets, DatagramFidelity::Native, 300),
+                mtu(1500),
+            ),
+            Err(PlanError::InnerMtu(MtuError::BelowMinimum(1200)))
+        );
+
+        // A shrunk datagram ceiling on a packet path does not move the plan.
+        assert_eq!(
+            replan(
+                &packet_plan,
+                FilterPolicy::PassThrough,
+                egress(Accepts::IpPackets, DatagramFidelity::Native, 100),
+                mtu(1500),
+            ),
+            Ok(Replan::Unchanged)
+        );
     }
 
     #[test]
@@ -466,6 +681,7 @@ mod tests {
                 overhead_bytes: 60,
                 max_datagram_size: Some(1300),
                 preserves_ecn: false,
+                nat_behavior: NatBehavior::EndpointIndependent,
             })
         );
         assert_eq!(

@@ -181,25 +181,27 @@ CONNECT-IP stays in P17.
 
 ### P3: Planner completion
 
-Two gaps between [Egress](egress.md) and the code: `NatBehavior` is unmodelled,
-and capability is documented as a live property with no transition function.
-The MASQUE QUIC-to-HTTP/2 fallback gate requires the second.
+**Status: complete.** Delivered:
 
-```rust
-enum Replan { Unchanged, Resteer(SteeringReason), Teardown }
+- `NatBehavior` on `EgressCapabilities`: ordered
+  `EndpointIndependent`/`AddressDependent`/`AddressAndPortDependent`, chained
+  by `min` like fidelity. The egress document defers routing consequences to
+  the first egress whose behavior affects routing; the field exists now so
+  capability reports carry it from day one.
+- `replan(current, filter, next, path_mtu) -> Result<Replan, PlanError>`.
+  Filter policy and path MTU are session properties and pass through
+  unchanged. `Teardown` answers a layer change or a transport-path crossing;
+  an inner-MTU move on the packet path is survivable and returns `Unchanged`
+  (MTU machinery absorbs it). `Resteer` fires exactly when a `PassThrough`
+  flow's new plan steers; recoveries and reason changes on already-steered
+  flows are `Unchanged`.
 
-fn replan(current: &FlowPlan, next: EgressCapabilities) -> Result<Replan, PlanError>;
-```
-
-`Teardown` is reserved for a capability change no live flow can survive.
-Re-steering must not drop established flows, which is the acceptance criterion,
-so `Resteer` is the expected result of a fidelity downgrade.
-
-**Gate:** properties, not examples. Chain fidelity is monotone non-increasing
-under `chain`. `plan_flow` never returns `QuicPolicy::PassThrough` when fidelity
-is below `Native` or inner MTU is below 1200 — currently true by construction
-and asserted by three examples, which a property test generalizes. Every
-Native-to-Emulated transition yields `Resteer`.
+**Gate met:** properties iterate the full domain product rather than naming
+examples: chain fidelity and NAT behavior are exactly `min` over all
+fidelity/NAT pairs; `plan_flow` never returns `PassThrough` below Native
+fidelity or below a 1200-byte budget across the MTU/overhead/ceiling grid;
+every Native-to-Emulated transition yields `Resteer`. 21 tests, fmt, clippy
+clean.
 
 **Unlocks:** P8 routes live capability changes through `replan`; P13 consumes
 `SteeringReason`.
