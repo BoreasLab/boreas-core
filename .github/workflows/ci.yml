@@ -34,6 +34,25 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # cargo-fuzz needs nightly for the sanitizer instrumentation.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      # A smoke run, not a campaign: each target gets one minute, which is
+      # enough to catch a reachable panic on the untrusted paths and cheap
+      # enough to gate every pull request. Longer campaigns run out of band.
+      - run: |
+          for target in reassembler clamp_mss datapath; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done
+        working-directory: .
+
   deny:
     name: licenses and advisories
     runs-on: ubuntu-latest

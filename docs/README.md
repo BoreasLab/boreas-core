@@ -41,7 +41,8 @@ that owns the work, then follow its links only when a boundary is crossed.
 | `src/lib.rs` | refined `Mtu`, error spine, capability composition, flow planning, ingress actions | [Architecture](architecture.md) |
 | `src/datapath.rs` | sans-io datapath core: dispatch, flow lifecycle, capability replanning | [Architecture](architecture.md) |
 | `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
-| `src/shell.rs` | tokio runtime shell, buffer pool, bounded channels | [Architecture](architecture.md) |
+| `src/shell.rs` | tokio runtime shell, bounded channels, deadline timer | [Architecture](architecture.md) |
+| `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
 | `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |
 | `src/path.rs` | PTB validation against known flows, SYN MSS clamping | [Networking](networking.md) |

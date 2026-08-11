@@ -13,6 +13,10 @@
 
 [graph]
 all-features = true
+# Dev-dependencies are checked too. They do not ship, but smoltcp is a
+# candidate to be linked for real once the P6 verdict is final, and a licence
+# problem is much cheaper to find before that than after.
+exclude-dev = false
 
 [advisories]
 version = 2
@@ -33,6 +37,9 @@ allow = [
     "ISC",
     "MPL-2.0",
     "Unicode-3.0",
+    # smoltcp. Public-domain-equivalent BSD without the attribution clause, so
+    # it is GPL-compatible and imposes no distribution obligation.
+    "0BSD",
 ]
 unused-allowed-license = "allow"
 confidence-threshold = 0.93

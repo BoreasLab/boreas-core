@@ -304,32 +304,64 @@ clippy clean.
 
 ### P8: Tokio runtime shell
 
-**Status: complete.** `Shell` in `src/shell.rs` interprets the pure core per
-the concurrency contract: one reactor task owns the `Datapath` by value, one
-timer re-arms against `Datapath::poll_timeout` (added this phase: the minimum
-of the reassembler and flow-table deadlines), and channels are bounded
-(`mpsc::channel(256)` both ways). Backpressure stays asymmetric: `Control`
-messages are awaited, datagram sends go through `send_datagram`'s `try_send`
-semantics and surface drops as `Telemetry::DatagramsDropped`. Shutdown is a
-`CancellationToken` plus an explicit `Control::Shutdown`, and `Shell::shutdown`
-drains the reactor's `JoinHandle` — no task leaks past it.
+**Status: complete.** `Shell` in `src/shell.rs` interprets the pure core: one
+reactor task owns the `Datapath` by value, so no lock guards it and none can be
+held across an `await`. Three properties define the phase.
 
-The shared buffer pool landed here, not in P7: `BufferPool`/`Pooled` are
-refcounted MTU-sized slices of one slab, and per-flow datagrams entering the
-shell carry `Pooled` bytes — the pool's first real consumer. Pool exhaustion
-returns `None`, which is a drop, never a wait.
+**Backpressure is asymmetric, so the channels are separate.** Control messages
+are policy and should block their producer, so `Control` is awaited. Datagrams
+are traffic, and blocking a UDP source converts loss into head-of-line delay,
+so `Datagram` has its own bounded channel and `Shell::try_send_datagram` offers
+without waiting. One channel could not honour both disciplines. A refusal
+returns `SendOutcome::Dropped` to the producer, which is the party that knows
+which flow it belongs to.
+
+**One timer, armed against `Datapath::poll_timeout`** — the minimum of the
+reassembler and flow-table deadlines — never a poll interval. Both underlying
+deadline queries are independent of state size: the timer wheel scans at most
+512 buckets and the reassembler's index is one `BTreeMap` lookup, recorded as
+[Verification](verification.md) item 10.
+
+**A packet is not an error.** Every `DatapathError` describes one packet that
+did not make it, so the reactor counts it and keeps interpreting the core;
+only the device itself fails fatally, and an interrupted read is retried. The
+same classification now applies in `Harness::step`, so a trace replayed under
+P5 behaves as it does in production.
+
+Telemetry is aggregated rather than per-event: counters are folded in the
+reactor and reported every 500 ms, because a message per occurrence would make
+the stream O(packets) under exactly the floods that matter. Observations the
+channel refuses are counted and reported as `Telemetry::Lost`, so a gap never
+reads as quiet.
+
+The shared buffer pool landed here as `src/pool.rs`, and it is the datapath's
+real storage: `FlowState` holds `DatagramBuffer<Pooled>`, so queue memory is
+one budget of `capacity x slice_size` instead of the product
+`flows x depth x MTU`. Buffers are allocated lazily and recycled, exhaustion is
+a drop, and `Drop` is the release — an expiring flow returns its whole queue by
+being dropped. `Pooled` is deliberately affine: it is not `Clone`, so two
+handles onto the same bytes are unrepresentable rather than merely discouraged.
+The pool contains no `unsafe`. Nothing drains these queues yet; the egress that
+does is P10, and until then the budget is what keeps an undrained queue bounded.
 
 `AsyncDevice` uses explicit `impl Future + Send` signatures rather than
-`async fn` in trait so reactor futures are provably `Send` on a multi-
-threaded runtime. Config reload via `watch::Receiver<Arc<Engine>>` waits for
-the filter engine to exist (P12); the capability-change path through
-`Control::CapabilityChange` already exercises the same pointer-swap shape.
+`async fn` in trait so reactor futures are provably `Send` on a multi-threaded
+runtime, and `recv` documents its cancel-safety obligation, because the reactor
+selects over it and drops the future routinely. Config reload via
+`watch::Receiver<Arc<Engine>>` waits for the filter engine to exist (P12); the
+capability-change path through `Control::CapabilityChange` already exercises the
+same pointer-swap shape.
 
-**Gate met:** `clippy::await_holding_lock` and `await_holding_refcell_ref`
-are denied locally and clean; `tests/shell.rs` proves forward-and-shutdown
-with no task leak and pool exhaustion accounting. 34 tests, fmt, clippy, and
-`cargo deny` clean (tokio 1.53 added; `unicode-ident`'s Unicode-3.0 allow-
-listed).
+**Gate met:** `tests/shell.rs` proves five properties, one per test — forward
+and shut down with no task leak; the timer waits on the core's deadline rather
+than a poll interval, asserted on tokio's paused clock over an hour of virtual
+time; a malformed packet and a crafted TCP option list are counted, not fatal;
+a datagram producer is never blocked and a refusal frees its buffer; control
+messages reach the core in order. 50 tests, plus `clamp_mss` and `datapath`
+fuzz targets on the untrusted paths and a one-minute-per-target fuzz smoke job
+in CI. fmt, clippy, and `cargo deny` clean, the last now including
+dev-dependencies. tokio is taken with named features rather than `full`; the
+full graph is recorded in [Verification](verification.md).
 
 **Unlocks:** P9, P10.
 

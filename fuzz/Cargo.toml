@@ -19,3 +19,17 @@ path = "fuzz_targets/reassembler.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "clamp_mss"
+path = "fuzz_targets/clamp_mss.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "datapath"
+path = "fuzz_targets/datapath.rs"
+test = false
+doc = false
+bench = false

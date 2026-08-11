@@ -9,15 +9,17 @@
 //! - a flow exists only after `plan_flow` has succeeded, so `FlowState.plan`
 //!   is always a valid plan for the current configuration;
 //! - per-flow datagram buffers are bounded at flow creation and `send_datagram`
-//!   drops rather than waits.
+//!   drops rather than waits;
+//! - the configuration is planned once at construction, so `FlowPlan` derivation
+//!   for a flow the core creates itself is total rather than optimistic.
 
 use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 
 use crate::{
     DatagramBuffer, EgressCapabilities, FilterPolicy, FlowPlan, FlowTableError, Fragment,
-    IngressAction, IngressPacket, InternalEndpoint, Mtu, PacketError, PlanError, PushOutcome,
-    Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath, UdpFlowTable,
-    clamp_mss, plan_flow, replan, route_ingress,
+    IngressAction, IngressPacket, InternalEndpoint, Mtu, PacketError, PlanError, Pooled,
+    PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
+    UdpFlowTable, clamp_mss, plan_flow, replan, route_ingress,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,10 +84,14 @@ impl From<FlowTableError> for DatapathError {
 
 struct FlowState {
     plan: FlowPlan,
-    // ponytail: owned `Vec<u8>` datagrams, not pooled slices. The buffers are
-    // never drained today, so refcounted pool handles have no consumer; add
-    // the shared pool with the first drain path (P8's runtime shell).
-    buffer: DatagramBuffer<Vec<u8>>,
+    /// Payload bytes live in the shared `BufferPool`, so queue memory is one
+    /// global budget rather than `flows x depth x MTU`. The per-flow capacity
+    /// remains the fairness bound: no single flow can spend the whole pool.
+    ///
+    /// ponytail: nothing consumes these yet. The egress that drains them is
+    /// P10; until then an idle queue is reclaimed when its flow expires, and
+    /// the pool's budget is what keeps that bounded.
+    buffer: DatagramBuffer<Pooled>,
 }
 
 pub struct Datapath {
@@ -109,6 +115,11 @@ impl Datapath {
         flow_idle_timeout: std::time::Duration,
         datagram_buffer_capacity: NonZeroUsize,
     ) -> Result<Self, DatapathError> {
+        // Parse, do not validate: a `Datapath` exists only for a configuration
+        // that plans. Every later `plan_flow` on this configuration is then a
+        // proof-carrying repeat rather than a fresh gamble.
+        plan_flow(filter, egress, path_mtu)?;
+
         Ok(Self {
             filter,
             egress,
@@ -220,16 +231,21 @@ impl Datapath {
         Ok(!existed)
     }
 
+    /// Queues a datagram for `endpoint`, creating the flow when the producer
+    /// is the first to name it. Never waits: a full per-flow queue is a drop,
+    /// and dropping the `Pooled` handle returns its bytes to the pool.
     pub fn send_datagram(
         &mut self,
         endpoint: InternalEndpoint,
-        datagram: Vec<u8>,
+        datagram: Pooled,
         now: Instant,
     ) -> Result<SendOutcome, DatapathError> {
+        // Planned before the closure so a configuration the current egress
+        // cannot serve surfaces as `DatapathError::Plan`, never as a panic.
+        let plan = plan_flow(self.filter, self.egress, self.path_mtu)?;
         let capacity = self.datagram_buffer_capacity;
         let flow = self.flows.get_or_insert_with(endpoint, now, || FlowState {
-            plan: plan_flow(self.filter, self.egress, self.path_mtu)
-                .expect("the configured plan was validated at construction"),
+            plan,
             buffer: DatagramBuffer::new(capacity),
         })?;
         let outcome = flow.buffer.try_send(datagram);
@@ -240,27 +256,37 @@ impl Datapath {
     }
 
     /// Re-plans every live flow after the egress reports a capability change.
+    ///
+    /// O(live flows), one `replan` per flow and no intermediate event buffer:
+    /// destructuring `self` borrows the flow table and the event queue as the
+    /// disjoint fields they are, which matters at the 10,000-flow target.
     pub fn on_capability_change(&mut self, next: EgressCapabilities) {
         self.egress = next;
-        let mut events = Vec::new();
-        self.flows.retain(|endpoint, state| {
-            match replan(&state.plan, self.filter, next, self.path_mtu) {
+        let Self {
+            filter,
+            path_mtu,
+            flows,
+            events,
+            ..
+        } = self;
+        let (filter, path_mtu) = (*filter, *path_mtu);
+
+        flows.retain(
+            |endpoint, state| match replan(&state.plan, filter, next, path_mtu) {
                 Ok(Replan::Unchanged) => true,
-                Ok(Replan::Resteer(reason)) => {
-                    // A survivable replan re-plans cleanly by definition.
-                    if let Ok(plan) = plan_flow(self.filter, next, self.path_mtu) {
-                        state.plan = plan;
-                    }
-                    events.push(FlowEvent::Resteered(reason));
+                // The replacement plan travels with the verdict, so a resteered
+                // flow cannot end up running on its stale plan.
+                Ok(Replan::Resteer { reason, plan }) => {
+                    state.plan = plan;
+                    events.push_back(FlowEvent::Resteered(reason));
                     true
                 }
                 Ok(Replan::Teardown) | Err(_) => {
-                    events.push(FlowEvent::FlowTornDown(*endpoint));
+                    events.push_back(FlowEvent::FlowTornDown(*endpoint));
                     false
                 }
-            }
-        });
-        self.events.extend(events);
+            },
+        );
     }
 
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
@@ -280,9 +306,11 @@ impl Datapath {
             .min()
     }
 
+    /// Advances both state machines. Expired flows are dropped here, which is
+    /// what returns their queued `Pooled` payloads to the shared pool.
     pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.reassembler.expire(now);
-        let _ = self.flows.expire(now);
+        drop(self.flows.expire(now));
     }
 }
 
@@ -299,10 +327,21 @@ fn endpoint_of(packet: IngressPacket) -> InternalEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BufferPool;
     use std::{
         net::{IpAddr, Ipv4Addr},
+        sync::Arc,
         time::Duration,
     };
+
+    /// A pool large enough that nothing in these tests hits its budget, so a
+    /// `None` here would be a defect rather than the exhaustion path.
+    fn pool() -> Arc<BufferPool> {
+        BufferPool::new(
+            NonZeroUsize::new(1500).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+        )
+    }
 
     fn egress(fidelity: crate::DatagramFidelity) -> EgressCapabilities {
         EgressCapabilities {
@@ -381,8 +420,9 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 1234,
         };
+        let pool = pool();
         assert_eq!(
-            path.send_datagram(endpoint, vec![1], now),
+            path.send_datagram(endpoint, pool.take(b"\x01").unwrap(), now),
             Ok(SendOutcome::Buffered)
         );
     }
@@ -428,6 +468,86 @@ mod tests {
         };
         // The flow is gone; a fresh send re-creates it and emits a new event.
         assert!(path.flows.is_empty());
-        let _ = path.send_datagram(endpoint, vec![1], now + Duration::from_secs(122));
+        let pool = pool();
+        let _ = path.send_datagram(
+            endpoint,
+            pool.take(b"\x01").unwrap(),
+            now + Duration::from_secs(122),
+        );
+    }
+
+    #[test]
+    fn an_unplannable_configuration_is_refused_at_construction() {
+        // Overhead exceeding the path leaves no inner MTU, so no flow on this
+        // configuration could ever plan. Rejecting it here is what makes every
+        // later `plan_flow` on the stored configuration a proof-carrying
+        // repeat rather than a panic waiting to happen.
+        let mut starved = egress(crate::DatagramFidelity::Native);
+        starved.accepts = crate::Accepts::IpPackets;
+        starved.overhead_bytes = 400;
+        assert_eq!(
+            Datapath::new(
+                FilterPolicy::PassThrough,
+                starved,
+                Mtu::new(1500).unwrap(),
+                Duration::from_secs(30),
+                NonZeroUsize::new(8).unwrap(),
+                Duration::from_secs(120),
+                NonZeroUsize::new(64).unwrap(),
+            )
+            .err(),
+            Some(DatapathError::Plan(PlanError::InnerMtu(
+                crate::MtuError::BelowMinimum(1100)
+            )))
+        );
+    }
+
+    #[test]
+    fn a_full_queue_drops_and_returns_its_bytes_to_the_pool() {
+        // Two bounds act here, and the per-flow one binds first by design: it
+        // is the fairness bound, so no single flow can spend the shared budget.
+        let queue_depth = NonZeroUsize::new(2).unwrap();
+        let mut path = Datapath::new(
+            FilterPolicy::PassThrough,
+            egress(crate::DatagramFidelity::Native),
+            Mtu::new(1500).unwrap(),
+            Duration::from_secs(30),
+            NonZeroUsize::new(8).unwrap(),
+            Duration::from_secs(120),
+            queue_depth,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let pool = BufferPool::new(
+            NonZeroUsize::new(1500).unwrap(),
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let endpoint = InternalEndpoint {
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            port: 1234,
+        };
+
+        let send = |path: &mut Datapath, pool: &Arc<BufferPool>| {
+            path.send_datagram(endpoint, pool.take(b"payload").unwrap(), now)
+        };
+        assert_eq!(send(&mut path, &pool), Ok(SendOutcome::Buffered));
+        assert_eq!(send(&mut path, &pool), Ok(SendOutcome::Buffered));
+        assert_eq!(pool.available(), 6, "queued payloads hold the budget");
+
+        // A third datagram exceeds the per-flow capacity while the pool still
+        // has room. The core drops it, and dropping the refused handle hands
+        // its buffer straight back rather than leaking the budget.
+        assert_eq!(send(&mut path, &pool), Ok(SendOutcome::Dropped));
+        assert_eq!(pool.available(), 6, "the refused buffer was returned");
+        assert_eq!(
+            path.poll_event(),
+            Some(FlowEvent::DatagramDropped(endpoint))
+        );
+
+        // Expiring the flow releases its whole queue at once: `Drop` is the
+        // release, so there is no separate reclamation step to forget.
+        path.on_timeout(now + Duration::from_secs(121));
+        assert!(path.flows.is_empty());
+        assert_eq!(pool.available(), 8);
     }
 }

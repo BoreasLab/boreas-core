@@ -182,6 +182,10 @@ pub struct Harness<D> {
     pub datapath: crate::Datapath,
     /// Virtual time base; one tick is one millisecond.
     base: std::time::Instant,
+    /// Packets the core refused, counted rather than fatal — the same
+    /// classification the runtime shell makes, so a trace replayed here
+    /// behaves as it would in production.
+    rejected: u64,
 }
 
 impl<D: Device> Harness<D> {
@@ -190,7 +194,13 @@ impl<D: Device> Harness<D> {
             device,
             datapath,
             base,
+            rejected: 0,
         }
+    }
+
+    /// Packets the core refused across every `step` so far.
+    pub fn rejected(&self) -> u64 {
+        self.rejected
     }
 
     /// Runs one tick at `ticks`: deliver due packets, flush transmits, expire.
@@ -200,10 +210,13 @@ impl<D: Device> Harness<D> {
 
         loop {
             match self.device.recv(&mut buf) {
-                Ok(len) => self
-                    .datapath
-                    .on_tun_packet(&buf[..len], now)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                // Untrusted input: a rejected packet is an observation, not a
+                // reason to abandon the trace.
+                Ok(len) => {
+                    if self.datapath.on_tun_packet(&buf[..len], now).is_err() {
+                        self.rejected += 1;
+                    }
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error),
             }

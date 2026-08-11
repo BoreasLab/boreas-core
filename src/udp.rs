@@ -46,8 +46,14 @@ impl<T: Copy> TimerWheel<T> {
             .min(u64::MAX - 1)
     }
 
+    /// Files `entry` under its deadline's second, never before `drained`.
+    ///
+    /// The clamp is the invariant `next_due` rests on: **every live entry's
+    /// second is at least `drained`.** A deadline landing in an already-drained
+    /// second is due now by definition, and the caller re-checks the real
+    /// deadline regardless, so clamping loses nothing.
     fn insert(&mut self, deadline: Instant, entry: T) {
-        let second = self.second(deadline);
+        let second = self.second(deadline).max(self.drained);
         if second >= self.drained + WHEEL_BUCKETS as u64 {
             self.overflow.push((second, entry));
         } else {
@@ -91,18 +97,27 @@ impl<T: Copy> TimerWheel<T> {
         }
     }
 
-    /// The earliest second that may contain a live entry. Conservative when
-    /// buckets hold rotation-collided or stale entries; always an under-
-    /// estimate-safe lower bound for the caller's own deadline check.
+    /// A lower bound on the earliest second that may contain a live entry.
+    ///
+    /// Because `insert` clamps every entry to `drained` or later, the first
+    /// occupied bucket at offset `i` from `drained` proves no entry exists in
+    /// `[drained, drained + i)`, and every entry in a later bucket or in
+    /// `overflow` is later still. So `drained + i` is a sound lower bound even
+    /// when a rotation collision puts a much later entry in that bucket, and
+    /// it is exact whenever no collision is present.
+    ///
+    /// O(WHEEL_BUCKETS) worst case, O(1) when the next bucket is occupied, and
+    /// **independent of the number of entries** — which is what makes it safe
+    /// to call once per reactor iteration at the 10,000-flow target.
     fn next_due(&self) -> Option<u64> {
-        let bucket_min = self
-            .buckets
-            .iter()
-            .flatten()
-            .map(|(second, _)| *second)
-            .min();
-        let overflow_min = self.overflow.iter().map(|(second, _)| *second).min();
-        bucket_min.into_iter().chain(overflow_min).min()
+        let horizon = self.drained + WHEEL_BUCKETS as u64;
+        (self.drained..horizon)
+            .find(|second| !self.bucket(*second).is_empty())
+            .or_else(|| (!self.overflow.is_empty()).then_some(horizon))
+    }
+
+    fn bucket(&self, second: u64) -> &[(u64, T)] {
+        &self.buckets[(second % WHEEL_BUCKETS as u64) as usize]
     }
 }
 
@@ -185,6 +200,10 @@ pub struct UdpFlowTable<V> {
     idle_timeout: Duration,
     flows: HashMap<InternalEndpoint, EntryState<V>>,
     wheel: TimerWheel<InternalEndpoint>,
+    /// Scratch reused across `expire` calls. The reactor arms a timer against
+    /// `next_deadline` and calls `expire` on every fire, so a per-call
+    /// allocation would be a steady-state cost with no steady-state work.
+    surfaced: Vec<InternalEndpoint>,
 }
 
 impl<V> UdpFlowTable<V> {
@@ -199,6 +218,7 @@ impl<V> UdpFlowTable<V> {
             idle_timeout,
             flows: HashMap::new(),
             wheel: TimerWheel::new(epoch),
+            surfaced: Vec::new(),
         })
     }
 
@@ -216,7 +236,8 @@ impl<V> UdpFlowTable<V> {
 
     /// The earliest instant that may contain an expired flow. Conservative:
     /// wheel slots are deadline hints, so the answer can be early but never
-    /// late. O(buckets) worst case, O(1) when the wheel is empty.
+    /// late. O(WHEEL_BUCKETS) worst case, O(1) typical, and independent of the
+    /// number of live flows.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.wheel
             .next_due()
@@ -262,26 +283,38 @@ impl<V> UdpFlowTable<V> {
         Ok(&mut state.value)
     }
 
+    /// Evicts every flow whose real deadline has arrived, returning the
+    /// values so the caller can dispose of them; refreshed flows whose stale
+    /// slot surfaced early are re-bucketed instead.
+    ///
+    /// O(surfaced slots). Allocates only when something actually expires:
+    /// `Vec::new` is allocation-free until its first push, and the surfaced
+    /// buffer is reused across calls.
     pub fn expire(&mut self, now: Instant) -> Vec<V> {
-        let mut surfaced = Vec::new();
+        // Swapped out so the wheel and the flow map can be borrowed while the
+        // buffer is in hand; the empty `Vec` left behind owns no allocation.
+        let mut surfaced = std::mem::take(&mut self.surfaced);
+        surfaced.clear();
         self.wheel.take_due(now, &mut surfaced);
 
         let mut expired = Vec::new();
-        let mut reinsert = Vec::new();
-        for endpoint in surfaced {
-            match self.flows.get(&endpoint) {
+        for endpoint in surfaced.drain(..) {
+            // One hash lookup per surfaced slot, whichever branch it takes.
+            match self.flows.entry(endpoint) {
+                Entry::Occupied(occupied) if occupied.get().deadline <= now => {
+                    expired.push(occupied.remove().value);
+                }
                 // The real deadline governs: a refreshed flow whose stale slot
                 // surfaced early is re-bucketed, not evicted.
-                Some(state) if state.deadline <= now => {
-                    expired.push(self.flows.remove(&endpoint).expect("checked above").value);
+                Entry::Occupied(occupied) => {
+                    let deadline = occupied.get().deadline;
+                    self.wheel.insert(deadline, endpoint);
                 }
-                Some(state) => reinsert.push((state.deadline, endpoint)),
-                None => {}
+                Entry::Vacant(_) => {}
             }
         }
-        for (deadline, endpoint) in reinsert {
-            self.wheel.insert(deadline, endpoint);
-        }
+
+        self.surfaced = surfaced;
         expired
     }
 }
@@ -342,6 +375,65 @@ mod tests {
         assert!(table.expire(start + Duration::from_secs(120)).is_empty());
         assert!(table.expire(start + Duration::from_secs(238)).is_empty());
         assert_eq!(table.expire(start + Duration::from_secs(240)), vec![7]);
+    }
+
+    #[test]
+    fn next_deadline_cost_is_independent_of_flow_count() {
+        // The audited defect: `next_due` scanned every entry in every bucket,
+        // so the reactor paid O(flows) to arm one timer. The structural proof
+        // is that the answer depends only on which buckets are occupied, so a
+        // table holding one flow and a table holding ten thousand — all in the
+        // same second — must agree exactly.
+        let start = Instant::now();
+        let mut one = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
+        let mut many = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
+
+        let endpoint = |index: u32| InternalEndpoint {
+            address: IpAddr::V4(Ipv4Addr::from(index)),
+            port: 12_345,
+        };
+        let _ = one.get_or_insert_with(endpoint(0), start, || 1_u16);
+        for index in 0..10_000 {
+            let _ = many.get_or_insert_with(endpoint(index), start, || 1_u16);
+        }
+
+        assert_eq!(one.next_deadline(), many.next_deadline());
+        assert_eq!(many.len(), 10_000);
+    }
+
+    #[test]
+    fn a_rotation_collision_never_reports_a_deadline_late() {
+        // Entries a full wheel rotation apart share a bucket. `next_due` may
+        // answer early — the caller re-checks the real deadline — but must
+        // never answer late, or a flow would outlive its mapping.
+        let start = Instant::now();
+        let mut table = UdpFlowTable::new(Duration::from_secs(600), start).unwrap();
+        let near = InternalEndpoint {
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            port: 1,
+        };
+        let far = InternalEndpoint {
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            port: 2,
+        };
+
+        // 600 s is past the 512-bucket horizon, so `far` starts in overflow;
+        // `near`, inserted 88 s later, lands a full rotation away in the wheel.
+        let _ = table.get_or_insert_with(far, start, || 1_u16);
+        let _ = table.get_or_insert_with(near, start + Duration::from_secs(88), || 2_u16);
+
+        let reported = table.next_deadline().expect("two live flows");
+        assert!(
+            reported <= start + Duration::from_secs(600),
+            "reported {reported:?} is later than the earliest real deadline"
+        );
+
+        // And both still expire at their own deadlines, in order.
+        assert_eq!(table.expire(start + Duration::from_secs(599)), Vec::new());
+        assert_eq!(table.expire(start + Duration::from_secs(601)), vec![1]);
+        assert_eq!(table.expire(start + Duration::from_secs(689)), vec![2]);
+        assert!(table.is_empty());
+        assert_eq!(table.next_deadline(), None);
     }
 
     #[test]

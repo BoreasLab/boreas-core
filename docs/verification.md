@@ -28,10 +28,34 @@ explicit. It checks the crate graph only, so vendored data such as the
 
 ### Current dependencies
 
+Reviewed 2026-08-11 against the resolved `Cargo.lock`. Every entry is checked
+by `cargo deny check` in CI, dev-dependencies included (`exclude-dev = false`).
+
 | Crate | Version | Role | License |
 |---|---:|---|---|
 | `etherparse` | 0.21.0 | borrowed IPv4, IPv6, and transport parsing | MIT OR Apache-2.0 |
 | `arrayvec` | 0.7.8, transitive | bounded parser storage | MIT OR Apache-2.0 |
+| `tokio` | 1.53.1 | runtime shell: reactor task, bounded channels, timer | MIT |
+| `tokio-util` | 0.7.19 | `CancellationToken` for structured shutdown | MIT |
+| `tokio-macros` | 2.7.2, transitive | `select!`, `pin!`, `#[tokio::test]` | MIT |
+| `futures-util` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
+| `futures-core` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
+| `futures-sink` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
+| `futures-task` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
+| `futures-macro` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
+| `pin-project-lite` | 0.2.17, transitive | pulled by `tokio` | Apache-2.0 OR MIT |
+| `bytes` | 1.12.1, transitive | pulled by `tokio-util` | MIT |
+| `slab` | 0.4.12, transitive | pulled by `tokio` | MIT |
+| `proc-macro2` | 1.0.107, transitive | build-time only | MIT OR Apache-2.0 |
+| `quote` | 1.0.47, transitive | build-time only | MIT OR Apache-2.0 |
+| `syn` | 3.0.3, transitive | build-time only | MIT OR Apache-2.0 |
+| `unicode-ident` | 1.0.24, transitive | build-time only | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| `smoltcp` | 0.13.1, dev-only | the P6 scaling measurement; never linked | 0BSD |
+
+`tokio` is taken with named features (`macros`, `rt`, `rt-multi-thread`,
+`sync`, `time`) rather than `full`. Boreas cross-compiles to Android, so the
+process, signal, and file drivers `full` would enable are shipped weight for
+capabilities the shell does not use.
 
 ### Planned and evaluated dependencies
 
@@ -200,6 +224,24 @@ These are deliberate hypotheses to test, not external facts:
    512 one-second buckets with an overflow list; `tests/scale.rs` holds at
    10,000 flows with one slot per flow under a 110k-packet refresh flood, and
    stale slots never evict a refreshed flow early.
+10. **Reactor wakeup cost:** measured 2026-08-11 on the aarch64 dev VM, release
+    build. The reactor arms one timer against `Datapath::poll_timeout`, so the
+    cost of that call is paid once per iteration and must not scale with state.
+    `UdpFlowTable::next_deadline` measures ~98 ns at 1 flow and ~99 ns at
+    10,000 flows — flat, because `TimerWheel::next_due` scans at most 512
+    buckets rather than every entry. `Reassembler::next_deadline` is one
+    `BTreeMap::first_key_value`, measured at 2.3 ns after a 200,000-fragment
+    flood. `tests/shell.rs` pins the wakeup rate itself on tokio's paused
+    clock: an idle reactor wakes on its 500 ms reporting tick, not on a poll
+    interval.
+11. **Fragment-flood amplification:** measured 2026-08-11, release build. A
+    64 KiB datagram delivered last-fragment-first costs 3.6 ms of `push` time
+    against 0.94 ms in order — linear in bytes, with the residual gap being
+    buffer growth and cache behaviour rather than fragment count. Before the
+    O(1) completion counter the same input cost 36.7 ms, a 29x penalty for an
+    ordering the sender chooses. The expiry index no longer grows with
+    fragments at all: `src/reassembly.rs` asserts one slot per pending
+    datagram after 10,000 rejected fragments.
 
 ## Updating This Ledger
 

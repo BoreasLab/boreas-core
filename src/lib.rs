@@ -2,6 +2,7 @@ mod datapath;
 mod device;
 mod packet;
 mod path;
+mod pool;
 mod reassembly;
 mod shell;
 mod udp;
@@ -12,8 +13,9 @@ pub use datapath::{Datapath, DatapathError, FlowEvent, Transmit};
 pub use device::{Device, Harness, SimDevice};
 pub use packet::{IngressPacket, PacketError, Transport};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
+pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
-pub use shell::{AsyncDevice, BufferPool, Control, Pooled, Shell, Telemetry};
+pub use shell::{AsyncDevice, Control, Datagram, Shell, Telemetry};
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
@@ -167,10 +169,17 @@ pub enum PlanError {
 /// `Resteer`, and `Teardown` is reserved for a change no live flow can
 /// survive (the egress no longer accepts the layer the flow runs on, or its
 /// remaining MTU cannot carry IPv6 at all).
+///
+/// `Resteer` carries the plan the flow must adopt. A re-steer without a
+/// replacement plan is not a state this type can express, so no caller has to
+/// re-derive one and none can silently keep the stale one when that fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Replan {
     Unchanged,
-    Resteer(SteeringReason),
+    Resteer {
+        reason: SteeringReason,
+        plan: FlowPlan,
+    },
     Teardown,
 }
 
@@ -255,7 +264,10 @@ pub fn replan(
 
     Ok(match (current.quic, next_plan.quic) {
         // A PassThrough flow whose new plan steers must move to HTTP/2.
-        (QuicPolicy::PassThrough, QuicPolicy::SteerToHttp2(reason)) => Replan::Resteer(reason),
+        (QuicPolicy::PassThrough, QuicPolicy::SteerToHttp2(reason)) => Replan::Resteer {
+            reason,
+            plan: next_plan,
+        },
         // Identical policies, a recovery from steering to pass-through, and a
         // change of steering reason on an already-steered flow all need no
         // action.
@@ -451,9 +463,16 @@ mod tests {
             if fidelity == DatagramFidelity::Native {
                 assert_eq!(result, Ok(Replan::Unchanged));
             } else {
+                // The verdict carries the plan the flow must adopt, and that
+                // plan is exactly what planning the new egress from scratch
+                // yields. This is the law that lets the caller assign it
+                // without a second, fallible derivation.
                 assert_eq!(
                     result,
-                    Ok(Replan::Resteer(SteeringReason::DatagramFidelity)),
+                    Ok(Replan::Resteer {
+                        reason: SteeringReason::DatagramFidelity,
+                        plan: plan_flow(FilterPolicy::PassThrough, next, mtu(1500)).unwrap(),
+                    }),
                     "Native to {fidelity:?} must re-steer, never drop"
                 );
             }

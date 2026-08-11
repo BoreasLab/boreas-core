@@ -105,36 +105,81 @@ fn clamp_ipv6(packet: &mut [u8], clamp: u16) -> bool {
     true
 }
 
-/// Byte range of the MSS value inside a TCP segment, when a SYN advertises one
-/// above `clamp`.
+/// TCP option kinds this module names. The remaining kinds are skipped by
+/// length, which is what the option list's TLV framing is for.
+const OPTION_END: u8 = 0;
+const OPTION_NOOP: u8 = 1;
+const OPTION_MSS: u8 = 2;
+/// `SYN` in the TCP flags byte.
+const FLAG_SYN: u8 = 0x02;
+
+/// One length-checked TCP option. Constructing this value *is* the proof that
+/// `value` lies inside the segment's declared header: the parser below is the
+/// only constructor, and it yields nothing it could not slice. Consumers
+/// therefore index `value` freely.
+struct TcpOption<'a> {
+    kind: u8,
+    /// Offset of `value` within the segment that produced it.
+    at: usize,
+    /// The option's payload, with its kind and length bytes removed.
+    value: &'a [u8],
+}
+
+/// Parses the TCP option region as a total iterator of length-checked records.
+///
+/// This is the trust boundary for the option list: the bytes are attacker-
+/// chosen, so every read is bounded by the data-offset field, which is itself
+/// bounded by the slice. A record that does not fit ends the iteration instead
+/// of panicking, and single-byte options (`END`, `NOOP`) are consumed here so
+/// no consumer has to know they exist.
+///
+/// O(header length), which the 4-bit data offset caps at 60 bytes. Every step
+/// advances `at` by at least one, so the iterator always terminates.
+fn tcp_options(segment: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
+    let header_len = usize::from(segment.get(12).copied().unwrap_or(0) >> 4) * 4;
+    // An inverted or over-long range yields `None`, so a nonsense data offset
+    // simply produces an empty option list.
+    let options = segment.get(20..header_len).unwrap_or_default();
+
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        loop {
+            match *options.get(at)? {
+                OPTION_END => return None,
+                OPTION_NOOP => at += 1,
+                kind => {
+                    let length = usize::from(*options.get(at + 1)?);
+                    // `at + 2 > at + length` when `length < 2`, and the range
+                    // slice rejects that as it rejects running off the end, so
+                    // one `get` enforces both bounds. `length >= 2` on success
+                    // is what guarantees progress.
+                    let value = options.get(at + 2..at + length)?;
+                    let option = TcpOption {
+                        kind,
+                        at: 20 + at + 2,
+                        value,
+                    };
+                    at += length;
+                    return Some(option);
+                }
+            }
+        }
+    })
+}
+
+/// Offset, within `segment`, of the MSS value a SYN advertises above `clamp`.
+/// `None` when the segment is not a SYN, carries no MSS option, carries a
+/// truncated one, or already sits at or below the clamp.
 fn mss_above(segment: &[u8], clamp: u16) -> Option<usize> {
-    if segment.len() < 20 || segment[13] & 0x02 == 0 {
-        return None;
-    }
-    let header_len = usize::from(segment[12] >> 4) * 4;
-    if header_len < 20 || header_len > segment.len() {
+    if segment.get(13).is_none_or(|flags| flags & FLAG_SYN == 0) {
         return None;
     }
 
-    let mut option = 20;
-    while option < header_len {
-        match segment[option] {
-            0 => return None,
-            1 => option += 1,
-            kind => {
-                let length = usize::from(*segment.get(option + 1)?);
-                if length < 2 || option + length > header_len {
-                    return None;
-                }
-                if kind == 2 {
-                    let value = u16::from_be_bytes([segment[option + 2], segment[option + 3]]);
-                    return (value > clamp).then_some(option + 2);
-                }
-                option += length;
-            }
-        }
-    }
-    None
+    let mss = tcp_options(segment).find(|option| option.kind == OPTION_MSS)?;
+    // RFC 9293: the MSS option's value is exactly two bytes. A shorter one is
+    // malformed, and `first_chunk` refuses it rather than reading past it.
+    let advertised = u16::from_be_bytes(*mss.value.first_chunk()?);
+    (advertised > clamp).then_some(mss.at)
 }
 
 fn checksum(parts: &[&[u8]]) -> u16 {
@@ -171,6 +216,86 @@ mod tests {
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         time::{Duration, Instant},
     };
+
+    /// A TCP header whose option region is exactly `options`, wrapped in the
+    /// smallest IPv4 SYN that carries it. Data offset is derived, so the
+    /// header always ends precisely where the options do — the alignment that
+    /// makes an over-read observable.
+    fn syn_with_options(options: &[u8]) -> Vec<u8> {
+        assert!(
+            options.len().is_multiple_of(4),
+            "TCP headers are 4-byte aligned"
+        );
+        let total = 20 + 20 + options.len();
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[32] = (((20 + options.len()) / 4) as u8) << 4;
+        packet[33] = 0x02; // SYN
+        packet[40..].copy_from_slice(options);
+        packet
+    }
+
+    #[test]
+    fn a_malformed_option_list_declines_rather_than_reading_past_it() {
+        // Each of these once had, or could have had, a read beyond the header.
+        // The parser's contract is total: every one of them is simply "no
+        // clampable MSS here", and the packet passes through unharmed.
+        let hostile: [&[u8]; 6] = [
+            // MSS claiming a two-byte header and no value: the regression case.
+            &[1, 1, 2, 2],
+            // MSS truncated to three bytes at the very end of the header.
+            &[1, 2, 3, 0xff],
+            // Zero length, which would otherwise never advance the cursor.
+            &[2, 0, 0, 0],
+            // A length that runs past the end of the option region.
+            &[2, 40, 0x05, 0xb4],
+            // End-of-options before the MSS that follows it.
+            &[0, 2, 4, 0x05],
+            // Nothing but padding.
+            &[1, 1, 1, 1],
+        ];
+
+        for options in hostile {
+            let mut packet = syn_with_options(options);
+            let before = packet.clone();
+            assert!(
+                !clamp_mss(&mut packet, Mtu::new(1500).unwrap()),
+                "options {options:?} must not report a clamp"
+            );
+            assert_eq!(packet, before, "options {options:?} must pass unmodified");
+        }
+    }
+
+    #[test]
+    fn a_well_formed_mss_option_still_clamps_after_any_padding() {
+        // The counterpart to the test above: totality must not have been
+        // bought by refusing the option the clamp exists to find. 1460 is the
+        // classic Ethernet advertisement; the clamp is 1500 - 60 - 40.
+        let variants: [&[u8]; 3] = [
+            &[2, 4, 0x05, 0xb4],
+            &[1, 1, 2, 4, 0x05, 0xb4, 1, 1],
+            &[3, 3, 7, 1, 2, 4, 0x05, 0xb4],
+        ];
+
+        for options in variants {
+            let mut packet = syn_with_options(options);
+            assert!(
+                clamp_mss(&mut packet, Mtu::new(1400).unwrap()),
+                "options {options:?} carry a clampable MSS"
+            );
+            let clamped = packet
+                .windows(2)
+                .any(|pair| u16::from_be_bytes([pair[0], pair[1]]) == 1360);
+            assert!(clamped, "options {options:?} must be rewritten to 1360");
+        }
+    }
 
     #[test]
     fn forged_ptb_cannot_lower_path_state() {

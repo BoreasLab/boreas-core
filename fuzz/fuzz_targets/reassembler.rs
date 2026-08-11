@@ -12,8 +12,7 @@ use libfuzzer_sys::fuzz_target;
 // Deterministic clock: `Instant` has no constructor from an integer, so a
 // base instant plus data-derived offsets keeps expiry paths reachable.
 fuzz_target!(|data: &[u8]| {
-    let mut reassembler =
-        Reassembler::new(Duration::from_secs(30), NonZeroUsize::new(4).unwrap());
+    let mut reassembler = Reassembler::new(Duration::from_secs(30), NonZeroUsize::new(4).unwrap());
     let base = std::time::Instant::now();
 
     let mut cursor = 0;

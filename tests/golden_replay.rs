@@ -9,7 +9,7 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, FlowEvent,
+    Accepts, BufferPool, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, FlowEvent,
     InternalEndpoint, Mtu, NatBehavior, SendOutcome, SteeringReason,
 };
 
@@ -60,18 +60,30 @@ fn golden_replay_is_byte_exact() {
     );
     assert_eq!(path.poll_transmit(), None, "step 1 transmit");
 
-    // 2. Two datagrams buffer; the third drops and reports.
+    // 2. Two datagrams buffer; the third drops and reports. Payload bytes come
+    //    from the shared pool, so the byte-exactness this test asserts covers
+    //    the budget accounting too.
+    let pool = BufferPool::new(
+        NonZeroUsize::new(1500).unwrap(),
+        NonZeroUsize::new(4).unwrap(),
+    );
     assert_eq!(
-        path.send_datagram(endpoint, vec![1], start),
+        path.send_datagram(endpoint, pool.take(&[1]).unwrap(), start),
         Ok(SendOutcome::Buffered)
     );
     assert_eq!(
-        path.send_datagram(endpoint, vec![2], start),
+        path.send_datagram(endpoint, pool.take(&[2]).unwrap(), start),
         Ok(SendOutcome::Buffered)
     );
+    assert_eq!(pool.available(), 2, "two queued payloads hold the budget");
     assert_eq!(
-        path.send_datagram(endpoint, vec![3], start),
+        path.send_datagram(endpoint, pool.take(&[3]).unwrap(), start),
         Ok(SendOutcome::Dropped)
+    );
+    assert_eq!(
+        pool.available(),
+        2,
+        "the refused payload returned its buffer"
     );
     assert_eq!(
         path.poll_event(),
@@ -87,8 +99,10 @@ fn golden_replay_is_byte_exact() {
         "step 3 event"
     );
 
-    // 4. Idle timeout evicts the flow; nothing else fires.
+    // 4. Idle timeout evicts the flow; nothing else fires, and the flow's
+    //    queue returns to the pool as it drops.
     path.on_timeout(start + Duration::from_secs(121));
     assert_eq!(path.poll_event(), None, "step 4 event");
     assert_eq!(path.poll_transmit(), None, "step 4 transmit");
+    assert_eq!(pool.available(), 4, "step 4 pool");
 }

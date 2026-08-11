@@ -12,12 +12,17 @@
 //! - capacity and timeouts bound memory; a poisoned or evicted key admits
 //!   nothing until it expires.
 //!
-//! Time enters only through `now`; expiry uses the deadline-plus-`BTreeMap`
-//! discipline of `UdpFlowTable`, including stale refresh entries that live for
-//! one extra window.
+//! Time enters only through `now`, and the expiry index follows the same
+//! discipline as `UdpFlowTable`'s timer wheel: **one slot per pending
+//! datagram, inserted once**. A later fragment refreshes the datagram's
+//! deadline in place, `expire` re-validates each surfaced slot against the
+//! real deadline and re-buckets it, and a datagram that completes early takes
+//! its slot with it. The index is therefore O(pending), bounded by
+//! `max_pending`, never O(fragments) — which matters because fragments are
+//! attacker-chosen and pending datagrams are not.
 
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap, btree_map, hash_map::Entry},
     net::IpAddr,
     num::NonZeroUsize,
     time::{Duration, Instant},
@@ -119,6 +124,13 @@ struct Pending {
     /// final fragment, so no 64 KiB allocation happens up front.
     data: Vec<u8>,
     received: [u64; BITMAP_WORDS],
+    /// Population count of `received`. Maintained incrementally because
+    /// overlap is rejected before a block is ever marked, so every marked
+    /// block is new and the count is exact. This is what keeps completion an
+    /// O(1) test: re-scanning the bitmap per fragment would make a 64 KiB
+    /// datagram quadratic in its own fragment count, and the fragment count is
+    /// the attacker's choice.
+    received_blocks: u32,
     total: Option<usize>,
     deadline: Instant,
     poisoned: bool,
@@ -129,6 +141,7 @@ impl Pending {
         Self {
             data: Vec::new(),
             received: [0; BITMAP_WORDS],
+            received_blocks: 0,
             total: None,
             deadline,
             poisoned: false,
@@ -139,15 +152,22 @@ impl Pending {
         self.received[block / 64] & (1 << (block % 64)) != 0
     }
 
+    /// Marks `first_block ..= last_block`, all of which the caller has already
+    /// shown to be unset. O(blocks in the fragment), dominated by the payload
+    /// copy that accompanies it.
     fn mark_received(&mut self, first_block: usize, last_block: usize) {
         for block in first_block..=last_block {
             self.received[block / 64] |= 1 << (block % 64);
         }
+        self.received_blocks += (last_block - first_block + 1) as u32;
     }
 
+    /// O(1). Sound because `push` admits a block at most once and refuses any
+    /// byte beyond a known `total`, so `received_blocks` never exceeds the
+    /// block count and equality means every block arrived.
     fn is_complete(&self) -> bool {
         self.total
-            .is_some_and(|total| (0..total.div_ceil(8)).all(|block| self.block_received(block)))
+            .is_some_and(|total| usize::try_from(self.received_blocks) == Ok(total.div_ceil(8)))
     }
 }
 
@@ -182,18 +202,18 @@ impl Reassembler {
         self.discarded
     }
 
-    /// The earliest live deadline, skipping stale refresh entries. O(stale
-    /// entries) worst case, O(1) typical.
+    /// A lower bound on the earliest live deadline: never later than the true
+    /// one, because a refreshed datagram's slot still sits at its former
+    /// deadline until `expire` re-buckets it. The caller's own deadline check
+    /// stays authoritative, so an early answer costs one extra `expire` pass
+    /// and nothing else.
+    ///
+    /// O(log pending), and every slot points at a live entry — which is what
+    /// makes this safe to call once per reactor iteration.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.expirations.iter().find_map(|(deadline, keys)| {
-            keys.iter()
-                .any(|key| {
-                    self.pending
-                        .get(key)
-                        .is_some_and(|pending| pending.deadline == *deadline)
-                })
-                .then_some(*deadline)
-        })
+        self.expirations
+            .first_key_value()
+            .map(|(deadline, _)| *deadline)
     }
 
     pub fn push(&mut self, fragment: Fragment<'_>, now: Instant) -> PushOutcome {
@@ -228,11 +248,16 @@ impl Reassembler {
         // Instant overflow is not a real clock; an entry expiring at `now` is
         // the conservative answer.
         let deadline = now.checked_add(self.timeout).unwrap_or(now);
-        self.expirations.entry(deadline).or_default().push(key);
 
         let pending = match self.pending.entry(key) {
             Entry::Occupied(occupied) => occupied.into_mut(),
-            Entry::Vacant(vacant) => vacant.insert(Pending::new(deadline)),
+            Entry::Vacant(vacant) => {
+                // One index slot per pending datagram, inserted exactly once.
+                // A later fragment only refreshes `deadline` below, so a
+                // fragment flood adds no expiry-index memory at all.
+                self.expirations.entry(deadline).or_default().push(key);
+                vacant.insert(Pending::new(deadline))
+            }
         };
         pending.deadline = deadline;
 
@@ -266,23 +291,63 @@ impl Reassembler {
         }
         pending.data[offset..extent].copy_from_slice(fragment.payload);
         pending.mark_received(first_block, last_block);
+
         if !fragment.more_fragments {
+            // The final fragment fixes the datagram's length, so a byte
+            // already received beyond it contradicts the declaration exactly
+            // as a later fragment past a known total does. `data.len()` is the
+            // largest extent seen, which makes the check O(1). Without it,
+            // `received_blocks` could count blocks outside `total` and the
+            // completion test would lose its soundness argument.
+            if pending.data.len() > extent {
+                pending.poisoned = true;
+                self.discarded = self.discarded.saturating_add(1);
+                return PushOutcome::Discarded;
+            }
             pending.total = Some(extent);
         }
 
-        if pending.is_complete() {
-            let Some(mut pending) = self.pending.remove(&key) else {
-                return PushOutcome::Discarded;
-            };
-            pending.data.truncate(pending.total.unwrap_or(0));
-            return PushOutcome::Complete(pending.data);
+        if !pending.is_complete() {
+            return PushOutcome::Pending;
         }
 
-        PushOutcome::Pending
+        // A completed datagram leaves `pending`, so its slot leaves the index
+        // with it; the index never outlives its entries.
+        let deadline = pending.deadline;
+        let Some(mut pending) = self.pending.remove(&key) else {
+            return PushOutcome::Discarded;
+        };
+        self.forget_slot(deadline, &key);
+        pending.data.truncate(pending.total.unwrap_or(0));
+        PushOutcome::Complete(pending.data)
     }
 
+    /// Removes one key from its expiry bucket. O(keys sharing the bucket),
+    /// bounded by `max_pending`; buckets are sets, so `swap_remove`'s
+    /// reordering is unobservable.
+    fn forget_slot(&mut self, deadline: Instant, key: &Key) {
+        let btree_map::Entry::Occupied(mut bucket) = self.expirations.entry(deadline) else {
+            return;
+        };
+        let keys = bucket.get_mut();
+        if let Some(at) = keys.iter().position(|candidate| candidate == key) {
+            keys.swap_remove(at);
+        }
+        if keys.is_empty() {
+            bucket.remove();
+        }
+    }
+
+    /// Evicts every pending datagram whose real deadline has arrived, and
+    /// re-buckets the slots of those refreshed since their slot was written.
+    ///
+    /// O(surfaced slots x log pending). Re-bucketing happens after the drain
+    /// so a re-inserted slot, whose deadline is by construction later than
+    /// `now`, cannot be re-surfaced by the same pass.
     pub fn expire(&mut self, now: Instant) -> usize {
         let mut evicted = 0;
+        let mut rebucket: Vec<(Instant, Key)> = Vec::new();
+
         while self
             .expirations
             .first_key_value()
@@ -292,17 +357,21 @@ impl Reassembler {
                 break;
             };
             for key in keys {
-                // A refreshed key sits in a later bucket; the stale entry here
-                // must not evict it early.
-                if self
-                    .pending
-                    .get(&key)
-                    .is_some_and(|pending| pending.deadline <= now)
-                    && self.pending.remove(&key).is_some()
-                {
-                    evicted += 1;
+                // The slot is a hint; the entry's real deadline governs, so a
+                // refreshed datagram is re-bucketed rather than evicted early.
+                match self.pending.entry(key) {
+                    Entry::Occupied(occupied) if occupied.get().deadline <= now => {
+                        occupied.remove();
+                        evicted += 1;
+                    }
+                    Entry::Occupied(occupied) => rebucket.push((occupied.get().deadline, key)),
+                    Entry::Vacant(_) => {}
                 }
             }
+        }
+
+        for (deadline, key) in rebucket {
+            self.expirations.entry(deadline).or_default().push(key);
         }
         evicted
     }
@@ -413,6 +482,113 @@ mod tests {
         // Expiry frees capacity for the same key later.
         assert_eq!(tiny.expire(now + Duration::from_secs(31)), 1);
         assert_eq!(tiny.push(second, now), PushOutcome::Pending);
+    }
+
+    /// Total slots in the expiry index. The invariant under test is that this
+    /// tracks pending datagrams, never fragments.
+    fn index_slots(reassembler: &Reassembler) -> usize {
+        reassembler.expirations.values().map(Vec::len).sum()
+    }
+
+    #[test]
+    fn a_fragment_flood_does_not_grow_the_expiry_index() {
+        // The P7 defect, in the module P7 did not reach. `max_pending` bounds
+        // `pending`; nothing bounded the index, and every fragment — including
+        // the ones immediately rejected as overlapping — used to add a slot.
+        let start = NOW();
+        let mut reassembler = fresh_reassembler();
+        assert_eq!(
+            reassembler.push(fragment(0, true, b"aaaaaaaa"), start),
+            PushOutcome::Pending
+        );
+
+        for tick in 0..10_000 {
+            let now = start + Duration::from_millis(tick);
+            assert_eq!(
+                reassembler.push(fragment(0, true, b"aaaaaaaa"), now),
+                PushOutcome::Discarded,
+                "an overlapping fragment is refused"
+            );
+        }
+
+        assert_eq!(reassembler.len(), 1, "one pending datagram");
+        assert_eq!(index_slots(&reassembler), 1, "one datagram, one slot");
+    }
+
+    #[test]
+    fn a_completed_datagram_takes_its_index_slot_with_it() {
+        // Without this, the index would grow with completions instead of
+        // fragments — the same unbounded shape wearing a different hat.
+        let now = NOW();
+        let mut reassembler = fresh_reassembler();
+        assert_eq!(
+            reassembler.push(fragment(0, true, b"aaaaaaaa"), now),
+            PushOutcome::Pending
+        );
+        assert_eq!(index_slots(&reassembler), 1);
+        assert_eq!(
+            reassembler.push(fragment(8, false, b"bb"), now),
+            PushOutcome::Complete(b"aaaaaaaabb".to_vec())
+        );
+        assert!(reassembler.is_empty());
+        assert_eq!(index_slots(&reassembler), 0, "the slot left with the entry");
+        assert_eq!(reassembler.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_refreshed_datagram_is_rebucketed_rather_than_evicted() {
+        // A slot is only a hint. The entry's real deadline governs, so the
+        // stale slot must survive expiry as a re-insertion, or the datagram
+        // would become invisible to every later pass.
+        let start = NOW();
+        let mut reassembler = fresh_reassembler();
+        assert_eq!(
+            reassembler.push(fragment(0, true, b"aaaaaaaa"), start),
+            PushOutcome::Pending
+        );
+        // Refresh at t+20s: real deadline moves to t+50s, slot stays at t+30s.
+        assert_eq!(
+            reassembler.push(
+                fragment(8, true, b"bbbbbbbb"),
+                start + Duration::from_secs(20)
+            ),
+            PushOutcome::Pending
+        );
+
+        assert_eq!(reassembler.expire(start + Duration::from_secs(31)), 0);
+        assert_eq!(reassembler.len(), 1, "the refreshed datagram survived");
+        assert_eq!(index_slots(&reassembler), 1, "and is still indexed");
+        assert_eq!(
+            reassembler.next_deadline(),
+            Some(start + Duration::from_secs(50)),
+            "re-bucketed at its real deadline"
+        );
+        assert_eq!(reassembler.expire(start + Duration::from_secs(51)), 1);
+        assert!(reassembler.is_empty());
+    }
+
+    #[test]
+    fn a_fragment_beyond_the_declared_total_poisons_the_datagram() {
+        // The soundness condition for the O(1) completion test: a block may
+        // never be counted outside `total`. The final fragment arriving last
+        // is caught by the extent check; arriving first, by this one.
+        let now = NOW();
+        let mut reassembler = fresh_reassembler();
+        // Data at offset 1000 first, then a final fragment declaring total 8.
+        assert_eq!(
+            reassembler.push(fragment(1000, true, b"aaaaaaaa"), now),
+            PushOutcome::Pending
+        );
+        assert_eq!(
+            reassembler.push(fragment(0, false, b"bbbbbbbb"), now),
+            PushOutcome::Discarded,
+            "a declared total cannot be shorter than what already arrived"
+        );
+        // Poisoned: nothing further is admitted under this key until it expires.
+        assert_eq!(
+            reassembler.push(fragment(0, false, b"bbbbbbbb"), now),
+            PushOutcome::Discarded
+        );
     }
 
     #[test]
