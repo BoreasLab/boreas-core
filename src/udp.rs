@@ -112,6 +112,16 @@ impl<V> UdpFlowTable<V> {
         self.flows.contains_key(endpoint)
     }
 
+    /// Drops flows failing `keep`, returning the number removed. Stale
+    /// expiration entries die with the flows they point at on the next
+    /// `expire`, at no extra cost.
+    pub fn retain(&mut self, mut keep: impl FnMut(&InternalEndpoint, &mut V) -> bool) -> usize {
+        let before = self.flows.len();
+        self.flows
+            .retain(|endpoint, state| keep(endpoint, &mut state.value));
+        before - self.flows.len()
+    }
+
     pub fn get_or_insert_with(
         &mut self,
         endpoint: InternalEndpoint,

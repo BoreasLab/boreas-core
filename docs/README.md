@@ -39,6 +39,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 | Path | Responsibility | Design owner |
 |---|---|---|
 | `src/lib.rs` | refined `Mtu`, error spine, capability composition, flow planning, ingress actions | [Architecture](architecture.md) |
+| `src/datapath.rs` | sans-io datapath core: dispatch, flow lifecycle, capability replanning | [Architecture](architecture.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
 | `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |
 | `src/path.rs` | PTB validation against known flows, SYN MSS clamping | [Networking](networking.md) |

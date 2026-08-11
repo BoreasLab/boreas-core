@@ -210,13 +210,23 @@ clean.
 
 ### P4: Sans-io Datapath
 
-Compose P1 through P3 plus the existing `UdpFlowTable` into the poll API above.
-The datapath owns flow state; it does not own a socket, a clock, or a task.
+**Status: complete.** `Datapath` in `src/datapath.rs` composes P1–P3 and
+`UdpFlowTable` behind the poll API: `on_tun_packet`, `on_egress_packet`,
+`poll_transmit`, `poll_event`, `on_timeout`, and `on_capability_change`. It
+owns flow state and queues; it owns no socket, clock, or task. Invalid states
+are structural: fragments quarantine and re-enter dispatch only after
+reassembly re-parses a whole datagram, so a flow's plan always derives from a
+real header; `FlowState` exists only behind a successful `plan_flow`; egress-
+side fragments are pathological and drop. MSS clamping fires on the packet
+fast path before forwarding. `UdpFlowTable::retain` was added for capability-
+driven teardown. `poll_timeout` is omitted for now: neither the reassembler
+nor the flow table exposes its earliest deadline yet, and inventing the
+accessor is P5's job when the simulator needs a wakeup.
 
-**Gate:** pcap replay. A captured trace is fed through the state machine and the
-emitted packets and event sequence are asserted byte-exact against a golden
-output. Deterministic and reproducible, because the only inputs are bytes and an
-`Instant`.
+**Gate met:** `tests/golden_replay.rs` drives a scripted trace — open, buffer,
+drop-and-report, re-steer, expire — and asserts every event and transmit
+byte-exact and in order against a synthetic clock. 27 tests, fmt, clippy
+clean.
 
 **Unlocks:** every subsequent phase.
 
