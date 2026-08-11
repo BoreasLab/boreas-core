@@ -2,6 +2,7 @@ mod datapath;
 mod device;
 mod packet;
 mod path;
+mod platform;
 mod pool;
 mod reassembly;
 mod shell;
@@ -13,6 +14,10 @@ pub use datapath::{Datapath, DatapathError, FlowEvent, Transmit};
 pub use device::{Device, Harness, SimDevice};
 pub use packet::{IngressPacket, PacketError, Transport};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
+#[cfg(unix)]
+pub use platform::AndroidTun;
+#[cfg(windows)]
+pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
 pub use shell::{AsyncDevice, Control, Datagram, Shell, Telemetry};

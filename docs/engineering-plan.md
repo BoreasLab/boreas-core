@@ -367,11 +367,27 @@ full graph is recorded in [Verification](verification.md).
 
 ### P9: Platform adapters
 
-Android `VpnService` fd via JNI, and Windows Wintun via `wintun-bindings`, each
-as a `Device`. Because P5 defined the seam, these are byte shims with no policy.
+**Status: code complete; device gate unexercised.** `src/platform.rs` holds
+both byte shims behind the seam, with no policy in either:
 
-**Gate:** loopback ping through the real device produces output identical to the
-same trace through `SimDevice`. Verified per platform, alone.
+- `AndroidTun` (unix): wraps the VpnService fd in tokio's `AsyncFd`, so
+  readiness is registered and `recv` is cancel-safe — a dropped future has
+  consumed nothing. Takes the fd by ownership; VpnService owns lifecycle.
+- `WintunDevice` (windows): `Arc<Session>`; sync `recv` is `try_receive`,
+  async `recv` moves `receive_blocking` to the blocking pool because Wintun's
+  read wait is a Win32 event tokio cannot poll. Cancel-safety holds because
+  the blocking call owns its session reference and runs to completion.
+
+Both adapters type-check on their own target (`cargo check` and clippy against
+x86_64-pc-windows-msvc and the host). `wintun-bindings` 0.7 is a
+Windows-target-only dependency; the dll remains the WireGuard-authorized
+signed binary per the verification ledger.
+
+**Gate:** loopback ping through the real device must produce output identical
+to the same trace through `SimDevice`, per platform. That needs the Android
+and Windows devices, which this environment does not have; the gate is
+**unexercised** and recorded as such rather than claimed. Both targets compile
+and lint clean, and the simulator equivalence harness exists from P5.
 
 **Unlocks:** P10. Nothing depends on P9 for correctness, which is the point.
 

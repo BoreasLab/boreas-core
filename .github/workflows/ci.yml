@@ -42,7 +42,8 @@ jobs:
       # cargo-fuzz needs nightly for the sanitizer instrumentation.
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
       # A smoke run, not a campaign: each target gets one minute, which is
       # enough to catch a reachable panic on the untrusted paths and cheap

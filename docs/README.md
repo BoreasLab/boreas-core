@@ -43,6 +43,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 | `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
 | `src/shell.rs` | tokio runtime shell, bounded channels, deadline timer | [Architecture](architecture.md) |
 | `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
+| `src/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
 | `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |
 | `src/path.rs` | PTB validation against known flows, SYN MSS clamping | [Networking](networking.md) |
