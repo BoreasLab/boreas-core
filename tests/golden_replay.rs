@@ -17,7 +17,6 @@ const NOW: Duration = Duration::from_secs(1_000);
 
 fn egress(fidelity: DatagramFidelity) -> EgressCapabilities {
     EgressCapabilities {
-        accepts: Accepts::Flows,
         datagram_fidelity: fidelity,
         overhead_bytes: 60,
         max_datagram_size: Some(1500),
@@ -37,12 +36,15 @@ fn udp_frame() -> Vec<u8> {
 fn golden_replay_is_byte_exact() {
     let mut path = Datapath::new(
         FilterPolicy::PassThrough,
+        Accepts::Flows,
         egress(DatagramFidelity::Native),
         Mtu::new(1500).unwrap(),
-        Duration::from_secs(30),
-        NonZeroUsize::new(8).unwrap(),
-        Duration::from_secs(120),
-        NonZeroUsize::new(2).unwrap(),
+        boreas_core::Limits {
+            reassembly_timeout: Duration::from_secs(30),
+            max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
+            flow_idle_timeout: Duration::from_secs(120),
+            datagram_buffer_capacity: NonZeroUsize::new(2).unwrap(),
+        },
     )
     .unwrap();
     let start = Instant::now() + NOW;
@@ -92,7 +94,7 @@ fn golden_replay_is_byte_exact() {
     );
 
     // 3. A fidelity downgrade re-steers; the flow and its buffered data live.
-    path.on_capability_change(egress(DatagramFidelity::Emulated));
+    path.on_capability_change(Accepts::Flows, egress(DatagramFidelity::Emulated));
     assert_eq!(
         path.poll_event(),
         Some(FlowEvent::Resteered(SteeringReason::DatagramFidelity)),

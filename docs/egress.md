@@ -42,14 +42,15 @@ smoltcp bypass.
 
 ### WireGuard
 
-Use GotaTun. GotaTun accepts IP packets directly and is intended to provide a
-portable userspace WireGuard implementation. GotaTun's maturity and Windows
-readiness remain verification items. Keep the egress boundary narrow enough to
+Use GotaTun. Integrated 2026-08-11 at 0.8.1 as `WireGuardEgress` in
+`src/egress.rs`: a sans-io wrapper over `Tunn`, driven by the shell through
+`EgressEmit::{ToNetwork, ToTunnel}` and an explicit timer tick. The reported
+overhead is 80 bytes, the IPv6-underlay worst case (40 outer IPv6 + 8 UDP + 32
+WireGuard header and tag); 60 bytes remains the IPv4 figure. Exact overhead is
+a measured property of the address family and implementation, recorded in
+[Verification](verification.md) item 4. Windows readiness and ECN behaviour
+(item 13) remain verification items. Keep the egress boundary narrow enough to
 substitute NepTUN if testing invalidates it.
-
-WireGuard overhead is approximately 60 bytes for initial planning. Treat exact
-overhead as a measured property of the selected address family, packet type,
-and implementation, not a universal constant.
 
 ### MASQUE CONNECT-IP
 

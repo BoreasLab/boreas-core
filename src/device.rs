@@ -247,8 +247,8 @@ mod tests {
     fn datapath() -> crate::Datapath {
         crate::Datapath::new(
             FilterPolicy::PassThrough,
+            Accepts::IpPackets,
             EgressCapabilities {
-                accepts: Accepts::IpPackets,
                 datagram_fidelity: DatagramFidelity::Native,
                 overhead_bytes: 60,
                 max_datagram_size: None,
@@ -256,10 +256,12 @@ mod tests {
                 nat_behavior: NatBehavior::EndpointIndependent,
             },
             Mtu::new(1500).unwrap(),
-            Duration::from_secs(30),
-            NonZeroUsize::new(8).unwrap(),
-            Duration::from_secs(120),
-            NonZeroUsize::new(64).unwrap(),
+            crate::Limits {
+                reassembly_timeout: Duration::from_secs(30),
+                max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
+                flow_idle_timeout: Duration::from_secs(120),
+                datagram_buffer_capacity: NonZeroUsize::new(64).unwrap(),
+            },
         )
         .unwrap()
     }

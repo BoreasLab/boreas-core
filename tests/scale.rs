@@ -26,8 +26,8 @@ fn udp_frame(flow: u32) -> Vec<u8> {
 fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
     let mut path = Datapath::new(
         FilterPolicy::PassThrough,
+        Accepts::Flows,
         EgressCapabilities {
-            accepts: Accepts::Flows,
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: 60,
             max_datagram_size: Some(1500),
@@ -35,10 +35,12 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
             nat_behavior: NatBehavior::EndpointIndependent,
         },
         Mtu::new(1500).unwrap(),
-        Duration::from_secs(30),
-        NonZeroUsize::new(1024).unwrap(),
-        Duration::from_secs(120),
-        NonZeroUsize::new(8).unwrap(),
+        boreas_core::Limits {
+            reassembly_timeout: Duration::from_secs(30),
+            max_pending_reassemblies: NonZeroUsize::new(1024).unwrap(),
+            flow_idle_timeout: Duration::from_secs(120),
+            datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
+        },
     )
     .unwrap();
 

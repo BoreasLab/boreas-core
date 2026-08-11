@@ -20,9 +20,8 @@ use boreas_core::{
     FilterPolicy, FlowEvent, InternalEndpoint, Mtu, NatBehavior, SendOutcome, Shell, Telemetry,
 };
 
-fn capabilities(accepts: Accepts) -> EgressCapabilities {
+fn capabilities() -> EgressCapabilities {
     EgressCapabilities {
-        accepts,
         datagram_fidelity: DatagramFidelity::Native,
         overhead_bytes: 60,
         max_datagram_size: Some(1500),
@@ -36,12 +35,15 @@ fn capabilities(accepts: Accepts) -> EgressCapabilities {
 fn datapath(accepts: Accepts, queue_depth: usize) -> Datapath {
     Datapath::new(
         FilterPolicy::PassThrough,
-        capabilities(accepts),
+        accepts,
+        capabilities(),
         Mtu::new(1500).unwrap(),
-        Duration::from_secs(30),
-        NonZeroUsize::new(8).unwrap(),
-        Duration::from_secs(120),
-        NonZeroUsize::new(queue_depth).unwrap(),
+        boreas_core::Limits {
+            reassembly_timeout: Duration::from_secs(30),
+            max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
+            flow_idle_timeout: Duration::from_secs(120),
+            datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
+        },
     )
     .unwrap()
 }
@@ -285,7 +287,10 @@ async fn control_messages_reach_the_core_in_order() {
 
     shell
         .control()
-        .send(Control::CapabilityChange(capabilities(Accepts::IpPackets)))
+        .send(Control::CapabilityChange(
+            Accepts::IpPackets,
+            capabilities(),
+        ))
         .await
         .expect("control channel open");
 

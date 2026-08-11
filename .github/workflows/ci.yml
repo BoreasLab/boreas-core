@@ -34,6 +34,20 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
+  windows:
+    name: windows check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # ring compiles C with MSVC, so only a real Windows runner can check the
+      # Wintun adapter and GotaTun together; the Linux cross-check ended with
+      # P10's dependency on ring.
+      - run: cargo clippy --all-targets -- -D warnings
+
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest

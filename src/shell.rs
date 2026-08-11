@@ -36,7 +36,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Datapath, EgressCapabilities, FlowEvent, InternalEndpoint, Pooled, SendOutcome, Transmit,
+    Accepts, Datapath, EgressCapabilities, FlowEvent, InternalEndpoint, Pooled, SendOutcome,
+    Transmit,
 };
 
 /// Depth of both reactor channels. Bounded is the point; the exact depth trades
@@ -53,7 +54,9 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// policy.
 #[derive(Debug)]
 pub enum Control {
-    CapabilityChange(EgressCapabilities),
+    /// The layer travels with the claim because both are derived from the
+    /// same [`crate::Egress`] variant by the sender; apart they could drift.
+    CapabilityChange(Accepts, EgressCapabilities),
     /// Ordered shutdown: control messages queued ahead of this one are applied
     /// first. [`Shell::shutdown`] uses the cancellation token instead, which
     /// needs no channel capacity and therefore cannot be refused.
@@ -303,7 +306,9 @@ async fn reactor_loop<D: AsyncDevice>(
             _ = shutdown.cancelled() => break,
 
             message = control.recv() => match message {
-                Some(Control::CapabilityChange(next)) => datapath.on_capability_change(next),
+                Some(Control::CapabilityChange(accepts, next)) => {
+                    datapath.on_capability_change(accepts, next);
+                }
                 // An explicit shutdown and a dropped owner are the same
                 // request: nobody is left to steer this reactor.
                 Some(Control::Shutdown) | None => break,

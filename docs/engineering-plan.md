@@ -393,27 +393,50 @@ and lint clean, and the simulator equivalence harness exists from P5.
 
 ### P10: Packet egress and splice
 
-GotaTun as the first `PacketEgress`. Splice via `copy_bidirectional`. The
-smoltcp bypass becomes real here.
+**Status: code complete; M1 device gate unexercised.** Delivered:
 
-At this phase `EgressCapabilities::accepts` becomes redundant with the
-implementation variant and can lie about it. Replace with a sum whose variant
-determines the layer:
+- `src/egress.rs` replaces `EgressCapabilities::accepts` with the
+  `Egress { Packet, Stream }` sum. The layer is the variant and the
+  capabilities come from the implementation behind it, so a claim can no
+  longer disagree with its implementation. `CapabilityError::MixedLayers` now
+  reports from `Egress::chain`, where two implementations actually meet. The
+  pure planner functions take the layer as an explicit parameter, and
+  `Control::CapabilityChange` carries it alongside the claim.
+- `WireGuardEgress`, a sans-io wrapper over GotaTun 0.8.1's `Tunn`: IP packets
+  in, `EgressEmit::{ToNetwork, ToTunnel}` out, handshake retries and
+  keepalives on an explicit `tick()` for the shell. Keepalives are suppressed
+  at the boundary and WireGuard's 16-byte padding is stripped against the IP
+  length field, so the tunnel side sees exactly the packet. The capability
+  claim is Native fidelity, 80-byte worst-case (IPv6 underlay) overhead,
+  endpoint-independent, and `preserves_ecn: false` until captures prove
+  otherwise.
+- The fast-path counter, `WireGuardEgress::fast_path_packets`. smoltcp remains
+  dev-only, so the bypass is currently structural — nothing links smoltcp —
+  and the counter is the tripwire for the phase that adds local termination.
+- The fusion benchmark, `examples/fusion.rs`: 10,000 packets driven
+  tun → datapath → WireGuard → peer → back, fully in-process. On the aarch64
+  dev VM, release build: 2.1 µs per packet end to end, of which 585 ns is the
+  core (within the ~1 µs budget) and the residual ~1.5 µs is ring AEAD in both
+  directions. The two-process baseline needs real devices and is recorded as
+  outstanding in [Verification](verification.md).
 
-```rust
-enum Egress { Packet(Box<dyn PacketEgress>), Stream(Box<dyn StreamEgress>) }
-```
+**Corrections to what this phase was assumed to contain.** The per-flow
+`DatagramBuffer` queues get their drain from the first *stream* egress
+(SOCKS5, P17): a packet egress consumes whole packets, so P8's note that "the
+egress that drains them is P10" was wrong about the phase, not about the
+design. Likewise `copy_bidirectional` splice presupposes locally terminated
+streams, and smoltcp integration is explicitly gated on re-measurement under
+live traffic ([Verification](verification.md) item 8), which is device-bound.
+Both therefore move past P10 rather than into it.
 
-`CapabilityError::MixedLayers` then reports a genuine configuration conflict
-rather than a possible internal inconsistency. Deferring this to P10 rather than
-P1 is deliberate: before an implementation exists, the field cannot disagree
-with anything.
-
-**Gate:** the M1 product gate — a working single-interface WireGuard client on
-both platforms. The fast-path counter proves packet egress never enters smoltcp.
-The fusion benchmark runs and reports against the two-process baseline.
-
-**Completes M1.**
+**Gate:** the in-process part is met — `tests/egress.rs` drives the scripted
+harness into a real client-server WireGuard pair and asserts byte-exact return,
+zero flow state on the packet path, and the reported capability set planning
+the fast path. The M1 product gate (single-interface client on Android and
+Windows hardware) needs the devices this environment does not have and is
+**unexercised**, same as P9's. A Windows CI job now compiles the Wintun
+adapter and GotaTun together, because ring's C build ended the local
+cross-check. 55 tests, fmt, clippy, and `cargo deny` clean.
 
 ## Tier 3: Filtering and Egress Breadth
 

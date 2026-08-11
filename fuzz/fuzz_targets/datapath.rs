@@ -14,15 +14,16 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use boreas_core::{
-    Accepts, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, Mtu, NatBehavior,
+    Accepts, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, Limits, Mtu,
+    NatBehavior,
 };
 use libfuzzer_sys::fuzz_target;
 
 fn datapath(accepts: Accepts) -> Datapath {
     Datapath::new(
         FilterPolicy::PassThrough,
+        accepts,
         EgressCapabilities {
-            accepts,
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: 60,
             max_datagram_size: Some(1500),
@@ -30,10 +31,12 @@ fn datapath(accepts: Accepts) -> Datapath {
             nat_behavior: NatBehavior::EndpointIndependent,
         },
         Mtu::new(1500).unwrap(),
-        Duration::from_secs(30),
-        NonZeroUsize::new(4).unwrap(),
-        Duration::from_secs(120),
-        NonZeroUsize::new(4).unwrap(),
+        Limits {
+            reassembly_timeout: Duration::from_secs(30),
+            max_pending_reassemblies: NonZeroUsize::new(4).unwrap(),
+            flow_idle_timeout: Duration::from_secs(120),
+            datagram_buffer_capacity: NonZeroUsize::new(4).unwrap(),
+        },
     )
     .expect("the fuzz configuration plans")
 }

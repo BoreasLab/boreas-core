@@ -16,7 +16,7 @@
 use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 
 use crate::{
-    DatagramBuffer, EgressCapabilities, FilterPolicy, FlowPlan, FlowTableError, Fragment,
+    Accepts, DatagramBuffer, EgressCapabilities, FilterPolicy, FlowPlan, FlowTableError, Fragment,
     IngressAction, IngressPacket, InternalEndpoint, Mtu, PacketError, PlanError, Pooled,
     PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
     UdpFlowTable, clamp_mss, plan_flow, replan, route_ingress,
@@ -35,6 +35,21 @@ pub enum FlowEvent {
     ReassemblyDiscarded,
     Resteered(SteeringReason),
     FlowTornDown(InternalEndpoint),
+}
+
+/// The tuning knobs of a [`Datapath`], grouped so the constructor reads as
+/// configuration rather than position. All four are bounds on memory or time;
+/// none of them changes policy.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub reassembly_timeout: std::time::Duration,
+    pub max_pending_reassemblies: NonZeroUsize,
+    /// RFC 4787 REQ-5 forbids going below two minutes; the flow table enforces
+    /// that floor.
+    pub flow_idle_timeout: std::time::Duration,
+    /// Per-flow datagram queue depth: the fairness bound under the shared
+    /// pool's global budget.
+    pub datagram_buffer_capacity: NonZeroUsize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,6 +111,11 @@ struct FlowState {
 
 pub struct Datapath {
     filter: FilterPolicy,
+    /// The layer the configured egress accepts. Separate from the capability
+    /// claim because the layer is a property of the implementation variant,
+    /// established by the caller from [`crate::Egress`] and unable to drift
+    /// from it there.
+    accepts: Accepts,
     egress: EgressCapabilities,
     path_mtu: Mtu,
     datagram_buffer_capacity: NonZeroUsize,
@@ -108,25 +128,27 @@ pub struct Datapath {
 impl Datapath {
     pub fn new(
         filter: FilterPolicy,
+        accepts: Accepts,
         egress: EgressCapabilities,
         path_mtu: Mtu,
-        reassembly_timeout: std::time::Duration,
-        max_pending_reassemblies: NonZeroUsize,
-        flow_idle_timeout: std::time::Duration,
-        datagram_buffer_capacity: NonZeroUsize,
+        limits: Limits,
     ) -> Result<Self, DatapathError> {
         // Parse, do not validate: a `Datapath` exists only for a configuration
         // that plans. Every later `plan_flow` on this configuration is then a
         // proof-carrying repeat rather than a fresh gamble.
-        plan_flow(filter, egress, path_mtu)?;
+        plan_flow(filter, accepts, egress, path_mtu)?;
 
         Ok(Self {
             filter,
+            accepts,
             egress,
             path_mtu,
-            datagram_buffer_capacity,
-            reassembler: Reassembler::new(reassembly_timeout, max_pending_reassemblies),
-            flows: UdpFlowTable::new(flow_idle_timeout, Instant::now())?,
+            datagram_buffer_capacity: limits.datagram_buffer_capacity,
+            reassembler: Reassembler::new(
+                limits.reassembly_timeout,
+                limits.max_pending_reassemblies,
+            ),
+            flows: UdpFlowTable::new(limits.flow_idle_timeout, Instant::now())?,
             events: VecDeque::new(),
             transmits: VecDeque::new(),
         })
@@ -155,7 +177,13 @@ impl Datapath {
         buf: &[u8],
         now: Instant,
     ) -> Result<(), DatapathError> {
-        match route_ingress(packet, self.filter, self.egress, self.path_mtu)? {
+        match route_ingress(
+            packet,
+            self.filter,
+            self.accepts,
+            self.egress,
+            self.path_mtu,
+        )? {
             IngressAction::Reassemble => self.on_fragment(buf, now),
             IngressAction::ForwardPacket(plan) => {
                 let mut bytes = buf.to_vec();
@@ -242,7 +270,7 @@ impl Datapath {
     ) -> Result<SendOutcome, DatapathError> {
         // Planned before the closure so a configuration the current egress
         // cannot serve surfaces as `DatapathError::Plan`, never as a panic.
-        let plan = plan_flow(self.filter, self.egress, self.path_mtu)?;
+        let plan = plan_flow(self.filter, self.accepts, self.egress, self.path_mtu)?;
         let capacity = self.datagram_buffer_capacity;
         let flow = self.flows.get_or_insert_with(endpoint, now, || FlowState {
             plan,
@@ -260,7 +288,8 @@ impl Datapath {
     /// O(live flows), one `replan` per flow and no intermediate event buffer:
     /// destructuring `self` borrows the flow table and the event queue as the
     /// disjoint fields they are, which matters at the 10,000-flow target.
-    pub fn on_capability_change(&mut self, next: EgressCapabilities) {
+    pub fn on_capability_change(&mut self, accepts: Accepts, next: EgressCapabilities) {
+        self.accepts = accepts;
         self.egress = next;
         let Self {
             filter,
@@ -271,8 +300,8 @@ impl Datapath {
         } = self;
         let (filter, path_mtu) = (*filter, *path_mtu);
 
-        flows.retain(
-            |endpoint, state| match replan(&state.plan, filter, next, path_mtu) {
+        flows.retain(|endpoint, state| {
+            match replan(&state.plan, filter, accepts, next, path_mtu) {
                 Ok(Replan::Unchanged) => true,
                 // The replacement plan travels with the verdict, so a resteered
                 // flow cannot end up running on its stale plan.
@@ -285,8 +314,8 @@ impl Datapath {
                     events.push_back(FlowEvent::FlowTornDown(*endpoint));
                     false
                 }
-            },
-        );
+            }
+        });
     }
 
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
@@ -327,7 +356,7 @@ fn endpoint_of(packet: IngressPacket) -> InternalEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BufferPool;
+    use crate::{BufferPool, Limits};
     use std::{
         net::{IpAddr, Ipv4Addr},
         sync::Arc,
@@ -343,9 +372,17 @@ mod tests {
         )
     }
 
+    fn limits(queue_depth: usize) -> Limits {
+        Limits {
+            reassembly_timeout: Duration::from_secs(30),
+            max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
+            flow_idle_timeout: Duration::from_secs(120),
+            datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
+        }
+    }
+
     fn egress(fidelity: crate::DatagramFidelity) -> EgressCapabilities {
         EgressCapabilities {
-            accepts: crate::Accepts::Flows,
             datagram_fidelity: fidelity,
             overhead_bytes: 60,
             max_datagram_size: Some(1500),
@@ -357,12 +394,10 @@ mod tests {
     fn datapath(fidelity: crate::DatagramFidelity) -> Datapath {
         Datapath::new(
             FilterPolicy::PassThrough,
+            Accepts::Flows,
             egress(fidelity),
             Mtu::new(1500).unwrap(),
-            Duration::from_secs(30),
-            NonZeroUsize::new(8).unwrap(),
-            Duration::from_secs(120),
-            NonZeroUsize::new(64).unwrap(),
+            limits(64),
         )
         .unwrap()
     }
@@ -408,7 +443,7 @@ mod tests {
         ));
 
         // MASQUE's QUIC-to-HTTP/2 fallback: fidelity drops, the flow lives.
-        path.on_capability_change(egress(crate::DatagramFidelity::Emulated));
+        path.on_capability_change(Accepts::Flows, egress(crate::DatagramFidelity::Emulated));
         assert_eq!(
             path.poll_event(),
             Some(FlowEvent::Resteered(SteeringReason::DatagramFidelity))
@@ -435,9 +470,8 @@ mod tests {
         path.on_tun_packet(&udp_packet(), now).unwrap();
         let _ = path.poll_event();
 
-        let mut packets_only = egress(crate::DatagramFidelity::Native);
-        packets_only.accepts = crate::Accepts::IpPackets;
-        path.on_capability_change(packets_only);
+        let packets_only = egress(crate::DatagramFidelity::Native);
+        path.on_capability_change(Accepts::IpPackets, packets_only);
         assert!(matches!(
             path.poll_event(),
             Some(FlowEvent::FlowTornDown(_))
@@ -482,18 +516,18 @@ mod tests {
         // configuration could ever plan. Rejecting it here is what makes every
         // later `plan_flow` on the stored configuration a proof-carrying
         // repeat rather than a panic waiting to happen.
-        let mut starved = egress(crate::DatagramFidelity::Native);
-        starved.accepts = crate::Accepts::IpPackets;
-        starved.overhead_bytes = 400;
+        let starved = egress(crate::DatagramFidelity::Native);
+        let starved = EgressCapabilities {
+            overhead_bytes: 400,
+            ..starved
+        };
         assert_eq!(
             Datapath::new(
                 FilterPolicy::PassThrough,
+                Accepts::IpPackets,
                 starved,
                 Mtu::new(1500).unwrap(),
-                Duration::from_secs(30),
-                NonZeroUsize::new(8).unwrap(),
-                Duration::from_secs(120),
-                NonZeroUsize::new(64).unwrap(),
+                limits(64),
             )
             .err(),
             Some(DatapathError::Plan(PlanError::InnerMtu(
@@ -506,15 +540,12 @@ mod tests {
     fn a_full_queue_drops_and_returns_its_bytes_to_the_pool() {
         // Two bounds act here, and the per-flow one binds first by design: it
         // is the fairness bound, so no single flow can spend the shared budget.
-        let queue_depth = NonZeroUsize::new(2).unwrap();
         let mut path = Datapath::new(
             FilterPolicy::PassThrough,
+            Accepts::Flows,
             egress(crate::DatagramFidelity::Native),
             Mtu::new(1500).unwrap(),
-            Duration::from_secs(30),
-            NonZeroUsize::new(8).unwrap(),
-            Duration::from_secs(120),
-            queue_depth,
+            limits(2),
         )
         .unwrap();
         let now = Instant::now();

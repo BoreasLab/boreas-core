@@ -51,6 +51,19 @@ by `cargo deny check` in CI, dev-dependencies included (`exclude-dev = false`).
 | `syn` | 3.0.3, transitive | build-time only | MIT OR Apache-2.0 |
 | `unicode-ident` | 1.0.24, transitive | build-time only | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | `smoltcp` | 0.13.1, dev-only | the P6 scaling measurement; never linked | 0BSD |
+| `gotatun` | 0.8.1 | sans-io WireGuard peer behind `WireGuardEgress` | MPL-2.0 |
+| `ring` | 0.17.14, transitive | gotatun's AEAD and X25519 backends | ISC-style, allowlist-covered |
+
+`gotatun`'s wider transitive graph (x25519-dalek, curve25519-dalek,
+chacha20poly1305, blake2, and friends) is BSD-3-Clause, MIT, or Apache-2.0
+throughout; `cargo deny check` verifies the full resolved set, dev included.
+Correcting the earlier ledger entry: GotaTun is MPL-2.0, not BSD-3-Clause as
+the planned-dependencies table recorded. MPL-2.0 qualifies through its
+secondary-license mechanism, so the admission stands on the existing policy.
+
+`ring` compiles C at build time, which ended the local
+x86_64-pc-windows-msvc cross-check that P9 used: this Linux environment has no
+MSVC. A windows-latest CI job now owns that check.
 
 `tokio` is taken with named features (`macros`, `rt`, `rt-multi-thread`,
 `sync`, `time`) rather than `full`. Boreas cross-compiles to Android, so the
@@ -70,7 +83,7 @@ compatible release and regenerate the license review at that time.
 | `rcgen` | leaf certificate generation | MIT OR Apache-2.0 | rustls organization; mature dependency surface |
 | `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | MIT OR Apache-2.0 | ISRG Prossimo-backed |
 | `tokio-quiche` and quiche | MASQUE and later H3 | BSD-compatible | used by iCloud Private Relay Proxy B, Oxy, and WARP's MASQUE client |
-| GotaTun | WireGuard | BSD-3-Clause | Mullvad project; audit and all-platform rollout were planned for 2026 |
+| ~~GotaTun~~ | WireGuard | integrated 2026-08-11 at 0.8.1 | MPL-2.0 (corrected from BSD-3-Clause); Mullvad project; Windows readiness unexercised, no device in this environment |
 | `smoltcp` | locally terminated TCP | BSD OR Apache-2.0 | vendored in AOSP; host-scale feature limits require testing |
 | `shadowsocks-rust` | Shadowsocks egress | verify before use | mature and active, exact current license remains an action item |
 | `wintun-bindings` | Windows Wintun loading | verify binding release | exposes Adapter and Session APIs |
@@ -167,6 +180,9 @@ Do not rely on these without a targeted check:
 2. The current `shadowsocks-rust` license and distribution obligations.
 3. WebView user-root behavior across vendor builds and Android releases.
 4. Exact per-egress overhead beyond the approximate 60-byte WireGuard budget.
+   Partially answered 2026-08-11: `WireGuardEgress` reports 80 bytes, the IPv6
+   underlay worst case (40 outer IPv6 + 8 UDP + 32 WireGuard), so the inner
+   MTU is never optimistic; the per-family exact figure remains unmeasured.
 5. GotaTun readiness on Windows.
 6. smoltcp behavior and socket-set cost at hundreds of concurrent sockets.
    **Measured 2026-08-11, smoltcp 0.13.1, aarch64 Linux VM, idle listening
@@ -242,6 +258,19 @@ These are deliberate hypotheses to test, not external facts:
     ordering the sender chooses. The expiry index no longer grows with
     fragments at all: `src/reassembly.rs` asserts one slot per pending
     datagram after 10,000 rejected fragments.
+12. **Fusion path cost:** measured 2026-08-11, release build, aarch64 dev VM,
+    `examples/fusion.rs`: 10,000 packets driven tun → datapath → WireGuard →
+    peer → back in-process. 2.1 µs per packet end to end; the datapath alone,
+    same script, is 585 ns per packet — within the ~1 µs per-packet budget in
+    [Engineering Plan](engineering-plan.md) — and the residual ~1.5 µs is ring
+    AEAD in both directions on a VM without crypto acceleration evidence.
+    The two-process baseline the M1 gate compares against needs real devices
+    and remains outstanding. Wakeups and context switches, the budget's actual
+    cost drivers, are kernel-visible and likewise belong to the device run.
+13. **ECN over WireGuard:** unverified. The inner header's ECN survives
+    encryption, but outer-header marking propagation through the UDP underlay
+    is unimplemented and unmeasured, so `WireGuardEgress` claims
+    `preserves_ecn: false`. Validate against packet captures before any claim.
 
 ## Updating This Ledger
 

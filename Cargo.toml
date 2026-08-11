@@ -6,6 +6,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 etherparse = "0.21.0"
+gotatun = { version = "0.8.1", default-features = false, features = ["ring"] }
 # Named features rather than "full": the shell needs a runtime, bounded
 # channels, a timer, and the `select!`/`pin!` macros, and nothing else. Boreas
 # cross-compiles to Android, where every unused tokio driver is dead weight in
@@ -23,7 +24,7 @@ tokio-util = { version = "0.7.19", features = ["rt"] }
 # The Windows adapter loads the WireGuard-authorized signed wintun.dll at
 # runtime; the bindings are Windows-only and never enter the Android graph.
 [target.'cfg(windows)'.dependencies]
-wintun-bindings = "0.7"
+wintun-bindings = "0.7.39"
 
 [dev-dependencies]
 # `test-util` provides the paused clock the P8 timer gate needs: virtual time

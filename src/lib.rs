@@ -1,5 +1,6 @@
 mod datapath;
 mod device;
+mod egress;
 mod packet;
 mod path;
 mod platform;
@@ -10,8 +11,12 @@ mod udp;
 
 use std::{error::Error, fmt};
 
-pub use datapath::{Datapath, DatapathError, FlowEvent, Transmit};
+pub use datapath::{Datapath, DatapathError, FlowEvent, Limits, Transmit};
 pub use device::{Device, Harness, SimDevice};
+pub use egress::{
+    Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
+    WireGuardConfig, WireGuardEgress,
+};
 pub use packet::{IngressPacket, PacketError, Transport};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 #[cfg(unix)]
@@ -77,9 +82,13 @@ pub enum DatagramFidelity {
     Native,
 }
 
+/// The live capability claim of one egress. There is deliberately no
+/// `accepts` field: the accepted layer is a property of the implementation
+/// variant (`Egress::Packet` vs `Egress::Stream`), so a claim can no longer
+/// disagree with the thing it describes. Callers receive the layer alongside
+/// this struct, derived from that variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EgressCapabilities {
-    pub accepts: Accepts,
     pub datagram_fidelity: DatagramFidelity,
     pub overhead_bytes: u16,
     pub max_datagram_size: Option<u16>,
@@ -105,13 +114,11 @@ pub enum CapabilityError {
 }
 
 impl EgressCapabilities {
+    /// The weakest-link composition of two claims. Layer agreement is not
+    /// checked here: it is a property of the implementations and is enforced
+    /// by [`Egress::chain`], the only place two implementations meet.
     pub fn chain(self, next: Self) -> Result<Self, CapabilityError> {
-        if self.accepts != next.accepts {
-            return Err(CapabilityError::MixedLayers);
-        }
-
         Ok(Self {
-            accepts: self.accepts,
             datagram_fidelity: self.datagram_fidelity.min(next.datagram_fidelity),
             overhead_bytes: self
                 .overhead_bytes
@@ -200,10 +207,11 @@ pub enum IngressAction {
 
 pub fn plan_flow(
     filter: FilterPolicy,
+    accepts: Accepts,
     egress: EgressCapabilities,
     path_mtu: Mtu,
 ) -> Result<FlowPlan, PlanError> {
-    let transport = match (filter, egress.accepts) {
+    let transport = match (filter, accepts) {
         (FilterPolicy::PassThrough, Accepts::IpPackets) => {
             let inner_mtu = path_mtu
                 .get()
@@ -245,21 +253,28 @@ pub fn plan_flow(
 /// moved. Errors only when the new capability cannot support the flow's layer
 /// or leaves a packet path below the IPv6 floor, and the caller answers those
 /// with `Teardown`.
+/// Re-plans a live flow after its egress reports a capability change (MASQUE's
+/// QUIC-to-HTTP/2 fallback is the driving case). The filter policy and path
+/// MTU are session properties and pass through unchanged; only the egress
+/// moved. Errors only when the new capability cannot support the flow's layer
+/// or leaves a packet path below the IPv6 floor, and the caller answers those
+/// with `Teardown`.
 pub fn replan(
     current: &FlowPlan,
     filter: FilterPolicy,
+    accepts: Accepts,
     next: EgressCapabilities,
     path_mtu: Mtu,
 ) -> Result<Replan, PlanError> {
-    let accepts = match current.transport {
+    let flow_layer = match current.transport {
         TransportPath::PacketFastPath { .. } => Accepts::IpPackets,
         TransportPath::LocalTermination => Accepts::Flows,
     };
-    if next.accepts != accepts {
+    if accepts != flow_layer {
         return Ok(Replan::Teardown);
     }
 
-    let next_plan = plan_flow(filter, next, path_mtu)?;
+    let next_plan = plan_flow(filter, accepts, next, path_mtu)?;
     // Crossing the transport boundary re-originates the flow's bytes; no live
     // flow survives it. A PacketFastPath whose inner MTU merely moved is the
     // same transport with a new budget, handled by MTU machinery, not teardown.
@@ -283,6 +298,7 @@ pub fn replan(
 pub fn route_ingress(
     packet: IngressPacket,
     filter: FilterPolicy,
+    accepts: Accepts,
     egress: EgressCapabilities,
     path_mtu: Mtu,
 ) -> Result<IngressAction, PlanError> {
@@ -292,7 +308,7 @@ pub fn route_ingress(
         Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => {}
     }
 
-    let plan = plan_flow(filter, egress, path_mtu)?;
+    let plan = plan_flow(filter, accepts, egress, path_mtu)?;
     if matches!(plan.transport, TransportPath::PacketFastPath { .. }) {
         return Ok(IngressAction::ForwardPacket(plan));
     }
@@ -351,13 +367,8 @@ impl Error for CapabilityError {}
 mod tests {
     use super::*;
 
-    fn egress(
-        accepts: Accepts,
-        fidelity: DatagramFidelity,
-        overhead_bytes: u16,
-    ) -> EgressCapabilities {
+    fn egress(fidelity: DatagramFidelity, overhead_bytes: u16) -> EgressCapabilities {
         EgressCapabilities {
-            accepts,
             datagram_fidelity: fidelity,
             overhead_bytes,
             max_datagram_size: None,
@@ -394,11 +405,11 @@ mod tests {
                     for right_nat in NAT_BEHAVIORS {
                         let first = EgressCapabilities {
                             nat_behavior: left_nat,
-                            ..egress(Accepts::Flows, left, 0)
+                            ..egress(left, 0)
                         };
                         let second = EgressCapabilities {
                             nat_behavior: right_nat,
-                            ..egress(Accepts::Flows, right, 0)
+                            ..egress(right, 0)
                         };
                         let chained = first.chain(second).unwrap();
                         assert_eq!(chained.datagram_fidelity, left.min(right));
@@ -417,11 +428,14 @@ mod tests {
                     for max_datagram_size in [None, Some(1199), Some(1200), Some(1500)] {
                         let capabilities = EgressCapabilities {
                             max_datagram_size,
-                            ..egress(Accepts::IpPackets, fidelity, overhead)
+                            ..egress(fidelity, overhead)
                         };
-                        let Ok(plan) =
-                            plan_flow(FilterPolicy::PassThrough, capabilities, mtu(path))
-                        else {
+                        let Ok(plan) = plan_flow(
+                            FilterPolicy::PassThrough,
+                            Accepts::IpPackets,
+                            capabilities,
+                            mtu(path),
+                        ) else {
                             continue; // overhead exceeded the path; not admitted
                         };
                         if fidelity != DatagramFidelity::Native {
@@ -453,18 +467,25 @@ mod tests {
         for fidelity in FIDELITIES {
             let live = plan_flow(
                 FilterPolicy::PassThrough,
+                Accepts::Flows,
                 EgressCapabilities {
                     max_datagram_size: Some(1500),
-                    ..egress(Accepts::Flows, DatagramFidelity::Native, 0)
+                    ..egress(DatagramFidelity::Native, 0)
                 },
                 mtu(1500),
             )
             .unwrap();
             let next = EgressCapabilities {
                 max_datagram_size: Some(1500),
-                ..egress(Accepts::Flows, fidelity, 0)
+                ..egress(fidelity, 0)
             };
-            let result = replan(&live, FilterPolicy::PassThrough, next, mtu(1500));
+            let result = replan(
+                &live,
+                FilterPolicy::PassThrough,
+                Accepts::Flows,
+                next,
+                mtu(1500),
+            );
             if fidelity == DatagramFidelity::Native {
                 assert_eq!(result, Ok(Replan::Unchanged));
             } else {
@@ -476,7 +497,9 @@ mod tests {
                     result,
                     Ok(Replan::Resteer {
                         reason: SteeringReason::DatagramFidelity,
-                        plan: plan_flow(FilterPolicy::PassThrough, next, mtu(1500)).unwrap(),
+                        plan:
+                            plan_flow(FilterPolicy::PassThrough, Accepts::Flows, next, mtu(1500),)
+                                .unwrap(),
                     }),
                     "Native to {fidelity:?} must re-steer, never drop"
                 );
@@ -488,7 +511,8 @@ mod tests {
     fn replan_tears_down_only_unsurvivable_changes() {
         let packet_plan = plan_flow(
             FilterPolicy::PassThrough,
-            egress(Accepts::IpPackets, DatagramFidelity::Native, 60),
+            Accepts::IpPackets,
+            egress(DatagramFidelity::Native, 60),
             mtu(1500),
         )
         .unwrap();
@@ -498,7 +522,8 @@ mod tests {
             replan(
                 &packet_plan,
                 FilterPolicy::PassThrough,
-                egress(Accepts::Flows, DatagramFidelity::Native, 60),
+                Accepts::Flows,
+                egress(DatagramFidelity::Native, 60),
                 mtu(1500),
             ),
             Ok(Replan::Teardown)
@@ -510,7 +535,8 @@ mod tests {
             replan(
                 &packet_plan,
                 FilterPolicy::PassThrough,
-                egress(Accepts::IpPackets, DatagramFidelity::Native, 300),
+                Accepts::IpPackets,
+                egress(DatagramFidelity::Native, 300),
                 mtu(1500),
             ),
             Err(PlanError::InnerMtu(MtuError::BelowMinimum(1200)))
@@ -521,7 +547,8 @@ mod tests {
             replan(
                 &packet_plan,
                 FilterPolicy::PassThrough,
-                egress(Accepts::IpPackets, DatagramFidelity::Native, 100),
+                Accepts::IpPackets,
+                egress(DatagramFidelity::Native, 100),
                 mtu(1500),
             ),
             Ok(Replan::Unchanged)
@@ -530,7 +557,7 @@ mod tests {
 
     #[test]
     fn fragments_never_reach_l4_admission() {
-        let native_l3 = egress(Accepts::IpPackets, DatagramFidelity::Native, 0);
+        let native_l3 = egress(DatagramFidelity::Native, 0);
         let ipv4_udp = [
             0x45, 0x03, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
@@ -549,7 +576,13 @@ mod tests {
                 let parsed = IngressPacket::parse(&packet).expect("wire-valid packet");
                 assert_eq!(parsed.transport, Transport::Fragment);
                 assert_eq!(
-                    route_ingress(parsed, FilterPolicy::PassThrough, native_l3, mtu(1500)),
+                    route_ingress(
+                        parsed,
+                        FilterPolicy::PassThrough,
+                        Accepts::IpPackets,
+                        native_l3,
+                        mtu(1500)
+                    ),
                     Ok(IngressAction::Reassemble),
                     "offset {offset_units}, more_fragments {more_fragments}"
                 );
@@ -569,7 +602,13 @@ mod tests {
         let parsed = IngressPacket::parse(&ipv6_fragment).expect("wire-valid packet");
         assert_eq!(parsed.transport, Transport::Fragment);
         assert_eq!(
-            route_ingress(parsed, FilterPolicy::PassThrough, native_l3, mtu(1500)),
+            route_ingress(
+                parsed,
+                FilterPolicy::PassThrough,
+                Accepts::IpPackets,
+                native_l3,
+                mtu(1500)
+            ),
             Ok(IngressAction::Reassemble)
         );
     }
@@ -594,9 +633,14 @@ mod tests {
 
     #[test]
     fn flow_planning_enforces_fast_path_and_quic_invariants() {
-        let native_l3 = egress(Accepts::IpPackets, DatagramFidelity::Native, 60);
+        let native_l3 = egress(DatagramFidelity::Native, 60);
         assert_eq!(
-            plan_flow(FilterPolicy::PassThrough, native_l3, mtu(1500)),
+            plan_flow(
+                FilterPolicy::PassThrough,
+                Accepts::IpPackets,
+                native_l3,
+                mtu(1500)
+            ),
             Ok(FlowPlan {
                 transport: TransportPath::PacketFastPath {
                     inner_mtu: mtu(1440)
@@ -606,13 +650,20 @@ mod tests {
         );
 
         assert_eq!(
-            plan_flow(FilterPolicy::InspectHttp, native_l3, mtu(1500)).map(|plan| plan.quic),
+            plan_flow(
+                FilterPolicy::InspectHttp,
+                Accepts::IpPackets,
+                native_l3,
+                mtu(1500)
+            )
+            .map(|plan| plan.quic),
             Ok(QuicPolicy::SteerToHttp2(SteeringReason::InspectionRequired))
         );
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
-                egress(Accepts::Flows, DatagramFidelity::Emulated, 60),
+                Accepts::Flows,
+                egress(DatagramFidelity::Emulated, 60),
                 mtu(1500),
             )
             .map(|plan| (plan.transport, plan.quic)),
@@ -624,15 +675,22 @@ mod tests {
 
         // On a terminated path the client's MTU is gone, so the egress's own
         // datagram ceiling decides whether QUIC clears RFC 9000's 1200 floor.
-        let native_l4 = egress(Accepts::Flows, DatagramFidelity::Native, 0);
+        let native_l4 = egress(DatagramFidelity::Native, 0);
         assert_eq!(
-            plan_flow(FilterPolicy::PassThrough, native_l4, mtu(1500)).map(|plan| plan.quic),
+            plan_flow(
+                FilterPolicy::PassThrough,
+                Accepts::Flows,
+                native_l4,
+                mtu(1500)
+            )
+            .map(|plan| plan.quic),
             Ok(QuicPolicy::SteerToHttp2(SteeringReason::MtuBelowMinimum)),
             "an undeclared datagram ceiling cannot be shown to clear the floor"
         );
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Accepts::Flows,
                 EgressCapabilities {
                     max_datagram_size: Some(1000),
                     ..native_l4
@@ -645,6 +703,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Accepts::Flows,
                 EgressCapabilities {
                     max_datagram_size: Some(1400),
                     ..native_l4
@@ -658,13 +717,19 @@ mod tests {
         // An inner MTU that cannot carry IPv6 is a rejected chain, not a
         // degraded mode. Distinguish it from overhead exceeding the path.
         assert_eq!(
-            plan_flow(FilterPolicy::PassThrough, native_l3, mtu(1300)),
+            plan_flow(
+                FilterPolicy::PassThrough,
+                Accepts::IpPackets,
+                native_l3,
+                mtu(1300)
+            ),
             Err(PlanError::InnerMtu(MtuError::BelowMinimum(1240)))
         );
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
-                egress(Accepts::IpPackets, DatagramFidelity::Native, 60_000),
+                Accepts::IpPackets,
+                egress(DatagramFidelity::Native, 60_000),
                 mtu(1500),
             ),
             Err(PlanError::OverheadExceedsPathMtu)
@@ -695,18 +760,17 @@ mod tests {
     fn chaining_uses_the_weakest_capability() {
         let first = EgressCapabilities {
             max_datagram_size: Some(1400),
-            ..egress(Accepts::IpPackets, DatagramFidelity::Native, 40)
+            ..egress(DatagramFidelity::Native, 40)
         };
         let second = EgressCapabilities {
             max_datagram_size: Some(1300),
             preserves_ecn: false,
-            ..egress(Accepts::IpPackets, DatagramFidelity::Emulated, 20)
+            ..egress(DatagramFidelity::Emulated, 20)
         };
 
         assert_eq!(
             first.chain(second),
             Ok(EgressCapabilities {
-                accepts: Accepts::IpPackets,
                 datagram_fidelity: DatagramFidelity::Emulated,
                 overhead_bytes: 60,
                 max_datagram_size: Some(1300),
@@ -714,10 +778,10 @@ mod tests {
                 nat_behavior: NatBehavior::EndpointIndependent,
             })
         );
-        assert_eq!(
-            first.chain(egress(Accepts::Flows, DatagramFidelity::Native, 0)),
-            Err(CapabilityError::MixedLayers)
-        );
+
+        // Layer agreement is checked where two implementations meet, not
+        // between two bare claims; the `Egress::chain` conflict path is
+        // covered in `egress.rs`.
     }
 
     #[test]
@@ -731,16 +795,23 @@ mod tests {
                 destination_port: 443,
             },
         };
-        let native_l3 = egress(Accepts::IpPackets, DatagramFidelity::Native, 60);
+        let native_l3 = egress(DatagramFidelity::Native, 60);
         assert!(matches!(
-            route_ingress(packet, FilterPolicy::PassThrough, native_l3, mtu(1500)),
+            route_ingress(
+                packet,
+                FilterPolicy::PassThrough,
+                Accepts::IpPackets,
+                native_l3,
+                mtu(1500)
+            ),
             Ok(IngressAction::ForwardPacket(_))
         ));
         assert!(matches!(
             route_ingress(
                 packet,
                 FilterPolicy::PassThrough,
-                egress(Accepts::Flows, DatagramFidelity::Native, 60),
+                Accepts::Flows,
+                egress(DatagramFidelity::Native, 60),
                 mtu(1500),
             ),
             Ok(IngressAction::OpenDatagram(_))
@@ -756,7 +827,8 @@ mod tests {
             route_ingress(
                 fragment,
                 FilterPolicy::InspectHttp,
-                egress(Accepts::IpPackets, DatagramFidelity::Native, 60_000),
+                Accepts::IpPackets,
+                egress(DatagramFidelity::Native, 60_000),
                 mtu(1500),
             ),
             Ok(IngressAction::Reassemble)
