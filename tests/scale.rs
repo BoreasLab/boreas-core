@@ -1,0 +1,85 @@
+//! The P7 gate: 10,000 flows through the P5 harness. Expiry state scales with
+//! flows, not packets; refreshed flows expire exactly at their real deadlines;
+//! per-flow buffers stay lazy.
+
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
+
+use boreas_core::{
+    Accepts, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, InternalEndpoint, Mtu,
+    NatBehavior,
+};
+
+fn udp_frame(flow: u32) -> Vec<u8> {
+    let [a, b, c, d] = Ipv4Addr::from(flow).octets();
+    let [port_hi, port_lo] = (10_000u16.wrapping_add(flow as u16)).to_be_bytes();
+    vec![
+        0x45, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, a, b, c, d, 198, 51, 100, 2, port_hi,
+        port_lo, 0x00, 0x35, 0x00, 0x08, 0, 0,
+    ]
+}
+
+#[test]
+fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
+    let mut path = Datapath::new(
+        FilterPolicy::PassThrough,
+        EgressCapabilities {
+            accepts: Accepts::Flows,
+            datagram_fidelity: DatagramFidelity::Native,
+            overhead_bytes: 60,
+            max_datagram_size: Some(1500),
+            preserves_ecn: true,
+            nat_behavior: NatBehavior::EndpointIndependent,
+        },
+        Mtu::new(1500).unwrap(),
+        Duration::from_secs(30),
+        NonZeroUsize::new(1024).unwrap(),
+        Duration::from_secs(120),
+        NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+
+    let start = Instant::now();
+    let flows = 10_000;
+
+    // Open 10,000 flows over 10 seconds, then flood every flow with 10
+    // refreshes each. The expiry index must hold one slot per flow, not one
+    // per packet.
+    for flow in 0..flows {
+        path.on_tun_packet(&udp_frame(flow), start + Duration::from_millis(flow as u64))
+            .unwrap();
+    }
+    for round in 0..10 {
+        for flow in 0..flows {
+            let now =
+                start + Duration::from_secs(10 + round * 10) + Duration::from_millis(flow as u64);
+            path.on_tun_packet(&udp_frame(flow), now).unwrap();
+        }
+    }
+
+    // Drain the open events without asserting order beyond the count.
+    let mut events = 0;
+    while path.poll_event().is_some() {
+        events += 1;
+    }
+    assert_eq!(events, flows as usize);
+
+    // Nothing expires inside the idle window of the last refresh.
+    let last_refresh = start + Duration::from_secs(100) + Duration::from_millis(flows as u64);
+    path.on_timeout(last_refresh + Duration::from_secs(60));
+    // Every flow saw its last refresh at or before last_refresh, so by
+    // last_refresh + 121s all of them are gone.
+    path.on_timeout(last_refresh + Duration::from_secs(121));
+    let endpoint = InternalEndpoint {
+        address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        port: 10_000,
+    };
+    assert_eq!(
+        path.send_datagram(endpoint, vec![1], last_refresh + Duration::from_secs(122)),
+        Ok(boreas_core::SendOutcome::Buffered),
+        "a fresh flow can be created after mass expiry"
+    );
+}

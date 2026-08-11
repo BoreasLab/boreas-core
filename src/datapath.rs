@@ -82,6 +82,9 @@ impl From<FlowTableError> for DatapathError {
 
 struct FlowState {
     plan: FlowPlan,
+    // ponytail: owned `Vec<u8>` datagrams, not pooled slices. The buffers are
+    // never drained today, so refcounted pool handles have no consumer; add
+    // the shared pool with the first drain path (P8's runtime shell).
     buffer: DatagramBuffer<Vec<u8>>,
 }
 
@@ -112,7 +115,7 @@ impl Datapath {
             path_mtu,
             datagram_buffer_capacity,
             reassembler: Reassembler::new(reassembly_timeout, max_pending_reassemblies),
-            flows: UdpFlowTable::new(flow_idle_timeout)?,
+            flows: UdpFlowTable::new(flow_idle_timeout, Instant::now())?,
             events: VecDeque::new(),
             transmits: VecDeque::new(),
         })
@@ -155,14 +158,16 @@ impl Datapath {
             }
             IngressAction::OpenStream(plan) => {
                 let endpoint = endpoint_of(packet);
-                self.open_flow(endpoint, plan, now)?;
-                self.events.push_back(FlowEvent::StreamOpened(endpoint));
+                if self.open_flow(endpoint, plan, now)? {
+                    self.events.push_back(FlowEvent::StreamOpened(endpoint));
+                }
                 Ok(())
             }
             IngressAction::OpenDatagram(plan) => {
                 let endpoint = endpoint_of(packet);
-                self.open_flow(endpoint, plan, now)?;
-                self.events.push_back(FlowEvent::DatagramOpened(endpoint));
+                if self.open_flow(endpoint, plan, now)? {
+                    self.events.push_back(FlowEvent::DatagramOpened(endpoint));
+                }
                 Ok(())
             }
             IngressAction::HandleIcmp(_) => {
@@ -197,18 +202,22 @@ impl Datapath {
         }
     }
 
+    /// Returns whether the flow was newly created. Refreshes of a live flow
+    /// are silent: an open event per packet would make the event stream
+    /// O(packets), which is the defect P7 exists to remove.
     fn open_flow(
         &mut self,
         endpoint: InternalEndpoint,
         plan: FlowPlan,
         now: Instant,
-    ) -> Result<(), DatapathError> {
+    ) -> Result<bool, DatapathError> {
+        let existed = self.flows.contains(&endpoint);
         let capacity = self.datagram_buffer_capacity;
         self.flows.get_or_insert_with(endpoint, now, || FlowState {
             plan,
             buffer: DatagramBuffer::new(capacity),
         })?;
-        Ok(())
+        Ok(!existed)
     }
 
     pub fn send_datagram(

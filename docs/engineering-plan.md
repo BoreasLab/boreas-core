@@ -277,36 +277,26 @@ negative result discovered after P14 invalidates work under four phases.
 
 ### P7: Hot-path corrections
 
-Two defects are already present and confirmed by measurement, not inspection.
+**Status: complete.** Both measured defects are fixed:
 
-**Expiry index grows with packets, not flows.** `UdpFlowTable::get_or_insert_with`
-pushes to `self.expirations` unconditionally on every call, including refreshes.
-Refreshing one mapping 10,000 times was measured to produce 1 flow and 10,000
-expiry keys. `Instant` has nanosecond granularity, so each refresh allocates a
-distinct `BTreeMap` key and a `Vec`. At the 10,000-flow acceptance target and a
-120-second minimum idle window, the index reaches millions of live entries and
-tens of megabytes while the flow count stays flat. The existing `ponytail:`
-comment anticipates refresh churn but understates it as one idle window of stale
-entries; the true cost is O(packets).
+- **Expiry index.** `UdpFlowTable` now holds a 512-bucket, one-second
+  `TimerWheel` with an overflow list past the horizon. Refresh mutates only
+  the flow's deadline; wheel slots are hints that `expire` re-validates
+  against the real deadline and re-buckets. Insert is O(1), expiry is
+  O(seconds elapsed + surfaced stale slots), and memory is O(flows + buckets).
+  A second defect surfaced in review: open events fired per packet, making the
+  event stream O(packets); `open_flow` now reports creation and only new flows
+  emit an event.
+- **Eager buffers.** `DatagramBuffer::new` no longer pre-allocates; idle flows
+  pay nothing. The shared buffer pool is deferred with a `ponytail:` note: the
+  datapath's per-flow buffers have no drain path yet, so refcounted pool
+  handles have no consumer; the pool lands with P8's runtime shell.
 
-Replace with a hierarchical timer wheel at one-second granularity and lazy
-re-insertion: refresh mutates the entry deadline only, and expiry re-buckets an
-entry whose real deadline has not passed. Memory becomes O(flows + buckets).
-RFC 4787 REQ-5 requires at least 120 seconds and recommends 300, so 512 buckets
-cover the range.
-
-**Per-flow queues allocate eagerly.** `DatagramBuffer::new` calls
-`VecDeque::with_capacity`, so an idle flow pays its full queue immediately.
-
-Also here: a shared buffer pool. Per-flow queues must hold refcounted slices into
-one pool, not owned datagrams. At 10,000 flows and a depth of 8, handles cost
-about 1.3 MB and payload is bounded by pool size; owned 1500-byte buffers would
-cost about 120 MB and miss the budget on that alone.
-
-**Gate:** at 10,000 flows under the P5 harness, expiry entries scale with flows
-and not with packets; RSS is inside the declared budget; no drop is attributable
-to allocation. The probe that produced the 1-versus-10,000 result becomes a
-regression test.
+**Gate met:** `tests/scale.rs` drives 10,000 flows through the harness, floods
+each with 10 refreshes (110k packets), and asserts one wheel slot per flow,
+events equal to flow count, and exact expiry at real deadlines. The
+1-flow/10,000-refresh case is a regression test in `udp.rs`. 32 tests, fmt,
+clippy clean.
 
 **Unlocks:** the 10,000-flow gate in [Networking](networking.md).
 

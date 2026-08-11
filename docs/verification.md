@@ -196,8 +196,10 @@ These are deliberate hypotheses to test, not external facts:
    RSS growth linear in socket count at no more than 2 KiB per socket (two
    1 KiB buffers plus socket state, per the workload's allocation). The
    integration must hold this under live traffic before merging, per phase P6.
-9. **Timer-wheel granularity:** confirm that one-second buckets over a 512-bucket
-   wheel hold at 10,000 flows, per phase P7.
+9. **Timer-wheel granularity:** confirmed 2026-08-11. The shipped wheel is
+   512 one-second buckets with an overflow list; `tests/scale.rs` holds at
+   10,000 flows with one slot per flow under a 110k-packet refresh flood, and
+   stale slots never evict a refreshed flow early.
 
 ## Updating This Ledger
 

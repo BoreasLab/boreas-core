@@ -179,7 +179,7 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 12_345,
         };
-        let mut flows = UdpFlowTable::new(Duration::from_secs(120)).unwrap();
+        let mut flows = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
         let _ = flows.get_or_insert_with(endpoint, start, || ());
 
         let quoted = IngressPacket {
