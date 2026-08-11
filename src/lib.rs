@@ -1,4 +1,5 @@
 mod datapath;
+mod device;
 mod packet;
 mod path;
 mod reassembly;
@@ -7,6 +8,7 @@ mod udp;
 use std::{error::Error, fmt};
 
 pub use datapath::{Datapath, DatapathError, FlowEvent, Transmit};
+pub use device::{Device, Harness, SimDevice};
 pub use packet::{IngressPacket, PacketError, Transport};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};

@@ -120,15 +120,17 @@ struct Pending {
     data: Vec<u8>,
     received: [u64; BITMAP_WORDS],
     total: Option<usize>,
+    deadline: Instant,
     poisoned: bool,
 }
 
 impl Pending {
-    fn new() -> Self {
+    fn new(deadline: Instant) -> Self {
         Self {
             data: Vec::new(),
             received: [0; BITMAP_WORDS],
             total: None,
+            deadline,
             poisoned: false,
         }
     }
@@ -180,6 +182,20 @@ impl Reassembler {
         self.discarded
     }
 
+    /// The earliest live deadline, skipping stale refresh entries. O(stale
+    /// entries) worst case, O(1) typical.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.expirations.iter().find_map(|(deadline, keys)| {
+            keys.iter()
+                .any(|key| {
+                    self.pending
+                        .get(key)
+                        .is_some_and(|pending| pending.deadline == *deadline)
+                })
+                .then_some(*deadline)
+        })
+    }
+
     pub fn push(&mut self, fragment: Fragment<'_>, now: Instant) -> PushOutcome {
         let offset = usize::from(fragment.offset);
         let extent = offset + fragment.payload.len();
@@ -216,8 +232,9 @@ impl Reassembler {
 
         let pending = match self.pending.entry(key) {
             Entry::Occupied(occupied) => occupied.into_mut(),
-            Entry::Vacant(vacant) => vacant.insert(Pending::new()),
+            Entry::Vacant(vacant) => vacant.insert(Pending::new(deadline)),
         };
+        pending.deadline = deadline;
 
         if pending.poisoned {
             self.discarded = self.discarded.saturating_add(1);
@@ -275,7 +292,16 @@ impl Reassembler {
                 break;
             };
             for key in keys {
-                evicted += usize::from(self.pending.remove(&key).is_some());
+                // A refreshed key sits in a later bucket; the stale entry here
+                // must not evict it early.
+                if self
+                    .pending
+                    .get(&key)
+                    .is_some_and(|pending| pending.deadline <= now)
+                    && self.pending.remove(&key).is_some()
+                {
+                    evicted += 1;
+                }
             }
         }
         evicted

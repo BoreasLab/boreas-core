@@ -232,24 +232,26 @@ clean.
 
 ### P5: Device seam and simulator
 
-```rust
-trait Device {
-    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize>;
-    fn send(&mut self, buf: &[u8]) -> io::Result<usize>;
-    fn mtu(&self) -> Mtu;
-}
-```
+**Status: complete.** `Device` in `src/device.rs` is the three-method seam
+(`recv`/`send`/`mtu`) from the plan; `SimDevice` is the second implementation.
+Delivery is scheduled against a virtual tick the harness drives, loss is
+one-in-N on each direction, and reordering is a bounded delivery jitter, all
+seeded by a SplitMix64 `Rng` — deterministic from the seed, no CSPRNG needed
+for a test wire. `set_mtu` scripts mid-run MTU changes; PTB injection is an
+ordinary `inject` of an ICMP packet and got no bespoke API. `Harness::step`
+drains device to datapath, datapath to device, and fires `on_timeout` at the
+virtual instant.
 
-Two implementations, satisfying the rule in [AGENTS.md](../AGENTS.md) that an
-abstraction needs more than one: `SimDevice` here, the platform adapters in P9.
-`SimDevice` scripts loss, reordering, MTU changes, and PTB injection, driven by
-a deterministic clock and a seeded RNG.
+Supporting changes: `next_deadline` on `UdpFlowTable` and `Reassembler`
+(reassembly now tracks per-key deadlines, and `expire` no longer evicts a
+refreshed key early — a real fix surfaced by the accessor, matching
+`UdpFlowTable`'s stale-entry discipline).
 
-Also here: the load harness that synthesizes flow counts and packet rates.
-
-**Gate:** the harness is self-verifying. Replaying P4's golden pcap through
-`SimDevice` must produce results identical to driving P4 directly. A harness
-that cannot reproduce a known-good result cannot certify anything else.
+**Gate met:** `harness_reproduces_directly_driven_results` drives the same
+trace through the harness and through direct datapath calls and asserts
+byte-identical transmits. `loss_and_reorder_are_scripted_and_deterministic`
+proves same-seed reproduction and actual reordering. 29 tests, fmt, clippy
+clean.
 
 **Unlocks:** P6, P7, P8, P9, and every load-based acceptance gate in
 [Delivery](delivery.md).

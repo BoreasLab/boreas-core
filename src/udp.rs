@@ -112,6 +112,21 @@ impl<V> UdpFlowTable<V> {
         self.flows.contains_key(endpoint)
     }
 
+    /// The earliest live deadline, skipping stale refresh entries that belong
+    /// to a since-refreshed flow. O(stale entries) worst case, O(1) typical.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.expirations.iter().find_map(|(deadline, endpoints)| {
+            endpoints
+                .iter()
+                .any(|endpoint| {
+                    self.flows
+                        .get(endpoint)
+                        .is_some_and(|state| state.deadline == *deadline)
+                })
+                .then_some(*deadline)
+        })
+    }
+
     /// Drops flows failing `keep`, returning the number removed. Stale
     /// expiration entries die with the flows they point at on the next
     /// `expire`, at no extra cost.
