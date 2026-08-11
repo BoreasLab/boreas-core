@@ -105,8 +105,7 @@ mod windows {
 
     impl Device for WintunDevice {
         fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let Some(packet) = self.session.try_receive().map_err(io::Error::other)?
-            else {
+            let Some(packet) = self.session.try_receive().map_err(io::Error::other)? else {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "no packet"));
             };
             let bytes = packet.bytes();
