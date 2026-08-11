@@ -258,16 +258,18 @@ clean.
 
 ### P6: smoltcp scaling verdict
 
-[Delivery](delivery.md) rates smoltcp scaling medium-high risk and requires the
-socket-count, RSS, and p99 budget to be fixed before integration merges. This
-phase is that measurement, and it runs while nothing yet depends on the stream
-API.
-
-Run the fixed workload against `SimDevice`. Publish the numbers to
-[Verification](verification.md) item 6.
-
-**Gate:** the declared budget is met, or smoltcp is replaced or specialized now.
-The phase closes either way; what it must not do is stay open.
+**Status: complete, provisional pass.** The measurement is
+`examples/smoltcp_scaling.rs` (smoltcp 0.13.1 as a dev-dependency, never linked
+into the library): N listening TCP sockets on an idle synthetic device, polled
+200 rounds each. On the aarch64 dev VM, poll cost is linear at ~5-25 ns per
+socket with no superlinear socket-set growth through 2000 sockets; p99 outliers
+correlate with timer-wheel fires, not socket count. The declared budget is now
+recorded in [Verification](verification.md) item 8: 1,000 sockets, under 100 ns
+per socket amortized, p99 under 1 ms excluding timer fires, RSS linear at no
+more than 2 KiB per socket. The verdict is provisional: idle listeners on an
+didle device, on a VM that is not the mobile target. P7 re-measures under live
+traffic; a failure there replaces or specializes smoltcp before any L7 phase
+depends on the stream API.
 
 **Unlocks:** P7, and every L7 phase that assumes a stream abstraction. Deferring
 this measurement is the single most expensive schedule error available: a

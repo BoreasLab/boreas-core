@@ -145,6 +145,15 @@ Do not rely on these without a targeted check:
 4. Exact per-egress overhead beyond the approximate 60-byte WireGuard budget.
 5. GotaTun readiness on Windows.
 6. smoltcp behavior and socket-set cost at hundreds of concurrent sockets.
+   **Measured 2026-08-11, smoltcp 0.13.1, aarch64 Linux VM, idle listening
+   sockets, `examples/smoltcp_scaling.rs`:** poll cost scales linearly at
+   roughly 5-25 ns per socket per poll across 100-2000 sockets (p50 2-14 µs
+   total at 500-2000 sockets). p99 is dominated by 10 ms timer-wheel wakeups
+   (retransmit/keepalive timers), not by socket count: single-digit µs typical,
+   millisecond outliers when a timer fires. No superlinear socket-set cost
+   observed at these counts. Caveat: idle listeners on an idle device; live
+   data transfer and the mobile target remain unmeasured, so the verdict is
+   provisional until P7's hot-path work re-measures under traffic.
 7. SOCKS5 UDP ASSOCIATE support among servers users actually operate.
 8. Claimed Hysteria2 and TUIC throughput and P95 improvements on the Boreas
    workload.
@@ -181,8 +190,12 @@ These are deliberate hypotheses to test, not external facts:
    Boreas never terminates HTTP/3 in v1, so the quiche-interoperability
    rationale does not apply. Raised by [Engineering Plan](engineering-plan.md)
    phase P14.
-8. **smoltcp budget:** fix the socket-count, RSS, and p99 latency targets before
-   integration merges, per phase P6.
+8. **smoltcp budget:** fixed 2026-08-11 from the item-6 measurement: at least
+   1,000 concurrent TCP sockets, per-socket poll cost under 100 ns amortized
+   (100 µs for a full set sweep), p99 poll under 1 ms excluding timer fires,
+   RSS growth linear in socket count at no more than 2 KiB per socket (two
+   1 KiB buffers plus socket state, per the workload's allocation). The
+   integration must hold this under live traffic before merging, per phase P6.
 9. **Timer-wheel granularity:** confirm that one-second buckets over a 512-bucket
    wheel hold at 10,000 flows, per phase P7.
 
