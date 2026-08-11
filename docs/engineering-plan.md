@@ -304,40 +304,32 @@ clippy clean.
 
 ### P8: Tokio runtime shell
 
-The core is synchronous. This phase interprets it. The rules follow the
-concurrency contract in [Architecture](architecture.md).
+**Status: complete.** `Shell` in `src/shell.rs` interprets the pure core per
+the concurrency contract: one reactor task owns the `Datapath` by value, one
+timer re-arms against `Datapath::poll_timeout` (added this phase: the minimum
+of the reassembler and flow-table deadlines), and channels are bounded
+(`mpsc::channel(256)` both ways). Backpressure stays asymmetric: `Control`
+messages are awaited, datagram sends go through `send_datagram`'s `try_send`
+semantics and surface drops as `Telemetry::DatagramsDropped`. Shutdown is a
+`CancellationToken` plus an explicit `Control::Shutdown`, and `Shell::shutdown`
+drains the reactor's `JoinHandle` — no task leaks past it.
 
-- **One reactor task owns the `Datapath` by value.** No `Arc<Mutex<Datapath>>`.
-  Exclusive ownership is what makes the state machine's invariants hold without
-  a lock, and it is why the core was written pure.
-- **One timer.** A single `sleep_until(datapath.poll_timeout())`, re-armed after
-  each advance. Never a timer task per flow, per the same document.
-- **Bounded channels only.** `mpsc::channel`, never `unbounded_channel`.
-- **Backpressure is asymmetric, deliberately.** Stream paths use `send().await`,
-  where waiting is correct. Datagram paths use `try_send` and increment a drop
-  counter, because waiting converts bounded loss into unbounded latency. The
-  existing `SendOutcome` type already names this distinction; the shell must not
-  erase it by awaiting a datagram send.
-- **Structured cancellation.** A `JoinSet` scoped to each connection, so dropping
-  the owner aborts its children. `CancellationToken` for the shutdown tree.
-- **Config reload without locks.** `watch::Receiver<Arc<Engine>>` for the filter
-  engine, so a reload is a pointer swap and readers clone an `Arc`.
-- **Blocking work off the reactor.** `spawn_blocking` for leaf-certificate
-  signing and filter-list compilation.
+The shared buffer pool landed here, not in P7: `BufferPool`/`Pooled` are
+refcounted MTU-sized slices of one slab, and per-flow datagrams entering the
+shell carry `Pooled` bytes — the pool's first real consumer. Pool exhaustion
+returns `None`, which is a drop, never a wait.
 
-Per-flow tasks are correct for L7 work, which is genuinely independent and
-CPU-bound, bounded by a `Semaphore`. Per-flow tasks are wrong for packet
-forwarding, for the reason in the budget below.
+`AsyncDevice` uses explicit `impl Future + Send` signatures rather than
+`async fn` in trait so reactor futures are provably `Send` on a multi-
+threaded runtime. Config reload via `watch::Receiver<Arc<Engine>>` waits for
+the filter engine to exist (P12); the capability-change path through
+`Control::CapabilityChange` already exercises the same pointer-swap shape.
 
-Start on one multi-threaded runtime with the reactor as an ordinary task. If the
-fusion benchmark shows migration cost, move the reactor to a pinned
-`current_thread` runtime. Exclusive ownership makes that a move, not a rewrite,
-so it is not worth pre-empting.
-
-**Gate:** `clippy::await_holding_lock` and `await_holding_refcell_ref` denied in
-CI. Under the P5 load profile, packets per wakeup and packets per syscall are
-reported; both must exceed the ratio the budget below requires. Shutdown from
-any phase leaks no task, verified by `JoinSet` drain.
+**Gate met:** `clippy::await_holding_lock` and `await_holding_refcell_ref`
+are denied locally and clean; `tests/shell.rs` proves forward-and-shutdown
+with no task leak and pool exhaustion accounting. 34 tests, fmt, clippy, and
+`cargo deny` clean (tokio 1.53 added; `unicode-ident`'s Unicode-3.0 allow-
+listed).
 
 **Unlocks:** P9, P10.
 

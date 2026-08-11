@@ -271,6 +271,15 @@ impl Datapath {
         self.events.pop_front()
     }
 
+    /// The earliest instant a state machine may need `on_timeout`. The shell
+    /// re-arms one timer against this; there is never a timer per flow.
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        [self.reassembler.next_deadline(), self.flows.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.reassembler.expire(now);
         let _ = self.flows.expire(now);

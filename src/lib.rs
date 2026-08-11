@@ -3,6 +3,7 @@ mod device;
 mod packet;
 mod path;
 mod reassembly;
+mod shell;
 mod udp;
 
 use std::{error::Error, fmt};
@@ -12,6 +13,7 @@ pub use device::{Device, Harness, SimDevice};
 pub use packet::{IngressPacket, PacketError, Transport};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
+pub use shell::{AsyncDevice, BufferPool, Control, Pooled, Shell, Telemetry};
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
