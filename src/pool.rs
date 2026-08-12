@@ -19,7 +19,7 @@
 
 use std::{
     num::NonZeroUsize,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -137,6 +137,15 @@ impl Deref for Pooled {
 
     fn deref(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+/// In-place rewriting of the bytes on loan. Sound precisely because `Pooled`
+/// is affine: one handle, one writer, so `&mut` here cannot alias another view
+/// of the same payload. `clamp_mss` is the caller this exists for.
+impl DerefMut for Pooled {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
     }
 }
 

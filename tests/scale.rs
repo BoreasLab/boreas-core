@@ -41,6 +41,10 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
         },
+        BufferPool::new(
+            NonZeroUsize::new(1500).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+        ),
     )
     .unwrap();
 

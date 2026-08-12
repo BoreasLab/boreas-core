@@ -37,6 +37,12 @@ fn datapath(accepts: Accepts) -> Datapath {
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(4).unwrap(),
         },
+        // Small on purpose: the fuzzer should reach the exhaustion path,
+        // where a forwarded packet is a counted drop rather than a panic.
+        boreas_core::BufferPool::new(
+            NonZeroUsize::new(2048).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+        ),
     )
     .expect("the fuzz configuration plans")
 }

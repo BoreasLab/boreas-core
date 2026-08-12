@@ -92,6 +92,16 @@ mod windows {
     pub struct WintunDevice {
         session: std::sync::Arc<wintun_bindings::Session>,
         mtu: Mtu,
+        /// A blocking read already in flight, retained across calls.
+        ///
+        /// This is what makes `recv` cancel-safe, and its absence was a real
+        /// defect: `spawn_blocking` cannot be cancelled, so dropping the join
+        /// handle lets the task run to completion and *discards the packet it
+        /// received*. The reactor drops this future every time another
+        /// `select!` arm wins, which is routine, so a fresh read per call
+        /// loses a packet per lost race. Holding the handle means the next
+        /// call awaits the same read instead of starting another.
+        pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
     }
 
     impl WintunDevice {
@@ -99,7 +109,11 @@ mod windows {
         /// the WireGuard-authorized signed binary; loading lives in the
         /// platform crate, not here.
         pub fn from_session(session: std::sync::Arc<wintun_bindings::Session>, mtu: Mtu) -> Self {
-            Self { session, mtu }
+            Self {
+                session,
+                mtu,
+                pending: None,
+            }
         }
     }
 
@@ -142,24 +156,39 @@ mod windows {
             buf: &'a mut [u8],
         ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
             // Wintun's read wait is a Win32 event, not a tokio primitive, so
-            // the blocking read moves to the blocking pool. Cancel-safety
-            // holds because `receive_blocking` owns its session reference and
-            // runs to completion even when the reactor drops the join handle.
-            let session = std::sync::Arc::clone(&self.session);
+            // the blocking read moves to the blocking pool. The task owns the
+            // bytes it read — it must, because nothing can hand them back
+            // through a cancelled future — and the handle stays in `self`
+            // until it has actually been observed. A dropped future therefore
+            // consumes nothing, which is the seam's stated obligation.
             async move {
-                let packet = tokio::task::spawn_blocking(move || {
-                    session.receive_blocking().map_err(io::Error::other)
-                })
-                .await
-                .map_err(io::Error::other)??;
-                let bytes = packet.bytes();
+                if self.pending.is_none() {
+                    let session = std::sync::Arc::clone(&self.session);
+                    self.pending = Some(tokio::task::spawn_blocking(move || {
+                        session
+                            .receive_blocking()
+                            .map(|packet| packet.bytes().to_vec())
+                            .map_err(io::Error::other)
+                    }));
+                }
+
+                let joined = self
+                    .pending
+                    .as_mut()
+                    .expect("the read was just started")
+                    .await;
+                // Reached only after the join future resolved, so the packet
+                // is in hand and the slot is genuinely free.
+                self.pending = None;
+
+                let bytes = joined.map_err(io::Error::other)??;
                 if bytes.len() > buf.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "packet exceeds the receive buffer",
                     ));
                 }
-                buf[..bytes.len()].copy_from_slice(bytes);
+                buf[..bytes.len()].copy_from_slice(&bytes);
                 Ok(bytes.len())
             }
         }

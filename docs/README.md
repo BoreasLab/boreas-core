@@ -38,12 +38,12 @@ that owns the work, then follow its links only when a boundary is crossed.
 
 | Path | Responsibility | Design owner |
 |---|---|---|
-| `src/lib.rs` | refined `Mtu`, error spine, capability composition, flow planning, ingress actions | [Architecture](architecture.md) |
+| `src/lib.rs` | refined `Mtu`, error spine, capability composition, flow planning, total ingress classification | [Architecture](architecture.md) |
 | `src/datapath.rs` | sans-io datapath core: dispatch, flow lifecycle, capability replanning | [Architecture](architecture.md) |
 | `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
-| `src/shell.rs` | tokio runtime shell, bounded channels, deadline timer | [Architecture](architecture.md) |
+| `src/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
 | `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
-| `src/egress.rs` | egress sum (packet vs stream), sans-io WireGuard via GotaTun | [Egress](egress.md) |
+| `src/egress.rs` | egress sum (packet vs stream), sans-io packet-egress interface, WireGuard via GotaTun | [Egress](egress.md) |
 | `src/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
 | `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |

@@ -15,14 +15,24 @@
 //! Run it with `cargo run --release --example fusion`. Debug numbers are shown
 //! but are not evidence.
 
-use std::{num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use boreas_core::{
-    Datapath, Egress, EgressEmit, FilterPolicy, Harness, Limits, Mtu, SimDevice, WireGuardConfig,
-    WireGuardEgress,
+    BufferPool, Datapath, Egress, EgressEmit, FilterPolicy, Harness, Limits, Mtu, PacketEgress,
+    SimDevice, WireGuardConfig, WireGuardEgress,
 };
 
 const PACKETS: usize = 10_000;
+
+/// Slices hold an encapsulated 1420-byte packet; the budget is deliberately
+/// small, because a steady-state datapath returns every buffer within one
+/// drain and a growing high-water mark would itself be the finding.
+fn fresh_pool() -> Arc<BufferPool> {
+    BufferPool::new(
+        NonZeroUsize::new(2048).unwrap(),
+        NonZeroUsize::new(64).unwrap(),
+    )
+}
 
 fn udp_frame(index: u32) -> Vec<u8> {
     let [a, b, c, d] = std::net::Ipv4Addr::from(index).octets();
@@ -33,14 +43,21 @@ fn udp_frame(index: u32) -> Vec<u8> {
     ]
 }
 
-fn egress(private_key: [u8; 32], peer_public_key: [u8; 32]) -> WireGuardEgress {
-    WireGuardEgress::new(WireGuardConfig {
-        private_key,
-        peer_public_key,
-        preshared_key: None,
-        persistent_keepalive: None,
-        inner_mtu: Mtu::new(1420).unwrap(),
-    })
+fn egress(
+    private_key: [u8; 32],
+    peer_public_key: [u8; 32],
+    pool: Arc<BufferPool>,
+) -> WireGuardEgress {
+    WireGuardEgress::new(
+        WireGuardConfig {
+            private_key,
+            peer_public_key,
+            preshared_key: None,
+            persistent_keepalive: None,
+            inner_mtu: Mtu::new(1420).unwrap(),
+        },
+        pool,
+    )
 }
 
 fn public_key_of(private: [u8; 32]) -> [u8; 32] {
@@ -48,8 +65,12 @@ fn public_key_of(private: [u8; 32]) -> [u8; 32] {
     gotatun::x25519::PublicKey::from(&secret).to_bytes()
 }
 
-fn packet_datapath() -> Datapath {
-    let egress = Egress::Packet(Box::new(egress([1; 32], public_key_of([2; 32]))));
+fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
+    let egress = Egress::Packet(Box::new(egress(
+        [1; 32],
+        public_key_of([2; 32]),
+        Arc::clone(&pool),
+    )));
     Datapath::new(
         FilterPolicy::PassThrough,
         egress.accepts(),
@@ -61,6 +82,7 @@ fn packet_datapath() -> Datapath {
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
         },
+        pool,
     )
     .expect("a WireGuard capability set plans")
 }
@@ -80,12 +102,10 @@ fn pump(
     ) {
         for emit in incoming.drain(..) {
             match emit {
-                EgressEmit::ToNetwork(datagram) => outgoing.extend(
-                    target
-                        .handle_network_packet(&datagram)
-                        .expect("in-band WireGuard exchange"),
-                ),
-                EgressEmit::ToTunnel(packet) => tunnelled.push(packet),
+                EgressEmit::ToNetwork(datagram) => target
+                    .handle_network_packet(&datagram, outgoing)
+                    .expect("in-band WireGuard exchange"),
+                EgressEmit::ToTunnel(packet) => tunnelled.push(packet.to_vec()),
             }
         }
     }
@@ -101,20 +121,25 @@ fn pump(
 
 fn main() {
     let base = std::time::Instant::now();
+    let pool = fresh_pool();
     let device = SimDevice::new(Mtu::new(1500).unwrap(), 7);
-    let mut harness = Harness::new(device, packet_datapath(), base);
-    let mut client = egress([1; 32], public_key_of([2; 32]));
-    let mut server = egress([2; 32], public_key_of([1; 32]));
-    // Packets the harness drained into the device, consumed by cursor.
+    let mut harness = Harness::new(device, packet_datapath(Arc::clone(&pool)), base);
+    let mut client = egress([1; 32], public_key_of([2; 32]), Arc::clone(&pool));
+    let mut server = egress([2; 32], public_key_of([1; 32]), Arc::clone(&pool));
+    // Egress-bound packets the harness has produced, consumed by cursor.
     let mut sent_cursor = 0;
+    let mut emits = Vec::new();
 
     // Warmup: the handshake, so the timed section measures steady state.
     harness.device.inject(&udp_frame(0), 0);
     harness.step(0).expect("scripted device");
-    let warmup = harness.device.sent()[sent_cursor..].to_vec();
-    sent_cursor = harness.device.sent().len();
+    let warmup = harness.to_egress()[sent_cursor..].to_vec();
+    sent_cursor = harness.to_egress().len();
     for packet in &warmup {
-        let first = client.handle_tun_packet(packet);
+        client
+            .handle_tun_packet(packet, &mut emits)
+            .expect("within the pool budget");
+        let first = std::mem::take(&mut emits);
         let tunnelled = pump(&mut client, &mut server, first);
         assert_eq!(tunnelled, vec![udp_frame(0)], "handshake warmup");
     }
@@ -123,11 +148,14 @@ fn main() {
     for index in 1..=PACKETS as u32 {
         harness.device.inject(&udp_frame(index), 0);
         harness.step(0).expect("scripted device");
-        let sent = harness.device.sent()[sent_cursor..].to_vec();
-        sent_cursor = harness.device.sent().len();
+        let sent = harness.to_egress()[sent_cursor..].to_vec();
+        sent_cursor = harness.to_egress().len();
         for packet in &sent {
-            let emits = client.handle_tun_packet(packet);
-            let tunnelled = pump(&mut client, &mut server, emits);
+            client
+                .handle_tun_packet(packet, &mut emits)
+                .expect("within the pool budget");
+            let produced = std::mem::take(&mut emits);
+            let tunnelled = pump(&mut client, &mut server, produced);
             for returned in tunnelled {
                 harness
                     .datapath
@@ -144,7 +172,7 @@ fn main() {
     // the performance budget's per-packet allowance is written against.
     let mut core_only = Harness::new(
         SimDevice::new(Mtu::new(1500).unwrap(), 7),
-        packet_datapath(),
+        packet_datapath(fresh_pool()),
         base,
     );
     let core_started = std::time::Instant::now();
@@ -166,6 +194,10 @@ fn main() {
     println!(
         "  fast path:    {} packets encapsulated",
         client.fast_path_packets()
+    );
+    println!(
+        "  pool:         {} of 64 slices free at rest (steady state returns every buffer)",
+        pool.available()
     );
     println!("  core only:    {core_per_packet:.0} ns/packet (no egress crypto)");
     println!(

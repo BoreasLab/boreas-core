@@ -48,6 +48,12 @@ packet directly to the tunnel. Do not involve smoltcp. This is the default path
 and should cover more than 90 percent of flows through splice or direct packet
 forwarding.
 
+The core states the destination rather than leaving the shell to infer it: a
+transmit carries the `Side` it is bound for, and forwarding is defined as the
+crossing from the side the packet arrived on. Without that, the only
+destination a shell can name is the interface it already holds, which turns
+the fast path into a loopback at the client.
+
 ### Local termination
 
 L4 egress requires local TCP termination and re-origination. This avoids

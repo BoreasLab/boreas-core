@@ -219,9 +219,9 @@ reassembly re-parses a whole datagram, so a flow's plan always derives from a
 real header; `FlowState` exists only behind a successful `plan_flow`; egress-
 side fragments are pathological and drop. MSS clamping fires on the packet
 fast path before forwarding. `UdpFlowTable::retain` was added for capability-
-driven teardown. `poll_timeout` is omitted for now: neither the reassembler
-nor the flow table exposes its earliest deadline yet, and inventing the
-accessor is P5's job when the simulator needs a wakeup.
+driven teardown. `poll_timeout` was omitted at the time — neither the
+reassembler nor the flow table exposed its earliest deadline — and landed in
+P5 with the accessors the simulator needed.
 
 **Gate met:** `tests/golden_replay.rs` drives a scripted trace — open, buffer,
 drop-and-report, re-steer, expire — and asserts every event and transmit
@@ -375,8 +375,20 @@ both byte shims behind the seam, with no policy in either:
   consumed nothing. Takes the fd by ownership; VpnService owns lifecycle.
 - `WintunDevice` (windows): `Arc<Session>`; sync `recv` is `try_receive`,
   async `recv` moves `receive_blocking` to the blocking pool because Wintun's
-  read wait is a Win32 event tokio cannot poll. Cancel-safety holds because
-  the blocking call owns its session reference and runs to completion.
+  read wait is a Win32 event tokio cannot poll.
+
+**Corrected during the P10 polish pass: the Windows adapter was not
+cancel-safe.** `spawn_blocking` cannot be cancelled, so dropping its
+`JoinHandle` lets the read run to completion and *discards the packet it
+returned*. The reactor drops that future every time another `select!` arm
+wins, which is routine, so the adapter lost one packet per lost race — the
+exact obligation `AsyncDevice::recv` states, violated by the adapter that
+documented itself as satisfying it. The fix retains the handle in the device:
+the task now returns owned bytes and the slot is cleared only after the join
+future has resolved, so a dropped future consumes nothing. The extra copy is
+Windows-only and unavoidable, because nothing can hand bytes back through a
+cancelled future. Compile-checked in CI, not locally; ring's C build still
+ends the local cross-check.
 
 Both adapters type-check on their own target (`cargo check` and clippy against
 x86_64-pc-windows-msvc and the host). `wintun-bindings` 0.7 is a
@@ -429,14 +441,78 @@ streams, and smoltcp integration is explicitly gated on re-measurement under
 live traffic ([Verification](verification.md) item 8), which is device-bound.
 Both therefore move past P10 rather than into it.
 
+### P10 polish pass
+
+A review of the delivered phase found one latent defect, one unstated
+architectural gap, and three costs the performance budget forbids. All five
+are closed.
+
+**The defect: a `Transmit` did not say where it was going.** It carried bytes
+and nothing else, so the shell had exactly one place to put them — the device
+— and a packet from the client's TUN was therefore sent back down the client's
+TUN instead of being encapsulated. Nothing caught it because no shell had an
+egress to send it to; every test wired the egress by hand. The fix is
+`Side { Tunnel, Egress }`, threaded from the ingress call so the destination
+is `from.across()`: forwarding is the crossing, `across` is an involution, and
+a transmit bound for the side it arrived on is now unconstructable. Fragments
+carry their side through reassembly, so a reassembled datagram cannot reverse
+direction either.
+
+**The gap: the reactor had no egress.** `Shell::start` took a datapath and a
+device, which is not a product — it is a loopback. `PacketEgress` is now the
+whole sans-io interface (`handle_tun_packet`, `handle_network_packet`, `tick`,
+`tick_interval`) rather than a capability report, so `Box<dyn PacketEgress>`
+is a thing the reactor can run; `AsyncNetwork` is the datagram seam beside
+`AsyncDevice`, with a `tokio::net::UdpSocket` implementation and no new
+dependency. The reactor now closes the loop in one task: device → core →
+egress → network, and network → egress → core → device. The drain is an
+alternating fixpoint over the two producers, which settles in at most two
+passes because a tunnel-bound transmit and a network-bound emission are both
+terminal. `tests/shell.rs` asserts both directions and that a tun-side packet
+never reappears on the tun.
+
+**The costs.** The plan's own budget says a heap allocation per packet is
+forbidden and that pooled buffers are the answer; the delivered phase
+allocated three times per packet. Now: `Transmit` and `EgressEmit` both carry
+`Pooled`, so the datapath and the egress draw on one budget and exhaustion is
+a counted drop (`FlowEvent::TransmitDropped`, `EgressError::PoolExhausted`)
+rather than an allocation or a wait; `Pooled` gained `DerefMut`, which is
+sound precisely because it is affine, so `clamp_mss` rewrites in place.
+Emissions go into a reactor-owned sink instead of a returned `Vec`.
+`plan_flow` was being re-derived per packet from inputs that only move when
+the configuration does, so `Datapath` memoizes the decision as
+`Result<FlowPlan, PlanError>` — keeping the failing configuration's behavior
+exactly (every packet counted and refused) while making the succeeding case a
+field read — and `route_ingress` became total: possessing a `FlowPlan` *is*
+the proof that the configuration plans. `strip_padding` ran a full
+network-and-transport `etherparse` parse to read a length the IP header states
+at a fixed offset; it is now an O(1) header read, and `etherparse` left the
+inbound egress path entirely.
+
+Measured after: core 573 ns/packet against the ~1 µs allowance (585 ns
+before), end to end 2 187 ns, and the pool returns every slice at rest, which
+is the property that actually changed — steady-state memory is now a declared
+budget rather than allocator behavior.
+
+**Deliberately not done, and why.** The budget also calls batching mandatory,
+and the reactor still reads one packet per wakeup. Batching needs a
+non-blocking read on `AsyncDevice`, which both platform adapters can supply
+(`AsyncFd::try_io`, `try_receive`) but neither can be measured here; the
+metric it serves — packets per wakeup — is device-bound, so it is recorded as
+an open item rather than built blind. The egress tick is likewise an
+unconditional 4 Hz wakeup, at parity with GotaTun's own device, and is the
+largest fixed wakeup cost in the shell; replacing it with an egress-declared
+next deadline needs GotaTun to expose one.
+
 **Gate:** the in-process part is met — `tests/egress.rs` drives the scripted
-harness into a real client-server WireGuard pair and asserts byte-exact return,
-zero flow state on the packet path, and the reported capability set planning
-the fast path. The M1 product gate (single-interface client on Android and
-Windows hardware) needs the devices this environment does not have and is
+harness into a real client-server WireGuard pair and asserts byte-exact
+return, zero flow state on the packet path, forwarding toward the egress
+rather than back down the device, and the reported capability set planning the
+fast path. The M1 product gate (single-interface client on Android and Windows
+hardware) needs the devices this environment does not have and is
 **unexercised**, same as P9's. A Windows CI job now compiles the Wintun
 adapter and GotaTun together, because ring's C build ended the local
-cross-check. 55 tests, fmt, clippy, and `cargo deny` clean.
+cross-check. 59 tests, fmt, clippy, and `cargo deny` clean.
 
 ## Tier 3: Filtering and Egress Breadth
 
@@ -611,3 +687,11 @@ Record outcomes in [Verification](verification.md).
    smoltcp integration merges rather than after.
 3. Whether the timer-wheel granularity of one second and 512 buckets in P7
    survives the 10,000-flow measurement, or needs a second tier.
+4. Device-side batching: the budget calls it mandatory and the reactor still
+   reads one packet per wakeup. It needs a non-blocking read on `AsyncDevice`,
+   which both adapters can supply, and its metric (packets per wakeup) is
+   device-bound. Decide it against the M1 on-device run, not before.
+5. The egress tick is an unconditional 4 Hz wakeup, at parity with GotaTun's
+   own device and the largest fixed wakeup cost in the shell. Replacing it
+   with an egress-declared next deadline requires GotaTun to expose one; carry
+   this into the battery measurement.

@@ -11,7 +11,7 @@ mod udp;
 
 use std::{error::Error, fmt};
 
-pub use datapath::{Datapath, DatapathError, FlowEvent, Limits, Transmit};
+pub use datapath::{Datapath, DatapathError, FlowEvent, Limits, Side, Transmit};
 pub use device::{Device, Harness, SimDevice};
 pub use egress::{
     Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
@@ -25,7 +25,7 @@ pub use platform::AndroidTun;
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
-pub use shell::{AsyncDevice, Control, Datagram, Shell, Telemetry};
+pub use shell::{AsyncDevice, AsyncNetwork, Control, Datagram, Shell, Telemetry};
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
@@ -253,12 +253,6 @@ pub fn plan_flow(
 /// moved. Errors only when the new capability cannot support the flow's layer
 /// or leaves a packet path below the IPv6 floor, and the caller answers those
 /// with `Teardown`.
-/// Re-plans a live flow after its egress reports a capability change (MASQUE's
-/// QUIC-to-HTTP/2 fallback is the driving case). The filter policy and path
-/// MTU are session properties and pass through unchanged; only the egress
-/// moved. Errors only when the new capability cannot support the flow's layer
-/// or leaves a packet path below the IPv6 floor, and the caller answers those
-/// with `Teardown`.
 pub fn replan(
     current: &FlowPlan,
     filter: FilterPolicy,
@@ -295,30 +289,33 @@ pub fn replan(
     })
 }
 
-pub fn route_ingress(
-    packet: IngressPacket,
-    filter: FilterPolicy,
-    accepts: Accepts,
-    egress: EgressCapabilities,
-    path_mtu: Mtu,
-) -> Result<IngressAction, PlanError> {
-    match packet.transport {
-        Transport::Fragment => return Ok(IngressAction::Reassemble),
-        Transport::Other => return Ok(IngressAction::DropUnsupported),
+/// Classifies one whole packet against an already-derived plan.
+///
+/// Total by construction: possessing a [`FlowPlan`] *is* the proof that the
+/// configuration plans, so there is no error left to return here and no
+/// caller has to handle one per packet. The plan is a session property —
+/// filter policy, egress capability, and path MTU — so deriving it once per
+/// configuration change instead of once per packet is both cheaper and the
+/// reason this function is total.
+///
+/// O(1): a match on a closed sum.
+pub fn route_ingress(transport: Transport, plan: FlowPlan) -> IngressAction {
+    match transport {
+        Transport::Fragment => return IngressAction::Reassemble,
+        Transport::Other => return IngressAction::DropUnsupported,
         Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => {}
     }
 
-    let plan = plan_flow(filter, accepts, egress, path_mtu)?;
     if matches!(plan.transport, TransportPath::PacketFastPath { .. }) {
-        return Ok(IngressAction::ForwardPacket(plan));
+        return IngressAction::ForwardPacket(plan);
     }
 
-    Ok(match packet.transport {
+    match transport {
         Transport::Tcp { .. } => IngressAction::OpenStream(plan),
         Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
         Transport::Icmp => IngressAction::HandleIcmp(plan),
         Transport::Other | Transport::Fragment => IngressAction::DropUnsupported,
-    })
+    }
 }
 
 impl fmt::Display for MtuError {
@@ -557,7 +554,13 @@ mod tests {
 
     #[test]
     fn fragments_never_reach_l4_admission() {
-        let native_l3 = egress(DatagramFidelity::Native, 0);
+        let native_l3_plan = plan_flow(
+            FilterPolicy::PassThrough,
+            Accepts::IpPackets,
+            egress(DatagramFidelity::Native, 0),
+            mtu(1500),
+        )
+        .unwrap();
         let ipv4_udp = [
             0x45, 0x03, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
@@ -576,14 +579,8 @@ mod tests {
                 let parsed = IngressPacket::parse(&packet).expect("wire-valid packet");
                 assert_eq!(parsed.transport, Transport::Fragment);
                 assert_eq!(
-                    route_ingress(
-                        parsed,
-                        FilterPolicy::PassThrough,
-                        Accepts::IpPackets,
-                        native_l3,
-                        mtu(1500)
-                    ),
-                    Ok(IngressAction::Reassemble),
+                    route_ingress(parsed.transport, native_l3_plan),
+                    IngressAction::Reassemble,
                     "offset {offset_units}, more_fragments {more_fragments}"
                 );
             }
@@ -602,14 +599,8 @@ mod tests {
         let parsed = IngressPacket::parse(&ipv6_fragment).expect("wire-valid packet");
         assert_eq!(parsed.transport, Transport::Fragment);
         assert_eq!(
-            route_ingress(
-                parsed,
-                FilterPolicy::PassThrough,
-                Accepts::IpPackets,
-                native_l3,
-                mtu(1500)
-            ),
-            Ok(IngressAction::Reassemble)
+            route_ingress(parsed.transport, native_l3_plan),
+            IngressAction::Reassemble
         );
     }
 
@@ -796,42 +787,41 @@ mod tests {
             },
         };
         let native_l3 = egress(DatagramFidelity::Native, 60);
+        let packet_plan = plan_flow(
+            FilterPolicy::PassThrough,
+            Accepts::IpPackets,
+            native_l3,
+            mtu(1500),
+        )
+        .unwrap();
+        let flow_plan = plan_flow(
+            FilterPolicy::PassThrough,
+            Accepts::Flows,
+            native_l3,
+            mtu(1500),
+        )
+        .unwrap();
+
         assert!(matches!(
-            route_ingress(
-                packet,
-                FilterPolicy::PassThrough,
-                Accepts::IpPackets,
-                native_l3,
-                mtu(1500)
-            ),
-            Ok(IngressAction::ForwardPacket(_))
+            route_ingress(packet.transport, packet_plan),
+            IngressAction::ForwardPacket(_)
         ));
         assert!(matches!(
-            route_ingress(
-                packet,
-                FilterPolicy::PassThrough,
-                Accepts::Flows,
-                egress(DatagramFidelity::Native, 60),
-                mtu(1500),
-            ),
-            Ok(IngressAction::OpenDatagram(_))
+            route_ingress(packet.transport, flow_plan),
+            IngressAction::OpenDatagram(_)
         ));
 
-        // A fragment short-circuits ahead of planning, so it is admitted even
-        // on a chain whose overhead would fail to plan.
-        let fragment = IngressPacket {
-            transport: Transport::Fragment,
-            ..packet
-        };
+        // A fragment is classified without consulting the plan at all, which
+        // is what lets the datapath quarantine one under a configuration that
+        // could not plan a flow. The plan passed here is irrelevant, and that
+        // is the point.
         assert_eq!(
-            route_ingress(
-                fragment,
-                FilterPolicy::InspectHttp,
-                Accepts::IpPackets,
-                egress(DatagramFidelity::Native, 60_000),
-                mtu(1500),
-            ),
-            Ok(IngressAction::Reassemble)
+            route_ingress(Transport::Fragment, flow_plan),
+            IngressAction::Reassemble
+        );
+        assert_eq!(
+            route_ingress(Transport::Other, packet_plan),
+            IngressAction::DropUnsupported
         );
     }
 }

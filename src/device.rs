@@ -186,6 +186,11 @@ pub struct Harness<D> {
     /// classification the runtime shell makes, so a trace replayed here
     /// behaves as it would in production.
     rejected: u64,
+    /// Egress-bound transmits, in order. The harness has no egress — that is
+    /// the runtime shell's job — so it records what would have crossed rather
+    /// than looping it back down the device, which is exactly the mistake
+    /// [`crate::Side`] exists to make unrepresentable.
+    to_egress: Vec<Vec<u8>>,
 }
 
 impl<D: Device> Harness<D> {
@@ -195,12 +200,18 @@ impl<D: Device> Harness<D> {
             datapath,
             base,
             rejected: 0,
+            to_egress: Vec::new(),
         }
     }
 
     /// Packets the core refused across every `step` so far.
     pub fn rejected(&self) -> u64 {
         self.rejected
+    }
+
+    /// Everything the core sent toward the egress, in order.
+    pub fn to_egress(&self) -> &[Vec<u8>] {
+        &self.to_egress
     }
 
     /// Runs one tick at `ticks`: deliver due packets, flush transmits, expire.
@@ -223,7 +234,12 @@ impl<D: Device> Harness<D> {
         }
 
         while let Some(transmit) = self.datapath.poll_transmit() {
-            self.device.send(&transmit.bytes)?;
+            match transmit.to {
+                crate::Side::Tunnel => {
+                    self.device.send(&transmit.bytes)?;
+                }
+                crate::Side::Egress => self.to_egress.push(transmit.bytes.to_vec()),
+            }
         }
 
         self.datapath.on_timeout(now);
@@ -244,6 +260,13 @@ mod tests {
         ]
     }
 
+    fn pool() -> std::sync::Arc<crate::BufferPool> {
+        crate::BufferPool::new(
+            NonZeroUsize::new(2048).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+        )
+    }
+
     fn datapath() -> crate::Datapath {
         crate::Datapath::new(
             FilterPolicy::PassThrough,
@@ -262,6 +285,7 @@ mod tests {
                 flow_idle_timeout: Duration::from_secs(120),
                 datagram_buffer_capacity: NonZeroUsize::new(64).unwrap(),
             },
+            pool(),
         )
         .unwrap()
     }
@@ -275,18 +299,23 @@ mod tests {
         let mut direct = datapath();
         let base = Instant::now();
         direct.on_tun_packet(&packet, base).unwrap();
-        let direct_transmits: Vec<Vec<u8>> =
-            std::iter::from_fn(|| direct.poll_transmit().map(|t| t.bytes)).collect();
+        let direct_transmits: Vec<(crate::Side, Vec<u8>)> =
+            std::iter::from_fn(|| direct.poll_transmit().map(|t| (t.to, t.bytes.to_vec())))
+                .collect();
 
         let mut device = SimDevice::new(Mtu::new(1500).unwrap(), 42);
         device.inject(&packet, 0);
         let mut harness = Harness::new(device, datapath(), base);
         harness.step(0).unwrap();
-        let harness_transmits = harness.device.sent();
 
-        assert_eq!(direct_transmits, harness_transmits);
-        assert_eq!(harness_transmits.len(), 1);
-        assert_eq!(harness_transmits[0], packet);
+        // A packet from the client's TUN is bound for the egress, so the
+        // device sees nothing and the egress log holds it exactly once.
+        assert_eq!(
+            direct_transmits,
+            vec![(crate::Side::Egress, packet.clone())]
+        );
+        assert!(harness.device.sent().is_empty());
+        assert_eq!(harness.to_egress(), &[packet]);
     }
 
     #[test]

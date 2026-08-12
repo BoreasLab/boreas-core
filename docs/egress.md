@@ -44,7 +44,13 @@ smoltcp bypass.
 
 Use GotaTun. Integrated 2026-08-11 at 0.8.1 as `WireGuardEgress` in
 `src/egress.rs`: a sans-io wrapper over `Tunn`, driven by the shell through
-`EgressEmit::{ToNetwork, ToTunnel}` and an explicit timer tick. The reported
+`EgressEmit::{ToNetwork, ToTunnel}` and an explicit timer tick. The sans-io
+methods live on the `PacketEgress` trait rather than on the concrete type, so
+the reactor drives any packet egress without naming a protocol, and every
+emission is a pooled buffer on the datapath's own budget — an egress sits on
+the hottest path there is, and the performance budget forbids allocating per
+packet. The reactor owns both the egress and the network seam
+(`AsyncNetwork`), so the fused path never leaves one task. The reported
 overhead is 80 bytes, the IPv6-underlay worst case (40 outer IPv6 + 8 UDP + 32
 WireGuard header and tag); 60 bytes remains the IPv4 figure. Exact overhead is
 a measured property of the address family and implementation, recorded in

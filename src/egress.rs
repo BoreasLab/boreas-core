@@ -6,15 +6,24 @@
 //! the enum variant and the capabilities come from the implementation behind
 //! it, so the two cannot drift apart.
 //!
-//! [`WireGuardEgress`] is the first packet egress: a sans-io wrapper over
-//! GotaTun's `Tunn`. It performs no socket I/O of its own — every method takes
-//! bytes and returns [`EgressEmit`] values for the shell to deliver — but it
-//! reads the real clock for handshake and rekey timers, so it belongs to the
-//! shell side of the pure-core boundary, not to [`crate::Datapath`].
+//! [`PacketEgress`] is the whole sans-io interface, not just a capability
+//! report: bytes in, [`EgressEmit`] values out, timers on an explicit `tick`.
+//! That is what lets the reactor drive any packet egress without naming
+//! WireGuard, and what makes `Box<dyn PacketEgress>` a thing you can run
+//! rather than only interrogate.
+//!
+//! [`WireGuardEgress`] is the first implementation: a sans-io wrapper over
+//! GotaTun's `Tunn`. It performs no socket I/O of its own, but it reads the
+//! real clock for handshake and rekey timers, so it belongs to the shell side
+//! of the pure-core boundary, not to [`crate::Datapath`].
+//!
+//! Every emitted buffer is [`Pooled`]. The engineering plan's per-packet
+//! budget forbids a heap allocation per packet, and an egress sits on the
+//! hottest path there is, so its outputs draw on the same single budget the
+//! datapath's do; exhaustion is a counted drop, never a wait.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use etherparse::{NetSlice, SlicedPacket};
 use gotatun::{
     noise::{
         Tunn, TunnResult, errors::WireGuardError, index_table::IndexTable,
@@ -25,14 +34,47 @@ use gotatun::{
     x25519::{PublicKey, StaticSecret},
 };
 
-use crate::{Accepts, CapabilityError, DatagramFidelity, EgressCapabilities, Mtu, NatBehavior};
+use crate::{
+    Accepts, BufferPool, CapabilityError, DatagramFidelity, EgressCapabilities, Mtu, NatBehavior,
+    Pooled,
+};
 
 /// An egress that accepts whole IP packets, such as WireGuard or MASQUE
 /// CONNECT-IP.
+///
+/// Emissions go into a caller-owned sink rather than a returned `Vec`, so the
+/// reactor reuses one buffer for the life of the process and a packet costs no
+/// allocation for the container it travels in. The sink is appended to, never
+/// cleared: one call may legitimately produce a handshake response for the
+/// network *and* a packet for the tunnel, and a caller batching several calls
+/// keeps their order.
 pub trait PacketEgress: Send {
     /// The capability claim the planner sees. The accepted layer is not part
     /// of it: the [`Egress`] variant already says so.
     fn capabilities(&self) -> EgressCapabilities;
+
+    /// Accepts one whole IP packet from the tunnel side, bound outward.
+    fn handle_tun_packet(
+        &mut self,
+        packet: &[u8],
+        out: &mut Vec<EgressEmit>,
+    ) -> Result<(), EgressError>;
+
+    /// Accepts one datagram from the network, bound inward.
+    fn handle_network_packet(
+        &mut self,
+        datagram: &[u8],
+        out: &mut Vec<EgressEmit>,
+    ) -> Result<(), EgressError>;
+
+    /// Drives the implementation's own timers: handshake retries, rekeys,
+    /// expiry, keepalives.
+    fn tick(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError>;
+
+    /// How often [`tick`](Self::tick) must be called. The implementation owns
+    /// its own cadence, so the shell arms a timer rather than knowing any
+    /// protocol's timer granularity.
+    fn tick_interval(&self) -> Duration;
 }
 
 /// An egress that accepts L4 flows, such as SOCKS5 or Shadowsocks.
@@ -87,6 +129,11 @@ pub const WIREGUARD_OVERHEAD_BYTES: u16 = 80;
 /// Match GotaTun's own device: handshake initiations per second per peer.
 const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
+/// GotaTun's own device ticks every 250 ms. WireGuard rounds its timers to the
+/// second, so any cadence in that range is correct; this one matches the
+/// reference implementation rather than inventing a number.
+const WIREGUARD_TICK: Duration = Duration::from_millis(250);
+
 /// Static configuration for one WireGuard peer. Keys are fixed-size arrays,
 /// so validity is structural and there is nothing to validate at runtime.
 pub struct WireGuardConfig {
@@ -104,12 +151,12 @@ pub struct WireGuardConfig {
 /// two destinations in one sum means a handler's caller cannot lose half of a
 /// handshake exchange: a decapsulation can legitimately produce both a
 /// handshake response for the network and a packet for the tunnel.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum EgressEmit {
     /// A UDP payload for the WireGuard peer's endpoint.
-    ToNetwork(Vec<u8>),
+    ToNetwork(Pooled),
     /// A decrypted IP packet for the datapath's egress side.
-    ToTunnel(Vec<u8>),
+    ToTunnel(Pooled),
 }
 
 #[derive(Debug)]
@@ -117,6 +164,9 @@ pub enum EgressError {
     /// Bytes from the UDP socket that are not a WireGuard packet. Routine on a
     /// public port; the caller counts and continues.
     MalformedNetworkPacket,
+    /// The shared buffer pool had no room for an emission. A drop, never a
+    /// wait, on the same budget every other payload draws from.
+    PoolExhausted,
     /// The tunnel itself failed, e.g. `ConnectionExpired` once the handshake
     /// has been retried past its limit.
     WireGuard(WireGuardError),
@@ -126,6 +176,7 @@ impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MalformedNetworkPacket => f.write_str("not a WireGuard packet"),
+            Self::PoolExhausted => f.write_str("no pooled buffer for the emission"),
             // GotaTun's error type is a plain enum without `Display`; Debug
             // names the variant, which is what an operator needs.
             Self::WireGuard(error) => write!(f, "WireGuard failure: {error:?}"),
@@ -146,13 +197,16 @@ impl From<WireGuardError> for EgressError {
 pub struct WireGuardEgress {
     tunn: Tunn,
     mtu: MtuWatcher,
+    pool: Arc<BufferPool>,
     /// IP packets encapsulated so far. This is the fast-path counter: every
     /// one of these is a packet that bypassed local termination entirely.
     fast_path_packets: u64,
 }
 
 impl WireGuardEgress {
-    pub fn new(config: WireGuardConfig) -> Self {
+    /// `pool` is the same budget the datapath draws on; its slice size must
+    /// admit an encapsulated packet, which is `inner_mtu + 32` bytes.
+    pub fn new(config: WireGuardConfig, pool: Arc<BufferPool>) -> Self {
         let private_key = StaticSecret::from(config.private_key);
         let our_public = PublicKey::from(&private_key);
         Self {
@@ -165,68 +219,9 @@ impl WireGuardEgress {
                 Arc::new(RateLimiter::new(&our_public, HANDSHAKE_RATE_LIMIT)),
             ),
             mtu: MtuWatcher::new(config.inner_mtu.get()),
+            pool,
             fast_path_packets: 0,
         }
-    }
-
-    /// Encapsulates one IP packet from the tunnel. Before a session exists
-    /// this emits the handshake initiation and queues the packet inside the
-    /// tunnel; the queue flushes on the tick or inbound packet that completes
-    /// the handshake.
-    pub fn handle_tun_packet(&mut self, packet: &[u8]) -> Vec<EgressEmit> {
-        self.fast_path_packets += 1;
-        self.tunn
-            .handle_outgoing_packet(Packet::copy_from(packet), Some(&mut self.mtu))
-            .map(network_emit)
-            .into_iter()
-            .collect()
-    }
-
-    /// Handles one UDP payload from the peer. A malformed datagram is an
-    /// observation, not a tunnel failure; a completed handshake flushes
-    /// whatever was queued while it ran.
-    pub fn handle_network_packet(
-        &mut self,
-        datagram: &[u8],
-    ) -> Result<Vec<EgressEmit>, EgressError> {
-        let kind = Packet::copy_from(datagram)
-            .try_into_wg()
-            .map_err(|_| EgressError::MalformedNetworkPacket)?;
-
-        let mut emits = match self.tunn.handle_incoming_packet(kind) {
-            TunnResult::Done => Vec::new(),
-            TunnResult::Err(error) => return Err(error.into()),
-            TunnResult::WriteToNetwork(kind) => vec![network_emit(kind)],
-            TunnResult::WriteToTunnel(packet) => {
-                let bytes: &[u8] = packet.as_ref();
-                if bytes.is_empty() {
-                    // A keepalive answers liveness inside the protocol; it is
-                    // not an IP packet and must not reach the datapath.
-                    Vec::new()
-                } else {
-                    // Data payloads are padded to a 16-byte multiple. The IP
-                    // header's own length field governs, so the tunnel is owed
-                    // exactly the packet, not the padding.
-                    vec![EgressEmit::ToTunnel(strip_padding(bytes).to_vec())]
-                }
-            }
-        };
-        emits.extend(self.flush_queue());
-        Ok(emits)
-    }
-
-    /// Drives handshake retries, rekeys, session expiry, and keepalives.
-    /// WireGuard rounds these timers to the second; GotaTun's own device
-    /// ticks every 250 ms, and any cadence in that range is correct.
-    pub fn tick(&mut self) -> Result<Vec<EgressEmit>, EgressError> {
-        let mut emits = self
-            .tunn
-            .update_timers()?
-            .map(network_emit)
-            .into_iter()
-            .collect::<Vec<_>>();
-        emits.extend(self.flush_queue());
-        Ok(emits)
     }
 
     /// The fast-path counter behind the M1 gate: every packet counted here
@@ -236,10 +231,24 @@ impl WireGuardEgress {
     }
 
     /// Packets queued while no session existed, encapsulated once one does.
-    fn flush_queue(&mut self) -> impl Iterator<Item = EgressEmit> + '_ {
-        self.tunn
-            .get_queued_packets(&mut self.mtu)
-            .map(network_emit)
+    fn flush_queue(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
+        // Collected before the pool is touched because `get_queued_packets`
+        // borrows the tunnel mutably; the queue is bounded by the tunnel's own
+        // depth and is empty on every packet but the one that completes a
+        // handshake.
+        let queued: Vec<WgKind> = self.tunn.get_queued_packets(&mut self.mtu).collect();
+        for kind in queued {
+            out.push(self.network_emit(kind)?);
+        }
+        Ok(())
+    }
+
+    fn network_emit(&self, kind: WgKind) -> Result<EgressEmit, EgressError> {
+        let packet: Packet = kind.into();
+        self.pool
+            .take(packet.as_ref())
+            .map(EgressEmit::ToNetwork)
+            .ok_or(EgressError::PoolExhausted)
     }
 }
 
@@ -257,31 +266,111 @@ impl PacketEgress for WireGuardEgress {
             nat_behavior: NatBehavior::EndpointIndependent,
         }
     }
+
+    /// Encapsulates one IP packet from the tunnel. Before a session exists
+    /// this emits the handshake initiation and queues the packet inside the
+    /// tunnel; the queue flushes on the tick or inbound packet that completes
+    /// the handshake. At most one emission, always network-bound.
+    fn handle_tun_packet(
+        &mut self,
+        packet: &[u8],
+        out: &mut Vec<EgressEmit>,
+    ) -> Result<(), EgressError> {
+        self.fast_path_packets += 1;
+        let Some(kind) = self
+            .tunn
+            .handle_outgoing_packet(Packet::copy_from(packet), Some(&mut self.mtu))
+        else {
+            return Ok(());
+        };
+        out.push(self.network_emit(kind)?);
+        Ok(())
+    }
+
+    /// Handles one UDP payload from the peer. A malformed datagram is an
+    /// observation, not a tunnel failure; a completed handshake flushes
+    /// whatever was queued while it ran.
+    fn handle_network_packet(
+        &mut self,
+        datagram: &[u8],
+        out: &mut Vec<EgressEmit>,
+    ) -> Result<(), EgressError> {
+        let kind = Packet::copy_from(datagram)
+            .try_into_wg()
+            .map_err(|_| EgressError::MalformedNetworkPacket)?;
+
+        match self.tunn.handle_incoming_packet(kind) {
+            TunnResult::Done => {}
+            TunnResult::Err(error) => return Err(error.into()),
+            TunnResult::WriteToNetwork(kind) => out.push(self.network_emit(kind)?),
+            TunnResult::WriteToTunnel(packet) => {
+                let bytes: &[u8] = packet.as_ref();
+                // A keepalive answers liveness inside the protocol; it is not
+                // an IP packet and must not reach the datapath. Data payloads
+                // are padded to a 16-byte multiple, and the IP header's own
+                // length field governs, so the tunnel is owed exactly the
+                // packet and not the padding.
+                if !bytes.is_empty() {
+                    let stripped = strip_padding(bytes);
+                    let pooled = self.pool.take(stripped).ok_or(EgressError::PoolExhausted)?;
+                    out.push(EgressEmit::ToTunnel(pooled));
+                }
+            }
+        }
+        self.flush_queue(out)
+    }
+
+    /// Drives handshake retries, rekeys, session expiry, and keepalives.
+    fn tick(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
+        if let Some(kind) = self.tunn.update_timers()? {
+            out.push(self.network_emit(kind)?);
+        }
+        self.flush_queue(out)
+    }
+
+    fn tick_interval(&self) -> Duration {
+        WIREGUARD_TICK
+    }
 }
 
-fn network_emit(kind: WgKind) -> EgressEmit {
-    let packet: Packet = kind.into();
-    EgressEmit::ToNetwork(packet.as_ref().to_vec())
-}
-
-/// The exact IP packet, without WireGuard's 16-byte-alignment padding. An
-/// unparseable packet passes through untouched: the datapath is the authority
-/// on rejecting it, and guessing a length here would only hide its count.
+/// The exact IP packet, without WireGuard's 16-byte-alignment padding.
+///
+/// O(1) and allocation-free: both families state their own length at a fixed
+/// offset in the fixed header, so this reads two bytes rather than running a
+/// full network-and-transport parse for a number the header already carries.
+/// A packet whose own header does not describe a sane length passes through
+/// untouched: the datapath is the authority on rejecting it, and guessing a
+/// length here would only hide its count.
 fn strip_padding(packet: &[u8]) -> &[u8] {
-    let Ok(sliced) = SlicedPacket::from_ip(packet) else {
-        return packet;
+    let declared = match packet.first().map(|version| version >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let header = usize::from(packet[0] & 0x0f) * 4;
+            let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+            (header >= 20 && total >= header).then_some(total)
+        }
+        Some(6) if packet.len() >= 40 => {
+            Some(40 + usize::from(u16::from_be_bytes([packet[4], packet[5]])))
+        }
+        _ => None,
     };
-    let length = match &sliced.net {
-        Some(NetSlice::Ipv4(ipv4)) => usize::from(ipv4.header().total_len()),
-        Some(NetSlice::Ipv6(ipv6)) => 40 + usize::from(ipv6.header().payload_length()),
-        _ => return packet,
-    };
-    packet.get(..length).unwrap_or(packet)
+    declared
+        .and_then(|length| packet.get(..length))
+        .unwrap_or(packet)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+
+    /// Large enough that nothing here meets the budget, so a `PoolExhausted`
+    /// in these tests would be a defect rather than the congestion path.
+    fn pool() -> Arc<BufferPool> {
+        BufferPool::new(
+            NonZeroUsize::new(2048).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+        )
+    }
 
     fn config(private_key: [u8; 32], peer_public_key: [u8; 32]) -> WireGuardConfig {
         WireGuardConfig {
@@ -299,12 +388,12 @@ mod tests {
         (private.to_bytes(), PublicKey::from(&private).to_bytes())
     }
 
-    fn pair() -> (WireGuardEgress, WireGuardEgress) {
+    fn pair(pool: &Arc<BufferPool>) -> (WireGuardEgress, WireGuardEgress) {
         let (client_private, client_public) = keypair(1);
         let (server_private, server_public) = keypair(2);
         (
-            WireGuardEgress::new(config(client_private, server_public)),
-            WireGuardEgress::new(config(server_private, client_public)),
+            WireGuardEgress::new(config(client_private, server_public), Arc::clone(pool)),
+            WireGuardEgress::new(config(server_private, client_public), Arc::clone(pool)),
         )
     }
 
@@ -324,12 +413,10 @@ mod tests {
         ) {
             for emit in incoming.drain(..) {
                 match emit {
-                    EgressEmit::ToNetwork(datagram) => outgoing.extend(
-                        target
-                            .handle_network_packet(&datagram)
-                            .expect("in-band WireGuard exchange"),
-                    ),
-                    EgressEmit::ToTunnel(packet) => tunnelled.push(packet),
+                    EgressEmit::ToNetwork(datagram) => target
+                        .handle_network_packet(&datagram, outgoing)
+                        .expect("in-band WireGuard exchange"),
+                    EgressEmit::ToTunnel(packet) => tunnelled.push(packet.to_vec()),
                 }
             }
         }
@@ -345,14 +432,16 @@ mod tests {
 
     #[test]
     fn handshake_then_ip_packet_round_trips_byte_exact() {
-        let (mut client, mut server) = pair();
+        let pool = pool();
+        let (mut client, mut server) = pair(&pool);
         let ip_packet = [
             0x45, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
         ];
 
         // The first packet triggers the handshake and is queued behind it.
-        let first = client.handle_tun_packet(&ip_packet);
+        let mut first = Vec::new();
+        client.handle_tun_packet(&ip_packet, &mut first).unwrap();
         assert!(
             first
                 .iter()
@@ -364,27 +453,91 @@ mod tests {
         assert_eq!(client.fast_path_packets(), 1);
 
         // With a session established, a second packet crosses directly.
-        let second = client.handle_tun_packet(&ip_packet);
+        let mut second = Vec::new();
+        client.handle_tun_packet(&ip_packet, &mut second).unwrap();
         let tunnelled = exchange(&mut client, &mut server, second);
         assert_eq!(tunnelled, vec![ip_packet]);
         assert_eq!(client.fast_path_packets(), 2);
+
+        // Every pooled buffer the exchange used has been returned: an egress
+        // that leaked the budget would starve the datapath sharing it.
+        assert_eq!(pool.available(), 64);
     }
 
     #[test]
     fn non_wireguard_datagrams_are_rejected_not_fatal() {
-        let (mut client, _server) = pair();
+        let pool = pool();
+        let (mut client, _server) = pair(&pool);
+        let mut out = Vec::new();
         assert!(matches!(
-            client.handle_network_packet(&[0xde, 0xad, 0xbe, 0xef]),
+            client.handle_network_packet(&[0xde, 0xad, 0xbe, 0xef], &mut out),
             Err(EgressError::MalformedNetworkPacket)
         ));
+        assert!(out.is_empty());
         // The tunnel still works afterwards.
-        let emits = client.handle_tun_packet(&[0x45; 28]);
-        assert!(!emits.is_empty());
+        client.handle_tun_packet(&[0x45; 28], &mut out).unwrap();
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn an_exhausted_pool_refuses_an_emission_instead_of_allocating() {
+        let pool = BufferPool::new(
+            NonZeroUsize::new(2048).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let (mut client, _server) = pair(&pool);
+        let held = pool.take(b"the only buffer").expect("within budget");
+
+        let mut out = Vec::new();
+        assert!(matches!(
+            client.handle_tun_packet(&[0x45; 28], &mut out),
+            Err(EgressError::PoolExhausted)
+        ));
+        assert!(out.is_empty(), "a refusal emits nothing");
+        assert_eq!(pool.exhausted(), 1);
+        drop(held);
+
+        // The refusal is the pool's state, not a broken egress: with the
+        // budget back, an egress emits normally. It is deliberately a fresh
+        // one — the dropped bytes were a handshake initiation, and WireGuard
+        // recovers those from its own retry timer on `tick`, not from the
+        // next packet, so re-offering to the same tunnel proves nothing.
+        let (mut fresh, _server) = pair(&pool);
+        fresh.handle_tun_packet(&[0x45; 28], &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn padding_is_stripped_by_the_header_the_packet_declares() {
+        // IPv4: 28 declared bytes inside a 32-byte padded payload.
+        let mut padded = vec![0u8; 32];
+        padded[0] = 0x45;
+        padded[2..4].copy_from_slice(&28u16.to_be_bytes());
+        assert_eq!(strip_padding(&padded).len(), 28);
+
+        // IPv6: 40 fixed bytes plus a declared 8-byte payload.
+        let mut padded = vec![0u8; 64];
+        padded[0] = 0x60;
+        padded[4..6].copy_from_slice(&8u16.to_be_bytes());
+        assert_eq!(strip_padding(&padded).len(), 48);
+
+        // Nonsense passes through whole rather than being guessed at: a
+        // declared length below the header, past the buffer, or on a version
+        // that is neither family.
+        let mut broken = vec![0u8; 32];
+        broken[0] = 0x45;
+        broken[2..4].copy_from_slice(&8u16.to_be_bytes());
+        assert_eq!(strip_padding(&broken).len(), 32);
+        broken[2..4].copy_from_slice(&9999u16.to_be_bytes());
+        assert_eq!(strip_padding(&broken).len(), 32);
+        assert_eq!(strip_padding(&[0x00; 32]).len(), 32);
+        assert_eq!(strip_padding(&[]).len(), 0);
     }
 
     #[test]
     fn the_reported_capabilities_match_the_implementation() {
-        let (client, _server) = pair();
+        let pool = pool();
+        let (client, _server) = pair(&pool);
         let egress = Egress::Packet(Box::new(client));
         assert_eq!(egress.accepts(), Accepts::IpPackets);
         let capabilities = egress.capabilities();

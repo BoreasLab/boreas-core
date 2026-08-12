@@ -183,7 +183,11 @@ Do not rely on these without a targeted check:
    Partially answered 2026-08-11: `WireGuardEgress` reports 80 bytes, the IPv6
    underlay worst case (40 outer IPv6 + 8 UDP + 32 WireGuard), so the inner
    MTU is never optimistic; the per-family exact figure remains unmeasured.
-5. GotaTun readiness on Windows.
+5. GotaTun readiness on Windows. Related and unexercised locally: the Wintun
+   adapter's cancel-safety fix of 2026-08-11 (retaining the `spawn_blocking`
+   join handle across `recv` calls, so a dropped future no longer discards the
+   packet the blocking read already consumed). Compile-checked in the Windows
+   CI job only; the behaviour needs a device.
 6. smoltcp behavior and socket-set cost at hundreds of concurrent sockets.
    **Measured 2026-08-11, smoltcp 0.13.1, aarch64 Linux VM, idle listening
    sockets, `examples/smoltcp_scaling.rs`:** poll cost scales linearly at
@@ -197,6 +201,17 @@ Do not rely on these without a targeted check:
 7. SOCKS5 UDP ASSOCIATE support among servers users actually operate.
 8. Claimed Hysteria2 and TUIC throughput and P95 improvements on the Boreas
    workload.
+9. Packets per wakeup and packets per syscall, the performance budget's primary
+   derived metrics. The reactor reads one packet per wakeup; device batching
+   needs a non-blocking read on `AsyncDevice` and can only be judged against a
+   real device. Related: the egress tick is an unconditional 4 Hz wakeup, at
+   parity with GotaTun's own device, and is the largest fixed wakeup cost in
+   the shell. Both belong to the M1 on-device battery run.
+10. That the pooled fast path holds its budget under real traffic. Measured
+    in-process 2026-08-11 (`examples/fusion.rs`, aarch64 dev VM, release):
+    core 573 ns/packet against the ~1 µs allowance, 2 187 ns end to end, and
+    every pool slice returned at rest across 10,000 packets. In-process only:
+    the two-process baseline still needs two real devices.
 
 ## Inferred Engineering Judgments
 

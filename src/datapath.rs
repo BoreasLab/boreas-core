@@ -10,21 +10,60 @@
 //!   is always a valid plan for the current configuration;
 //! - per-flow datagram buffers are bounded at flow creation and `send_datagram`
 //!   drops rather than waits;
-//! - the configuration is planned once at construction, so `FlowPlan` derivation
-//!   for a flow the core creates itself is total rather than optimistic.
+//! - the configuration is planned once at construction and re-planned only when
+//!   it changes, so classification is total rather than optimistic and no
+//!   packet pays for a decision that cannot have moved since the last one;
+//! - a `Transmit` names the side it is bound for, so the shell cannot send a
+//!   fast-path packet back down the interface it arrived on.
 
-use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
+use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use crate::{
-    Accepts, DatagramBuffer, EgressCapabilities, FilterPolicy, FlowPlan, FlowTableError, Fragment,
-    IngressAction, IngressPacket, InternalEndpoint, Mtu, PacketError, PlanError, Pooled,
-    PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
-    UdpFlowTable, clamp_mss, plan_flow, replan, route_ingress,
+    Accepts, BufferPool, DatagramBuffer, EgressCapabilities, FilterPolicy, FlowPlan,
+    FlowTableError, Fragment, IngressAction, IngressPacket, InternalEndpoint, Mtu, PacketError,
+    PlanError, Pooled, PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport,
+    TransportPath, UdpFlowTable, clamp_mss, plan_flow, replan, route_ingress,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One of the two sides the datapath sits between: the client's TUN and the
+/// configured egress.
+///
+/// It names both the side a packet arrived on and the side a transmit is bound
+/// for, because every forwarding decision the core makes is exactly the
+/// crossing between them. [`Side::across`] is that crossing and is its own
+/// inverse.
+///
+/// Before this type existed, [`Transmit`] carried bytes and nothing else, so
+/// the shell had to guess the destination — and the only guess available, the
+/// device, sends a fast-path packet straight back at the client instead of
+/// encapsulating it. The destination is a fact the core knows and the shell
+/// cannot re-derive, so the core states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Tunnel,
+    Egress,
+}
+
+impl Side {
+    /// The other side. `s.across().across() == s`.
+    pub fn across(self) -> Self {
+        match self {
+            Self::Tunnel => Self::Egress,
+            Self::Egress => Self::Tunnel,
+        }
+    }
+}
+
+/// One packet the core has decided to forward, and the side it belongs on.
+///
+/// The payload is a [`Pooled`] buffer rather than an owned `Vec`: the
+/// engineering plan's per-packet budget puts a heap allocation at ~100 ns and
+/// forbids one per packet, and the pool already exists for exactly this. Not
+/// `Clone`, because `Pooled` is affine.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Transmit {
-    pub bytes: Vec<u8>,
+    pub to: Side,
+    pub bytes: Pooled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +74,11 @@ pub enum FlowEvent {
     ReassemblyDiscarded,
     Resteered(SteeringReason),
     FlowTornDown(InternalEndpoint),
+    /// A packet the core planned to forward but could not hold: the shared
+    /// pool's budget was spent, or the packet exceeded a pool slice. Per
+    /// packet under congestion, so the shell folds it into a counter rather
+    /// than forwarding one message per occurrence.
+    TransmitDropped,
 }
 
 /// The tuning knobs of a [`Datapath`], grouped so the constructor reads as
@@ -103,9 +147,10 @@ struct FlowState {
     /// global budget rather than `flows x depth x MTU`. The per-flow capacity
     /// remains the fairness bound: no single flow can spend the whole pool.
     ///
-    /// ponytail: nothing consumes these yet. The egress that drains them is
-    /// P10; until then an idle queue is reclaimed when its flow expires, and
-    /// the pool's budget is what keeps that bounded.
+    /// ponytail: the drain is the first *stream* egress (SOCKS5, P17). A
+    /// packet egress consumes whole packets and never these queues. Until
+    /// then an idle queue is reclaimed when its flow expires, and the pool's
+    /// budget is what keeps that bounded.
     buffer: DatagramBuffer<Pooled>,
 }
 
@@ -118,6 +163,19 @@ pub struct Datapath {
     accepts: Accepts,
     egress: EgressCapabilities,
     path_mtu: Mtu,
+    /// The planning decision for the current configuration, memoized.
+    ///
+    /// Every input to `plan_flow` — filter policy, accepted layer, capability
+    /// claim, path MTU — is a session property, so the answer moves only when
+    /// the configuration does. Deriving it per packet was both wasted work on
+    /// the hot path and a fallible call in a place with no interesting failure;
+    /// holding the `Result` keeps the failing configuration's behavior exactly
+    /// as it was (every packet counted and refused) while making the succeeding
+    /// case a field read.
+    plan: Result<FlowPlan, PlanError>,
+    /// Payload storage for forwarded packets and queued datagrams alike. One
+    /// budget, `capacity x slice_size`, for everything the core holds.
+    pool: Arc<BufferPool>,
     datagram_buffer_capacity: NonZeroUsize,
     reassembler: Reassembler,
     flows: UdpFlowTable<FlowState>,
@@ -126,23 +184,28 @@ pub struct Datapath {
 }
 
 impl Datapath {
+    /// `pool` must admit at least `path_mtu` bytes per slice; a packet larger
+    /// than a slice cannot be held and is dropped and counted like any other
+    /// exhaustion.
     pub fn new(
         filter: FilterPolicy,
         accepts: Accepts,
         egress: EgressCapabilities,
         path_mtu: Mtu,
         limits: Limits,
+        pool: Arc<BufferPool>,
     ) -> Result<Self, DatapathError> {
         // Parse, do not validate: a `Datapath` exists only for a configuration
-        // that plans. Every later `plan_flow` on this configuration is then a
-        // proof-carrying repeat rather than a fresh gamble.
-        plan_flow(filter, accepts, egress, path_mtu)?;
+        // that plans, and the proof is kept rather than recomputed.
+        let plan = plan_flow(filter, accepts, egress, path_mtu)?;
 
         Ok(Self {
             filter,
             accepts,
             egress,
             path_mtu,
+            plan: Ok(plan),
+            pool,
             datagram_buffer_capacity: limits.datagram_buffer_capacity,
             reassembler: Reassembler::new(
                 limits.reassembly_timeout,
@@ -154,11 +217,14 @@ impl Datapath {
         })
     }
 
+    /// A packet from the client's TUN. Whatever it produces is bound for the
+    /// egress, because that is the side it did not come from.
     pub fn on_tun_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
-        self.dispatch(packet, buf, now)
+        self.dispatch(packet, buf, Side::Tunnel, now)
     }
 
+    /// A decapsulated packet from the egress, bound for the client.
     pub fn on_egress_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
         // Fragments arriving from the egress side are pathological: the peer's
@@ -168,31 +234,36 @@ impl Datapath {
             self.events.push_back(FlowEvent::ReassemblyDiscarded);
             return Ok(());
         }
-        self.dispatch(packet, buf, now)
+        self.dispatch(packet, buf, Side::Egress, now)
     }
 
     fn dispatch(
         &mut self,
         packet: IngressPacket,
         buf: &[u8],
+        from: Side,
         now: Instant,
     ) -> Result<(), DatapathError> {
-        match route_ingress(
-            packet,
-            self.filter,
-            self.accepts,
-            self.egress,
-            self.path_mtu,
-        )? {
-            IngressAction::Reassemble => self.on_fragment(buf, now),
+        let action = match packet.transport {
+            // Neither answer can depend on an egress capability, so neither
+            // waits on one: L4 must never observe a fragment, and a protocol
+            // this datapath does not carry is dropped whatever the egress
+            // could have carried. Ordering the plan behind them is what keeps
+            // an unplannable configuration from silently changing reassembly.
+            Transport::Fragment => IngressAction::Reassemble,
+            Transport::Other => IngressAction::DropUnsupported,
+            carried => route_ingress(carried, self.plan?),
+        };
+        match action {
+            IngressAction::Reassemble => self.on_fragment(buf, from, now),
             IngressAction::ForwardPacket(plan) => {
-                let mut bytes = buf.to_vec();
-                if let TransportPath::PacketFastPath { inner_mtu } = plan.transport {
+                let clamp = match plan.transport {
                     // The clamp is the only mechanism that reaches a terminated
                     // path's segment size; on non-SYN packets it is a no-op.
-                    let _ = clamp_mss(&mut bytes, inner_mtu);
-                }
-                self.transmits.push_back(Transmit { bytes });
+                    TransportPath::PacketFastPath { inner_mtu } => Some(inner_mtu),
+                    TransportPath::LocalTermination => None,
+                };
+                self.forward(buf, from.across(), clamp);
                 Ok(())
             }
             IngressAction::OpenStream(plan) => {
@@ -212,16 +283,31 @@ impl Datapath {
             IngressAction::HandleIcmp(_) => {
                 // PTB generation toward the client is deferred to the effect
                 // shell; the packet itself is forwarded unchanged.
-                self.transmits.push_back(Transmit {
-                    bytes: buf.to_vec(),
-                });
+                self.forward(buf, from.across(), None);
                 Ok(())
             }
             IngressAction::DropUnsupported => Ok(()),
         }
     }
 
-    fn on_fragment(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
+    /// Copies one packet into a pooled buffer and queues it for `to`.
+    ///
+    /// Exhaustion is a counted drop, never a wait and never an allocation: the
+    /// pool's budget is the bound on how many packets the core can hold at
+    /// once, and a packet that does not fit it is exactly the congestion the
+    /// budget exists to express.
+    fn forward(&mut self, buf: &[u8], to: Side, clamp: Option<Mtu>) {
+        let Some(mut bytes) = self.pool.take(buf) else {
+            self.events.push_back(FlowEvent::TransmitDropped);
+            return;
+        };
+        if let Some(inner_mtu) = clamp {
+            let _ = clamp_mss(&mut bytes, inner_mtu);
+        }
+        self.transmits.push_back(Transmit { to, bytes });
+    }
+
+    fn on_fragment(&mut self, buf: &[u8], from: Side, now: Instant) -> Result<(), DatapathError> {
         let Some(fragment) = Fragment::parse(buf)? else {
             return Ok(());
         };
@@ -234,9 +320,10 @@ impl Datapath {
             PushOutcome::Complete(datagram) => {
                 // A completed datagram re-enters dispatch as a fresh packet: a
                 // flow is planned from its real header, never admitted from the
-                // fragment boundary alone.
+                // fragment boundary alone. It keeps the side it arrived on, so
+                // reassembly cannot reverse a packet's direction.
                 let packet = IngressPacket::parse(&datagram)?;
-                self.dispatch(packet, &datagram, now)
+                self.dispatch(packet, &datagram, from, now)
             }
         }
     }
@@ -268,9 +355,10 @@ impl Datapath {
         datagram: Pooled,
         now: Instant,
     ) -> Result<SendOutcome, DatapathError> {
-        // Planned before the closure so a configuration the current egress
-        // cannot serve surfaces as `DatapathError::Plan`, never as a panic.
-        let plan = plan_flow(self.filter, self.accepts, self.egress, self.path_mtu)?;
+        // The memoized plan, so a configuration the current egress cannot
+        // serve surfaces as `DatapathError::Plan` before the flow exists,
+        // never as a panic inside the closure.
+        let plan = self.plan?;
         let capacity = self.datagram_buffer_capacity;
         let flow = self.flows.get_or_insert_with(endpoint, now, || FlowState {
             plan,
@@ -291,6 +379,11 @@ impl Datapath {
     pub fn on_capability_change(&mut self, accepts: Accepts, next: EgressCapabilities) {
         self.accepts = accepts;
         self.egress = next;
+        // The memoized decision moves with the configuration it describes. An
+        // unplannable capability is kept as the `Err` it is: every subsequent
+        // packet is refused and counted, which is what the caller already saw
+        // when planning happened per packet.
+        self.plan = plan_flow(self.filter, accepts, next, self.path_mtu);
         let Self {
             filter,
             path_mtu,
@@ -398,6 +491,7 @@ mod tests {
             egress(fidelity),
             Mtu::new(1500).unwrap(),
             limits(64),
+            pool(),
         )
         .unwrap()
     }
@@ -489,6 +583,75 @@ mod tests {
     }
 
     #[test]
+    fn a_transmit_always_leaves_by_the_side_it_did_not_arrive_on() {
+        // The law the `Side` type exists to state: forwarding crosses the
+        // datapath. A tun-side packet is bound for the egress and an egress-
+        // side packet is bound for the tunnel, and `across` is the involution
+        // that says so.
+        assert_eq!(Side::Tunnel.across(), Side::Egress);
+        assert_eq!(Side::Egress.across(), Side::Tunnel);
+        for side in [Side::Tunnel, Side::Egress] {
+            assert_eq!(side.across().across(), side);
+        }
+
+        let mut path = Datapath::new(
+            FilterPolicy::PassThrough,
+            Accepts::IpPackets,
+            egress(crate::DatagramFidelity::Native),
+            Mtu::new(1500).unwrap(),
+            limits(8),
+            pool(),
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        path.on_tun_packet(&udp_packet(), now).unwrap();
+        let transmit = path.poll_transmit().expect("the fast path forwards");
+        assert_eq!(transmit.to, Side::Egress, "a tun packet is bound outward");
+        assert_eq!(*transmit.bytes, udp_packet()[..]);
+
+        path.on_egress_packet(&udp_packet(), now).unwrap();
+        let transmit = path.poll_transmit().expect("the fast path forwards");
+        assert_eq!(transmit.to, Side::Tunnel, "a tunnel packet is bound inward");
+    }
+
+    #[test]
+    fn an_exhausted_pool_drops_and_counts_rather_than_allocating() {
+        // The forward path holds no bytes of its own. When the shared budget
+        // is spent the packet is a counted drop, which is the same discipline
+        // the per-flow queues already follow.
+        let pool = BufferPool::new(
+            NonZeroUsize::new(1500).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let mut path = Datapath::new(
+            FilterPolicy::PassThrough,
+            Accepts::IpPackets,
+            egress(crate::DatagramFidelity::Native),
+            Mtu::new(1500).unwrap(),
+            limits(8),
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        path.on_tun_packet(&udp_packet(), now).unwrap();
+        let held = path.poll_transmit().expect("the first packet fits");
+        assert_eq!(pool.available(), 0);
+
+        path.on_tun_packet(&udp_packet(), now).unwrap();
+        assert!(path.poll_transmit().is_none(), "nothing was allocated");
+        assert_eq!(path.poll_event(), Some(FlowEvent::TransmitDropped));
+        assert_eq!(pool.exhausted(), 1);
+
+        // Draining the first transmit returns the budget, and forwarding works
+        // again: the drop was congestion, not a broken datapath.
+        drop(held);
+        path.on_tun_packet(&udp_packet(), now).unwrap();
+        assert!(path.poll_transmit().is_some());
+    }
+
+    #[test]
     fn timeout_expires_flow_state() {
         let mut path = datapath(crate::DatagramFidelity::Native);
         let now = Instant::now();
@@ -528,6 +691,7 @@ mod tests {
                 starved,
                 Mtu::new(1500).unwrap(),
                 limits(64),
+                pool(),
             )
             .err(),
             Some(DatapathError::Plan(PlanError::InnerMtu(
@@ -540,19 +704,20 @@ mod tests {
     fn a_full_queue_drops_and_returns_its_bytes_to_the_pool() {
         // Two bounds act here, and the per-flow one binds first by design: it
         // is the fairness bound, so no single flow can spend the shared budget.
+        let pool = BufferPool::new(
+            NonZeroUsize::new(1500).unwrap(),
+            NonZeroUsize::new(8).unwrap(),
+        );
         let mut path = Datapath::new(
             FilterPolicy::PassThrough,
             Accepts::Flows,
             egress(crate::DatagramFidelity::Native),
             Mtu::new(1500).unwrap(),
             limits(2),
+            Arc::clone(&pool),
         )
         .unwrap();
         let now = Instant::now();
-        let pool = BufferPool::new(
-            NonZeroUsize::new(1500).unwrap(),
-            NonZeroUsize::new(8).unwrap(),
-        );
         let endpoint = InternalEndpoint {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 1234,

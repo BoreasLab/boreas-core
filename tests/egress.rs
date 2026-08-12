@@ -4,12 +4,22 @@
 //! the datapath's egress side byte-identical. No sockets, no real devices —
 //! those belong to the M1 product gate, which this environment cannot run.
 
-use std::{net::Ipv4Addr, num::NonZeroUsize, time::Duration};
+use std::{net::Ipv4Addr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use boreas_core::{
-    Accepts, DatagramFidelity, Datapath, Egress, EgressCapabilities, EgressEmit, FilterPolicy,
-    Harness, Limits, Mtu, NatBehavior, SimDevice, WireGuardConfig, WireGuardEgress,
+    Accepts, BufferPool, DatagramFidelity, Datapath, Egress, EgressCapabilities, EgressEmit,
+    FilterPolicy, Harness, Limits, Mtu, NatBehavior, SimDevice, WireGuardConfig, WireGuardEgress,
 };
+
+/// Slices large enough for an encapsulated 1420-byte packet, and a budget
+/// nothing here approaches: an exhaustion in this test would be a defect, not
+/// the congestion path (`src/egress.rs` covers that one).
+fn pool() -> Arc<BufferPool> {
+    BufferPool::new(
+        NonZeroUsize::new(2048).unwrap(),
+        NonZeroUsize::new(64).unwrap(),
+    )
+}
 
 fn udp_frame(source: Ipv4Addr, source_port: u16) -> Vec<u8> {
     let [a, b, c, d] = source.octets();
@@ -20,11 +30,10 @@ fn udp_frame(source: Ipv4Addr, source_port: u16) -> Vec<u8> {
     ]
 }
 
-fn packet_datapath() -> Datapath {
+fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
     // The egress's real capabilities drive the plan, exactly as the shell
     // would derive them from the `Egress` sum.
-    let client = client_egress();
-    let egress = Egress::Packet(Box::new(client));
+    let egress = Egress::Packet(Box::new(client_egress(Arc::clone(&pool))));
     let capabilities = egress.capabilities();
     assert_eq!(egress.accepts(), Accepts::IpPackets);
     Datapath::new(
@@ -38,28 +47,35 @@ fn packet_datapath() -> Datapath {
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
         },
+        pool,
     )
     .expect("a WireGuard capability set plans the packet fast path")
 }
 
-fn client_egress() -> WireGuardEgress {
-    WireGuardEgress::new(WireGuardConfig {
-        private_key: [1; 32],
-        peer_public_key: server_public_key(),
-        preshared_key: None,
-        persistent_keepalive: None,
-        inner_mtu: Mtu::new(1420).unwrap(),
-    })
+fn client_egress(pool: Arc<BufferPool>) -> WireGuardEgress {
+    WireGuardEgress::new(
+        WireGuardConfig {
+            private_key: [1; 32],
+            peer_public_key: server_public_key(),
+            preshared_key: None,
+            persistent_keepalive: None,
+            inner_mtu: Mtu::new(1420).unwrap(),
+        },
+        pool,
+    )
 }
 
-fn server_egress() -> WireGuardEgress {
-    WireGuardEgress::new(WireGuardConfig {
-        private_key: [2; 32],
-        peer_public_key: client_public_key(),
-        preshared_key: None,
-        persistent_keepalive: None,
-        inner_mtu: Mtu::new(1420).unwrap(),
-    })
+fn server_egress(pool: Arc<BufferPool>) -> WireGuardEgress {
+    WireGuardEgress::new(
+        WireGuardConfig {
+            private_key: [2; 32],
+            peer_public_key: client_public_key(),
+            preshared_key: None,
+            persistent_keepalive: None,
+            inner_mtu: Mtu::new(1420).unwrap(),
+        },
+        pool,
+    )
 }
 
 fn client_public_key() -> [u8; 32] {
@@ -82,6 +98,8 @@ fn pump(
     server: &mut WireGuardEgress,
     initial: Vec<EgressEmit>,
 ) -> Vec<Vec<u8>> {
+    use boreas_core::PacketEgress;
+
     fn deliver(
         target: &mut WireGuardEgress,
         incoming: &mut Vec<EgressEmit>,
@@ -90,12 +108,10 @@ fn pump(
     ) {
         for emit in incoming.drain(..) {
             match emit {
-                EgressEmit::ToNetwork(datagram) => outgoing.extend(
-                    target
-                        .handle_network_packet(&datagram)
-                        .expect("in-band WireGuard exchange"),
-                ),
-                EgressEmit::ToTunnel(packet) => tunnelled.push(packet),
+                EgressEmit::ToNetwork(datagram) => target
+                    .handle_network_packet(&datagram, outgoing)
+                    .expect("in-band WireGuard exchange"),
+                EgressEmit::ToTunnel(packet) => tunnelled.push(packet.to_vec()),
             }
         }
     }
@@ -111,21 +127,31 @@ fn pump(
 
 #[test]
 fn tun_to_wireguard_and_back_is_byte_exact() {
+    use boreas_core::PacketEgress;
+
     let frame = udp_frame(Ipv4Addr::new(192, 0, 2, 1), 1234);
     let base = std::time::Instant::now();
+    let pool = pool();
 
     // The device offers the packet; the harness runs the datapath over it.
     let mut device = SimDevice::new(Mtu::new(1500).unwrap(), 7);
     device.inject(&frame, 0);
-    let mut harness = Harness::new(device, packet_datapath(), base);
+    let mut harness = Harness::new(device, packet_datapath(Arc::clone(&pool)), base);
     harness.step(0).expect("device is scripted, not lossy");
 
-    // The packet path must have forwarded the packet untouched and planned no
-    // flow: a packet-path flow is local termination, and the fast-path
-    // counter on the egress is what proves none of this entered smoltcp. The
-    // harness drains transmits into the device, so read them from its log.
-    let forwarded = harness.device.sent().to_vec();
-    assert_eq!(forwarded, vec![frame.clone()], "forwarded unmodified");
+    // The packet path forwarded the packet untouched, toward the egress and
+    // not back down the device it arrived on, and planned no flow: a
+    // packet-path flow is local termination, and the fast-path counter on the
+    // egress is what proves none of this entered smoltcp.
+    assert_eq!(
+        harness.to_egress(),
+        std::slice::from_ref(&frame),
+        "forwarded unmodified"
+    );
+    assert!(
+        harness.device.sent().is_empty(),
+        "a tun-side packet never returns down the tun"
+    );
     assert!(
         harness.datapath.poll_event().is_none(),
         "the packet path opens no flows"
@@ -133,23 +159,27 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
 
     // The forwarded packet enters the WireGuard egress; the first packet also
     // triggers the handshake, which the loopback exchange completes.
-    let mut client = client_egress();
-    let mut server = server_egress();
-    let first = client.handle_tun_packet(&forwarded[0]);
+    let mut client = client_egress(Arc::clone(&pool));
+    let mut server = server_egress(Arc::clone(&pool));
+    let mut first = Vec::new();
+    client
+        .handle_tun_packet(&harness.to_egress()[0], &mut first)
+        .expect("within the pool budget");
     let tunnelled = pump(&mut client, &mut server, first);
     assert_eq!(tunnelled, vec![frame.clone()], "wire payload survives");
     assert_eq!(client.fast_path_packets(), 1);
 
     // The decapsulated packet re-enters the datapath's egress side and is
-    // forwarded back toward the client byte-identically.
+    // forwarded back toward the client byte-identically, on the tunnel side.
     harness
         .datapath
         .on_egress_packet(&tunnelled[0], base)
         .expect("a whole IP packet from the tunnel");
-    let returning: Vec<Vec<u8>> = std::iter::from_fn(|| harness.datapath.poll_transmit())
-        .map(|transmit| transmit.bytes)
-        .collect();
-    assert_eq!(returning, vec![frame]);
+    let returning: Vec<(boreas_core::Side, Vec<u8>)> =
+        std::iter::from_fn(|| harness.datapath.poll_transmit())
+            .map(|transmit| (transmit.to, transmit.bytes.to_vec()))
+            .collect();
+    assert_eq!(returning, vec![(boreas_core::Side::Tunnel, frame)]);
 }
 
 #[test]
