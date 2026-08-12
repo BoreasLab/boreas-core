@@ -46,10 +46,10 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    Accepts, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit, FlowEvent, HostPolicy,
-    InternalEndpoint, Message, PacketEgress, Pooled, Provenance, QueryPlan, Rcode, Resolution,
-    RuleCounts, SendOutcome, Side, Transmit, Upstream, plan_query, write_failure, write_refusal,
-    write_response,
+    Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit,
+    FlowEvent, HostPolicy, InternalEndpoint, Message, PacketEgress, Pooled, Provenance, QueryPlan,
+    Rcode, Resolution, RuleCounts, SendOutcome, Side, Transmit, Upstream, answer_addresses,
+    plan_query, write_failure, write_refusal, write_response,
 };
 
 /// Depth of both reactor channels. Bounded is the point; the exact depth trades
@@ -135,6 +135,9 @@ pub enum Telemetry {
     /// Datagrams the egress refused: not a WireGuard packet, or no buffer for
     /// the emission. Routine on a public port, so counted, not fatal.
     EgressRejected(u64),
+    /// QUIC attempts the steering backstop refused. Convergence is this
+    /// falling back to zero once the browser has re-raced to TCP.
+    QuicSteered(u64),
     /// One resolved query, with everything needed to explain its verdict.
     ///
     /// Passed through whole rather than folded: a query is a flow-scale event,
@@ -520,6 +523,9 @@ struct Answer {
     resolver: InternalEndpoint,
     message: Vec<u8>,
     resolution: Resolution,
+    /// Addresses this answer resolved to for a steered host. Empty for every
+    /// other verdict, so the index grows only by what inspection put in it.
+    steered: Vec<std::net::IpAddr>,
 }
 
 /// The reactor's half of the resolver channels.
@@ -593,6 +599,7 @@ async fn resolve<U: DnsUpstream>(
     let request = Message::parse(&payload).ok()?;
     let question = *request.question();
     let mut message = vec![0u8; MAX_DNS_RESPONSE];
+    let mut steered = Vec::new();
 
     let (len, resolution) = match plan_query(&question, policy) {
         // A refused name never leaves the device, so the block costs no query
@@ -607,13 +614,20 @@ async fn resolve<U: DnsUpstream>(
                 provenance: Provenance::Policy,
                 rule: Some(rule),
                 ech: EchOutcome::Absent,
+                alpn: AlpnOutcome::Absent,
             },
         ),
-        QueryPlan::Forward { ech } => {
+        QueryPlan::Forward { policy } => {
             let kind = upstream.kind();
             let rewritten = match upstream.query(&payload).await {
                 Ok(reply) => Message::parse(&reply).and_then(|reply| {
-                    write_response(&mut message, &request, &reply, ech)
+                    // The steering index is fed from the upstream's own
+                    // answers, before the rewrite, so extracting it costs no
+                    // second parse of what this shell just wrote.
+                    if policy.steers() {
+                        answer_addresses(&reply, &mut steered)?;
+                    }
+                    write_response(&mut message, &request, &reply, policy)
                         .map(|rewritten| (rewritten, reply.rcode()))
                 }),
                 Err(_) => Err(crate::DnsError::Truncated),
@@ -629,6 +643,7 @@ async fn resolve<U: DnsUpstream>(
                         provenance: Provenance::Upstream(kind),
                         rule: None,
                         ech: rewritten.ech,
+                        alpn: rewritten.alpn,
                     },
                 ),
                 // An upstream that did not answer, answered with something
@@ -636,18 +651,23 @@ async fn resolve<U: DnsUpstream>(
                 // carry, all reach the client the same visible way: a
                 // `SERVFAIL` its stub resolver retries, never a silent drop
                 // that stalls the application until its own timeout.
-                Err(_) => (
-                    write_failure(&mut message, &request).ok()?,
-                    Resolution {
-                        name: question.name,
-                        qtype: question.qtype,
-                        rcode: Rcode::ServerFailure,
-                        answers: 0,
-                        provenance: Provenance::Upstream(kind),
-                        rule: None,
-                        ech: EchOutcome::Absent,
-                    },
-                ),
+                Err(_) => {
+                    // A failed rewrite must not leave half an index behind.
+                    steered.clear();
+                    (
+                        write_failure(&mut message, &request).ok()?,
+                        Resolution {
+                            name: question.name,
+                            qtype: question.qtype,
+                            rcode: Rcode::ServerFailure,
+                            answers: 0,
+                            provenance: Provenance::Upstream(kind),
+                            rule: None,
+                            ech: EchOutcome::Absent,
+                            alpn: AlpnOutcome::Absent,
+                        },
+                    )
+                }
             }
         }
     };
@@ -658,6 +678,7 @@ async fn resolve<U: DnsUpstream>(
         resolver,
         message,
         resolution,
+        steered,
     })
 }
 
@@ -695,6 +716,7 @@ struct Counters {
     transmits_dropped: u64,
     egress_rejected: u64,
     queries_dropped: u64,
+    quic_steered: u64,
 }
 
 impl Counters {
@@ -717,6 +739,7 @@ impl Counters {
         report(&mut self.transmits_dropped, Telemetry::TransmitsDropped);
         report(&mut self.egress_rejected, Telemetry::EgressRejected);
         report(&mut self.queries_dropped, Telemetry::QueriesDropped);
+        report(&mut self.quic_steered, Telemetry::QuicSteered);
     }
 }
 
@@ -822,7 +845,10 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             // A resolved query. Bounded by the answer channel, and addressed
             // back to the client from the resolver address it asked.
             Some(answer) = queries.back.recv() => {
-                let Answer { client, resolver, message, resolution } = answer;
+                let Answer { client, resolver, message, resolution, steered } = answer;
+                if !steered.is_empty() {
+                    datapath.steer_addresses(&steered, Instant::now());
+                }
                 if datapath.answer_dns(client, resolver, &message).is_err() {
                     counters.packets_rejected += 1;
                 }
@@ -959,6 +985,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             FlowEvent::ReassemblyDiscarded => counters.reassembly_discarded += 1,
             FlowEvent::DatagramDropped(_) => counters.datagrams_dropped += 1,
             FlowEvent::TransmitDropped => counters.transmits_dropped += 1,
+            FlowEvent::QuicSteered => counters.quic_steered += 1,
             // Flow lifecycle events are bounded by the flow count, so they
             // pass through one for one.
             event @ (FlowEvent::StreamOpened(_)

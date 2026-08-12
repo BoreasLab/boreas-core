@@ -23,11 +23,12 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, AsyncDevice, AsyncNetwork, BufferPool, DNS_PORT, DatagramFidelity, Datapath,
-    DnsPolicy, DnsUpstream, EchOutcome, EgressCapabilities, EgressEmit, EgressError, FilterPolicy,
-    HostPolicy, IngressPacket, InternalEndpoint, Message, Mtu, NatBehavior, PacketEgress,
-    Provenance, Rcode, RecordType, ResourceRecord, RuleCounts, SVCPARAM_ALPN, SVCPARAM_ECH,
-    Session, Shell, Telemetry, Transport, Upstream, ech_param, svc_params, write_udp,
+    Accepts, AlpnOutcome, AsyncDevice, AsyncNetwork, BufferPool, DNS_PORT, DatagramFidelity,
+    Datapath, DnsPolicy, DnsUpstream, EchOutcome, EgressCapabilities, EgressEmit, EgressError,
+    FilterPolicy, HTTPS_PORT, HostPolicy, IngressPacket, InternalEndpoint, Message, Mtu,
+    NatBehavior, PacketEgress, Provenance, Rcode, RecordType, ResourceRecord, RuleCounts,
+    SVCPARAM_ALPN, SVCPARAM_ECH, Session, Shell, Telemetry, Transport, Upstream, ech_param,
+    h3_alpn_param, svc_params, write_udp,
 };
 
 const CLIENT: InternalEndpoint = InternalEndpoint {
@@ -82,9 +83,10 @@ fn reply(request: &[u8], answers: &[(&str, RecordType, Vec<u8>)]) -> Vec<u8> {
 fn https_rdata(target: &str, ech: bool) -> Vec<u8> {
     let mut out = 1u16.to_be_bytes().to_vec();
     out.extend_from_slice(&wire_name(target));
+    // The shape a real HTTPS record has today: h3 first, then h2.
     out.extend_from_slice(&SVCPARAM_ALPN.to_be_bytes());
-    out.extend_from_slice(&3u16.to_be_bytes());
-    out.extend_from_slice(b"\x02h2");
+    out.extend_from_slice(&6u16.to_be_bytes());
+    out.extend_from_slice(b"\x02h3\x02h2");
     if ech {
         out.extend_from_slice(&SVCPARAM_ECH.to_be_bytes());
         out.extend_from_slice(&(ECH_CONFIG.len() as u16).to_be_bytes());
@@ -211,6 +213,11 @@ impl DnsUpstream for ScriptedUpstream {
                     https_rdata("target.example", true),
                 )],
                 RecordType::A => vec![(name.as_str(), RecordType::A, vec![203, 0, 113, 7])],
+                RecordType::Svcb => vec![(
+                    name.as_str(),
+                    RecordType::Svcb,
+                    https_rdata("target.example", true),
+                )],
                 RecordType::Aaaa => vec![(name.as_str(), RecordType::Aaaa, vec![0x20; 16])],
                 _ => Vec::new(),
             };
@@ -250,6 +257,10 @@ fn datapath(pool: Arc<BufferPool>) -> Datapath {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
+            // Long enough to outlast a browser's cached Alt-Svc entry for
+            // an origin, which is what the DNS rewrite alone cannot reach.
+            steering_backstop: Duration::from_secs(60),
+            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
         },
         pool,
     )
@@ -357,16 +368,23 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
     assert!(answers[0].2.is_empty());
     assert_eq!(consulted.load(Ordering::Relaxed), 3);
 
-    // 2. The inspected host's HTTPS answer lost exactly its ECH parameter.
+    // 2. The inspected host's HTTPS answer lost its ECH parameter, and since
+    //    the upstream advertised h3, its ALPN block as well: both rewrites
+    //    follow from the one verdict.
     let (_, rcode, records) = &answers[1];
     assert_eq!(*rcode, Rcode::NoError);
     assert_eq!(records[0].0, RecordType::Https);
     assert_eq!(ech_param(&records[0].1).unwrap(), None, "ECH was stripped");
+    assert_eq!(
+        h3_alpn_param(&records[0].1).unwrap(),
+        None,
+        "h3 was steered"
+    );
     let keys: Vec<u16> = svc_params(&records[0].1)
         .unwrap()
         .map(|param| param.unwrap().key)
         .collect();
-    assert_eq!(keys, vec![SVCPARAM_ALPN], "only ECH was removed");
+    assert!(keys.is_empty(), "only the two parameters were removed");
 
     // 3. The allowed host, in the same session and the same run, keeps its ECH
     //    configuration. This is the gate: policy is per host, never global.
@@ -413,6 +431,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
         .expect("the inspected host reported");
     assert_eq!(inspected.provenance, Provenance::Upstream(Upstream::DoH));
     assert_eq!(inspected.ech, EchOutcome::Stripped { count: 1 });
+    assert_eq!(inspected.alpn, AlpnOutcome::Steered { count: 1 });
     assert_eq!(inspected.answers, 1);
 
     let allowed = reports
@@ -422,6 +441,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
         })
         .expect("the allowed host reported");
     assert_eq!(allowed.ech, EchOutcome::Preserved);
+    assert_eq!(allowed.alpn, AlpnOutcome::Preserved);
     assert_eq!(allowed.rule, None);
 
     let aaaa = reports
@@ -429,6 +449,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
         .find(|report| report.qtype == RecordType::Aaaa)
         .expect("the AAAA query reported");
     assert_eq!(aaaa.ech, EchOutcome::Absent, "no SVCB record, no ECH");
+    assert_eq!(aaaa.alpn, AlpnOutcome::Absent, "and nothing to steer");
 
     shell.shutdown().await.expect("clean shutdown");
     // Every pooled buffer the queries and answers borrowed has come back.
@@ -456,6 +477,10 @@ async fn a_forwarding_session_never_intercepts() {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
+            // Long enough to outlast a browser's cached Alt-Svc entry for
+            // an origin, which is what the DNS rewrite alone cannot reach.
+            steering_backstop: Duration::from_secs(60),
+            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
         },
         Arc::clone(&pool),
     )
@@ -602,6 +627,164 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
         }
     );
     assert_eq!(reported, counts);
+
+    shell.shutdown().await.expect("clean shutdown");
+    assert_eq!(pool.available(), 64);
+}
+
+/// A UDP datagram from the client to `destination` on `port`, which is how a
+/// browser opens a QUIC connection.
+fn udp_to(destination: IpAddr, port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 2048];
+    let len = write_udp(
+        &mut out,
+        CLIENT,
+        InternalEndpoint {
+            address: destination,
+            port,
+        },
+        payload,
+    )
+    .expect("a client datagram fits");
+    out.truncate(len);
+    out
+}
+
+#[tokio::test]
+async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cache() {
+    // The P13 gate. Steering acts at discovery, before a connection exists,
+    // so an inspected host's answer loses its HTTP/3 advertisement; the
+    // transient UDP/443 backstop covers the window in which a browser still
+    // holds a cached Alt-Svc entry and would race QUIC anyway.
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
+    let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(16);
+    let consulted = Arc::new(AtomicU64::new(0));
+
+    let mut policy = HostPolicy::new();
+    assert!(policy.inspect("shop.example"));
+
+    let pool = pool();
+    let mut shell = Shell::start(
+        datapath(Arc::clone(&pool)),
+        Session {
+            device: MockDevice {
+                inbound: inbound_rx,
+                sent: sent_tx,
+            },
+            network: SilentNetwork,
+            egress: NullEgress,
+            upstream: ScriptedUpstream {
+                consulted: Arc::clone(&consulted),
+            },
+            policy: tokio::sync::watch::channel(Arc::new(policy)).1,
+        },
+    );
+
+    let mut next = async |id: u16| {
+        let packet = tokio::time::timeout(Duration::from_secs(5), sent_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no answer for query {id}"))
+            .expect("device channel open");
+        dns_answer(&packet)
+    };
+
+    // HTTPS and SVCB both carry SvcParams, so both are steered.
+    for (id, qtype) in [(1u16, RecordType::Https), (2, RecordType::Svcb)] {
+        inbound_tx
+            .send(dns_packet(&query(id, "www.shop.example", qtype)))
+            .await
+            .unwrap();
+        let message = next(id).await;
+        let parsed = Message::parse(&message).expect("a well-formed answer");
+        let answers: Vec<ResourceRecord<'_>> = parsed
+            .answers()
+            .collect::<Result<_, _>>()
+            .expect("well formed");
+        assert_eq!(answers[0].rtype, qtype);
+        assert_eq!(
+            h3_alpn_param(answers[0].rdata).unwrap(),
+            None,
+            "{qtype:?} still advertises HTTP/3"
+        );
+        assert_eq!(
+            ech_param(answers[0].rdata).unwrap(),
+            None,
+            "an inspected host loses ECH as well"
+        );
+        assert!(
+            svc_params(answers[0].rdata)
+                .unwrap()
+                .all(|param| param.unwrap().key != SVCPARAM_ALPN)
+        );
+    }
+
+    // An allowed host in the same session keeps its HTTP/3 advertisement:
+    // steering is per host, exactly as ECH policy is.
+    inbound_tx
+        .send(dns_packet(&query(
+            3,
+            "www.other.example",
+            RecordType::Https,
+        )))
+        .await
+        .unwrap();
+    let parsed_bytes = next(3).await;
+    let parsed = Message::parse(&parsed_bytes).unwrap();
+    let answers: Vec<ResourceRecord<'_>> = parsed.answers().collect::<Result<_, _>>().unwrap();
+    assert!(
+        h3_alpn_param(answers[0].rdata).unwrap().is_some(),
+        "an allowed host must not pay for an inspected one"
+    );
+
+    // Resolve the inspected host's address, which is what opens the backstop.
+    inbound_tx
+        .send(dns_packet(&query(4, "www.shop.example", RecordType::A)))
+        .await
+        .unwrap();
+    let _ = next(4).await;
+
+    // A QUIC attempt to that address is now refused, so the browser's race
+    // resolves to TCP. TCP to the same address and port is untouched — it is
+    // the destination steering is trying to reach.
+    let steered: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+    inbound_tx
+        .send(udp_to(steered, HTTPS_PORT, b"\x00fake quic initial"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), sent_rx.recv())
+            .await
+            .is_err(),
+        "a steered QUIC attempt must not be answered or looped back"
+    );
+
+    // A QUIC attempt to any other address crosses normally, which the egress
+    // sees rather than the device.
+    inbound_tx
+        .send(udp_to(
+            Ipv4Addr::new(198, 51, 100, 9).into(),
+            HTTPS_PORT,
+            b"x",
+        ))
+        .await
+        .unwrap();
+
+    // The drops are counted, which is the convergence signal.
+    let steered_count = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match shell.next_telemetry().await {
+                Some(Telemetry::QuicSteered(count)) => return count,
+                Some(_) => continue,
+                None => panic!("telemetry closed"),
+            }
+        }
+    })
+    .await
+    .expect("a steering report");
+    assert_eq!(
+        steered_count, 1,
+        "exactly the attempt to the steered address"
+    );
 
     shell.shutdown().await.expect("clean shutdown");
     assert_eq!(pool.available(), 64);

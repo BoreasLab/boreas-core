@@ -69,6 +69,21 @@ Every answer carries a `Resolution`: the name, the rule that matched, the
 transport that answered, and what happened to ECH. A verdict a user cannot see
 the reason for is a verdict they cannot argue with.
 
+Steering rides the same machinery. An inspected host's HTTPS and SVCB answers
+lose their HTTP/3 advertisement as well as their ECH configuration, both
+derived from the one verdict, because a locally added root can never validate
+over QUIC: an inspected host reached over h3 is a host whose interception
+silently never fires. Removing the `alpn` parameter leaves the record's default
+ALPN, and TLS ALPN still negotiates h2 on the connection that follows.
+
+DNS steering only reaches a browser that has no cached Alt-Svc entry for the
+origin. The transient UDP/443 backstop covers the rest: the addresses an
+inspected host resolves to refuse QUIC for a bounded window, so the browser's
+QUIC-versus-TCP race resolves to TCP within its own 300-to-500 ms window. TCP
+to the same address is untouched — it is the destination steering aims at — and
+the drop counter is the convergence signal. Alt-Svc *header* rewriting waits on
+interception, since the header only exists inside an HTTP response.
+
 Encrypted upstreams are the remaining work. DoH, DoT, and DoQ each need a TLS
 stack, which [Engineering Plan](engineering-plan.md) first admits at P14, so
 the transport seam exists and Do53 is the implementation behind it today. The

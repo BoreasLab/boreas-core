@@ -675,8 +675,6 @@ environment does not have and is **unexercised**, like P9's and P10's.
 
 ### P13: Protocol steering
 
-HTTPS/SVCB and Alt-Svc rewriting, plus the transient UDP/443 backstop.
-
 **This must precede P14, and the order is load-bearing.** Browsers race QUIC
 against TCP and take QUIC if it answers within roughly 300 to 500 ms. Ship MITM
 first and an allowlisted host reaches h3, where a locally added root can never
@@ -684,9 +682,62 @@ validate, so interception silently never fires and the failure looks like a
 filtering bug rather than a transport one. [Delivery](delivery.md) places both
 in M3; within M3 this order is not interchangeable.
 
-**Gate:** an allowlisted host does not enter the MITM path over QUIC during
-cache expiry or the QUIC/TCP race. Convergence within one Alt-Svc cache window
-or one backstop window is measured, not assumed.
+**Status: both discovery-time mechanisms complete; Alt-Svc rewriting is
+blocked on P14.** Delivered:
+
+- **HTTPS/SVCB rewriting**, on exactly the machinery P11 built. `h3_alpn_param`
+  finds the `alpn` parameter when it advertises h3 — registered `h3` and the
+  drafts browsers still accept — and extends the range over `no-default-alpn`
+  when it follows, which RFC 9460 section 7.1.1 requires because that parameter
+  may only appear alongside `alpn`. Keys are strictly increasing and no integer
+  lies between 1 and 2, so the pair is always one contiguous range and the
+  removal stays a slice operation. Steering removes the advertisement rather
+  than editing the list: the record's default ALPN is then `http/1.1`, TLS ALPN
+  still negotiates h2 on the connection that follows, and the browser cannot
+  reach h3 from DNS.
+- `alpn_policy`, with the same law as `ech_policy` — strip if and only if the
+  host is inspected — and `answer_policy` deriving both from one verdict.
+  Grouping them is not tidiness: a caller holding one without the other could
+  steer without stripping ECH, which is precisely the half-applied policy that
+  makes an interception fail silently.
+- `Rdata` now carries three parts rather than two, because an inspected host
+  whose answer advertises h3 loses two disjoint ranges from one RDATA. Two is
+  the number of removals any policy in this crate performs, so three slices
+  cover the domain and a doubly-rewritten answer still costs no allocation.
+- **The transient UDP/443 backstop.** DNS steering stops a browser with no
+  cached Alt-Svc entry; the backstop covers the window while a stale one
+  expires. `answer_addresses` feeds a steered-address index from the upstream's
+  own A and AAAA answers — before the rewrite, so no second parse — and
+  `admit` refuses UDP to port 443 for those addresses while the window is open.
+  TCP to the same address and port is untouched, because that is the
+  destination steering is trying to reach, and the check applies only outward,
+  because an inbound packet to port 443 is a response rather than an attempt.
+- The index is a `HashMap` and deliberately not a timer wheel. It is bounded by
+  the inspected allowlist times its addresses — tens of entries — so an O(1)
+  probe per UDP/443 packet is what the hot path needs and a wheel over tens of
+  entries would be a segment tree where a prefix sum suffices. The earliest
+  deadline is maintained rather than searched, because the reactor reads it
+  once per wakeup and wakeups are what the performance budget is written
+  against. `Limits` gained the window and a capacity, so state fed by network
+  input is bounded like every other queue in this crate.
+
+**Alt-Svc rewriting is deferred, and the reason is structural.** An `Alt-Svc`
+header arrives in an HTTP response, so rewriting one requires reading HTTP
+responses, which requires the interception P14 has not shipped. The DNS half
+and the L4 backstop are exactly the two mechanisms that work *without* it, and
+they are what the phase's ordering argument is about: both act at discovery,
+before a connection exists. When P14 lands, Alt-Svc rewriting becomes a header
+edit on a path that already exists, and the backstop window can shrink to what
+the header rewrite leaves uncovered.
+
+**Gate:** `tests/dns.rs` drives an inspected host, an allowed host, and a QUIC
+attempt through one session: HTTPS and SVCB answers for the inspected host lose
+their h3 advertisement and their ECH configuration, the allowed host in the
+same run keeps both, and a QUIC datagram to the inspected host's resolved
+address is dropped and counted while TCP to the same address is not. The
+convergence *measurement* — that a real browser re-races to TCP within one
+window — needs the browser and the device this environment does not have and is
+**unexercised**.
 
 ### P14: MITM, allowlist-only
 

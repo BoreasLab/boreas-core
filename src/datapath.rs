@@ -16,14 +16,20 @@
 //! - a `Transmit` names the side it is bound for, so the shell cannot send a
 //!   fast-path packet back down the interface it arrived on.
 
-use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
-    Accepts, Admission, BufferPool, DatagramBuffer, DnsPolicy, EgressCapabilities, FilterPolicy,
-    FlowPlan, FlowTableError, Fragment, IngressAction, IngressPacket, InternalEndpoint, Mtu,
-    PacketError, PlanError, Pooled, PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason,
-    Transport, TransportPath, UdpFlowTable, WriteError, admit, clamp_mss, plan_flow, replan,
-    route_planned, udp_datagram_len, write_udp,
+    Accepts, Admission, Backstop, BufferPool, DatagramBuffer, DnsPolicy, EgressCapabilities,
+    FilterPolicy, FlowPlan, FlowTableError, Fragment, IngressAction, IngressPacket,
+    InternalEndpoint, Mtu, PacketError, PlanError, Pooled, PushOutcome, Reassembler, Replan,
+    SendOutcome, SteeringReason, Transport, TransportPath, UdpFlowTable, WriteError, admit,
+    clamp_mss, plan_flow, replan, route_planned, udp_datagram_len, write_udp,
 };
 
 /// One of the two sides the datapath sits between: the client's TUN and the
@@ -80,6 +86,89 @@ pub enum FlowEvent {
     /// packet under congestion, so the shell folds it into a counter rather
     /// than forwarding one message per occurrence.
     TransmitDropped,
+    /// A QUIC attempt dropped by the steering backstop. Per packet while a
+    /// browser retries, so folded into a counter; the count is the
+    /// convergence signal [Filtering](../docs/filtering.md) asks for.
+    QuicSteered,
+}
+
+/// Addresses whose QUIC attempts the steering backstop refuses, and until
+/// when.
+///
+/// DNS steering removes the HTTP/3 advertisement, which stops a browser that
+/// has no cached Alt-Svc entry for the origin. This covers the window while a
+/// stale one expires — the reason [Filtering](../docs/filtering.md) calls the
+/// backstop transient rather than a rule.
+///
+/// A `HashMap` and not a timer wheel. The set is bounded by the inspected
+/// hosts on a deliberately small allowlist times their addresses, so it holds
+/// tens of entries: an O(1) probe per UDP/443 packet is what the hot path
+/// needs, and a timer wheel over tens of entries would be a segment tree where
+/// a prefix sum suffices. The earliest deadline is kept rather than searched,
+/// because the reactor reads it once per wakeup and wakeups are what the
+/// performance budget is written against.
+struct SteeredAddresses {
+    window: Duration,
+    capacity: NonZeroUsize,
+    until: HashMap<IpAddr, Instant>,
+    /// The minimum of `until`'s values, maintained on insert in O(1) and
+    /// recomputed on the sweep that empties them in O(entries).
+    earliest: Option<Instant>,
+}
+
+impl SteeredAddresses {
+    fn new(window: Duration, capacity: NonZeroUsize) -> Self {
+        Self {
+            window,
+            capacity,
+            until: HashMap::new(),
+            earliest: None,
+        }
+    }
+
+    /// Opens or extends the window for each address. Returns how many were
+    /// refused because the index is full — a bound on state fed by network
+    /// input, like every other queue in this crate.
+    fn steer(&mut self, addresses: &[IpAddr], now: Instant) -> usize {
+        let Some(deadline) = now.checked_add(self.window) else {
+            return addresses.len();
+        };
+        let mut refused = 0;
+        for address in addresses {
+            if !self.until.contains_key(address) && self.until.len() >= self.capacity.get() {
+                refused += 1;
+                continue;
+            }
+            self.until.insert(*address, deadline);
+            self.earliest = Some(
+                self.earliest
+                    .map_or(deadline, |soonest| soonest.min(deadline)),
+            );
+        }
+        refused
+    }
+
+    /// O(1). The real deadline governs, so an entry the sweep has not reached
+    /// yet still lapses on time.
+    fn active(&self, address: &IpAddr, now: Instant) -> Backstop {
+        match self.until.get(address) {
+            Some(deadline) if *deadline > now => Backstop::Active,
+            _ => Backstop::Lapsed,
+        }
+    }
+
+    /// O(entries), and only when the earliest deadline has arrived.
+    fn expire(&mut self, now: Instant) {
+        if self.earliest.is_none_or(|earliest| earliest > now) {
+            return;
+        }
+        self.until.retain(|_, deadline| *deadline > now);
+        self.earliest = self.until.values().copied().min();
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.earliest
+    }
 }
 
 /// The tuning knobs of a [`Datapath`], grouped so the constructor reads as
@@ -95,6 +184,17 @@ pub struct Limits {
     /// Per-flow datagram queue depth: the fairness bound under the shared
     /// pool's global budget.
     pub datagram_buffer_capacity: NonZeroUsize,
+    /// How long a steered host's addresses refuse QUIC after the answer that
+    /// named them.
+    ///
+    /// It must outlast a browser's cached Alt-Svc entry for the origin, which
+    /// is what the DNS rewrite alone cannot reach, and it costs nothing when
+    /// no host is inspected. Convergence within one window is the P13 gate, so
+    /// this is configuration rather than a constant.
+    pub steering_backstop: Duration,
+    /// How many addresses the steering index may hold. A bound on state fed by
+    /// network input; the inspected allowlist is deliberately small.
+    pub max_steered_addresses: NonZeroUsize,
 }
 
 /// One intercepted DNS query, waiting for the shell to resolve it.
@@ -209,6 +309,7 @@ pub struct Datapath {
     pool: Arc<BufferPool>,
     datagram_buffer_capacity: NonZeroUsize,
     reassembler: Reassembler,
+    steered: SteeredAddresses,
     flows: UdpFlowTable<FlowState>,
     events: VecDeque<FlowEvent>,
     transmits: VecDeque<Transmit>,
@@ -245,6 +346,7 @@ impl Datapath {
                 limits.reassembly_timeout,
                 limits.max_pending_reassemblies,
             ),
+            steered: SteeredAddresses::new(limits.steering_backstop, limits.max_steered_addresses),
             flows: UdpFlowTable::new(limits.flow_idle_timeout, Instant::now())?,
             events: VecDeque::new(),
             transmits: VecDeque::new(),
@@ -279,10 +381,19 @@ impl Datapath {
         from: Side,
         now: Instant,
     ) -> Result<(), DatapathError> {
+        // The backstop applies only outward: an inbound packet to port 443 is
+        // a response, and steering acts on attempts. Passing `Lapsed` for the
+        // egress side makes that a property of the call rather than a check
+        // inside the classifier.
+        let backstop = match from {
+            Side::Tunnel => self.steered.active(&packet.destination, now),
+            Side::Egress => Backstop::Lapsed,
+        };
         // `admit` settles everything no egress capability could change, which
         // is also everything that must keep working under a configuration that
-        // cannot plan at all: reassembly, unsupported protocols, and DNS.
-        let action = match admit(packet.transport, self.dns) {
+        // cannot plan at all: reassembly, unsupported protocols, DNS, and the
+        // steering backstop.
+        let action = match admit(packet.transport, self.dns, backstop) {
             Admission::Settled(action) => action,
             Admission::Planned => route_planned(packet.transport, self.plan?),
         };
@@ -290,6 +401,10 @@ impl Datapath {
             IngressAction::Reassemble => self.on_fragment(buf, from, now),
             IngressAction::ResolveDns => {
                 self.intercept_dns(packet, buf);
+                Ok(())
+            }
+            IngressAction::DropSteered => {
+                self.events.push_back(FlowEvent::QuicSteered);
                 Ok(())
             }
             IngressAction::ForwardPacket(plan) => {
@@ -361,6 +476,20 @@ impl Datapath {
     /// The next intercepted query, if any.
     pub fn poll_query(&mut self) -> Option<DnsQuery> {
         self.queries.pop_front()
+    }
+
+    /// Opens the steering backstop for the addresses an inspected host just
+    /// resolved to.
+    ///
+    /// Called by the shell after a resolution whose policy steers; the core
+    /// never learns an address any other way, which is what keeps the index
+    /// exactly as large as the inspected allowlist made it.
+    ///
+    /// O(addresses), with a hash insert each.
+    pub fn steer_addresses(&mut self, addresses: &[IpAddr], now: Instant) {
+        for _ in 0..self.steered.steer(addresses, now) {
+            self.events.push_back(FlowEvent::TransmitDropped);
+        }
     }
 
     /// Queues the answer to an intercepted query, addressed back to the client
@@ -520,16 +649,21 @@ impl Datapath {
     /// The earliest instant a state machine may need `on_timeout`. The shell
     /// re-arms one timer against this; there is never a timer per flow.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        [self.reassembler.next_deadline(), self.flows.next_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.reassembler.next_deadline(),
+            self.flows.next_deadline(),
+            self.steered.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Advances both state machines. Expired flows are dropped here, which is
     /// what returns their queued `Pooled` payloads to the shared pool.
     pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.reassembler.expire(now);
+        self.steered.expire(now);
         drop(self.flows.expire(now));
     }
 }
@@ -569,6 +703,10 @@ mod tests {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
+            // Long enough to outlast a browser's cached Alt-Svc entry for
+            // an origin, which is what the DNS rewrite alone cannot reach.
+            steering_backstop: Duration::from_secs(60),
+            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
         }
     }
 

@@ -40,6 +40,10 @@ fn datapath(accepts: Accepts, dns: DnsPolicy) -> Datapath {
             max_pending_reassemblies: NonZeroUsize::new(4).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(4).unwrap(),
+            // Long enough to outlast a browser's cached Alt-Svc entry for
+            // an origin, which is what the DNS rewrite alone cannot reach.
+            steering_backstop: Duration::from_secs(60),
+            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
         },
         // Small on purpose: the fuzzer should reach the exhaustion path,
         // where a forwarded packet is a counted drop rather than a panic.

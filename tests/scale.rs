@@ -41,6 +41,10 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
             max_pending_reassemblies: NonZeroUsize::new(1024).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
+            // Long enough to outlast a browser's cached Alt-Svc entry for
+            // an origin, which is what the DNS rewrite alone cannot reach.
+            steering_backstop: Duration::from_secs(60),
+            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
         },
         BufferPool::new(
             NonZeroUsize::new(1500).unwrap(),

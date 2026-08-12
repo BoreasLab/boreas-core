@@ -48,6 +48,10 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
+            // Long enough to outlast a browser's cached Alt-Svc entry for
+            // an origin, which is what the DNS rewrite alone cannot reach.
+            steering_backstop: Duration::from_secs(60),
+            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
         },
         pool,
     )

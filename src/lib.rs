@@ -16,10 +16,12 @@ use std::{error::Error, fmt};
 pub use datapath::{Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Side, Transmit};
 pub use device::{Device, Harness, SimDevice};
 pub use dns::{
-    Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy, HostPolicy, HostVerdict, Judgment, Message,
-    Name, Provenance, QueryPlan, Question, Rcode, Rdata, RecordType, Resolution, ResourceRecord,
-    Rewritten, RuleCounts, SVCPARAM_ALPN, SVCPARAM_ECH, SvcParam, SvcParams, Upstream, ech_param,
-    ech_policy, plan_query, svc_params, write_failure, write_refusal, write_response,
+    AlpnOutcome, AlpnPolicy, AnswerPolicy, Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy,
+    HostPolicy, HostVerdict, Judgment, Message, Name, Provenance, QueryPlan, Question, Rcode,
+    Rdata, RecordType, Resolution, ResourceRecord, Rewritten, RuleCounts, SVCPARAM_ALPN,
+    SVCPARAM_ECH, SVCPARAM_NO_DEFAULT_ALPN, SvcParam, SvcParams, Upstream, alpn_policy,
+    answer_addresses, answer_policy, ech_param, ech_policy, h3_alpn_param, plan_query, svc_params,
+    write_failure, write_refusal, write_response,
 };
 pub use egress::{
     Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
@@ -42,6 +44,11 @@ pub use shell::{
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
 pub const MIN_QUIC_MTU: u16 = 1200;
+
+/// The port QUIC and HTTPS share. The transient steering backstop acts on
+/// UDP here and nowhere else: TCP on this port is the destination steering is
+/// trying to reach.
+pub const HTTPS_PORT: u16 = 443;
 
 /// RFC 8200 requires every link carrying IPv6 to have an MTU of at least 1280
 /// bytes. Boreas is dual-stack and configures its own TUN MTU, so this is an
@@ -229,11 +236,35 @@ pub enum IngressAction {
     /// no egress: the answer is synthesized locally, and a refused name never
     /// leaves the device at all.
     ResolveDns,
+    /// A QUIC attempt toward a host this session must inspect, dropped while
+    /// its steering window is open.
+    ///
+    /// Not a block: the browser races QUIC against TCP and takes whichever
+    /// answers first, so refusing the QUIC half makes the race resolve to TCP
+    /// within the browser's own 300-to-500 ms window. The user sees the site;
+    /// the session sees a connection it can inspect.
+    DropSteered,
     ForwardPacket(FlowPlan),
     OpenStream(FlowPlan),
     OpenDatagram(FlowPlan),
     HandleIcmp(FlowPlan),
     DropUnsupported,
+}
+
+/// Whether the transient UDP/443 steering backstop applies to a packet.
+///
+/// Computed by the caller rather than by [`admit`], because it is a lookup
+/// against live state and not a property of the packet: keeping it a value
+/// keeps the classifier a total function of values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backstop {
+    /// Nothing to steer: the destination is not a steered address, its window
+    /// has closed, or the packet is arriving from the egress side rather than
+    /// leaving for it.
+    Lapsed,
+    /// The destination belongs to a host this session must inspect and its
+    /// window is open.
+    Active,
 }
 
 /// What can be settled about a packet before its plan is consulted.
@@ -255,7 +286,7 @@ pub enum Admission {
 /// not need.
 ///
 /// O(1): a match on a closed sum.
-pub fn admit(transport: Transport, dns: DnsPolicy) -> Admission {
+pub fn admit(transport: Transport, dns: DnsPolicy, backstop: Backstop) -> Admission {
     match transport {
         Transport::Fragment => Admission::Settled(IngressAction::Reassemble),
         Transport::Other => Admission::Settled(IngressAction::DropUnsupported),
@@ -263,6 +294,10 @@ pub fn admit(transport: Transport, dns: DnsPolicy) -> Admission {
             destination_port: DNS_PORT,
             ..
         } if dns == DnsPolicy::Intercept => Admission::Settled(IngressAction::ResolveDns),
+        Transport::Udp {
+            destination_port: HTTPS_PORT,
+            ..
+        } if backstop == Backstop::Active => Admission::Settled(IngressAction::DropSteered),
         Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => Admission::Planned,
     }
 }
@@ -380,8 +415,13 @@ pub fn replan(
 /// packet is both cheaper and the reason this function is total.
 ///
 /// O(1).
-pub fn route_ingress(transport: Transport, plan: FlowPlan, dns: DnsPolicy) -> IngressAction {
-    match admit(transport, dns) {
+pub fn route_ingress(
+    transport: Transport,
+    plan: FlowPlan,
+    dns: DnsPolicy,
+    backstop: Backstop,
+) -> IngressAction {
+    match admit(transport, dns, backstop) {
         Admission::Settled(action) => action,
         Admission::Planned => route_planned(transport, plan),
     }
@@ -648,7 +688,12 @@ mod tests {
                 let parsed = IngressPacket::parse(&packet).expect("wire-valid packet");
                 assert_eq!(parsed.transport, Transport::Fragment);
                 assert_eq!(
-                    route_ingress(parsed.transport, native_l3_plan, DnsPolicy::Forward),
+                    route_ingress(
+                        parsed.transport,
+                        native_l3_plan,
+                        DnsPolicy::Forward,
+                        Backstop::Lapsed
+                    ),
                     IngressAction::Reassemble,
                     "offset {offset_units}, more_fragments {more_fragments}"
                 );
@@ -668,8 +713,68 @@ mod tests {
         let parsed = IngressPacket::parse(&ipv6_fragment).expect("wire-valid packet");
         assert_eq!(parsed.transport, Transport::Fragment);
         assert_eq!(
-            route_ingress(parsed.transport, native_l3_plan, DnsPolicy::Forward),
+            route_ingress(
+                parsed.transport,
+                native_l3_plan,
+                DnsPolicy::Forward,
+                Backstop::Lapsed
+            ),
             IngressAction::Reassemble
+        );
+    }
+
+    #[test]
+    fn the_backstop_refuses_quic_only_outward_and_only_while_open() {
+        let plan = plan_flow(
+            FilterPolicy::PassThrough,
+            Accepts::IpPackets,
+            egress(DatagramFidelity::Native, 0),
+            mtu(1500),
+        )
+        .unwrap();
+        let quic = Transport::Udp {
+            source_port: 50_000,
+            destination_port: MIN_QUIC_MTU.wrapping_sub(757), // 443
+        };
+        assert_eq!(
+            quic,
+            Transport::Udp {
+                source_port: 50_000,
+                destination_port: HTTPS_PORT
+            }
+        );
+
+        // Open: the attempt is refused so the browser's race resolves to TCP.
+        assert_eq!(
+            route_ingress(quic, plan, DnsPolicy::Intercept, Backstop::Active),
+            IngressAction::DropSteered
+        );
+        // Closed: ordinary traffic, whatever the DNS policy.
+        for dns in [DnsPolicy::Intercept, DnsPolicy::Forward] {
+            assert_eq!(
+                route_ingress(quic, plan, dns, Backstop::Lapsed),
+                IngressAction::ForwardPacket(plan)
+            );
+        }
+        // TCP to the same port is the destination steering aims at, so the
+        // backstop must never touch it.
+        let https = Transport::Tcp {
+            source_port: 50_000,
+            destination_port: HTTPS_PORT,
+        };
+        assert_eq!(
+            route_ingress(https, plan, DnsPolicy::Intercept, Backstop::Active),
+            IngressAction::ForwardPacket(plan)
+        );
+        // And a query to the resolver still wins over the backstop, because
+        // the two act on different ports and cannot both apply.
+        let query = Transport::Udp {
+            source_port: 50_000,
+            destination_port: DNS_PORT,
+        };
+        assert_eq!(
+            route_ingress(query, plan, DnsPolicy::Intercept, Backstop::Active),
+            IngressAction::ResolveDns
         );
     }
 
@@ -874,11 +979,21 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            route_ingress(packet.transport, packet_plan, DnsPolicy::Forward),
+            route_ingress(
+                packet.transport,
+                packet_plan,
+                DnsPolicy::Forward,
+                Backstop::Lapsed
+            ),
             IngressAction::ForwardPacket(_)
         ));
         assert!(matches!(
-            route_ingress(packet.transport, flow_plan, DnsPolicy::Forward),
+            route_ingress(
+                packet.transport,
+                flow_plan,
+                DnsPolicy::Forward,
+                Backstop::Lapsed
+            ),
             IngressAction::OpenDatagram(_)
         ));
 
@@ -887,11 +1002,21 @@ mod tests {
         // could not plan a flow. The plan passed here is irrelevant, and that
         // is the point.
         assert_eq!(
-            route_ingress(Transport::Fragment, flow_plan, DnsPolicy::Forward),
+            route_ingress(
+                Transport::Fragment,
+                flow_plan,
+                DnsPolicy::Forward,
+                Backstop::Lapsed
+            ),
             IngressAction::Reassemble
         );
         assert_eq!(
-            route_ingress(Transport::Other, packet_plan, DnsPolicy::Forward),
+            route_ingress(
+                Transport::Other,
+                packet_plan,
+                DnsPolicy::Forward,
+                Backstop::Lapsed
+            ),
             IngressAction::DropUnsupported
         );
     }

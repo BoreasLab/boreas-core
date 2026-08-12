@@ -31,7 +31,13 @@
 //! only for [`HostVerdict::Inspected`], and the strip is a byte range removed
 //! from one answer.
 
-use std::{collections::HashSet, error::Error, fmt, ops::Range};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ops::Range,
+};
 
 /// The UDP and TCP port DNS is served on. Interception keys on the port
 /// rather than on a resolver address: the client's configured resolver lives
@@ -76,6 +82,9 @@ pub enum DnsError {
     /// SvcParam keys were not in strictly increasing order, which RFC 9460
     /// section 2.2 requires.
     SvcParamsOutOfOrder,
+    /// An `alpn` value carried a zero-length identifier, which makes the
+    /// list's own length ambiguous.
+    EmptyAlpnIdentifier,
     /// The output buffer could not hold the message.
     OutputTooSmall,
 }
@@ -91,6 +100,7 @@ impl fmt::Display for DnsError {
             Self::NoQuestion => "message carries no question",
             Self::CompressedQuestion => "question name uses compression",
             Self::SvcParamsOutOfOrder => "SvcParam keys are not strictly increasing",
+            Self::EmptyAlpnIdentifier => "ALPN list carries a zero-length identifier",
             Self::OutputTooSmall => "output buffer is too small",
         })
     }
@@ -552,9 +562,79 @@ impl<'a> Answers<'a> {
 
 /// RFC 9460 section 14.3.2: the `ech` SvcParam key.
 pub const SVCPARAM_ECH: u16 = 5;
-/// RFC 9460 section 14.3.2: the `alpn` SvcParam key, which P13's steering
-/// reads to decide whether a host is offering h3.
+/// RFC 9460 section 14.3.2: the `alpn` SvcParam key, which steering reads to
+/// decide whether a host is offering h3.
 pub const SVCPARAM_ALPN: u16 = 1;
+/// RFC 9460 section 14.3.2: the `no-default-alpn` SvcParam key.
+///
+/// Section 7.1.1 permits it only alongside `alpn`, so removing one requires
+/// removing the other. Their keys are 1 and 2, SvcParams are in strictly
+/// increasing key order, and no integer lies between them — so whenever both
+/// are present they are adjacent, and the pair is a single contiguous range.
+/// That is what keeps the removal a slice operation.
+pub const SVCPARAM_NO_DEFAULT_ALPN: u16 = 2;
+
+/// Whether an ALPN identifier names HTTP/3.
+///
+/// RFC 9114 registers `h3`; the drafts that browsers still accept are `h3-29`
+/// and friends. Matching the prefix covers both without enumerating a moving
+/// list, and the only cost of a false positive is that a host loses an ALPN
+/// advertisement it could have kept.
+fn is_h3(identifier: &[u8]) -> bool {
+    identifier == b"h3" || identifier.starts_with(b"h3-")
+}
+
+/// The contiguous range that must go if an HTTPS or SVCB RDATA advertises
+/// HTTP/3: the `alpn` parameter, plus `no-default-alpn` when it follows.
+///
+/// `None` when the record advertises no ALPN, or advertises one without h3 —
+/// in which case nothing is rewritten, because steering removes an
+/// advertisement rather than editing one. Dropping the parameter leaves the
+/// record's default ALPN, which for an HTTPS record is `http/1.1`; TLS ALPN
+/// still negotiates h2 on the connection that follows, so the browser reaches
+/// h2 and cannot reach h3 from DNS.
+///
+/// O(parameters + ALPN identifiers), allocation-free.
+pub fn h3_alpn_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
+    let mut found: Option<Range<usize>> = None;
+    for param in svc_params(rdata)? {
+        let param = param?;
+        match param.key {
+            SVCPARAM_ALPN if alpn_offers_h3(param.value)? => found = Some(param.at),
+            // Only extends a range this record actually produced, so a
+            // `no-default-alpn` on a record keeping its ALPN is left alone.
+            SVCPARAM_NO_DEFAULT_ALPN => {
+                if let Some(range) = found.as_mut() {
+                    range.end = param.at.end;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// The `alpn` value is a sequence of one-octet-length-prefixed identifiers
+/// (RFC 9460 section 7.1). A zero-length identifier is malformed and refused
+/// rather than skipped, because skipping it would make the list's length
+/// ambiguous.
+fn alpn_offers_h3(value: &[u8]) -> Result<bool, DnsError> {
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let length = usize::from(value[cursor]);
+        if length == 0 {
+            return Err(DnsError::EmptyAlpnIdentifier);
+        }
+        let identifier = value
+            .get(cursor + 1..cursor + 1 + length)
+            .ok_or(DnsError::Truncated)?;
+        if is_h3(identifier) {
+            return Ok(true);
+        }
+        cursor += 1 + length;
+    }
+    Ok(false)
+}
 
 /// One SvcParam, with the byte range it occupies inside the RDATA. The range
 /// is what makes removal a slice operation rather than a rebuild.
@@ -820,6 +900,22 @@ pub enum EchPolicy {
     Strip,
 }
 
+/// What must happen to the ALPN advertisement of this host's answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlpnPolicy {
+    /// Leave it exactly as published.
+    Preserve,
+    /// Remove the HTTP/3 advertisement, for this host and only this host.
+    ///
+    /// Browsers race QUIC against TCP and take QUIC if it answers within
+    /// roughly 300 to 500 ms. A locally added root can never validate over
+    /// QUIC, so an inspected host reached over h3 is a host whose interception
+    /// silently never fires — and the failure looks like a filtering bug
+    /// rather than a transport one. Steering acts at discovery, before a
+    /// connection exists, which is why it lives here and not in the datapath.
+    StripH3,
+}
+
 /// The one place ECH policy is decided.
 ///
 /// The law, and the P11 gate: `Strip` if and only if the host is inspected.
@@ -829,6 +925,47 @@ pub fn ech_policy(verdict: HostVerdict) -> EchPolicy {
     match verdict {
         HostVerdict::Inspected => EchPolicy::Strip,
         HostVerdict::Allowed | HostVerdict::Blocked => EchPolicy::Preserve,
+    }
+}
+
+/// The one place ALPN steering is decided, with the same law: strip if and
+/// only if the host is inspected.
+pub fn alpn_policy(verdict: HostVerdict) -> AlpnPolicy {
+    match verdict {
+        HostVerdict::Inspected => AlpnPolicy::StripH3,
+        HostVerdict::Allowed | HostVerdict::Blocked => AlpnPolicy::Preserve,
+    }
+}
+
+/// Every rewrite one host's answers undergo.
+///
+/// Grouped because both are decided from one verdict and applied in one pass
+/// over the answer section, and because a caller holding one of them without
+/// the other would be a caller that could steer without stripping ECH — which
+/// is precisely the half-applied policy that makes an interception fail
+/// silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnswerPolicy {
+    pub ech: EchPolicy,
+    pub alpn: AlpnPolicy,
+}
+
+impl AnswerPolicy {
+    /// Whether this host's addresses belong in the transient UDP/443 backstop.
+    ///
+    /// Exactly the hosts whose ALPN was rewritten: DNS steering only stops a
+    /// browser that has no cached Alt-Svc entry, and the backstop is what
+    /// covers the window while a stale one expires.
+    pub fn steers(self) -> bool {
+        matches!(self.alpn, AlpnPolicy::StripH3)
+    }
+}
+
+/// Derives both rewrites from one verdict.
+pub fn answer_policy(verdict: HostVerdict) -> AnswerPolicy {
+    AnswerPolicy {
+        ech: ech_policy(verdict),
+        alpn: alpn_policy(verdict),
     }
 }
 
@@ -845,7 +982,7 @@ pub enum QueryPlan {
     /// Answer locally with [`write_refusal`]. No query leaves the device.
     Refuse { rule: Name },
     /// Send it upstream, then run [`write_response`] with this policy.
-    Forward { ech: EchPolicy },
+    Forward { policy: AnswerPolicy },
 }
 
 /// Plans one intercepted query. Total: every name has a verdict, and every
@@ -860,7 +997,7 @@ pub fn plan_query(question: &Question, policy: &HostPolicy) -> QueryPlan {
             rule: judgment.matched.unwrap_or(Name::ROOT),
         },
         verdict => QueryPlan::Forward {
-            ech: ech_policy(verdict),
+            policy: answer_policy(verdict),
         },
     }
 }
@@ -907,6 +1044,18 @@ pub enum EchOutcome {
     Stripped { count: u16 },
 }
 
+/// What happened to the HTTP/3 advertisement in one response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlpnOutcome {
+    /// No answer advertised HTTP/3, so there was nothing to steer.
+    Absent,
+    /// Advertised and preserved, because the host is not inspected.
+    Preserved,
+    /// Removed from `count` answers, so the browser's QUIC race cannot win
+    /// for a host whose interception QUIC would silently defeat.
+    Steered { count: u16 },
+}
+
 /// Everything needed to explain one verdict after the fact.
 ///
 /// One of these per query, and a query is a flow-scale event rather than a
@@ -922,38 +1071,75 @@ pub struct Resolution {
     /// The rule that decided the verdict. Absent when no rule matched.
     pub rule: Option<Name>,
     pub ech: EchOutcome,
+    pub alpn: AlpnOutcome,
 }
 
-/// RDATA being written: the bytes as they arrived, or those bytes with one
-/// contiguous range removed.
+/// RDATA being written: the bytes as they arrived, minus up to two disjoint
+/// ranges.
 ///
-/// Removal is the only edit any policy in this module performs, so this is the
-/// whole domain — and expressing it as two slices means an ECH strip rewrites
-/// nothing and allocates nothing.
+/// Removal is the only edit any policy in this module performs, and two is the
+/// number of removals any of them performs at once — the ALPN block that
+/// steering drops and the ECH parameter that inspection drops. Three slices
+/// therefore cover the whole domain, and a rewritten answer costs no
+/// allocation and no byte copy that the writer would not have made anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rdata<'a> {
-    head: &'a [u8],
-    tail: &'a [u8],
+    parts: [&'a [u8]; 3],
 }
 
 impl<'a> Rdata<'a> {
     pub fn verbatim(bytes: &'a [u8]) -> Self {
         Self {
-            head: bytes,
-            tail: &[],
+            parts: [bytes, &[], &[]],
         }
     }
 
     /// `None` when the range does not lie inside `bytes`.
     pub fn without(bytes: &'a [u8], cut: Range<usize>) -> Option<Self> {
         Some(Self {
-            head: bytes.get(..cut.start)?,
-            tail: bytes.get(cut.end..)?,
+            parts: [bytes.get(..cut.start)?, bytes.get(cut.end..)?, &[]],
         })
     }
 
+    /// Removes two disjoint ranges. `None` unless `first` ends at or before
+    /// `second` begins, so an overlap is unconstructable rather than silently
+    /// producing bytes from neither range.
+    pub fn without_both(
+        bytes: &'a [u8],
+        first: Range<usize>,
+        second: Range<usize>,
+    ) -> Option<Self> {
+        if first.end > second.start {
+            return None;
+        }
+        Some(Self {
+            parts: [
+                bytes.get(..first.start)?,
+                bytes.get(first.end..second.start)?,
+                bytes.get(second.end..)?,
+            ],
+        })
+    }
+
+    /// Removes `first` and `second` in whichever order they appear, and
+    /// tolerates either being absent.
+    fn without_all(
+        bytes: &'a [u8],
+        first: Option<Range<usize>>,
+        second: Option<Range<usize>>,
+    ) -> Option<Self> {
+        match (first, second) {
+            (None, None) => Some(Self::verbatim(bytes)),
+            (Some(only), None) | (None, Some(only)) => Self::without(bytes, only),
+            (Some(left), Some(right)) if left.start <= right.start => {
+                Self::without_both(bytes, left, right)
+            }
+            (Some(left), Some(right)) => Self::without_both(bytes, right, left),
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.head.len() + self.tail.len()
+        self.parts.iter().map(|part| part.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -967,6 +1153,7 @@ pub struct Rewritten {
     pub len: usize,
     pub answers: u16,
     pub ech: EchOutcome,
+    pub alpn: AlpnOutcome,
 }
 
 /// Writes the response the client receives, from the client's query and the
@@ -991,7 +1178,7 @@ pub fn write_response(
     out: &mut [u8],
     query: &Message<'_>,
     upstream: &Message<'_>,
-    ech: EchPolicy,
+    policy: AnswerPolicy,
 ) -> Result<Rewritten, DnsError> {
     let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | upstream.rcode().to_wire();
     if query.recursion_desired() {
@@ -1002,23 +1189,28 @@ pub fn write_response(
     }
 
     let mut cursor = write_header_and_question(out, query, flags)?;
-    let (mut answers, mut stripped, mut published) = (0u16, 0u16, false);
+    let mut answers = 0u16;
+    let (mut ech_seen, mut ech_stripped) = (false, 0u16);
+    let (mut h3_seen, mut h3_stripped) = (false, 0u16);
 
     for answer in upstream.answers() {
         let answer = answer?;
-        let cut = if answer.rtype.carries_svc_params() {
-            ech_param(answer.rdata)?
+        // Only SVCB-shaped records carry either parameter, so every other
+        // answer crosses verbatim without being parsed a second time.
+        let (ech_at, h3_at) = if answer.rtype.carries_svc_params() {
+            (ech_param(answer.rdata)?, h3_alpn_param(answer.rdata)?)
         } else {
-            None
+            (None, None)
         };
-        published |= cut.is_some();
-        let rdata = match (cut, ech) {
-            (Some(range), EchPolicy::Strip) => {
-                stripped += 1;
-                Rdata::without(answer.rdata, range).ok_or(DnsError::Truncated)?
-            }
-            _ => Rdata::verbatim(answer.rdata),
-        };
+        ech_seen |= ech_at.is_some();
+        h3_seen |= h3_at.is_some();
+
+        let ech_cut = ech_at.filter(|_| policy.ech == EchPolicy::Strip);
+        let h3_cut = h3_at.filter(|_| policy.alpn == AlpnPolicy::StripH3);
+        ech_stripped += u16::from(ech_cut.is_some());
+        h3_stripped += u16::from(h3_cut.is_some());
+        let rdata = Rdata::without_all(answer.rdata, h3_cut, ech_cut).ok_or(DnsError::Truncated)?;
+
         cursor = write_record(out, cursor, &answer, rdata)?;
         answers += 1;
     }
@@ -1027,12 +1219,45 @@ pub fn write_response(
     Ok(Rewritten {
         len: cursor,
         answers,
-        ech: match (published, stripped) {
+        ech: match (ech_seen, ech_stripped) {
             (false, _) => EchOutcome::Absent,
             (true, 0) => EchOutcome::Preserved,
             (true, count) => EchOutcome::Stripped { count },
         },
+        alpn: match (h3_seen, h3_stripped) {
+            (false, _) => AlpnOutcome::Absent,
+            (true, 0) => AlpnOutcome::Preserved,
+            (true, count) => AlpnOutcome::Steered { count },
+        },
     })
+}
+
+/// The addresses an answer resolves to, appended to `out`.
+///
+/// `A` and `AAAA` RDATA are exactly the address, so this is a filter and a
+/// decode with no parsing left to do. It exists for the steering index: the
+/// transient UDP/443 backstop needs to know which addresses belong to a host
+/// whose ALPN was just rewritten.
+///
+/// O(answers), and allocates only what the sink grows by.
+pub fn answer_addresses(message: &Message<'_>, out: &mut Vec<IpAddr>) -> Result<(), DnsError> {
+    for answer in message.answers() {
+        let answer = answer?;
+        match answer.rtype {
+            RecordType::A => {
+                if let Some(octets) = answer.rdata.first_chunk::<4>() {
+                    out.push(IpAddr::V4(Ipv4Addr::from(*octets)));
+                }
+            }
+            RecordType::Aaaa => {
+                if let Some(octets) = answer.rdata.first_chunk::<16>() {
+                    out.push(IpAddr::V6(Ipv6Addr::from(*octets)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The response a refused name receives: `NXDOMAIN` with no answers.
@@ -1091,7 +1316,7 @@ fn write_record(
     fields[8..10].copy_from_slice(&length.to_be_bytes());
     cursor += 10;
 
-    for part in [rdata.head, rdata.tail] {
+    for part in rdata.parts {
         let end = cursor + part.len();
         out.get_mut(cursor..end)
             .ok_or(DnsError::OutputTooSmall)?
@@ -1321,12 +1546,21 @@ mod tests {
             };
             match plan_query(&question, &policy) {
                 QueryPlan::Refuse { rule } => Ok(rule.as_bytes().to_vec()),
-                QueryPlan::Forward { ech } => Err(ech),
+                QueryPlan::Forward { policy } => Err(policy),
             }
         };
         assert_eq!(plan("a.tracker.example"), Ok(b"tracker.example".to_vec()));
-        assert_eq!(plan("shop.example"), Err(EchPolicy::Strip));
-        assert_eq!(plan("other.example"), Err(EchPolicy::Preserve));
+        assert_eq!(
+            plan("shop.example"),
+            Err(answer_policy(HostVerdict::Inspected))
+        );
+        assert_eq!(
+            plan("other.example"),
+            Err(answer_policy(HostVerdict::Allowed))
+        );
+        // The inspected plan is the one that feeds the steering index.
+        assert!(answer_policy(HostVerdict::Inspected).steers());
+        assert!(!answer_policy(HostVerdict::Allowed).steers());
     }
 
     #[test]
@@ -1385,7 +1619,13 @@ mod tests {
         let upstream = Message::parse(&upstream_bytes).unwrap();
 
         let mut out = [0u8; 1500];
-        let preserved = write_response(&mut out, &client, &upstream, EchPolicy::Preserve).unwrap();
+        let preserved = write_response(
+            &mut out,
+            &client,
+            &upstream,
+            answer_policy(HostVerdict::Allowed),
+        )
+        .unwrap();
         assert_eq!(preserved.answers, 2);
         assert_eq!(preserved.ech, EchOutcome::Preserved);
         let parsed = Message::parse(&out[..preserved.len]).unwrap();
@@ -1400,26 +1640,142 @@ mod tests {
         assert_eq!(answers[1].rdata, &[93, 184, 215, 14]);
 
         let mut stripped_out = [0u8; 1500];
-        let stripped =
-            write_response(&mut stripped_out, &client, &upstream, EchPolicy::Strip).unwrap();
+        let stripped = write_response(
+            &mut stripped_out,
+            &client,
+            &upstream,
+            answer_policy(HostVerdict::Inspected),
+        )
+        .unwrap();
         assert_eq!(stripped.ech, EchOutcome::Stripped { count: 1 });
         let parsed = Message::parse(&stripped_out[..stripped.len]).unwrap();
         let after: Vec<ResourceRecord<'_>> = parsed.answers().collect::<Result<_, _>>().unwrap();
         assert_eq!(after.len(), 2, "stripping removes a param, not a record");
 
-        // Exactly the ech param is gone: the alpn param and the target name
-        // survive, and the A record is untouched.
+        // This answer advertised h3, so an inspected host loses both the ECH
+        // configuration and the ALPN block — two disjoint cuts in one RDATA,
+        // which is the whole reason `Rdata` carries three parts.
+        assert_eq!(stripped.alpn, AlpnOutcome::Steered { count: 1 });
         assert_eq!(ech_param(after[0].rdata).unwrap(), None);
+        assert_eq!(h3_alpn_param(after[0].rdata).unwrap(), None);
         let remaining: Vec<u16> = svc_params(after[0].rdata)
             .unwrap()
             .map(|param| param.unwrap().key)
             .collect();
-        assert_eq!(remaining, vec![SVCPARAM_ALPN]);
+        assert!(remaining.is_empty(), "both parameters were removed");
         assert_eq!(
             after[0].rdata.len(),
-            answers[0].rdata.len() - (4 + ECH_CONFIG.len())
+            answers[0].rdata.len() - (4 + ECH_CONFIG.len()) - (4 + 3),
+            "exactly the two parameters, and nothing between them"
         );
-        assert_eq!(after[1].rdata, answers[1].rdata);
+        assert_eq!(
+            after[1].rdata, answers[1].rdata,
+            "the A record is untouched"
+        );
+    }
+
+    #[test]
+    fn the_two_cuts_are_independent() {
+        // An inspected host whose answer advertises h2 rather than h3 keeps
+        // its ALPN and loses only its ECH: the policies compose, they do not
+        // imply each other.
+        let client = query("shop.example", RecordType::Https, 5);
+        let client = Message::parse(&client).unwrap();
+        let upstream_bytes = response(
+            "shop.example",
+            RecordType::Https,
+            &[(
+                "shop.example",
+                RecordType::Https,
+                https_rdata("a.shop.example", Some(b"\x02h2"), Some(ECH_CONFIG)),
+            )],
+        );
+        let upstream = Message::parse(&upstream_bytes).unwrap();
+
+        let mut out = [0u8; 1500];
+        let written = write_response(
+            &mut out,
+            &client,
+            &upstream,
+            answer_policy(HostVerdict::Inspected),
+        )
+        .unwrap();
+        assert_eq!(written.ech, EchOutcome::Stripped { count: 1 });
+        assert_eq!(written.alpn, AlpnOutcome::Absent, "no h3 was advertised");
+
+        let parsed = Message::parse(&out[..written.len]).unwrap();
+        let answers: Vec<ResourceRecord<'_>> = parsed.answers().collect::<Result<_, _>>().unwrap();
+        let remaining: Vec<u16> = svc_params(answers[0].rdata)
+            .unwrap()
+            .map(|param| param.unwrap().key)
+            .collect();
+        assert_eq!(remaining, vec![SVCPARAM_ALPN], "h2 keeps its advertisement");
+    }
+
+    #[test]
+    fn h3_detection_covers_the_drafts_and_takes_no_default_alpn_with_it() {
+        let with = |alpn: &[u8], no_default: bool| {
+            let mut rdata = 1u16.to_be_bytes().to_vec();
+            rdata.extend_from_slice(&wire_name("target.example"));
+            rdata.extend_from_slice(&SVCPARAM_ALPN.to_be_bytes());
+            rdata.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(alpn);
+            if no_default {
+                rdata.extend_from_slice(&SVCPARAM_NO_DEFAULT_ALPN.to_be_bytes());
+                rdata.extend_from_slice(&0u16.to_be_bytes());
+            }
+            rdata
+        };
+
+        // Registered and draft identifiers both count; anything else does not.
+        for alpn in [&b"\x02h3"[..], b"\x05h3-29", b"\x02h2\x02h3"] {
+            let rdata = with(alpn, false);
+            assert!(
+                h3_alpn_param(&rdata).unwrap().is_some(),
+                "{alpn:?} advertises HTTP/3"
+            );
+        }
+        for alpn in [&b"\x02h2"[..], b"\x08http/1.1", b"\x03h3x"] {
+            let rdata = with(alpn, false);
+            assert_eq!(h3_alpn_param(&rdata).unwrap(), None, "{alpn:?}");
+        }
+
+        // RFC 9460 section 7.1.1 permits `no-default-alpn` only alongside
+        // `alpn`, so the removal must take both — and because keys are
+        // strictly increasing with no integer between 1 and 2, the pair is
+        // always one contiguous range.
+        let rdata = with(b"\x02h3", true);
+        let range = h3_alpn_param(&rdata).unwrap().expect("h3 advertised");
+        assert_eq!(range.end, rdata.len(), "the pair reaches the end together");
+        let kept = Rdata::without(&rdata, range).unwrap();
+        assert_eq!(kept.len(), rdata.len() - (4 + 3) - 4);
+
+        // `no-default-alpn` on a record keeping its ALPN is left alone.
+        let mut rdata = 1u16.to_be_bytes().to_vec();
+        rdata.extend_from_slice(&wire_name("target.example"));
+        rdata.extend_from_slice(&SVCPARAM_NO_DEFAULT_ALPN.to_be_bytes());
+        rdata.extend_from_slice(&0u16.to_be_bytes());
+        assert_eq!(h3_alpn_param(&rdata).unwrap(), None);
+
+        // A zero-length identifier makes the list's own length ambiguous.
+        let rdata = with(b"\x00", false);
+        assert_eq!(
+            h3_alpn_param(&rdata).unwrap_err(),
+            DnsError::EmptyAlpnIdentifier
+        );
+    }
+
+    #[test]
+    fn two_disjoint_cuts_compose_and_an_overlap_is_unconstructable() {
+        let bytes = b"0123456789";
+        assert_eq!(Rdata::verbatim(bytes).len(), 10);
+        assert_eq!(Rdata::without(bytes, 2..4).unwrap().len(), 8);
+        assert_eq!(Rdata::without_both(bytes, 1..3, 6..8).unwrap().len(), 6);
+        // Adjacent is disjoint; overlapping is not, and yields no value rather
+        // than bytes drawn from neither range.
+        assert!(Rdata::without_both(bytes, 1..3, 3..5).is_some());
+        assert!(Rdata::without_both(bytes, 1..4, 3..5).is_none());
+        assert!(Rdata::without_both(bytes, 1..3, 20..30).is_none());
     }
 
     #[test]
@@ -1437,8 +1793,9 @@ mod tests {
         );
         let upstream = Message::parse(&upstream_bytes).unwrap();
         let mut out = [0u8; 1500];
-        for ech in [EchPolicy::Preserve, EchPolicy::Strip] {
-            let written = write_response(&mut out, &client, &upstream, ech).unwrap();
+        for verdict in [HostVerdict::Allowed, HostVerdict::Inspected] {
+            let written =
+                write_response(&mut out, &client, &upstream, answer_policy(verdict)).unwrap();
             assert_eq!(written.ech, EchOutcome::Absent);
         }
     }
@@ -1474,7 +1831,13 @@ mod tests {
         let upstream = Message::parse(&upstream_bytes).unwrap();
         let mut tiny = [0u8; 20];
         assert_eq!(
-            write_response(&mut tiny, &client, &upstream, EchPolicy::Preserve).unwrap_err(),
+            write_response(
+                &mut tiny,
+                &client,
+                &upstream,
+                answer_policy(HostVerdict::Allowed)
+            )
+            .unwrap_err(),
             DnsError::OutputTooSmall
         );
     }
