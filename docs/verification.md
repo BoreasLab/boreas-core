@@ -81,7 +81,7 @@ compatible release and regenerate the license review at that time.
 | `adblock` | network, cosmetic, and scriptlet rules | MPL-2.0 compatible | Brave production lineage; Firefox ships adblock-rust; supports uBO-style syntax and Apple content-blocking export |
 | `rustls` | single v1 TLS stack | MIT OR Apache-2.0 | explicit crypto provider required from the 0.24 line; prior noted MSRV 1.83 |
 | `rcgen` | leaf certificate generation | MIT OR Apache-2.0 | rustls organization; mature dependency surface |
-| `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | MIT OR Apache-2.0 | ISRG Prossimo-backed |
+| `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | MIT OR Apache-2.0 | ISRG Prossimo-backed; **not admitted at P11.** Message parsing, host policy, provenance, and ECH rewriting are Boreas's own regardless of who carries the bytes, so the only thing it supplies today is the encrypted transports — and those need the TLS stack the plan first admits at P14. Revisit with that decision |
 | `tokio-quiche` and quiche | MASQUE and later H3 | BSD-compatible | used by iCloud Private Relay Proxy B, Oxy, and WARP's MASQUE client |
 | ~~GotaTun~~ | WireGuard | integrated 2026-08-11 at 0.8.1 | MPL-2.0 (corrected from BSD-3-Clause); Mullvad project; Windows readiness unexercised, no device in this environment |
 | `smoltcp` | locally terminated TCP | BSD OR Apache-2.0 | vendored in AOSP; host-scale feature limits require testing |
@@ -207,7 +207,21 @@ Do not rely on these without a targeted check:
    real device. Related: the egress tick is an unconditional 4 Hz wakeup, at
    parity with GotaTun's own device, and is the largest fixed wakeup cost in
    the shell. Both belong to the M1 on-device battery run.
-10. That the pooled fast path holds its budget under real traffic. Measured
+10. Whether the DNS upstream socket is genuinely excluded from the tunnel. The
+    `TunnelBypass` seam names the obligation — `VpnService.protect` on the
+    descriptor on Android, binding the physical interface's address on Windows
+    — and `DirectSockets` deliberately does not discharge it. A resolver
+    reached through the tunnel that is resolving for it is a loop, and this
+    environment has neither platform to prove the exclusion on. Device-bound,
+    and a prerequisite for the M2 gate.
+11. Whether a 1232-byte response budget is sufficient in practice. Responses
+    are written uncompressed and capped at the DNS Flag Day 2020 size so a
+    synthesized datagram never needs fragmentation on a `DF`-set path; an
+    over-large answer becomes a `SERVFAIL` the stub retries. The correct answer
+    is `TC=1` and TCP/53, which needs the local termination arriving at P14.
+    Measure the `SERVFAIL` counter against a real corpus before deciding
+    whether that wait is acceptable.
+12. That the pooled fast path holds its budget under real traffic. Measured
     in-process 2026-08-11 (`examples/fusion.rs`, aarch64 dev VM, release):
     core 573 ns/packet against the ~1 µs allowance, 2 187 ns end to end, and
     every pool slice returned at rest across 10,000 packets. In-process only:

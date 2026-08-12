@@ -18,8 +18,8 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use boreas_core::{
-    BufferPool, Datapath, Egress, EgressEmit, FilterPolicy, Harness, Limits, Mtu, PacketEgress,
-    SimDevice, WireGuardConfig, WireGuardEgress,
+    BufferPool, Datapath, DnsPolicy, Egress, EgressEmit, FilterPolicy, Harness, Limits, Mtu,
+    PacketEgress, SimDevice, WireGuardConfig, WireGuardEgress,
 };
 
 const PACKETS: usize = 10_000;
@@ -73,6 +73,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
     )));
     Datapath::new(
         FilterPolicy::PassThrough,
+        DnsPolicy::Forward,
         egress.accepts(),
         egress.capabilities(),
         Mtu::new(1500).unwrap(),

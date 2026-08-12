@@ -9,7 +9,7 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, BufferPool, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy,
+    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy,
     InternalEndpoint, Mtu, NatBehavior,
 };
 
@@ -26,6 +26,7 @@ fn udp_frame(flow: u32) -> Vec<u8> {
 fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
     let mut path = Datapath::new(
         FilterPolicy::PassThrough,
+        DnsPolicy::Forward,
         Accepts::Flows,
         EgressCapabilities {
             datagram_fidelity: DatagramFidelity::Native,

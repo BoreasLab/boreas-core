@@ -43,6 +43,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 | `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
 | `src/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
 | `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
+| `src/dns.rs` | DNS parsing, host policy, verdict provenance, ECH policy | [Filtering](filtering.md) |
 | `src/egress.rs` | egress sum (packet vs stream), sans-io packet-egress interface, WireGuard via GotaTun | [Egress](egress.md) |
 | `src/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |

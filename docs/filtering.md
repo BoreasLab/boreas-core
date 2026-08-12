@@ -52,6 +52,29 @@ cannot rely on SNI. DNS is the durable no-decryption policy signal.
 ECH policy must stay coupled to resolver control. Do not silently disable ECH
 globally when host-level policy or steering is sufficient.
 
+Implemented in `src/dns.rs`. `ech_policy` is the entire decision and its law is
+that ECH is stripped if and only if the host is inspected, so an allowed host
+in the same session keeps the configuration its authority published; there is
+no global switch in the crate to reach for. Stripping removes the `ech`
+SvcParam from that host's HTTPS or SVCB answer and nothing else, expressed as a
+byte range so the rewrite copies no bytes it did not have to. Host rules are a
+suffix index in which the most specific rule wins and, at equal specificity,
+blocking beats inspection — a refused host is never also intercepted — and a
+refused name is answered locally with `NXDOMAIN`, so the block costs no query
+and leaks no name upstream. `NXDOMAIN` rather than a null address because a
+client handed `0.0.0.0` opens a connection that fails on a timeout, while a
+name error fails immediately down a path every browser already has.
+
+Every answer carries a `Resolution`: the name, the rule that matched, the
+transport that answered, and what happened to ECH. A verdict a user cannot see
+the reason for is a verdict they cannot argue with.
+
+Encrypted upstreams are the remaining work. DoH, DoT, and DoQ each need a TLS
+stack, which [Engineering Plan](engineering-plan.md) first admits at P14, so
+the transport seam exists and Do53 is the implementation behind it today. The
+`Upstream` a verdict records distinguishes them precisely because the privacy
+claim differs per transport.
+
 ## HTTP Priority
 
 Cloudflare Radar Q2 2026 reported HTTP/2 at 51.16 percent, HTTP/1.x at 27.80

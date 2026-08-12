@@ -182,7 +182,10 @@ fn mss_above(segment: &[u8], clamp: u16) -> Option<usize> {
     (advertised > clamp).then_some(mss.at)
 }
 
-fn checksum(parts: &[&[u8]]) -> u16 {
+/// The internet checksum (RFC 1071) over a sequence of parts, treated as one
+/// byte stream. Shared with `packet::write_udp`, which needs the same sum over
+/// a pseudo-header it assembles from pieces.
+pub(crate) fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum = 0_u32;
     let mut pending_high = None;
     for part in parts {
@@ -315,6 +318,8 @@ mod tests {
                 source_port: endpoint.port,
                 destination_port: 443,
             },
+            payload_at: 0,
+            payload_len: 0,
         };
 
         // CVE-2024-53259 shape: a sub-1200 PTB must never disable QUIC.

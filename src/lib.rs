@@ -1,5 +1,6 @@
 mod datapath;
 mod device;
+mod dns;
 mod egress;
 mod packet;
 mod path;
@@ -11,13 +12,19 @@ mod udp;
 
 use std::{error::Error, fmt};
 
-pub use datapath::{Datapath, DatapathError, FlowEvent, Limits, Side, Transmit};
+pub use datapath::{Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Side, Transmit};
 pub use device::{Device, Harness, SimDevice};
+pub use dns::{
+    Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy, HostPolicy, HostVerdict, Judgment, Message,
+    Name, Provenance, QueryPlan, Question, Rcode, Rdata, RecordType, Resolution, ResourceRecord,
+    Rewritten, SVCPARAM_ALPN, SVCPARAM_ECH, SvcParam, SvcParams, Upstream, ech_param, ech_policy,
+    plan_query, svc_params, write_failure, write_refusal, write_response,
+};
 pub use egress::{
     Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
     WireGuardConfig, WireGuardEgress,
 };
-pub use packet::{IngressPacket, PacketError, Transport};
+pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 #[cfg(unix)]
 pub use platform::AndroidTun;
@@ -25,7 +32,10 @@ pub use platform::AndroidTun;
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
-pub use shell::{AsyncDevice, AsyncNetwork, Control, Datagram, Shell, Telemetry};
+pub use shell::{
+    AsyncDevice, AsyncNetwork, Control, Datagram, DirectSockets, DnsUpstream, Do53Upstream,
+    Session, Shell, Telemetry, TunnelBypass,
+};
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
@@ -140,6 +150,21 @@ pub enum FilterPolicy {
     InspectHttp,
 }
 
+/// Whether this session answers DNS itself.
+///
+/// A session property like [`FilterPolicy`], and deliberately separate from
+/// it: DNS filtering is the enforcement tier that reaches every application on
+/// the device, including the ones that reject the Boreas CA and can therefore
+/// never be intercepted at TLS, so it is on or off independently of whether
+/// anything is being inspected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsPolicy {
+    /// Queries to [`DNS_PORT`] are answered by the local resolver.
+    Intercept,
+    /// Queries cross like any other datagram.
+    Forward,
+}
+
 /// A packet path carries whole IP packets, so it has a meaningful per-packet
 /// budget. A terminated path re-originates a byte stream upstream, where the
 /// client's packet size stops existing and local MSS clamping governs instead.
@@ -198,11 +223,68 @@ pub enum Replan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressAction {
     Reassemble,
+    /// A DNS query this session answers itself. It opens no flow and consults
+    /// no egress: the answer is synthesized locally, and a refused name never
+    /// leaves the device at all.
+    ResolveDns,
     ForwardPacket(FlowPlan),
     OpenStream(FlowPlan),
     OpenDatagram(FlowPlan),
     HandleIcmp(FlowPlan),
     DropUnsupported,
+}
+
+/// What can be settled about a packet before its plan is consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Decided. No egress capability could have changed this answer.
+    Settled(IngressAction),
+    /// A whole packet of a carried protocol; [`route_planned`] finishes it.
+    Planned,
+}
+
+/// The part of ingress classification that no egress capability can change.
+///
+/// A fragment must be reassembled before L4 can observe it, a protocol this
+/// datapath does not carry must be dropped, and an intercepted DNS query must
+/// be answered locally — whatever the egress can or cannot do. Separating
+/// these is what lets all three still work under a configuration that cannot
+/// plan a flow at all, and it is why the caller never pays for a plan it does
+/// not need.
+///
+/// O(1): a match on a closed sum.
+pub fn admit(transport: Transport, dns: DnsPolicy) -> Admission {
+    match transport {
+        Transport::Fragment => Admission::Settled(IngressAction::Reassemble),
+        Transport::Other => Admission::Settled(IngressAction::DropUnsupported),
+        Transport::Udp {
+            destination_port: DNS_PORT,
+            ..
+        } if dns == DnsPolicy::Intercept => Admission::Settled(IngressAction::ResolveDns),
+        Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => Admission::Planned,
+    }
+}
+
+/// Classifies a whole packet of a carried protocol against its plan.
+///
+/// Total by construction: possessing a [`FlowPlan`] *is* the proof that the
+/// configuration plans, so there is no error left to return and no caller
+/// handles one per packet.
+///
+/// O(1).
+pub fn route_planned(transport: Transport, plan: FlowPlan) -> IngressAction {
+    if matches!(plan.transport, TransportPath::PacketFastPath { .. }) {
+        return IngressAction::ForwardPacket(plan);
+    }
+
+    match transport {
+        Transport::Tcp { .. } => IngressAction::OpenStream(plan),
+        Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
+        Transport::Icmp => IngressAction::HandleIcmp(plan),
+        // Both were settled by `admit`; reaching them here means a caller
+        // bypassed it, and dropping is the answer that cannot be wrong.
+        Transport::Other | Transport::Fragment => IngressAction::DropUnsupported,
+    }
 }
 
 pub fn plan_flow(
@@ -289,32 +371,17 @@ pub fn replan(
     })
 }
 
-/// Classifies one whole packet against an already-derived plan.
+/// Classifies one whole packet: [`admit`], then [`route_planned`].
 ///
-/// Total by construction: possessing a [`FlowPlan`] *is* the proof that the
-/// configuration plans, so there is no error left to return here and no
-/// caller has to handle one per packet. The plan is a session property —
-/// filter policy, egress capability, and path MTU — so deriving it once per
-/// configuration change instead of once per packet is both cheaper and the
-/// reason this function is total.
+/// The plan is a session property — filter policy, egress capability, and path
+/// MTU — so deriving it once per configuration change instead of once per
+/// packet is both cheaper and the reason this function is total.
 ///
-/// O(1): a match on a closed sum.
-pub fn route_ingress(transport: Transport, plan: FlowPlan) -> IngressAction {
-    match transport {
-        Transport::Fragment => return IngressAction::Reassemble,
-        Transport::Other => return IngressAction::DropUnsupported,
-        Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => {}
-    }
-
-    if matches!(plan.transport, TransportPath::PacketFastPath { .. }) {
-        return IngressAction::ForwardPacket(plan);
-    }
-
-    match transport {
-        Transport::Tcp { .. } => IngressAction::OpenStream(plan),
-        Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
-        Transport::Icmp => IngressAction::HandleIcmp(plan),
-        Transport::Other | Transport::Fragment => IngressAction::DropUnsupported,
+/// O(1).
+pub fn route_ingress(transport: Transport, plan: FlowPlan, dns: DnsPolicy) -> IngressAction {
+    match admit(transport, dns) {
+        Admission::Settled(action) => action,
+        Admission::Planned => route_planned(transport, plan),
     }
 }
 
@@ -579,7 +646,7 @@ mod tests {
                 let parsed = IngressPacket::parse(&packet).expect("wire-valid packet");
                 assert_eq!(parsed.transport, Transport::Fragment);
                 assert_eq!(
-                    route_ingress(parsed.transport, native_l3_plan),
+                    route_ingress(parsed.transport, native_l3_plan, DnsPolicy::Forward),
                     IngressAction::Reassemble,
                     "offset {offset_units}, more_fragments {more_fragments}"
                 );
@@ -599,7 +666,7 @@ mod tests {
         let parsed = IngressPacket::parse(&ipv6_fragment).expect("wire-valid packet");
         assert_eq!(parsed.transport, Transport::Fragment);
         assert_eq!(
-            route_ingress(parsed.transport, native_l3_plan),
+            route_ingress(parsed.transport, native_l3_plan, DnsPolicy::Forward),
             IngressAction::Reassemble
         );
     }
@@ -785,6 +852,8 @@ mod tests {
                 source_port: 1234,
                 destination_port: 443,
             },
+            payload_at: 0,
+            payload_len: 0,
         };
         let native_l3 = egress(DatagramFidelity::Native, 60);
         let packet_plan = plan_flow(
@@ -803,11 +872,11 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            route_ingress(packet.transport, packet_plan),
+            route_ingress(packet.transport, packet_plan, DnsPolicy::Forward),
             IngressAction::ForwardPacket(_)
         ));
         assert!(matches!(
-            route_ingress(packet.transport, flow_plan),
+            route_ingress(packet.transport, flow_plan, DnsPolicy::Forward),
             IngressAction::OpenDatagram(_)
         ));
 
@@ -816,11 +885,11 @@ mod tests {
         // could not plan a flow. The plan passed here is irrelevant, and that
         // is the point.
         assert_eq!(
-            route_ingress(Transport::Fragment, flow_plan),
+            route_ingress(Transport::Fragment, flow_plan, DnsPolicy::Forward),
             IngressAction::Reassemble
         );
         assert_eq!(
-            route_ingress(Transport::Other, packet_plan),
+            route_ingress(Transport::Other, packet_plan, DnsPolicy::Forward),
             IngressAction::DropUnsupported
         );
     }

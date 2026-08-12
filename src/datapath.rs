@@ -19,10 +19,11 @@
 use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use crate::{
-    Accepts, BufferPool, DatagramBuffer, EgressCapabilities, FilterPolicy, FlowPlan,
-    FlowTableError, Fragment, IngressAction, IngressPacket, InternalEndpoint, Mtu, PacketError,
-    PlanError, Pooled, PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport,
-    TransportPath, UdpFlowTable, clamp_mss, plan_flow, replan, route_ingress,
+    Accepts, Admission, BufferPool, DatagramBuffer, DnsPolicy, EgressCapabilities, FilterPolicy,
+    FlowPlan, FlowTableError, Fragment, IngressAction, IngressPacket, InternalEndpoint, Mtu,
+    PacketError, PlanError, Pooled, PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason,
+    Transport, TransportPath, UdpFlowTable, WriteError, admit, clamp_mss, plan_flow, replan,
+    route_planned, udp_datagram_len, write_udp,
 };
 
 /// One of the two sides the datapath sits between: the client's TUN and the
@@ -96,11 +97,32 @@ pub struct Limits {
     pub datagram_buffer_capacity: NonZeroUsize,
 }
 
+/// One intercepted DNS query, waiting for the shell to resolve it.
+///
+/// The payload is a pooled buffer, which is also the bound: pending queries
+/// cannot outgrow the shared budget, and a flood of them is a counted drop
+/// like any other congestion rather than unbounded growth.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DnsQuery {
+    /// The client that asked.
+    pub client: InternalEndpoint,
+    /// The resolver address it addressed. A stub resolver discards a reply
+    /// whose source is not the address it sent to, so the answer must be
+    /// written *from* here, which is why it travels with the query.
+    pub resolver: InternalEndpoint,
+    /// The DNS message, without its IP and UDP headers.
+    pub payload: Pooled,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum DatapathError {
     Malformed(PacketError),
     Plan(PlanError),
     FlowTable(FlowTableError),
+    /// A synthesized packet could not be written. Distinct from `Malformed`,
+    /// which describes input: this one describes something this datapath tried
+    /// to originate.
+    Write(WriteError),
 }
 
 impl std::fmt::Display for DatapathError {
@@ -109,6 +131,7 @@ impl std::fmt::Display for DatapathError {
             Self::Malformed(error) => write!(f, "malformed packet: {error}"),
             Self::Plan(error) => write!(f, "planning failed: {error}"),
             Self::FlowTable(error) => write!(f, "flow table rejected the configuration: {error}"),
+            Self::Write(error) => write!(f, "could not write a synthesized packet: {error}"),
         }
     }
 }
@@ -119,7 +142,14 @@ impl std::error::Error for DatapathError {
             Self::Malformed(error) => Some(error),
             Self::Plan(error) => Some(error),
             Self::FlowTable(error) => Some(error),
+            Self::Write(error) => Some(error),
         }
+    }
+}
+
+impl From<WriteError> for DatapathError {
+    fn from(error: WriteError) -> Self {
+        Self::Write(error)
     }
 }
 
@@ -156,6 +186,7 @@ struct FlowState {
 
 pub struct Datapath {
     filter: FilterPolicy,
+    dns: DnsPolicy,
     /// The layer the configured egress accepts. Separate from the capability
     /// claim because the layer is a property of the implementation variant,
     /// established by the caller from [`crate::Egress`] and unable to drift
@@ -181,6 +212,7 @@ pub struct Datapath {
     flows: UdpFlowTable<FlowState>,
     events: VecDeque<FlowEvent>,
     transmits: VecDeque<Transmit>,
+    queries: VecDeque<DnsQuery>,
 }
 
 impl Datapath {
@@ -189,6 +221,7 @@ impl Datapath {
     /// exhaustion.
     pub fn new(
         filter: FilterPolicy,
+        dns: DnsPolicy,
         accepts: Accepts,
         egress: EgressCapabilities,
         path_mtu: Mtu,
@@ -201,6 +234,7 @@ impl Datapath {
 
         Ok(Self {
             filter,
+            dns,
             accepts,
             egress,
             path_mtu,
@@ -214,6 +248,7 @@ impl Datapath {
             flows: UdpFlowTable::new(limits.flow_idle_timeout, Instant::now())?,
             events: VecDeque::new(),
             transmits: VecDeque::new(),
+            queries: VecDeque::new(),
         })
     }
 
@@ -244,18 +279,19 @@ impl Datapath {
         from: Side,
         now: Instant,
     ) -> Result<(), DatapathError> {
-        let action = match packet.transport {
-            // Neither answer can depend on an egress capability, so neither
-            // waits on one: L4 must never observe a fragment, and a protocol
-            // this datapath does not carry is dropped whatever the egress
-            // could have carried. Ordering the plan behind them is what keeps
-            // an unplannable configuration from silently changing reassembly.
-            Transport::Fragment => IngressAction::Reassemble,
-            Transport::Other => IngressAction::DropUnsupported,
-            carried => route_ingress(carried, self.plan?),
+        // `admit` settles everything no egress capability could change, which
+        // is also everything that must keep working under a configuration that
+        // cannot plan at all: reassembly, unsupported protocols, and DNS.
+        let action = match admit(packet.transport, self.dns) {
+            Admission::Settled(action) => action,
+            Admission::Planned => route_planned(packet.transport, self.plan?),
         };
         match action {
             IngressAction::Reassemble => self.on_fragment(buf, from, now),
+            IngressAction::ResolveDns => {
+                self.intercept_dns(packet, buf);
+                Ok(())
+            }
             IngressAction::ForwardPacket(plan) => {
                 let clamp = match plan.transport {
                     // The clamp is the only mechanism that reaches a terminated
@@ -288,6 +324,68 @@ impl Datapath {
             }
             IngressAction::DropUnsupported => Ok(()),
         }
+    }
+
+    /// Captures one DNS query for the shell to resolve.
+    ///
+    /// The datapath cannot resolve anything — that needs an upstream, a
+    /// socket, and a clock — so it keeps the two endpoints and the message and
+    /// hands them across the seam. A query whose payload will not fit the
+    /// shared budget is a counted drop, and the client's stub resolver
+    /// retries, which is exactly what it does for a lost datagram.
+    fn intercept_dns(&mut self, packet: IngressPacket, buf: &[u8]) {
+        let Transport::Udp {
+            source_port,
+            destination_port,
+        } = packet.transport
+        else {
+            return;
+        };
+        let Some(payload) = packet.payload(buf).and_then(|bytes| self.pool.take(bytes)) else {
+            self.events.push_back(FlowEvent::TransmitDropped);
+            return;
+        };
+        self.queries.push_back(DnsQuery {
+            client: InternalEndpoint {
+                address: packet.source,
+                port: source_port,
+            },
+            resolver: InternalEndpoint {
+                address: packet.destination,
+                port: destination_port,
+            },
+            payload,
+        });
+    }
+
+    /// The next intercepted query, if any.
+    pub fn poll_query(&mut self) -> Option<DnsQuery> {
+        self.queries.pop_front()
+    }
+
+    /// Queues the answer to an intercepted query, addressed back to the client
+    /// from the resolver address it asked.
+    ///
+    /// This is the one place the datapath originates a packet rather than
+    /// forwarding one, so it writes both checksums in full; there is no
+    /// predecessor to adjust from.
+    pub fn answer_dns(
+        &mut self,
+        client: InternalEndpoint,
+        resolver: InternalEndpoint,
+        response: &[u8],
+    ) -> Result<(), DatapathError> {
+        let len = udp_datagram_len(resolver.address, response.len());
+        let Some(mut bytes) = self.pool.take_zeroed(len) else {
+            self.events.push_back(FlowEvent::TransmitDropped);
+            return Ok(());
+        };
+        write_udp(&mut bytes, resolver, client, response)?;
+        self.transmits.push_back(Transmit {
+            to: Side::Tunnel,
+            bytes,
+        });
+        Ok(())
     }
 
     /// Copies one packet into a pooled buffer and queues it for `to`.
@@ -487,6 +585,7 @@ mod tests {
     fn datapath(fidelity: crate::DatagramFidelity) -> Datapath {
         Datapath::new(
             FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
             Accepts::Flows,
             egress(fidelity),
             Mtu::new(1500).unwrap(),
@@ -596,6 +695,7 @@ mod tests {
 
         let mut path = Datapath::new(
             FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
             Accepts::IpPackets,
             egress(crate::DatagramFidelity::Native),
             Mtu::new(1500).unwrap(),
@@ -626,6 +726,7 @@ mod tests {
         );
         let mut path = Datapath::new(
             FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
             Accepts::IpPackets,
             egress(crate::DatagramFidelity::Native),
             Mtu::new(1500).unwrap(),
@@ -687,6 +788,7 @@ mod tests {
         assert_eq!(
             Datapath::new(
                 FilterPolicy::PassThrough,
+                DnsPolicy::Forward,
                 Accepts::IpPackets,
                 starved,
                 Mtu::new(1500).unwrap(),
@@ -710,6 +812,7 @@ mod tests {
         );
         let mut path = Datapath::new(
             FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
             Accepts::Flows,
             egress(crate::DatagramFidelity::Native),
             Mtu::new(1500).unwrap(),

@@ -67,7 +67,26 @@ impl BufferPool {
     /// buffer was allocated with `slice_size` capacity and is only ever
     /// cleared, so no reallocation happens after a buffer's first use.
     pub fn take(self: &Arc<Self>, bytes: &[u8]) -> Option<Pooled> {
-        if bytes.len() > self.slice_size.get() {
+        let mut pooled = self.reserve(bytes.len())?;
+        pooled.bytes.extend_from_slice(bytes);
+        Some(pooled)
+    }
+
+    /// A pooled buffer of `len` zeroed bytes, for a caller that *builds* its
+    /// content rather than copying an existing slice. The datapath synthesizes
+    /// whole IP datagrams this way, so a constructed packet costs the same
+    /// nothing an forwarded one does.
+    pub fn take_zeroed(self: &Arc<Self>, len: usize) -> Option<Pooled> {
+        let mut pooled = self.reserve(len)?;
+        pooled.bytes.resize(len, 0);
+        Some(pooled)
+    }
+
+    /// Spends one unit of budget and hands back an empty buffer with room for
+    /// `len` bytes. The single place the invariant `free.len() <= live <=
+    /// capacity` is touched.
+    fn reserve(self: &Arc<Self>, len: usize) -> Option<Pooled> {
+        if len > self.slice_size.get() {
             return None;
         }
 
@@ -88,11 +107,9 @@ impl BufferPool {
             }
         };
 
-        let mut buffer = recycled.unwrap_or_else(|| Vec::with_capacity(self.slice_size.get()));
-        buffer.extend_from_slice(bytes);
         Some(Pooled {
             pool: Arc::clone(self),
-            bytes: buffer,
+            bytes: recycled.unwrap_or_else(|| Vec::with_capacity(self.slice_size.get())),
         })
     }
 

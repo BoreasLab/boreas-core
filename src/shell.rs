@@ -33,24 +33,55 @@
 
 use std::{
     io,
+    net::SocketAddr,
     num::NonZeroU64,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     time::{Instant as TokioInstant, sleep_until},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    Accepts, Datapath, EgressCapabilities, EgressEmit, FlowEvent, InternalEndpoint, PacketEgress,
-    Pooled, SendOutcome, Side, Transmit,
+    Accepts, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit, FlowEvent, HostPolicy,
+    InternalEndpoint, Message, PacketEgress, Pooled, Provenance, QueryPlan, Rcode, Resolution,
+    SendOutcome, Side, Transmit, Upstream, plan_query, write_failure, write_refusal,
+    write_response,
 };
 
 /// Depth of both reactor channels. Bounded is the point; the exact depth trades
 /// burst tolerance against queueing delay and is not load-bearing.
 const CHANNEL_DEPTH: usize = 256;
+
+/// Resolutions in flight at once. A browser opening one page asks for tens of
+/// names at the same moment, so serializing them would add a round trip per
+/// name; leaving it unbounded would let one page open unbounded upstream
+/// state. A query that cannot get a permit waits at the resolver, which backs
+/// the bounded query channel up, which turns into a drop at the reactor — and
+/// a stub resolver retries a dropped query, which is exactly what it already
+/// does for a lost datagram.
+const MAX_INFLIGHT_QUERIES: usize = 64;
+
+/// The largest response this shell will build.
+///
+/// 1232 bytes is the DNS Flag Day 2020 recommendation: it clears the IPv6
+/// minimum MTU with room for headers, so a synthesized answer never needs IP
+/// fragmentation — which matters because these datagrams are written with the
+/// Don't Fragment bit set. A rewritten response that will not fit becomes a
+/// `SERVFAIL` rather than a truncated answer.
+///
+/// ponytail: the correct answer for an over-large response is `TC=1` and a
+/// retry over TCP/53, which needs the local termination that arrives with
+/// P14. Until then a `SERVFAIL` is the visible failure, and the counter says
+/// how often it happens.
+const MAX_DNS_RESPONSE: usize = 1232;
+
+/// The largest upstream reply this shell will read. EDNS0 permits more; a
+/// resolver answering a stub does not need it.
+const MAX_DNS_MESSAGE: usize = 4096;
 
 /// How often accumulated counters are reported. Reporting on a clock rather
 /// than per occurrence is what keeps the telemetry stream O(time) instead of
@@ -84,7 +115,7 @@ pub struct Datagram {
 ///
 /// Every counting variant reports occurrences *since the previous report*, so
 /// an observer sums rather than diffs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Telemetry {
     /// A per-flow lifecycle event, passed through one for one because the flow
     /// count bounds it.
@@ -104,8 +135,39 @@ pub enum Telemetry {
     /// Datagrams the egress refused: not a WireGuard packet, or no buffer for
     /// the emission. Routine on a public port, so counted, not fatal.
     EgressRejected(u64),
+    /// One resolved query, with everything needed to explain its verdict.
+    ///
+    /// Passed through whole rather than folded: a query is a flow-scale event,
+    /// not a packet-scale one, and a verdict a user cannot see the reason for
+    /// is a verdict they cannot argue with. Boxed so the common counting
+    /// variants stay small.
+    Resolved(Box<Resolution>),
+    /// Queries dropped because the resolver was saturated. The client's stub
+    /// resolver retries; this is how an operator sees that it had to.
+    QueriesDropped(u64),
     /// Telemetry observations this channel could not accept.
     Lost(u64),
+}
+
+/// The effectful half of a session: the four seams the reactor drives, and the
+/// host rules the resolver applies. The pure half is the [`Datapath`].
+///
+/// Grouped rather than passed positionally because they are configuration, and
+/// because the set grows with each egress and filtering phase; a constructor
+/// that reads as a record does not become a nine-argument call.
+pub struct Session<D, N, E, U> {
+    /// The client's TUN.
+    pub device: D,
+    /// The socket carrying the egress's encapsulated datagrams.
+    pub network: N,
+    /// The packet egress.
+    pub egress: E,
+    /// The DNS upstream. Never consulted by a session configured with
+    /// [`crate::DnsPolicy::Forward`], because the core emits no queries.
+    pub upstream: U,
+    /// Host rules. Shared rather than owned because P12 swaps them under a
+    /// running reactor.
+    pub policy: Arc<HostPolicy>,
 }
 
 /// A running reactor and the handles that talk to it.
@@ -115,6 +177,7 @@ pub struct Shell {
     telemetry: mpsc::Receiver<Telemetry>,
     shutdown: CancellationToken,
     reactor: tokio::task::JoinHandle<io::Result<()>>,
+    resolver: tokio::task::JoinHandle<()>,
 }
 
 impl Shell {
@@ -128,26 +191,51 @@ impl Shell {
     /// [`try_send_datagram`](Self::try_send_datagram). The reactor never
     /// allocates payload bytes, which is what makes the pool's budget the real
     /// bound on queue memory.
-    /// `network` and `egress` are the outward half of the fused interface: the
-    /// egress encapsulates, and the network carries what it produced. They are
-    /// not optional, because a shell without them has nowhere to put a
-    /// fast-path packet except back down the interface it came from.
-    pub fn start<D, N, E>(datapath: Datapath, device: D, network: N, egress: E) -> Self
+    /// The reactor and the resolver are two tasks, and the split is
+    /// load-bearing: a resolution is a network round trip, and awaiting one
+    /// inside the reactor would stall every packet behind a slow upstream.
+    /// They meet over two bounded channels, so a saturated resolver becomes a
+    /// dropped query — which a stub resolver retries — and never a stalled
+    /// datapath.
+    pub fn start<D, N, E, U>(datapath: Datapath, session: Session<D, N, E, U>) -> Self
     where
         D: AsyncDevice + Send + 'static,
         N: AsyncNetwork + Send + 'static,
         E: PacketEgress + 'static,
+        U: DnsUpstream + 'static,
     {
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (datagram_tx, datagram_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (query_tx, query_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (answer_tx, answer_rx) = mpsc::channel(CHANNEL_DEPTH);
         let shutdown = CancellationToken::new();
+
+        let Session {
+            device,
+            network,
+            egress,
+            upstream,
+            policy,
+        } = session;
+
+        let resolver = tokio::spawn(resolver_loop(
+            Arc::new(upstream),
+            policy,
+            query_rx,
+            answer_tx,
+            shutdown.clone(),
+        ));
 
         let reactor = tokio::spawn(reactor_loop(
             datapath,
             device,
             network,
             egress,
+            Queries {
+                out: query_tx,
+                back: answer_rx,
+            },
             control_rx,
             datagram_rx,
             TelemetrySink {
@@ -163,6 +251,7 @@ impl Shell {
             telemetry: telemetry_rx,
             shutdown,
             reactor,
+            resolver,
         }
     }
 
@@ -207,7 +296,16 @@ impl Shell {
     /// re-raised here rather than laundered into an `io::Error`.
     pub async fn shutdown(self) -> io::Result<()> {
         self.shutdown.cancel();
-        match self.reactor.await {
+        // The resolver is joined too, and it joins its own in-flight
+        // resolutions, so no task and no pooled buffer outlives this call.
+        let resolver = self.resolver.await;
+        let reactor = self.reactor.await;
+        if let Err(error) = resolver
+            && error.is_panic()
+        {
+            std::panic::resume_unwind(error.into_panic());
+        }
+        match reactor {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
             Err(error) => Err(io::Error::other(error)),
@@ -282,6 +380,270 @@ impl AsyncNetwork for tokio::net::UdpSocket {
     }
 }
 
+/// One DNS upstream transport.
+///
+/// Only the wire. The policy that decides whether to consult an upstream at
+/// all, and what to do with what it says, is pure and lives in
+/// [`crate::dns`](crate); the single thing this trait contributes to a verdict
+/// is which [`Upstream`] it was.
+pub trait DnsUpstream: Send + Sync {
+    /// The transport kind, which is what a verdict's provenance records.
+    fn kind(&self) -> Upstream;
+
+    /// Sends one DNS message and returns the reply.
+    ///
+    /// Called from a task of its own, never from the reactor, so it may await
+    /// as long as it likes without stalling the datapath. It must impose its
+    /// own timeout: the resolver bounds how many of these run at once, not how
+    /// long any one of them takes.
+    fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
+}
+
+/// Creates the sockets a DNS upstream uses.
+///
+/// It exists because those sockets must not travel through Boreas's own TUN —
+/// a resolver reached through the tunnel that is resolving for it is a loop —
+/// and excluding them is a platform act this crate cannot perform:
+/// `VpnService.protect` on the descriptor on Android, binding the physical
+/// interface's address on Windows. The seam names the obligation so that no
+/// implementation can quietly skip it.
+pub trait TunnelBypass: Send + Sync {
+    fn udp(
+        &self,
+        peer: SocketAddr,
+    ) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send;
+}
+
+/// The bypass for a host where nothing is in the way: an ordinary ephemeral
+/// socket on the default route.
+///
+/// Correct on a desktop whose default route is not the tunnel, and the
+/// deliberate wrong answer on Android, where the socket must be protected
+/// before it is connected. Named for what it does not do.
+pub struct DirectSockets;
+
+impl TunnelBypass for DirectSockets {
+    // Written as an explicit future type for the same reason `AsyncDevice` is:
+    // the trait promises `Send`, and only the explicit form states it.
+    #[allow(clippy::manual_async_fn)]
+    fn udp(
+        &self,
+        peer: SocketAddr,
+    ) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send {
+        async move {
+            let bind: SocketAddr = if peer.is_ipv4() {
+                ([0, 0, 0, 0], 0).into()
+            } else {
+                ([0u16; 8], 0).into()
+            };
+            let socket = tokio::net::UdpSocket::bind(bind).await?;
+            socket.connect(peer).await?;
+            Ok(socket)
+        }
+    }
+}
+
+/// Plain DNS over UDP to one resolver.
+///
+/// One ephemeral socket per query, which is what makes concurrent queries
+/// correlate without a transaction-id demultiplexer: a connected socket
+/// receives exactly its own reply, and the random source port is the entropy a
+/// spoofing attacker has to beat.
+///
+/// Do53 is readable by anything on the path, which is why [`Upstream`]
+/// distinguishes it. It is the transport that needs no TLS stack, and so the
+/// one that can exist before the crate admits one.
+pub struct Do53Upstream<B> {
+    resolver: SocketAddr,
+    bypass: B,
+    timeout: Duration,
+}
+
+impl<B: TunnelBypass> Do53Upstream<B> {
+    /// Two seconds matches what stub resolvers already assume; a longer wait
+    /// holds a permit that another query could be using.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    pub fn new(resolver: SocketAddr, bypass: B) -> Self {
+        Self {
+            resolver,
+            bypass,
+            timeout: Self::DEFAULT_TIMEOUT,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
+    fn kind(&self) -> Upstream {
+        Upstream::Do53
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
+        async move {
+            let socket = self.bypass.udp(self.resolver).await?;
+            socket.send(message).await?;
+            let mut reply = vec![0u8; MAX_DNS_MESSAGE];
+            let len = tokio::time::timeout(self.timeout, socket.recv(&mut reply))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
+                })??;
+            reply.truncate(len);
+            Ok(reply)
+        }
+    }
+}
+
+/// One resolved query, on its way back to the reactor that will address it.
+struct Answer {
+    client: InternalEndpoint,
+    resolver: InternalEndpoint,
+    message: Vec<u8>,
+    resolution: Resolution,
+}
+
+/// The reactor's half of the resolver channels.
+struct Queries {
+    out: mpsc::Sender<DnsQuery>,
+    back: mpsc::Receiver<Answer>,
+}
+
+/// Resolves intercepted queries until cancelled.
+///
+/// Concurrency is bounded by a semaphore rather than by the channel alone: a
+/// permit is the admission to hold upstream state, and a query that cannot get
+/// one waits here, which backs the query channel up, which becomes a counted
+/// drop at the reactor. Every spawned resolution is tracked, so shutdown joins
+/// them and no pooled buffer outlives the shell.
+async fn resolver_loop<U: DnsUpstream + 'static>(
+    upstream: Arc<U>,
+    policy: Arc<HostPolicy>,
+    mut queries: mpsc::Receiver<DnsQuery>,
+    answers: mpsc::Sender<Answer>,
+    shutdown: CancellationToken,
+) {
+    let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_QUERIES));
+    let tracker = TaskTracker::new();
+
+    loop {
+        let query = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            query = queries.recv() => match query {
+                Some(query) => query,
+                None => break,
+            },
+        };
+        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+            break;
+        };
+        let upstream = Arc::clone(&upstream);
+        let policy = Arc::clone(&policy);
+        let answers = answers.clone();
+        tracker.spawn(async move {
+            let _permit = permit;
+            if let Some(answer) = resolve(upstream.as_ref(), policy.as_ref(), query).await {
+                // Best-effort: a reactor that cannot accept the answer is one
+                // whose client has long since retried.
+                let _ = answers.try_send(answer);
+            }
+        });
+    }
+
+    tracker.close();
+    tracker.wait().await;
+}
+
+/// Resolves one query: plan, consult (or do not), rewrite, explain.
+///
+/// `None` only when the query is not a DNS message at all, which is a drop
+/// rather than an answer — there is no question to put in a response.
+async fn resolve<U: DnsUpstream>(
+    upstream: &U,
+    policy: &HostPolicy,
+    query: DnsQuery,
+) -> Option<Answer> {
+    let DnsQuery {
+        client,
+        resolver,
+        payload,
+    } = query;
+    let request = Message::parse(&payload).ok()?;
+    let question = *request.question();
+    let mut message = vec![0u8; MAX_DNS_RESPONSE];
+
+    let (len, resolution) = match plan_query(&question, policy) {
+        // A refused name never leaves the device, so the block costs no query
+        // and leaks no name to any upstream.
+        QueryPlan::Refuse { rule } => (
+            write_refusal(&mut message, &request).ok()?,
+            Resolution {
+                name: question.name,
+                qtype: question.qtype,
+                rcode: Rcode::NameError,
+                answers: 0,
+                provenance: Provenance::Policy,
+                rule: Some(rule),
+                ech: EchOutcome::Absent,
+            },
+        ),
+        QueryPlan::Forward { ech } => {
+            let kind = upstream.kind();
+            let rewritten = match upstream.query(&payload).await {
+                Ok(reply) => Message::parse(&reply).and_then(|reply| {
+                    write_response(&mut message, &request, &reply, ech)
+                        .map(|rewritten| (rewritten, reply.rcode()))
+                }),
+                Err(_) => Err(crate::DnsError::Truncated),
+            };
+            match rewritten {
+                Ok((rewritten, rcode)) => (
+                    rewritten.len,
+                    Resolution {
+                        name: question.name,
+                        qtype: question.qtype,
+                        rcode,
+                        answers: rewritten.answers,
+                        provenance: Provenance::Upstream(kind),
+                        rule: None,
+                        ech: rewritten.ech,
+                    },
+                ),
+                // An upstream that did not answer, answered with something
+                // unparseable, or answered with more than this shell will
+                // carry, all reach the client the same visible way: a
+                // `SERVFAIL` its stub resolver retries, never a silent drop
+                // that stalls the application until its own timeout.
+                Err(_) => (
+                    write_failure(&mut message, &request).ok()?,
+                    Resolution {
+                        name: question.name,
+                        qtype: question.qtype,
+                        rcode: Rcode::ServerFailure,
+                        answers: 0,
+                        provenance: Provenance::Upstream(kind),
+                        rule: None,
+                        ech: EchOutcome::Absent,
+                    },
+                ),
+            }
+        }
+    };
+
+    message.truncate(len);
+    Some(Answer {
+        client,
+        resolver,
+        message,
+        resolution,
+    })
+}
+
 /// Best-effort telemetry with visible loss. Never awaits: telemetry must not be
 /// able to stall the datapath.
 struct TelemetrySink {
@@ -315,6 +677,7 @@ struct Counters {
     reassembly_discarded: u64,
     transmits_dropped: u64,
     egress_rejected: u64,
+    queries_dropped: u64,
 }
 
 impl Counters {
@@ -336,6 +699,7 @@ impl Counters {
         );
         report(&mut self.transmits_dropped, Telemetry::TransmitsDropped);
         report(&mut self.egress_rejected, Telemetry::EgressRejected);
+        report(&mut self.queries_dropped, Telemetry::QueriesDropped);
     }
 }
 
@@ -358,6 +722,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     mut device: D,
     mut network: N,
     mut egress: E,
+    mut queries: Queries,
     mut control: mpsc::Receiver<Control>,
     mut datagrams: mpsc::Receiver<Datagram>,
     mut telemetry: TelemetrySink,
@@ -428,6 +793,16 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 Err(error) => return Err(error),
             },
 
+            // A resolved query. Bounded by the answer channel, and addressed
+            // back to the client from the resolver address it asked.
+            Some(answer) = queries.back.recv() => {
+                let Answer { client, resolver, message, resolution } = answer;
+                if datapath.answer_dns(client, resolver, &message).is_err() {
+                    counters.packets_rejected += 1;
+                }
+                telemetry.emit(Telemetry::Resolved(Box::new(resolution)));
+            }
+
             result = network.recv(&mut net_buf) => match result {
                 // Anything can arrive on a public UDP port. A datagram the
                 // egress refuses is counted, exactly like a malformed packet.
@@ -460,6 +835,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             &mut network,
             &mut egress,
             &mut emits,
+            &mut queries.out,
             &mut telemetry,
             &mut counters,
         )
@@ -478,6 +854,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         &mut network,
         &mut egress,
         &mut emits,
+        &mut queries.out,
         &mut telemetry,
         &mut counters,
     )
@@ -501,6 +878,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     network: &mut N,
     egress: &mut E,
     emits: &mut Vec<EgressEmit>,
+    queries: &mut mpsc::Sender<DnsQuery>,
     telemetry: &mut TelemetrySink,
     counters: &mut Counters,
 ) -> io::Result<()> {
@@ -535,6 +913,16 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 
         if emits.is_empty() {
             break;
+        }
+    }
+
+    // Intercepted queries go to the resolver without waiting. Blocking here
+    // would put a slow upstream in front of every packet, which is the whole
+    // reason the resolver is a separate task; a refusal is a drop the client's
+    // stub resolver retries.
+    while let Some(query) = datapath.poll_query() {
+        if queries.try_send(query).is_err() {
+            counters.queries_dropped += 1;
         }
     }
 

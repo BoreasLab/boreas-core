@@ -250,7 +250,9 @@ impl<D: Device> Harness<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Accepts, DatagramFidelity, EgressCapabilities, FilterPolicy, NatBehavior};
+    use crate::{
+        Accepts, DatagramFidelity, DnsPolicy, EgressCapabilities, FilterPolicy, NatBehavior,
+    };
     use std::{num::NonZeroUsize, time::Instant};
 
     fn udp_frame() -> Vec<u8> {
@@ -270,6 +272,7 @@ mod tests {
     fn datapath() -> crate::Datapath {
         crate::Datapath::new(
             FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
             Accepts::IpPackets,
             EgressCapabilities {
                 datagram_fidelity: DatagramFidelity::Native,

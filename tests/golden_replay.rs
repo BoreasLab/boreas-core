@@ -9,8 +9,8 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, BufferPool, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, FlowEvent,
-    InternalEndpoint, Mtu, NatBehavior, SendOutcome, SteeringReason,
+    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy,
+    FlowEvent, InternalEndpoint, Mtu, NatBehavior, SendOutcome, SteeringReason,
 };
 
 const NOW: Duration = Duration::from_secs(1_000);
@@ -36,6 +36,7 @@ fn udp_frame() -> Vec<u8> {
 fn golden_replay_is_byte_exact() {
     let mut path = Datapath::new(
         FilterPolicy::PassThrough,
+        DnsPolicy::Forward,
         Accepts::Flows,
         egress(DatagramFidelity::Native),
         Mtu::new(1500).unwrap(),

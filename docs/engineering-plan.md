@@ -518,11 +518,106 @@ cross-check. 59 tests, fmt, clippy, and `cargo deny` clean.
 
 ### P11: DNS and ECH policy
 
-Interception, DoH/DoT/DoQ upstreams via `hickory-resolver`, verdict provenance
-retained for explanation. ECH policy stays coupled to resolver control.
+**Status: complete for the phase gate; the encrypted upstreams are deferred
+with a reason, below.** Delivered:
 
-**Gate:** answers for A, AAAA, HTTPS, and SVCB carry provenance sufficient to
-explain a verdict; ECH is not disabled globally when host policy suffices.
+- `src/dns.rs`, the pure core. Borrowed message parsing with no allocation:
+  the header and question decode eagerly because every caller needs both, and
+  the answer section is walked lazily as a fallible iterator. `Name` is fixed
+  inline storage — RFC 1035 caps a name at 255 wire bytes, so parsing a query
+  allocates nothing at all — ASCII-lowercased per RFC 4343, with bytes outside
+  ASCII passing through and comparing bytewise so DNS-SD and internationalized
+  names need no opinion about text encoding. **Compression pointers must point
+  strictly backwards**, which makes the cursor strictly decrease and the chain
+  finite; decompression terminates on adversarial input without a visited set.
+- `HostPolicy`, a suffix index. The lookup walks the query's suffixes from most
+  to least specific and stops at the first match, so the most specific rule
+  wins and, at equal specificity, blocking beats inspection — a refused host is
+  never also intercepted. O(labels) hash probes, at most two per label, and the
+  253-character name limit bounds labels at 127. The keys use `HashSet`'s
+  SipHash with its per-process random seed, which matters because qnames are
+  attacker-chosen: any application on the device can ask for any name.
+- `ech_policy`, the whole of ECH policy and the phase's second gate: `Strip` if
+  and only if the host is inspected. There is no global ECH switch anywhere in
+  the crate, because disabling ECH for the session would hand every site's SNI
+  back to the network for the sake of the few hosts actually inspected.
+  Stripping is a byte range removed from one answer's RDATA, expressed as
+  `Rdata { head, tail }`, so it rewrites nothing and allocates nothing.
+- `write_response`, which rebuilds the client's answer. Three decisions carry
+  it. The transaction id, the question section, and the recursion-desired bit
+  come from the *client's query*, never from the upstream — a resolver that
+  echoes an upstream's id answers a question the client did not ask; the
+  question is copied as raw bytes so a client using 0x20 case randomization
+  still recognizes its own query, which is exactly why a compressed question
+  name is refused (nothing precedes the question but the header, so a pointer
+  there is nonsense, and refusing it is what makes the verbatim copy provably
+  safe). And names are written **uncompressed**: the only edit is deleting a
+  byte range from one RDATA, and deleting bytes from the middle of a message
+  invalidates every compression pointer targeting anything after the deletion.
+  Uncompressed output costs tens of bytes on a response crossing a 1420-byte
+  tunnel and cannot be wrong.
+- Interception in the core. `admit` now settles everything no egress capability
+  can change — reassembly, unsupported protocols, and DNS — so all three keep
+  working under a configuration that cannot plan a flow, and `route_planned`
+  handles the rest. Interception keys on the port rather than on a resolver
+  address: the client's configured resolver lives inside the tunnel, so every
+  query on port 53 is one Boreas owns. A query becomes a `DnsQuery` carrying a
+  pooled payload — which is also its bound, since pending queries cannot
+  outgrow the shared budget — and `answer_dns` writes the reply back. That
+  needed `packet::write_udp`, the dual of `IngressPacket::parse` and the only
+  place this crate originates a packet rather than forwarding one; both
+  checksums are computed in full because a synthesized datagram has no
+  predecessor to adjust from.
+- The shell. `DnsUpstream` is the transport and nothing else; `TunnelBypass`
+  names a platform obligation the crate cannot discharge — the upstream socket
+  must not travel through Boreas's own TUN, which means `VpnService.protect` on
+  Android and binding the physical interface on Windows — and `Do53Upstream`
+  uses one ephemeral socket per query, which is what lets concurrent queries
+  correlate without a transaction-id demultiplexer. **The resolver is a second
+  task, and the split is load-bearing:** a resolution is a network round trip,
+  and awaiting one inside the reactor would stall every packet behind a slow
+  upstream. They meet over two bounded channels with a 64-permit semaphore, so
+  a saturated resolver becomes a dropped query the stub retries, never a
+  stalled datapath.
+- `Telemetry::Resolved` carries a whole `Resolution`: the name, the rule that
+  matched, the transport that answered, the rcode, and what happened to ECH.
+  One per query, and a query is a flow-scale event rather than a packet-scale
+  one, so it travels whole rather than folded into a counter. A blocked name
+  costs no query and leaks no name to any upstream.
+
+**Deferred, with the reason, because it is a finding about this plan.** DoH,
+DoT, and DoQ all need a TLS stack, and the plan first admits `rustls` at P14
+for MITM. So P11 as written cannot be finished without either pulling that
+dependency forward or accepting Do53 to a trusted resolver until P14 arrives.
+`hickory-resolver` was not admitted for the same reason: the parsing, policy,
+provenance, and rewriting above are ours regardless of who carries the bytes,
+so the only thing it would supply today is the encrypted transports, and
+admitting a dependency for a capability that has no executable path yet is
+what [AGENTS.md](../AGENTS.md) forbids. Recorded as an open item below.
+
+Also deferred: TCP/53 and `TC=1` truncation handling, which need the local
+termination that arrives with P14. Until then a response too large for the
+1232-byte DNS Flag Day budget becomes a visible `SERVFAIL` the stub retries
+rather than a fragmented datagram that a `DF`-set path would drop, and the
+counter says how often that happens.
+
+**Gate met:** `tests/dns.rs` drives three queries through the whole shell in
+one session — a blocked name, an inspected host, and an allowed host — and
+asserts that the blocked name is refused locally with the upstream consulted
+three times rather than four, that the inspected host's HTTPS answer loses
+exactly its `ech` parameter and keeps its `alpn`, and that **the allowed host,
+in the same session and the same run, keeps its ECH configuration**. That last
+assertion is the gate: a global switch would have moved both. Every answer's
+`Telemetry::Resolved` names its rule, its transport, and its ECH outcome, and
+A, AAAA, HTTPS, and SVCB are all covered. The `dns` fuzz target ran 7.16M
+executions clean over query and answer bytes that need not agree with each
+other, asserting that a written response re-parses and that a stripped answer
+never still publishes an ECH configuration; the `datapath` target now also
+drives interception and answer synthesis. 75 tests, fmt, clippy, and
+`cargo deny` clean.
+
+**Unlocks:** P12 consumes the same `watch`-swappable `Arc<HostPolicy>`; P13
+reads `SVCPARAM_ALPN` from the same SvcParam walk this phase added.
 
 ### P12: adblock engine and list pipeline
 
@@ -695,3 +790,14 @@ Record outcomes in [Verification](verification.md).
    own device and the largest fixed wakeup cost in the shell. Replacing it
    with an egress-declared next deadline requires GotaTun to expose one; carry
    this into the battery measurement.
+6. **P11's encrypted upstreams need a TLS stack the plan first admits at P14.**
+   Decide between admitting `rustls` (and with it `hickory-resolver`, or a
+   direct DoH client) at P11, and accepting Do53 to a trusted resolver until
+   P14. The privacy claim in [Filtering](filtering.md) assumes the former; the
+   dependency ordering in this document assumes the latter. One of them has to
+   move.
+7. Whether Boreas should rewrite the transaction id it sends upstream. Today
+   the client's own id travels out, and the ephemeral source port carries the
+   anti-spoofing entropy. Rewriting is transparent — `write_response` takes the
+   id from the client's query and ignores the upstream's — so this is a cheap
+   change waiting on a decision, not a design question.

@@ -6,22 +6,26 @@
 //! - no panic on any byte sequence, at any arrival time;
 //! - a rejected packet is a `Result`, never a defect — the shell counts these
 //!   and keeps interpreting the core, so a panic here would be a reactor kill;
-//! - the core's queues stay bounded: transmits and events drain to completion
-//!   after every packet, exactly as the reactor drains them.
+//! - the core's queues stay bounded: transmits, events, and intercepted DNS
+//!   queries drain to completion after every packet, exactly as the reactor
+//!   drains them;
+//! - synthesizing a DNS answer from an arbitrary payload, for an arbitrary
+//!   client endpoint, writes a datagram or reports why — never a panic.
 
 #![no_main]
 
 use std::{num::NonZeroUsize, time::Duration};
 
 use boreas_core::{
-    Accepts, DatagramFidelity, Datapath, EgressCapabilities, FilterPolicy, Limits, Mtu,
-    NatBehavior,
+    Accepts, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy, Limits,
+    Mtu, NatBehavior,
 };
 use libfuzzer_sys::fuzz_target;
 
-fn datapath(accepts: Accepts) -> Datapath {
+fn datapath(accepts: Accepts, dns: DnsPolicy) -> Datapath {
     Datapath::new(
         FilterPolicy::PassThrough,
+        dns,
         accepts,
         EgressCapabilities {
             datagram_fidelity: DatagramFidelity::Native,
@@ -48,10 +52,16 @@ fn datapath(accepts: Accepts) -> Datapath {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Both egress shapes: `IpPackets` exercises the packet fast path and its
-    // MSS clamp, `Flows` exercises flow admission and the timer wheel.
-    for accepts in [Accepts::IpPackets, Accepts::Flows] {
-        let mut path = datapath(accepts);
+    // Both egress shapes, and both DNS policies: `IpPackets` exercises the
+    // packet fast path and its MSS clamp, `Flows` exercises flow admission and
+    // the timer wheel, and `Intercept` diverts UDP/53 into the query queue and
+    // back out through the synthesized answer.
+    for (accepts, dns) in [
+        (Accepts::IpPackets, DnsPolicy::Forward),
+        (Accepts::IpPackets, DnsPolicy::Intercept),
+        (Accepts::Flows, DnsPolicy::Intercept),
+    ] {
+        let mut path = datapath(accepts, dns);
         let base = std::time::Instant::now();
 
         let mut cursor = 0;
@@ -72,7 +82,14 @@ fuzz_target!(|data: &[u8]| {
             let _ = path.on_egress_packet(packet, now);
             path.on_timeout(now);
 
-            // Drain as the reactor does, so nothing accumulates across packets.
+            // Drain as the reactor does, so nothing accumulates across
+            // packets. An intercepted query is answered with its own payload,
+            // which is arbitrary bytes addressed to an arbitrary endpoint —
+            // the shape the response writer must survive.
+            while let Some(query) = path.poll_query() {
+                let payload = query.payload.to_vec();
+                let _ = path.answer_dns(query.client, query.resolver, &payload);
+            }
             while path.poll_transmit().is_some() {}
             while path.poll_event().is_some() {}
 

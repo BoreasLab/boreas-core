@@ -7,8 +7,9 @@
 use std::{net::Ipv4Addr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use boreas_core::{
-    Accepts, BufferPool, DatagramFidelity, Datapath, Egress, EgressCapabilities, EgressEmit,
-    FilterPolicy, Harness, Limits, Mtu, NatBehavior, SimDevice, WireGuardConfig, WireGuardEgress,
+    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, Egress, EgressCapabilities,
+    EgressEmit, FilterPolicy, Harness, Limits, Mtu, NatBehavior, SimDevice, WireGuardConfig,
+    WireGuardEgress,
 };
 
 /// Slices large enough for an encapsulated 1420-byte packet, and a budget
@@ -38,6 +39,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
     assert_eq!(egress.accepts(), Accepts::IpPackets);
     Datapath::new(
         FilterPolicy::PassThrough,
+        DnsPolicy::Forward,
         egress.accepts(),
         capabilities,
         Mtu::new(1500).unwrap(),

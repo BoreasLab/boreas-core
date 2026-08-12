@@ -18,9 +18,10 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, AsyncDevice, AsyncNetwork, BufferPool, Control, DatagramFidelity, Datapath,
-    EgressCapabilities, EgressEmit, EgressError, FilterPolicy, FlowEvent, InternalEndpoint, Mtu,
-    NatBehavior, PacketEgress, SendOutcome, Shell, Telemetry,
+    Accepts, AsyncDevice, AsyncNetwork, BufferPool, Control, DatagramFidelity, Datapath, DnsPolicy,
+    DnsUpstream, EgressCapabilities, EgressEmit, EgressError, FilterPolicy, FlowEvent, HostPolicy,
+    InternalEndpoint, Mtu, NatBehavior, PacketEgress, SendOutcome, Session, Shell, Telemetry,
+    Upstream,
 };
 
 fn capabilities() -> EgressCapabilities {
@@ -38,6 +39,7 @@ fn capabilities() -> EgressCapabilities {
 fn datapath_on(accepts: Accepts, queue_depth: usize, pool: Arc<BufferPool>) -> Datapath {
     Datapath::new(
         FilterPolicy::PassThrough,
+        DnsPolicy::Forward,
         accepts,
         capabilities(),
         Mtu::new(1500).unwrap(),
@@ -219,6 +221,26 @@ impl PacketEgress for PassThroughEgress {
     }
 }
 
+/// A DNS upstream that is never consulted: these sessions are configured with
+/// `DnsPolicy::Forward`, so the core emits no queries at all. It exists to
+/// name that fact rather than to answer anything.
+struct NoUpstream;
+
+impl DnsUpstream for NoUpstream {
+    fn kind(&self) -> Upstream {
+        Upstream::Do53
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn query(&self, _message: &[u8]) -> impl Future<Output = std::io::Result<Vec<u8>>> + Send {
+        async {
+            Err(std::io::Error::other(
+                "this session forwards DNS rather than intercepting it",
+            ))
+        }
+    }
+}
+
 fn wire() -> (MockDevice, Wire) {
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
     let (sent_tx, sent_rx) = tokio::sync::mpsc::channel(64);
@@ -256,9 +278,13 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
     let pool = pool(64);
     let shell = Shell::start(
         datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
-        device,
-        net,
-        PassThroughEgress { pool },
+        Session {
+            device,
+            network: net,
+            egress: PassThroughEgress { pool },
+            upstream: NoUpstream,
+            policy: Arc::new(HostPolicy::new()),
+        },
     );
 
     wire.inbound.send(udp_frame()).await.unwrap();
@@ -294,9 +320,13 @@ async fn the_timer_is_armed_against_the_core_deadline_not_a_poll_interval() {
     let pool = pool(64);
     let shell = Shell::start(
         datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
-        device,
-        net,
-        PassThroughEgress { pool },
+        Session {
+            device,
+            network: net,
+            egress: PassThroughEgress { pool },
+            upstream: NoUpstream,
+            policy: Arc::new(HostPolicy::new()),
+        },
     );
 
     // Let the reactor reach its first wait, then run an hour of virtual time.
@@ -324,9 +354,13 @@ async fn a_malformed_packet_is_counted_not_fatal() {
     let pool = pool(64);
     let mut shell = Shell::start(
         datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
-        device,
-        net,
-        PassThroughEgress { pool },
+        Session {
+            device,
+            network: net,
+            egress: PassThroughEgress { pool },
+            upstream: NoUpstream,
+            policy: Arc::new(HostPolicy::new()),
+        },
     );
     let wire = wire.inbound;
 
@@ -401,9 +435,13 @@ async fn a_datagram_producer_is_never_blocked_and_a_refusal_frees_its_buffer() {
     // producer's budget, and a shared one would confuse the two.
     let shell = Shell::start(
         datapath_on(Accepts::Flows, 8, pool(64)),
-        device,
-        net,
-        PassThroughEgress { pool: pool(64) },
+        Session {
+            device,
+            network: net,
+            egress: PassThroughEgress { pool: pool(64) },
+            upstream: NoUpstream,
+            policy: Arc::new(HostPolicy::new()),
+        },
     );
     let pool = producer;
     let endpoint = InternalEndpoint {
@@ -434,9 +472,13 @@ async fn control_messages_reach_the_core_in_order() {
     let pool = pool(64);
     let mut shell = Shell::start(
         datapath_on(Accepts::Flows, 8, Arc::clone(&pool)),
-        device,
-        net,
-        PassThroughEgress { pool },
+        Session {
+            device,
+            network: net,
+            egress: PassThroughEgress { pool },
+            upstream: NoUpstream,
+            policy: Arc::new(HostPolicy::new()),
+        },
     );
 
     // Open a flow, then withdraw the layer it runs on.
