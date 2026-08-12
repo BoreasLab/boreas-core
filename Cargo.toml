@@ -7,19 +7,15 @@ license = "AGPL-3.0-only"
 [dependencies]
 etherparse = "0.21.0"
 gotatun = { version = "0.8.1", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Named features rather than "full": the shell needs a runtime, bounded
 # channels, a timer, and the `select!`/`pin!` macros, and nothing else. Boreas
 # cross-compiles to Android, where every unused tokio driver is dead weight in
 # the shipped artefact.
-tokio = { version = "1.53.1", features = [
-    "macros",
-    "net",
-    "rt",
-    "rt-multi-thread",
-    "sync",
-    "time",
-] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
+webpki-roots = "1"
 
 # The Windows adapter loads the WireGuard-authorized signed wintun.dll at
 # runtime; the bindings are Windows-only and never enter the Android graph.

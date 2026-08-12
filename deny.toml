@@ -40,6 +40,11 @@ allow = [
     # smoltcp. Public-domain-equivalent BSD without the attribution clause, so
     # it is GPL-compatible and imposes no distribution obligation.
     "0BSD",
+    # webpki-roots. The Mozilla root-certificate *data*, not code: a permissive
+    # data licence with no copyleft and no share-alike obligation, so it
+    # combines into an AGPL work and imposes nothing on distribution. Admitted
+    # explicitly, which is what this allowlist exists to force.
+    "CDLA-Permissive-2.0",
 ]
 unused-allowed-license = "allow"
 confidence-threshold = 0.93

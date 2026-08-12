@@ -10,6 +10,7 @@ mod pool;
 mod reassembly;
 mod shell;
 mod udp;
+mod upstream;
 
 use std::{error::Error, fmt};
 
@@ -36,9 +37,10 @@ pub use platform::AndroidTun;
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
-pub use shell::{
-    AsyncDevice, AsyncNetwork, Control, Datagram, DirectSockets, DnsUpstream, Do53Upstream,
-    Session, Shell, Telemetry, TunnelBypass,
+pub use shell::{AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry};
+pub use upstream::{
+    DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
+    DotUpstream, TunnelBypass, UpstreamError,
 };
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};

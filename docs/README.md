@@ -46,6 +46,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 | `src/dns.rs` | DNS parsing, host policy, verdict provenance, ECH policy | [Filtering](filtering.md) |
 | `src/filter.rs` | filter-list parsing, deferral accounting, policy compilation | [Filtering](filtering.md) |
 | `src/egress.rs` | egress sum (packet vs stream), sans-io packet-egress interface, WireGuard via GotaTun | [Egress](egress.md) |
+| `src/upstream.rs` | DNS upstream transports: Do53, DoT, DoH, and the tunnel-bypass seam | [Filtering](filtering.md) |
 | `src/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
 | `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
 | `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |

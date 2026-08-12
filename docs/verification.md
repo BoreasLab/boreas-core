@@ -61,6 +61,16 @@ Correcting the earlier ledger entry: GotaTun is MPL-2.0, not BSD-3-Clause as
 the planned-dependencies table recorded. MPL-2.0 qualifies through its
 secondary-license mechanism, so the admission stands on the existing policy.
 
+`webpki-roots` carries the Mozilla root-certificate **data** under
+CDLA-Permissive-2.0, which `deny.toml` now allows explicitly. It is a
+permissive data licence with no copyleft and no share-alike obligation, so it
+combines into an AGPL work and imposes nothing on distribution.
+
+The DNS transports use that bundle rather than the platform trust store, and
+that is a security property rather than a portability shortcut: Boreas installs
+its own root into the user store for interception, and a resolver trusting the
+OS store would trust the certificate authority Boreas itself controls.
+
 `ring` compiles C at build time, which ended the local
 x86_64-pc-windows-msvc cross-check that P9 used: this Linux environment has no
 MSVC. A windows-latest CI job now owns that check.
@@ -79,9 +89,9 @@ compatible release and regenerate the license review at that time.
 |---|---|---|---|
 | `lol_html` | streaming HTML rewrite | BSD-compatible | Cloudflare Workers lineage; designed for bounded memory |
 | `adblock` | network, cosmetic, and scriptlet rules | MPL-2.0 compatible | Brave production lineage; Firefox ships adblock-rust; supports uBO-style syntax and Apple content-blocking export |
-| `rustls` | single v1 TLS stack | MIT OR Apache-2.0 | explicit crypto provider required from the 0.24 line; prior noted MSRV 1.83 |
+| ~~`rustls`~~ | single v1 TLS stack | integrated 2026-08-11 at 0.23.43 | MIT OR Apache-2.0 OR ISC. Taken with `default-features = false` and the `ring` provider **already in the graph for WireGuard**, so no second crypto backend ships to a target that counts bytes; `tls12` is kept for resolver interoperability. `tokio-rustls` 0.26.4 and `webpki-roots` 1.0.9 came with it |
 | `rcgen` | leaf certificate generation | MIT OR Apache-2.0 | rustls organization; mature dependency surface |
-| `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | MIT OR Apache-2.0 | ISRG Prossimo-backed; **not admitted at P11.** Message parsing, host policy, provenance, and ECH rewriting are Boreas's own regardless of who carries the bytes, so the only thing it supplies today is the encrypted transports — and those need the TLS stack the plan first admits at P14. Revisit with that decision |
+| `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | MIT OR Apache-2.0 | ISRG Prossimo-backed; **not admitted, and no longer needed.** DoT and DoH landed directly on `rustls` at a few hundred lines each, against a far smaller graph. Reconsider only for DNSSEC validation. Earlier note: Message parsing, host policy, provenance, and ECH rewriting are Boreas's own regardless of who carries the bytes, so the only thing it supplies today is the encrypted transports — and those need the TLS stack the plan first admits at P14. Revisit with that decision |
 | `tokio-quiche` and quiche | MASQUE and later H3 | BSD-compatible | used by iCloud Private Relay Proxy B, Oxy, and WARP's MASQUE client |
 | ~~GotaTun~~ | WireGuard | integrated 2026-08-11 at 0.8.1 | MPL-2.0 (corrected from BSD-3-Clause); Mullvad project; Windows readiness unexercised, no device in this environment |
 | `smoltcp` | locally terminated TCP | BSD OR Apache-2.0 | vendored in AOSP; host-scale feature limits require testing |
@@ -201,27 +211,41 @@ Do not rely on these without a targeted check:
 7. SOCKS5 UDP ASSOCIATE support among servers users actually operate.
 8. Claimed Hysteria2 and TUIC throughput and P95 improvements on the Boreas
    workload.
-9. Packets per wakeup and packets per syscall, the performance budget's primary
+9. Whether one TLS connection per DNS query is acceptable on a real page load.
+   Measured 2026-08-11 against a live resolver (`examples/resolve.rs`, aarch64
+   dev VM, release): Do53 1.9 ms; DoT 10.7 ms cold and 4.9 ms resumed; DoH
+   10.3 ms cold and 9.7 ms resumed. Session resumption is doing the work on
+   DoT; DoH gains less because `Connection: close` forgoes keep-alive.
+   Persistent pipelined connections are the fix and are gated on the
+   transaction-id rewriting in item 7 below, since a shared connection must
+   demultiplex replies by an id that is currently the client's own. Measure a
+   real page load before deciding whether the current cost is acceptable.
+10. Whether DoH over HTTP/1.1 is accepted by the resolvers users configure.
+    RFC 8484 section 5.2 requires client support for HTTP/2; this client speaks
+    HTTP/1.1 and offers only `http/1.1` in ALPN, so a server that refuses it
+    fails the handshake rather than the exchange. Verified against Cloudflare
+    on 2026-08-11. The gap closes when P14's `h2` stack arrives.
+11. Packets per wakeup and packets per syscall, the performance budget's primary
    derived metrics. The reactor reads one packet per wakeup; device batching
    needs a non-blocking read on `AsyncDevice` and can only be judged against a
    real device. Related: the egress tick is an unconditional 4 Hz wakeup, at
    parity with GotaTun's own device, and is the largest fixed wakeup cost in
    the shell. Both belong to the M1 on-device battery run.
-10. Whether the DNS upstream socket is genuinely excluded from the tunnel. The
+12. Whether the DNS upstream socket is genuinely excluded from the tunnel. The
     `TunnelBypass` seam names the obligation — `VpnService.protect` on the
     descriptor on Android, binding the physical interface's address on Windows
     — and `DirectSockets` deliberately does not discharge it. A resolver
     reached through the tunnel that is resolving for it is a loop, and this
     environment has neither platform to prove the exclusion on. Device-bound,
     and a prerequisite for the M2 gate.
-11. Whether a 1232-byte response budget is sufficient in practice. Responses
+13. Whether a 1232-byte response budget is sufficient in practice. Responses
     are written uncompressed and capped at the DNS Flag Day 2020 size so a
     synthesized datagram never needs fragmentation on a `DF`-set path; an
     over-large answer becomes a `SERVFAIL` the stub retries. The correct answer
     is `TC=1` and TCP/53, which needs the local termination arriving at P14.
     Measure the `SERVFAIL` counter against a real corpus before deciding
     whether that wait is acceptable.
-12. That the pooled fast path holds its budget under real traffic. Measured
+14. That the pooled fast path holds its budget under real traffic. Measured
     in-process 2026-08-11 (`examples/fusion.rs`, aarch64 dev VM, release):
     core 573 ns/packet against the ~1 µs allowance, 2 187 ns end to end, and
     every pool slice returned at rest across 10,000 packets. In-process only:

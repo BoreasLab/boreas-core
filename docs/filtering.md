@@ -84,11 +84,19 @@ to the same address is untouched — it is the destination steering aims at — 
 the drop counter is the convergence signal. Alt-Svc *header* rewriting waits on
 interception, since the header only exists inside an HTTP response.
 
-Encrypted upstreams are the remaining work. DoH, DoT, and DoQ each need a TLS
-stack, which [Engineering Plan](engineering-plan.md) first admits at P14, so
-the transport seam exists and Do53 is the implementation behind it today. The
-`Upstream` a verdict records distinguishes them precisely because the privacy
-claim differs per transport.
+Encrypted upstreams are implemented in `src/upstream.rs`. DoT (RFC 7858) is
+complete; DoH (RFC 8484) speaks HTTP/1.1 rather than the HTTP/2 the RFC
+requires clients to support, an interim gap that closes when interception
+brings an `h2` stack. DoQ waits on the QUIC stack that arrives with egress
+breadth. The `Upstream` a verdict records distinguishes them precisely because
+the privacy claim differs per transport: DoT is encrypted and authenticated but
+runs on a port a hostile network can simply block, which is the difference DoH
+exists to cover.
+
+The resolver's trust anchors are Mozilla's bundle and not the platform store,
+because Boreas installs its own root into the user store for interception and a
+resolver trusting the OS store would trust the authority Boreas itself
+controls.
 
 ## HTTP Priority
 

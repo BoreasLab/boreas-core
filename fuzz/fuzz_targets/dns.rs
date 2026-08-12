@@ -14,12 +14,15 @@
 //!   the cursor decreases and the chain is finite;
 //! - a written response re-parses, which is what makes the rewrite a total
 //!   function from a valid message to a valid message rather than to bytes;
-//! - stripping ECH removes exactly the `ech` parameter: the answer count is
-//!   unchanged and the rewritten record no longer publishes one.
+//! - a rewritten answer loses exactly the parameters its policy removes: the
+//!   answer count is unchanged, and an inspected host's record no longer
+//!   publishes an ECH configuration or an HTTP/3 advertisement.
 
 #![no_main]
 
-use boreas_core::{EchPolicy, Message, ech_param, svc_params, write_response};
+use boreas_core::{
+    HostVerdict, Message, answer_policy, ech_param, h3_alpn_param, svc_params, write_response,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -50,8 +53,9 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut out = [0u8; 4096];
-    for ech in [EchPolicy::Preserve, EchPolicy::Strip] {
-        let Ok(rewritten) = write_response(&mut out, &query, &upstream, ech) else {
+    for verdict in [HostVerdict::Allowed, HostVerdict::Inspected] {
+        let policy = answer_policy(verdict);
+        let Ok(rewritten) = write_response(&mut out, &query, &upstream, policy) else {
             continue;
         };
         let parsed = Message::parse(&out[..rewritten.len])
@@ -71,11 +75,16 @@ fuzz_target!(|data: &[u8]| {
         );
         for answer in answers {
             let answer = answer.expect("a written record must be a readable one");
-            if ech == EchPolicy::Strip && answer.rtype.carries_svc_params() {
+            if verdict == HostVerdict::Inspected && answer.rtype.carries_svc_params() {
                 assert_eq!(
                     ech_param(answer.rdata).ok().flatten(),
                     None,
                     "a stripped answer must not still publish an ECH configuration"
+                );
+                assert_eq!(
+                    h3_alpn_param(answer.rdata).ok().flatten(),
+                    None,
+                    "a steered answer must not still advertise HTTP/3"
                 );
             }
         }

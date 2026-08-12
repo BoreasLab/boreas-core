@@ -33,7 +33,6 @@
 
 use std::{
     io,
-    net::SocketAddr,
     num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant},
@@ -48,8 +47,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit,
     FlowEvent, HostPolicy, InternalEndpoint, Message, PacketEgress, Pooled, Provenance, QueryPlan,
-    Rcode, Resolution, RuleCounts, SendOutcome, Side, Transmit, Upstream, answer_addresses,
-    plan_query, write_failure, write_refusal, write_response,
+    Rcode, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses, plan_query,
+    upstream::DnsUpstream, write_failure, write_refusal, write_response,
 };
 
 /// Depth of both reactor channels. Bounded is the point; the exact depth trades
@@ -78,10 +77,6 @@ const MAX_INFLIGHT_QUERIES: usize = 64;
 /// P14. Until then a `SERVFAIL` is the visible failure, and the counter says
 /// how often it happens.
 const MAX_DNS_RESPONSE: usize = 1232;
-
-/// The largest upstream reply this shell will read. EDNS0 permits more; a
-/// resolver answering a stub does not need it.
-const MAX_DNS_MESSAGE: usize = 4096;
 
 /// How often accumulated counters are reported. Reporting on a clock rather
 /// than per occurrence is what keeps the telemetry stream O(time) instead of
@@ -394,126 +389,6 @@ impl AsyncNetwork for tokio::net::UdpSocket {
         buf: &'a [u8],
     ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
         tokio::net::UdpSocket::send(self, buf)
-    }
-}
-
-/// One DNS upstream transport.
-///
-/// Only the wire. The policy that decides whether to consult an upstream at
-/// all, and what to do with what it says, is pure and lives in
-/// [`crate::dns`](crate); the single thing this trait contributes to a verdict
-/// is which [`Upstream`] it was.
-pub trait DnsUpstream: Send + Sync {
-    /// The transport kind, which is what a verdict's provenance records.
-    fn kind(&self) -> Upstream;
-
-    /// Sends one DNS message and returns the reply.
-    ///
-    /// Called from a task of its own, never from the reactor, so it may await
-    /// as long as it likes without stalling the datapath. It must impose its
-    /// own timeout: the resolver bounds how many of these run at once, not how
-    /// long any one of them takes.
-    fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
-}
-
-/// Creates the sockets a DNS upstream uses.
-///
-/// It exists because those sockets must not travel through Boreas's own TUN —
-/// a resolver reached through the tunnel that is resolving for it is a loop —
-/// and excluding them is a platform act this crate cannot perform:
-/// `VpnService.protect` on the descriptor on Android, binding the physical
-/// interface's address on Windows. The seam names the obligation so that no
-/// implementation can quietly skip it.
-pub trait TunnelBypass: Send + Sync {
-    fn udp(
-        &self,
-        peer: SocketAddr,
-    ) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send;
-}
-
-/// The bypass for a host where nothing is in the way: an ordinary ephemeral
-/// socket on the default route.
-///
-/// Correct on a desktop whose default route is not the tunnel, and the
-/// deliberate wrong answer on Android, where the socket must be protected
-/// before it is connected. Named for what it does not do.
-pub struct DirectSockets;
-
-impl TunnelBypass for DirectSockets {
-    // Written as an explicit future type for the same reason `AsyncDevice` is:
-    // the trait promises `Send`, and only the explicit form states it.
-    #[allow(clippy::manual_async_fn)]
-    fn udp(
-        &self,
-        peer: SocketAddr,
-    ) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send {
-        async move {
-            let bind: SocketAddr = if peer.is_ipv4() {
-                ([0, 0, 0, 0], 0).into()
-            } else {
-                ([0u16; 8], 0).into()
-            };
-            let socket = tokio::net::UdpSocket::bind(bind).await?;
-            socket.connect(peer).await?;
-            Ok(socket)
-        }
-    }
-}
-
-/// Plain DNS over UDP to one resolver.
-///
-/// One ephemeral socket per query, which is what makes concurrent queries
-/// correlate without a transaction-id demultiplexer: a connected socket
-/// receives exactly its own reply, and the random source port is the entropy a
-/// spoofing attacker has to beat.
-///
-/// Do53 is readable by anything on the path, which is why [`Upstream`]
-/// distinguishes it. It is the transport that needs no TLS stack, and so the
-/// one that can exist before the crate admits one.
-pub struct Do53Upstream<B> {
-    resolver: SocketAddr,
-    bypass: B,
-    timeout: Duration,
-}
-
-impl<B: TunnelBypass> Do53Upstream<B> {
-    /// Two seconds matches what stub resolvers already assume; a longer wait
-    /// holds a permit that another query could be using.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
-
-    pub fn new(resolver: SocketAddr, bypass: B) -> Self {
-        Self {
-            resolver,
-            bypass,
-            timeout: Self::DEFAULT_TIMEOUT,
-        }
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-}
-
-impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
-    fn kind(&self) -> Upstream {
-        Upstream::Do53
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
-        async move {
-            let socket = self.bypass.udp(self.resolver).await?;
-            socket.send(message).await?;
-            let mut reply = vec![0u8; MAX_DNS_MESSAGE];
-            let len = tokio::time::timeout(self.timeout, socket.recv(&mut reply))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
-                })??;
-            reply.truncate(len);
-            Ok(reply)
-        }
     }
 }
 

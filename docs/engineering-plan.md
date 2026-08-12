@@ -585,15 +585,12 @@ with a reason, below.** Delivered:
   one, so it travels whole rather than folded into a counter. A blocked name
   costs no query and leaks no name to any upstream.
 
-**Deferred, with the reason, because it is a finding about this plan.** DoH,
-DoT, and DoQ all need a TLS stack, and the plan first admits `rustls` at P14
-for MITM. So P11 as written cannot be finished without either pulling that
-dependency forward or accepting Do53 to a trusted resolver until P14 arrives.
-`hickory-resolver` was not admitted for the same reason: the parsing, policy,
-provenance, and rewriting above are ours regardless of who carries the bytes,
-so the only thing it would supply today is the encrypted transports, and
-admitting a dependency for a capability that has no executable path yet is
-what [AGENTS.md](../AGENTS.md) forbids. Recorded as an open item below.
+**The encrypted transports were deferred at first, then delivered once the TLS
+stack was admitted; see the P11 addendum below.** `hickory-resolver` was never
+admitted: the parsing, policy, provenance, and rewriting above are ours
+regardless of who carries the bytes, so the only thing it would have supplied
+is the transports — and those turned out to be a few hundred lines each on top
+of `rustls`, against a dependency graph an order of magnitude smaller.
 
 Also deferred: TCP/53 and `TC=1` truncation handling, which need the local
 termination that arrives with P14. Until then a response too large for the
@@ -618,6 +615,62 @@ drives interception and answer synthesis. 75 tests, fmt, clippy, and
 
 **Unlocks:** P12 consumes the same `watch`-swappable `Arc<HostPolicy>`; P13
 reads `SVCPARAM_ALPN` from the same SvcParam walk this phase added.
+
+### P11 addendum: encrypted transports
+
+Delivered after P13, once P14's dependency question was decided.
+
+- `src/upstream.rs` holds every transport behind `DnsUpstream`, which is only
+  the wire: the policy that decides whether to consult one, and what to do with
+  what it says, stays pure in `src/dns.rs`. The single thing a transport
+  contributes to a verdict is which `Upstream` carried it.
+- **DoT (RFC 7858)**, complete and conformant. The framing is the whole
+  protocol — two octets of big-endian length then the message, in both
+  directions — and the reader checks the declared length against the accepted
+  message size *before* sizing a buffer, so a hostile resolver cannot decide
+  how much memory a query costs. The `dot` ALPN identifier from section 3.2 is
+  offered, so a server that will not speak it fails the handshake rather than
+  the exchange.
+- **DoH (RFC 8484)**, with one bounded conformance gap. A `POST` of
+  `application/dns-message`, which is the wire format already in hand — no
+  re-encoding, and no base64 as the `GET` form would need. Section 5.2 requires
+  a client to support HTTP/2 and this one speaks HTTP/1.1; public resolvers
+  accept it, and the alternative today is an HTTP/2 client the crate has no
+  other use for. The `h2` stack arrives with P14's interception, at which point
+  this moves onto it behind the same trait. `Connection: close` and a read to
+  end-of-stream is what keeps the response reader to a status line and headers:
+  there is no chunked transfer to decode when the body ends with the
+  connection, and only a `200` yields a body, because a DNS answer parsed out
+  of an error page would be worse than no answer.
+- **The trust anchors are Mozilla's bundle, deliberately not the platform
+  store.** Boreas installs its own root into the user store for interception,
+  and a resolver trusting the OS store would trust the certificate authority
+  Boreas itself controls — precisely the relationship this connection must not
+  have. This is a security property of the choice, not a portability shortcut.
+- **One connection per query.** Concurrent queries on a shared connection must
+  be matched by transaction id, and the id travelling upstream is the client's,
+  so a shared connection needs id rewriting before it can be correct at all.
+  A connection per query is correct without either, and the cost is bounded by
+  session resumption: each upstream owns one `ClientConfig` for its lifetime
+  and rustls keeps the session cache there, so every query after the first is a
+  one-round-trip resumption. Persistent pipelined connections remain the
+  follow-up, gated on the id rewriting in [Verification](verification.md).
+- `TunnelBypass` gained `tcp` alongside `udp`, because TLS needs a stream and
+  the platform obligation is identical: the socket must not travel through
+  Boreas's own TUN.
+
+**DoQ is not delivered and the reason is not TLS.** DNS over QUIC needs a QUIC
+stack, which the plan admits at P17 with `tokio-quiche` for MASQUE. Adding one
+here for DNS alone would be the largest dependency in the graph serving the
+smallest capability in it.
+
+**Gate met, and measured rather than asserted:** `examples/resolve.rs` resolves
+one name through all three transports against a live resolver. On the aarch64
+dev VM: Do53 1.9 ms, DoT 10.7 ms then 4.9 ms primed, DoH 10.3 ms then 9.7 ms
+primed. The DoT figure is the resumption working; the DoH pair is close because
+`Connection: close` forgoes keep-alive, which is the cost the h2 move recovers.
+The framing, the bounds, and every refusal are unit-tested against in-memory
+streams, because a test that needs somebody else's uptime is not a gate.
 
 ### P12: filter-list pipeline
 
@@ -743,6 +796,24 @@ window — needs the browser and the device this environment does not have and i
 
 User-store CA lifecycle, rustls, `rcgen` leaf generation, h1 and h2
 interception. Deliberately narrow: an explicit allowlist, manually maintained.
+
+**Status: blocked on local TCP termination, which is a missing phase rather
+than a missing decision.** Interception needs a byte stream to terminate, and
+this crate has none: `smoltcp` is still a dev-dependency, exercised only by
+`examples/smoltcp_scaling.rs`, and P10 recorded that its integration is gated
+on re-measurement under live traffic ([Verification](verification.md) item 6),
+which is device-bound. Every other input to P14 — an allowlist, a CA, a leaf
+generator, an `http`-shaped exchange — is downstream of having a stream, so
+building them first would be building against a substrate whose shape is not
+yet fixed. **The plan needs a phase between P10 and P14 that integrates
+smoltcp and delivers `TransportPath::LocalTermination` for real.** It is
+recorded as an open item below rather than silently absorbed into P14.
+
+**The dependency half is done.** `rustls` 0.23 is admitted, on the `ring`
+provider already in the graph for WireGuard, so no second crypto provider is
+shipped to a target that counts bytes. `tokio-rustls` and `webpki-roots` come
+with it. That was the decision open item 6 asked for, and it is what let P11's
+encrypted transports land; `rcgen` and `h2` wait for the stream.
 
 **Scope reduction proposed here.** [Filtering](filtering.md) specifies a neutral
 `Exchange` model with three wire adapters, justified by quiche and `tokio-quiche`
@@ -885,12 +956,16 @@ Record outcomes in [Verification](verification.md).
    own device and the largest fixed wakeup cost in the shell. Replacing it
    with an egress-declared next deadline requires GotaTun to expose one; carry
    this into the battery measurement.
-6. **P11's encrypted upstreams need a TLS stack the plan first admits at P14.**
-   Decide between admitting `rustls` (and with it `hickory-resolver`, or a
-   direct DoH client) at P11, and accepting Do53 to a trusted resolver until
-   P14. The privacy claim in [Filtering](filtering.md) assumes the former; the
-   dependency ordering in this document assumes the latter. One of them has to
-   move.
+6. ~~P11's encrypted upstreams need a TLS stack the plan first admits at
+   P14.~~ **Decided 2026-08-11:** `rustls` is admitted early, on the `ring`
+   provider already in the graph, and P11's DoT and DoH landed on it.
+   `hickory-resolver` was not needed once the transports turned out to be a few
+   hundred lines each.
+8. **The plan is missing a phase between P10 and P14: smoltcp integration and
+   real local termination.** P14 cannot start without a byte stream, and P6's
+   scaling verdict is explicitly provisional pending re-measurement under live
+   traffic. Insert it, sequence its device-bound measurement, and only then
+   schedule P14.
 7. Whether Boreas should rewrite the transaction id it sends upstream. Today
    the client's own id travels out, and the ephemeral source port carries the
    anti-spoofing entropy. Rewriting is transparent — `write_response` takes the
