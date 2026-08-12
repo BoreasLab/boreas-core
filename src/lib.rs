@@ -2,6 +2,7 @@ mod datapath;
 mod device;
 mod dns;
 mod egress;
+mod filter;
 mod packet;
 mod path;
 mod platform;
@@ -17,13 +18,14 @@ pub use device::{Device, Harness, SimDevice};
 pub use dns::{
     Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy, HostPolicy, HostVerdict, Judgment, Message,
     Name, Provenance, QueryPlan, Question, Rcode, Rdata, RecordType, Resolution, ResourceRecord,
-    Rewritten, SVCPARAM_ALPN, SVCPARAM_ECH, SvcParam, SvcParams, Upstream, ech_param, ech_policy,
-    plan_query, svc_params, write_failure, write_refusal, write_response,
+    Rewritten, RuleCounts, SVCPARAM_ALPN, SVCPARAM_ECH, SvcParam, SvcParams, Upstream, ech_param,
+    ech_policy, plan_query, svc_params, write_failure, write_refusal, write_response,
 };
 pub use egress::{
     Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
     WireGuardConfig, WireGuardEgress,
 };
+pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
 pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 #[cfg(unix)]

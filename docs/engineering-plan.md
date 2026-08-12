@@ -619,15 +619,59 @@ drives interception and answer synthesis. 75 tests, fmt, clippy, and
 **Unlocks:** P12 consumes the same `watch`-swappable `Arc<HostPolicy>`; P13
 reads `SVCPARAM_ALPN` from the same SvcParam walk this phase added.
 
-### P12: adblock engine and list pipeline
+### P12: filter-list pipeline
 
-Network rules and the filter-list build. Reload through the P8 `watch` channel.
+**Status: the name tier is complete; the URL tier is deferred with a reason.**
+Delivered:
 
-**Gate:** the M2 product gate — visible ad blocking across applications with no
-CA installed. Confirm the `data/test/fake-uBO-files/` GPL subtree named in
-[Verification](verification.md) is absent from the shipped artifact.
+- `src/filter.rs`, the compiler between two different worlds. A filter list is
+  hundreds of thousands of lines written against *URLs*; the tier enforceable
+  without a CA is *names*. A line classifies into a closed sum with three real
+  answers — enforceable, nothing to enforce, and *well-formed but this tier
+  cannot decide it* — and the third carries `Deferred` to name the missing
+  faculty. A rule needing a URL is not a parse error and not a silent drop; it
+  is a counted deferral, and the count is what tells an operator how much
+  coverage waits on P14.
+- Adblock Plus network syntax (`||host^`, `@@||host^`), hosts-file syntax
+  including multi-name sink lines, comments, and list headers. Exceptions beat
+  every block that matches the same query, at any specificity: that is ABP
+  semantics and the fail-open direction [Filtering](filtering.md) mandates.
+- `ListReport`, a commutative monoid under `merge` with `default()` as its
+  identity, so several lists compile independently and sum in any order. Every
+  line is accounted for exactly once, which the tests assert against a real
+  build rather than an invented one.
+- Hot reload through the P8 `watch` channel — the thing that channel was built
+  for and had no payload for until now. A build publishes a whole new index;
+  each query is decided against exactly one version, the one current when it
+  was admitted, so a reload cannot split a decision in half. The resolver reads
+  the receiver to decide and the reactor observes it to report
+  `Telemetry::PolicyReloaded`.
 
-**Completes M2.**
+**Deferring is the design, not a shortcut.** `||ads.example^$third-party`
+blocks a host only in third-party context, and there is no third party at the
+name tier — the same host is first-party to itself. Compiling it into a name
+rule would break the site that owns it. The stated invariant is that every
+divergence from Adblock Plus goes toward matching *less*: `||example.com`
+anchors at a domain boundary in ABP, which also matches
+`example.com.evil.example`, and the suffix index does not. A compiled list can
+under-block and cannot over-block.
+
+**The `adblock` crate is not admitted here.** Its engine matches URLs, and
+there are no URLs until interception exists, so admitting it now would be a
+dependency with no executable path — the rule [AGENTS.md](../AGENTS.md) states.
+It belongs at P14, where `http::Request` first supplies what it needs, and the
+`data/test/fake-uBO-files/` packaging check in
+[Verification](verification.md) moves there with it.
+
+**Gate:** `tests/dns.rs` compiles a mixed ABP-and-hosts list into a live
+session, publishes it under a running reactor, and asserts that a name which
+resolved a moment earlier is now refused locally with no upstream query, that
+an exception in the same list still beats the more specific block above it, and
+that the swap is reported with the rules it holds. The M2 *product* gate —
+visible ad blocking across applications on a device — needs the device this
+environment does not have and is **unexercised**, like P9's and P10's.
+
+**Completes the M2 mechanism; the M2 product gate stays open.**
 
 ### P13: Protocol steering
 

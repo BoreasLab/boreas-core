@@ -40,7 +40,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{Semaphore, mpsc, watch},
     time::{Instant as TokioInstant, sleep_until},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -48,7 +48,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     Accepts, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit, FlowEvent, HostPolicy,
     InternalEndpoint, Message, PacketEgress, Pooled, Provenance, QueryPlan, Rcode, Resolution,
-    SendOutcome, Side, Transmit, Upstream, plan_query, write_failure, write_refusal,
+    RuleCounts, SendOutcome, Side, Transmit, Upstream, plan_query, write_failure, write_refusal,
     write_response,
 };
 
@@ -145,6 +145,10 @@ pub enum Telemetry {
     /// Queries dropped because the resolver was saturated. The client's stub
     /// resolver retries; this is how an operator sees that it had to.
     QueriesDropped(u64),
+    /// A new host policy took effect, with the rules it holds. Emitted on the
+    /// swap rather than counted, because a reload is an operator action and
+    /// there is one of them, not one per packet.
+    PolicyReloaded(RuleCounts),
     /// Telemetry observations this channel could not accept.
     Lost(u64),
 }
@@ -165,9 +169,18 @@ pub struct Session<D, N, E, U> {
     /// The DNS upstream. Never consulted by a session configured with
     /// [`crate::DnsPolicy::Forward`], because the core emits no queries.
     pub upstream: U,
-    /// Host rules. Shared rather than owned because P12 swaps them under a
-    /// running reactor.
-    pub policy: Arc<HostPolicy>,
+    /// Host rules, hot-swappable.
+    ///
+    /// A `watch` channel rather than an `Arc` because a filter-list build
+    /// replaces the whole index at once and must not stall the datapath doing
+    /// it: the sender publishes a freshly compiled policy, and each query is
+    /// decided against exactly one version — the one current when it was
+    /// admitted — so a reload mid-flight cannot split a decision in half.
+    ///
+    /// Both tasks hold a receiver, which is what a `watch` channel is for: the
+    /// resolver reads it to decide, and the reactor observes the change to
+    /// report it.
+    pub policy: watch::Receiver<Arc<HostPolicy>>,
 }
 
 /// A running reactor and the handles that talk to it.
@@ -221,7 +234,7 @@ impl Shell {
 
         let resolver = tokio::spawn(resolver_loop(
             Arc::new(upstream),
-            policy,
+            policy.clone(),
             query_rx,
             answer_tx,
             shutdown.clone(),
@@ -232,6 +245,7 @@ impl Shell {
             device,
             network,
             egress,
+            policy,
             Queries {
                 out: query_tx,
                 back: answer_rx,
@@ -523,7 +537,7 @@ struct Queries {
 /// them and no pooled buffer outlives the shell.
 async fn resolver_loop<U: DnsUpstream + 'static>(
     upstream: Arc<U>,
-    policy: Arc<HostPolicy>,
+    policy: watch::Receiver<Arc<HostPolicy>>,
     mut queries: mpsc::Receiver<DnsQuery>,
     answers: mpsc::Sender<Answer>,
     shutdown: CancellationToken,
@@ -543,7 +557,10 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
             break;
         };
         let upstream = Arc::clone(&upstream);
-        let policy = Arc::clone(&policy);
+        // One snapshot, taken as the query is admitted. The borrow is released
+        // before the task is spawned, so no guard crosses an `await` and a
+        // reload cannot change a decision half-way through it.
+        let policy = Arc::clone(&policy.borrow());
         let answers = answers.clone();
         tracker.spawn(async move {
             let _permit = permit;
@@ -722,6 +739,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     mut device: D,
     mut network: N,
     mut egress: E,
+    mut policy: watch::Receiver<Arc<HostPolicy>>,
     mut queries: Queries,
     mut control: mpsc::Receiver<Control>,
     mut datagrams: mpsc::Receiver<Datagram>,
@@ -792,6 +810,14 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 // The device itself failed. That is not recoverable here.
                 Err(error) => return Err(error),
             },
+
+            // A filter-list build replaced the policy. `changed` is
+            // cancel-safe, so losing this arm to a busier one costs nothing:
+            // the next pass still sees the change.
+            Ok(()) = policy.changed() => {
+                let counts = policy.borrow_and_update().len();
+                telemetry.emit(Telemetry::PolicyReloaded(counts));
+            }
 
             // A resolved query. Bounded by the answer channel, and addressed
             // back to the client from the resolver address it asked.

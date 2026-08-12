@@ -26,8 +26,8 @@ use boreas_core::{
     Accepts, AsyncDevice, AsyncNetwork, BufferPool, DNS_PORT, DatagramFidelity, Datapath,
     DnsPolicy, DnsUpstream, EchOutcome, EgressCapabilities, EgressEmit, EgressError, FilterPolicy,
     HostPolicy, IngressPacket, InternalEndpoint, Message, Mtu, NatBehavior, PacketEgress,
-    Provenance, Rcode, RecordType, ResourceRecord, SVCPARAM_ALPN, SVCPARAM_ECH, Session, Shell,
-    Telemetry, Transport, Upstream, ech_param, svc_params, write_udp,
+    Provenance, Rcode, RecordType, ResourceRecord, RuleCounts, SVCPARAM_ALPN, SVCPARAM_ECH,
+    Session, Shell, Telemetry, Transport, Upstream, ech_param, svc_params, write_udp,
 };
 
 const CLIENT: InternalEndpoint = InternalEndpoint {
@@ -308,7 +308,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
             upstream: ScriptedUpstream {
                 consulted: Arc::clone(&consulted),
             },
-            policy: Arc::new(policy),
+            policy: tokio::sync::watch::channel(Arc::new(policy)).1,
         },
     );
 
@@ -473,7 +473,7 @@ async fn a_forwarding_session_never_intercepts() {
             upstream: ScriptedUpstream {
                 consulted: Arc::clone(&consulted),
             },
-            policy: Arc::new(HostPolicy::new()),
+            policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
         },
     );
 
@@ -488,6 +488,120 @@ async fn a_forwarding_session_never_intercepts() {
             .is_err()
     );
     assert_eq!(consulted.load(Ordering::Relaxed), 0);
+
+    shell.shutdown().await.expect("clean shutdown");
+    assert_eq!(pool.available(), 64);
+}
+
+#[tokio::test]
+async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
+    // The M2 mechanism: a compiled list replaces the whole index under a live
+    // reactor, and the next query is decided by the new one. This is the P8
+    // `watch` channel finally carrying what it was built for.
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
+    let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(16);
+    let consulted = Arc::new(AtomicU64::new(0));
+    let (publish, policy) = tokio::sync::watch::channel(Arc::new(HostPolicy::new()));
+
+    let pool = pool();
+    let mut shell = Shell::start(
+        datapath(Arc::clone(&pool)),
+        Session {
+            device: MockDevice {
+                inbound: inbound_rx,
+                sent: sent_tx,
+            },
+            network: SilentNetwork,
+            egress: NullEgress,
+            upstream: ScriptedUpstream {
+                consulted: Arc::clone(&consulted),
+            },
+            policy,
+        },
+    );
+
+    let mut ask = async |id: u16| {
+        inbound_tx
+            .send(dns_packet(&query(id, "ads.tracker.example", RecordType::A)))
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(5), sent_rx.recv())
+            .await
+            .expect("the shell answered")
+            .expect("device channel open");
+        Message::parse(&dns_answer(&packet))
+            .expect("a well-formed answer")
+            .rcode()
+    };
+
+    // An empty policy blocks nothing, so the name resolves upstream.
+    assert_eq!(ask(1).await, Rcode::NoError);
+    assert_eq!(consulted.load(Ordering::Relaxed), 1);
+
+    // Compile a list and publish it. Adblock Plus and hosts-file syntax in one
+    // build, with an exception that must survive the more specific block.
+    let mut built = HostPolicy::new();
+    let report = built.extend_from_list(
+        "! test list\n\
+         ||tracker.example^\n\
+         0.0.0.0 beacon.example\n\
+         ||tracker.example^$third-party\n\
+         @@||safe.tracker.example^\n\
+         tracker.example##.ad\n",
+    );
+    assert_eq!(report.blocked, 2);
+    assert_eq!(report.allowed, 1);
+    assert_eq!(report.deferred.needs_request_context, 1);
+    assert_eq!(report.deferred.cosmetic, 1);
+    let counts = built.len();
+    publish
+        .send(Arc::new(built))
+        .expect("the reactor is running");
+
+    // The same query is now refused, and nothing left the device for it.
+    assert_eq!(ask(2).await, Rcode::NameError);
+    assert_eq!(
+        consulted.load(Ordering::Relaxed),
+        1,
+        "a blocked name costs no upstream query"
+    );
+
+    // The exception in the same list still wins over the block above it.
+    inbound_tx
+        .send(dns_packet(&query(3, "safe.tracker.example", RecordType::A)))
+        .await
+        .unwrap();
+    let packet = tokio::time::timeout(Duration::from_secs(5), sent_rx.recv())
+        .await
+        .expect("the shell answered")
+        .expect("device channel open");
+    assert_eq!(
+        Message::parse(&dns_answer(&packet)).unwrap().rcode(),
+        Rcode::NoError
+    );
+    assert_eq!(consulted.load(Ordering::Relaxed), 2);
+
+    // And the swap was reported, with what the new policy holds.
+    let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match shell.next_telemetry().await {
+                Some(Telemetry::PolicyReloaded(counts)) => return counts,
+                Some(_) => continue,
+                None => panic!("telemetry closed"),
+            }
+        }
+    })
+    .await
+    .expect("a reload report");
+    assert_eq!(
+        reported,
+        RuleCounts {
+            allowed: 1,
+            blocked: 2,
+            inspected: 0,
+        }
+    );
+    assert_eq!(reported, counts);
 
     shell.shutdown().await.expect("clean shutdown");
     assert_eq!(pool.available(), 64);

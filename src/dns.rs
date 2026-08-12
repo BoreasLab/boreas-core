@@ -685,17 +685,29 @@ pub struct Judgment {
 /// Host rules, indexed for suffix lookup.
 ///
 /// A rule covers a name and everything under it, so the lookup walks the
-/// query's suffixes from most to least specific and stops at the first match:
-/// **the most specific rule wins, and at equal specificity blocking wins over
-/// inspection**, because a host that is refused is never also intercepted.
+/// query's suffixes from most to least specific. Two laws decide the winner:
 ///
-/// O(labels) hash probes per query, at most two per label, and a name's
+/// - **An exception wins outright, at any specificity.** That is Adblock Plus
+///   semantics for network rules, and it is the fail-open direction
+///   [Filtering](../docs/filtering.md) mandates: a rule that says "never touch
+///   this" must not be overridden by a more specific rule that says "block".
+/// - **Otherwise the most specific rule wins, and at equal specificity
+///   blocking beats inspection**, because a host that is refused is never also
+///   intercepted.
+///
+/// O(labels) hash probes per query, at most three per label, and a name's
 /// 253-character limit bounds labels at 127 — typically three to five. The
-/// keys are `HashSet`'s default SipHash with a per-process random seed, which
-/// matters because qnames are attacker-chosen: any application on the device
-/// can ask for any name it likes.
+/// exception law is what costs the full walk rather than an early exit: a
+/// block found at the first label must still yield to an exception found at
+/// the last. The keys are `HashSet`'s default SipHash with a per-process
+/// random seed, which matters because qnames are attacker-chosen: any
+/// application on the device can ask for any name it likes.
+///
+/// Space is O(distinct rule hosts), which a full filter-list build puts in the
+/// hundreds of thousands; each key is its own name's bytes and nothing else.
 #[derive(Default)]
 pub struct HostPolicy {
+    allowed: HashSet<Box<[u8]>>,
     blocked: HashSet<Box<[u8]>>,
     inspected: HashSet<Box<[u8]>>,
 }
@@ -711,9 +723,29 @@ impl HostPolicy {
         Self::insert(&mut self.blocked, name)
     }
 
+    /// Adds an exception. It beats every blocking and inspection rule that
+    /// matches the same query, however specific they are.
+    pub fn allow(&mut self, name: &str) -> bool {
+        Self::insert(&mut self.allowed, name)
+    }
+
     /// Adds an inspection rule; see [`HostVerdict::Inspected`].
     pub fn inspect(&mut self, name: &str) -> bool {
         Self::insert(&mut self.inspected, name)
+    }
+
+    /// How many rules of each kind this policy holds. The number an operator
+    /// reads back after a list reload.
+    pub fn len(&self) -> RuleCounts {
+        RuleCounts {
+            allowed: self.allowed.len(),
+            blocked: self.blocked.len(),
+            inspected: self.inspected.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allowed.is_empty() && self.blocked.is_empty() && self.inspected.is_empty()
     }
 
     fn insert(set: &mut HashSet<Box<[u8]>>, name: &str) -> bool {
@@ -726,25 +758,56 @@ impl HostPolicy {
         }
     }
 
+    /// Adds an already-parsed name, which is how the filter-list compiler
+    /// avoids re-normalizing what it has just parsed.
+    pub(crate) fn insert_name(&mut self, verdict: HostVerdict, name: &Name) {
+        let set = match verdict {
+            HostVerdict::Allowed => &mut self.allowed,
+            HostVerdict::Blocked => &mut self.blocked,
+            HostVerdict::Inspected => &mut self.inspected,
+        };
+        set.insert(name.as_bytes().into());
+    }
+
     pub fn judge(&self, name: &Name) -> Judgment {
+        let mut decided = None;
         for suffix in name.suffixes() {
-            for (set, verdict) in [
-                (&self.blocked, HostVerdict::Blocked),
-                (&self.inspected, HostVerdict::Inspected),
-            ] {
-                if set.contains(suffix) {
-                    return Judgment {
-                        verdict,
-                        matched: Some(Name::from_normalized(suffix)),
-                    };
+            // The exception law: an allow anywhere in the chain ends the
+            // search, which is why the walk cannot stop at the first block.
+            if self.allowed.contains(suffix) {
+                return Judgment {
+                    verdict: HostVerdict::Allowed,
+                    matched: Some(Name::from_normalized(suffix)),
+                };
+            }
+            if decided.is_none() {
+                for (set, verdict) in [
+                    (&self.blocked, HostVerdict::Blocked),
+                    (&self.inspected, HostVerdict::Inspected),
+                ] {
+                    if set.contains(suffix) {
+                        decided = Some(Judgment {
+                            verdict,
+                            matched: Some(Name::from_normalized(suffix)),
+                        });
+                        break;
+                    }
                 }
             }
         }
-        Judgment {
+        decided.unwrap_or(Judgment {
             verdict: HostVerdict::Allowed,
             matched: None,
-        }
+        })
     }
+}
+
+/// Rules held, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleCounts {
+    pub allowed: usize,
+    pub blocked: usize,
+    pub inspected: usize,
 }
 
 /// What must happen to the `ech` SvcParam of this host's answers.
