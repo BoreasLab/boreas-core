@@ -320,6 +320,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
                 consulted: Arc::clone(&consulted),
             },
             policy: tokio::sync::watch::channel(Arc::new(policy)).1,
+            termination: None,
         },
     );
 
@@ -499,6 +500,7 @@ async fn a_forwarding_session_never_intercepts() {
                 consulted: Arc::clone(&consulted),
             },
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
         },
     );
 
@@ -542,6 +544,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
                 consulted: Arc::clone(&consulted),
             },
             policy,
+            termination: None,
         },
     );
 
@@ -677,6 +680,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
                 consulted: Arc::clone(&consulted),
             },
             policy: tokio::sync::watch::channel(Arc::new(policy)).1,
+            termination: None,
         },
     );
 

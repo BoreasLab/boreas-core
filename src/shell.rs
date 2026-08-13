@@ -147,6 +147,11 @@ pub enum Telemetry {
     /// swap rather than counted, because a reload is an operator action and
     /// there is one of them, not one per packet.
     PolicyReloaded(RuleCounts),
+    /// Packets of terminated flows the local TCP stack could not accept: its
+    /// queue was full, or the session routed a flow to termination without a
+    /// terminator configured. TCP retransmits, so this is congestion or
+    /// misconfiguration rather than data loss.
+    TerminationDropped(u64),
     /// Telemetry observations this channel could not accept.
     Lost(u64),
 }
@@ -179,6 +184,24 @@ pub struct Session<D, N, E, U> {
     /// resolver reads it to decide, and the reactor observes the change to
     /// report it.
     pub policy: watch::Receiver<Arc<HostPolicy>>,
+    /// The local TCP terminator, when this session terminates flows.
+    pub termination: Option<Termination>,
+}
+
+/// The local TCP terminator's two channels, from the reactor's side.
+///
+/// Present only for a session that terminates flows. A pure packet-path
+/// session never routes a flow to [`crate::TransportPath::LocalTermination`],
+/// so it needs no stack and carries `None` — which is why this is an option
+/// rather than a always-present pair of idle channels.
+pub struct Termination {
+    /// Packets of terminated flows, offered to the terminator without waiting:
+    /// a full queue is a counted drop, and TCP retransmits, exactly as the
+    /// forward path treats congestion.
+    pub packets: mpsc::Sender<Pooled>,
+    /// Segments the terminator produced for the client. The reactor owns the
+    /// device, so they are written here rather than there.
+    pub replies: mpsc::Receiver<Vec<u8>>,
 }
 
 /// A running reactor and the handles that talk to it.
@@ -228,6 +251,7 @@ impl Shell {
             egress,
             upstream,
             policy,
+            termination,
         } = session;
 
         let resolver = tokio::spawn(resolver_loop(
@@ -254,6 +278,7 @@ impl Shell {
                 channel: telemetry_tx,
                 lost: 0,
             },
+            termination,
             shutdown.clone(),
         ));
 
@@ -592,6 +617,7 @@ struct Counters {
     egress_rejected: u64,
     queries_dropped: u64,
     quic_steered: u64,
+    termination_dropped: u64,
 }
 
 impl Counters {
@@ -615,6 +641,19 @@ impl Counters {
         report(&mut self.egress_rejected, Telemetry::EgressRejected);
         report(&mut self.queries_dropped, Telemetry::QueriesDropped);
         report(&mut self.quic_steered, Telemetry::QuicSteered);
+        report(&mut self.termination_dropped, Telemetry::TerminationDropped);
+    }
+}
+
+/// The terminator's next segment for the client, or a future that never
+/// completes when this session has no terminator.
+///
+/// `recv` is cancel-safe, so losing this arm of the reactor's `select!` to a
+/// busier one costs nothing: the next pass still sees the segment.
+async fn next_reply(termination: &mut Option<Termination>) -> Option<Vec<u8>> {
+    match termination {
+        Some(termination) => termination.replies.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -642,6 +681,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     mut control: mpsc::Receiver<Control>,
     mut datagrams: mpsc::Receiver<Datagram>,
     mut telemetry: TelemetrySink,
+    mut termination: Option<Termination>,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let mut tun_buf = vec![0u8; MAX_PACKET_BYTES];
@@ -664,6 +704,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         // The core's own next deadline, not a poll interval. `None` means no
         // state machine has pending work, so the reactor waits only for its
         // reporting tick, the egress's tick, and its input sources.
+        let mut reply: Option<Vec<u8>> = None;
         let core_deadline = datapath.poll_timeout().map(TokioInstant::from_std);
         let wake = core_deadline
             .into_iter()
@@ -742,7 +783,21 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 Err(error) => return Err(error),
             },
 
+            // A segment the terminator produced. It is only captured here:
+            // another arm holds `device` for its read, so the write happens
+            // after the `select!` rather than inside this handler.
+            Some(segment) = next_reply(&mut termination) => {
+                reply = Some(segment);
+            }
+
             () = &mut sleep => {}
+        }
+
+        // The terminator's segments are the client's own connection being
+        // served, so they go straight down the device: they are already IP
+        // packets addressed to the client and the core has nothing to add.
+        if let Some(segment) = reply.take() {
+            device.send(&segment).await?;
         }
 
         let now = Instant::now();
@@ -765,6 +820,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             &mut queries.out,
             &mut telemetry,
             &mut counters,
+            &mut termination,
         )
         .await?;
 
@@ -784,6 +840,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         &mut queries.out,
         &mut telemetry,
         &mut counters,
+        &mut termination,
     )
     .await?;
     counters.flush(&mut telemetry);
@@ -808,6 +865,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     queries: &mut mpsc::Sender<DnsQuery>,
     telemetry: &mut TelemetrySink,
     counters: &mut Counters,
+    termination: &mut Option<Termination>,
 ) -> io::Result<()> {
     loop {
         for emit in emits.drain(..) {
@@ -850,6 +908,30 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     while let Some(query) = datapath.poll_query() {
         if queries.try_send(query).is_err() {
             counters.queries_dropped += 1;
+        }
+    }
+
+    // Packets of terminated flows go to the local TCP stack, which lives in
+    // its own task for the same reason the resolver does: serving a connection
+    // awaits, and the reactor must not. A full queue is a counted drop and TCP
+    // retransmits, which is the discipline the forward path already uses.
+    while let Some(packet) = datapath.poll_terminate() {
+        match termination {
+            Some(termination) => {
+                if termination.packets.try_send(packet).is_err() {
+                    counters.termination_dropped += 1;
+                }
+            }
+            // A flow planned for termination with no terminator configured is a
+            // misconfiguration, and counting it is how an operator sees it.
+            None => counters.termination_dropped += 1,
+        }
+    }
+
+    // Whatever the terminator has ready beyond the one the `select!` captured.
+    if let Some(termination) = termination {
+        while let Ok(segment) = termination.replies.try_recv() {
+            device.send(&segment).await?;
         }
     }
 

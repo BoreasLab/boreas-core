@@ -21,10 +21,12 @@ The core currently provides:
 - an h1/h2 interception exchange on hyper, with a URL-tier filter seam, that
   never bridges HTTP versions
 
-The upstream dialer (TCP plus TLS with tunnel bypass) and the reactor
-integration that drives termination and the exchange live are under
-construction, as are the platform on-device gates, the remaining filtering
-tiers, and egress breadth.
+- a reactor bridge presenting each terminated connection as an async stream,
+  with backpressure carried by TCP's own window rather than by dropping bytes
+
+The upstream dialer (TCP plus TLS with tunnel bypass) and the session assembly
+that chooses between interception and splice are under construction, as are the
+platform on-device gates, the remaining filtering tiers, and egress breadth.
 
 ## Documentation
 

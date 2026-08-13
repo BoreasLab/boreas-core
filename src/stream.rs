@@ -329,8 +329,11 @@ impl LocalStack {
                 RecvError::InvalidState => StreamError::WouldBlock,
             });
         }
-        // No buffered bytes: distinguish "not yet" from "never again".
-        if socket.may_recv() {
+        // No buffered bytes: distinguish "not yet" from "never again". A socket
+        // still completing its handshake is "not yet" — `may_recv` is false
+        // there, and reporting that as `Closed` would hand the consumer a
+        // spurious end-of-stream before the connection had even opened.
+        if socket.may_recv() || handshaking(socket.state()) {
             Err(StreamError::WouldBlock)
         } else {
             Err(StreamError::Closed)
@@ -342,7 +345,11 @@ impl LocalStack {
     pub fn send(&mut self, id: StreamId, buf: &[u8]) -> Result<usize, StreamError> {
         let socket = self.socket_mut(id)?;
         if !socket.may_send() {
-            return Err(StreamError::Closed);
+            return Err(if handshaking(socket.state()) {
+                StreamError::WouldBlock
+            } else {
+                StreamError::Closed
+            });
         }
         match socket.send_slice(buf) {
             Ok(0) => Err(StreamError::WouldBlock),
@@ -476,8 +483,20 @@ fn endpoint(address: IpAddr, port: u16) -> InternalEndpoint {
     InternalEndpoint { address, port }
 }
 
+/// Whether the connection has not yet reached `ESTABLISHED`.
+///
+/// A connection is published to its consumer as soon as the listener commits to
+/// it, which is `SYN-RECEIVED` — one ACK before the stream can carry bytes.
+/// `smoltcp` reports neither `may_recv` nor `may_send` there, and the two
+/// readings are indistinguishable from a peer that has closed unless the state
+/// itself is consulted. Naming the pre-established set is what keeps
+/// [`StreamError::Closed`] meaning "never again" rather than "not yet".
+fn handshaking(state: State) -> bool {
+    matches!(state, State::Listen | State::SynSent | State::SynReceived)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use smoltcp::wire::IpEndpoint;
     use std::{
@@ -513,15 +532,25 @@ mod tests {
     /// terminator — it needs no any-IP, only a route to reach the off-link
     /// server. This is a real peer performing a real handshake; the test asserts
     /// nothing the TCP state machine did not actually produce.
-    struct Client {
+    pub(crate) struct Client {
         device: QueueDevice,
         iface: Interface,
         sockets: SocketSet<'static>,
         handle: SocketHandle,
+        /// Milliseconds on this client's own virtual clock, advanced by
+        /// [`Client::tick`]. The terminator under test runs on the wall clock,
+        /// so the two need not agree: TCP only requires each side's clock to
+        /// advance monotonically.
+        ms: u64,
     }
 
     impl Client {
-        fn connect(source: Ipv4Addr, local_port: u16, server: Ipv4Addr, server_port: u16) -> Self {
+        pub(crate) fn connect(
+            source: Ipv4Addr,
+            local_port: u16,
+            server: Ipv4Addr,
+            server_port: u16,
+        ) -> Self {
             let mut device = QueueDevice {
                 inbound: VecDeque::new(),
                 outbound: VecDeque::new(),
@@ -550,6 +579,7 @@ mod tests {
                 iface,
                 sockets,
                 handle,
+                ms: 0,
             }
         }
 
@@ -561,6 +591,39 @@ mod tests {
 
         fn socket(&mut self) -> &mut Socket<'static> {
             self.sockets.get_mut::<Socket>(self.handle)
+        }
+
+        /// Advances this client's clock and lets its state machine run. The
+        /// unit of progress for a caller driving the client against a
+        /// terminator that lives in another task.
+        pub(crate) fn tick(&mut self) {
+            self.ms += 20;
+            let now = SmolInstant::from_millis(i64::try_from(self.ms).unwrap_or(i64::MAX));
+            self.poll(now);
+        }
+
+        /// Everything the client has put on the wire since the last call.
+        pub(crate) fn take_outbound(&mut self) -> Vec<Vec<u8>> {
+            self.device.outbound.drain(..).collect()
+        }
+
+        /// Hands the client one packet from the wire.
+        pub(crate) fn deliver(&mut self, packet: Vec<u8>) {
+            self.device.inbound.push_back(packet);
+        }
+
+        /// Queues application bytes for the peer.
+        pub(crate) fn send(&mut self, bytes: &[u8]) -> Result<usize, SendError> {
+            self.socket().send_slice(bytes)
+        }
+
+        /// Drains whatever application bytes have arrived.
+        pub(crate) fn take_received(&mut self) -> Vec<u8> {
+            let mut buf = [0u8; 512];
+            match self.socket().recv_slice(&mut buf) {
+                Ok(read) => buf[..read].to_vec(),
+                Err(_) => Vec::new(),
+            }
         }
     }
 
@@ -629,6 +692,40 @@ mod tests {
             .recv_slice(&mut client_buf)
             .expect("client read");
         assert_eq!(&client_buf[..read], response);
+    }
+
+    #[test]
+    fn a_half_open_connection_reports_not_yet_rather_than_closed() {
+        // A connection is published as soon as the listener commits to it,
+        // which is SYN-RECEIVED — one ACK before it can carry bytes. Both
+        // directions must say `WouldBlock` there. Reporting `Closed` would
+        // hand the consumer an end-of-stream before the stream existed, which
+        // is exactly the defect that made the bridge tear connections down on
+        // arrival.
+        let base = Instant::now();
+        let mut server = LocalStack::new(mtu(), &[HTTPS], limits(64, 4), base);
+        let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
+
+        // One half-round: the client's SYN reaches the terminator, but its ACK
+        // of the SYN-ACK never does, so the socket stays in SYN-RECEIVED.
+        client.tick(); // emits the SYN
+        for packet in client.take_outbound() {
+            server.push(&packet);
+        }
+        server.poll(base);
+        let accepted = server.poll_accept().expect("the listener committed");
+
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            server.recv(accepted.id, &mut buf),
+            Err(StreamError::WouldBlock),
+            "a handshaking socket has nothing yet, not nothing ever"
+        );
+        assert_eq!(
+            server.send(accepted.id, b"early"),
+            Err(StreamError::WouldBlock),
+            "and it cannot be written to yet either"
+        );
     }
 
     #[test]

@@ -314,6 +314,9 @@ pub struct Datapath {
     events: VecDeque<FlowEvent>,
     transmits: VecDeque<Transmit>,
     queries: VecDeque<DnsQuery>,
+    /// Packets of terminated flows, waiting for the shell's local TCP stack.
+    /// Pooled, so pending termination cannot outgrow the shared budget.
+    terminate: VecDeque<Pooled>,
 }
 
 impl Datapath {
@@ -351,6 +354,7 @@ impl Datapath {
             events: VecDeque::new(),
             transmits: VecDeque::new(),
             queries: VecDeque::new(),
+            terminate: VecDeque::new(),
         })
     }
 
@@ -422,6 +426,15 @@ impl Datapath {
                 if self.open_flow(endpoint, plan, now)? {
                     self.events.push_back(FlowEvent::StreamOpened(endpoint));
                 }
+                // A terminated flow's packets belong to the local TCP stack,
+                // which lives in the shell: the core owns no socket and cannot
+                // run a state machine that must answer with segments of its
+                // own. Only the client's side is captured — the terminator
+                // originates its own upstream connection, so nothing arrives
+                // for this flow from the egress.
+                if from == Side::Tunnel {
+                    self.capture_for_termination(buf);
+                }
                 Ok(())
             }
             IngressAction::OpenDatagram(plan) => {
@@ -476,6 +489,30 @@ impl Datapath {
     /// The next intercepted query, if any.
     pub fn poll_query(&mut self) -> Option<DnsQuery> {
         self.queries.pop_front()
+    }
+
+    /// Copies one packet of a terminated flow for the local TCP stack.
+    ///
+    /// The whole IP packet travels, not its payload: the terminator is a real
+    /// stack that parses headers, computes checksums, and answers with
+    /// segments of its own. A packet that will not fit the shared budget is a
+    /// counted drop, and TCP retransmits — which is the same discipline the
+    /// forward path already applies to congestion.
+    fn capture_for_termination(&mut self, buf: &[u8]) {
+        match self.pool.take(buf) {
+            Some(packet) => self.terminate.push_back(packet),
+            None => self.events.push_back(FlowEvent::TransmitDropped),
+        }
+    }
+
+    /// The next packet bound for the local TCP stack, if any.
+    ///
+    /// The dual of [`poll_transmit`](Self::poll_transmit) for terminated flows:
+    /// those packets are not forwarded anywhere, they are *consumed* by a stack
+    /// the shell owns, and whatever it answers re-enters as an ordinary
+    /// tunnel-bound write.
+    pub fn poll_terminate(&mut self) -> Option<Pooled> {
+        self.terminate.pop_front()
     }
 
     /// Opens the steering backstop for the addresses an inspected host just
@@ -733,6 +770,23 @@ mod tests {
         .unwrap()
     }
 
+    /// A minimal wire-valid IPv4 TCP SYN to port 443, which a session
+    /// configured for termination routes to the local stack.
+    fn tcp_syn() -> [u8; 40] {
+        let mut packet = [0u8; 40];
+        packet[0] = 0x45; // IPv4, 5-word header
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
+        packet[8] = 64; // TTL
+        packet[9] = 6; // TCP
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&49152u16.to_be_bytes()); // source port
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes()); // destination
+        packet[32] = 0x50; // data offset: 5 words
+        packet[33] = 0x02; // SYN
+        packet
+    }
+
     fn udp_packet() -> [u8; 28] {
         [
             0x45, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
@@ -807,6 +861,34 @@ mod tests {
             path.poll_event(),
             Some(FlowEvent::FlowTornDown(_))
         ));
+    }
+
+    #[test]
+    fn a_terminated_flow_hands_its_packets_to_the_local_stack() {
+        // On a terminated path a TCP packet is not forwarded anywhere: it is
+        // consumed by the local stack the shell owns. The core captures it
+        // whole — headers included, because the terminator is a real stack —
+        // and emits no transmit for it.
+        let mut path = datapath(crate::DatagramFidelity::Native);
+        let now = Instant::now();
+        let syn = tcp_syn();
+
+        path.on_tun_packet(&syn, now).unwrap();
+        assert!(matches!(
+            path.poll_event(),
+            Some(FlowEvent::StreamOpened(_))
+        ));
+        assert!(
+            path.poll_transmit().is_none(),
+            "a terminated packet is consumed, not forwarded"
+        );
+        let captured = path.poll_terminate().expect("the packet was captured");
+        assert_eq!(
+            *captured,
+            syn[..],
+            "the whole packet travels, headers and all"
+        );
+        assert!(path.poll_terminate().is_none(), "exactly one capture");
     }
 
     #[test]

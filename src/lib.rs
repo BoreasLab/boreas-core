@@ -13,6 +13,7 @@ mod pool;
 mod reassembly;
 mod shell;
 mod stream;
+mod terminate;
 mod udp;
 mod upstream;
 
@@ -44,8 +45,11 @@ pub use platform::AndroidTun;
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
-pub use shell::{AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry};
+pub use shell::{
+    AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry, Termination,
+};
 pub use stream::{LocalStack, StreamError, StreamId, Terminated, TerminationLimits};
+pub use terminate::{Accepted, TerminatedStream, run_terminator};
 pub use upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
     DotUpstream, TunnelBypass, UpstreamError,

@@ -288,6 +288,7 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
             egress: PassThroughEgress { pool },
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
         },
     );
 
@@ -330,6 +331,7 @@ async fn the_timer_is_armed_against_the_core_deadline_not_a_poll_interval() {
             egress: PassThroughEgress { pool },
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
         },
     );
 
@@ -364,6 +366,7 @@ async fn a_malformed_packet_is_counted_not_fatal() {
             egress: PassThroughEgress { pool },
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
         },
     );
     let wire = wire.inbound;
@@ -445,6 +448,7 @@ async fn a_datagram_producer_is_never_blocked_and_a_refusal_frees_its_buffer() {
             egress: PassThroughEgress { pool: pool(64) },
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
         },
     );
     let pool = producer;
@@ -482,6 +486,7 @@ async fn control_messages_reach_the_core_in_order() {
             egress: PassThroughEgress { pool },
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
         },
     );
 

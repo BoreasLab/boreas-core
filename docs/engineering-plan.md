@@ -829,11 +829,33 @@ distinct `Closed` from "nothing yet", and the socket-ceiling refusal. The
 device gate — the same handshake over a real TUN — needs the device this
 environment does not have.
 
-**Still deferred here:** wiring `LocalStack` into the reactor. The terminator
-is driven directly in its tests, the way `Datapath` is; the async bridge that
-feeds it from the running reactor and spawns a MITM task per accepted stream is
-not yet built. Nothing depends on that wiring for the substrate's correctness,
-which is the point of testing it sans-io first.
+- `src/terminate.rs`, the reactor bridge. `run_terminator` drives the stack as
+  a **second task**, for the same reason the resolver is one: serving a
+  terminated connection awaits, and an HTTP round trip must never sit in front
+  of the packet path. `TerminatedStream` presents each connection as an
+  ordinary `AsyncRead + AsyncWrite`, so `hyper` consumes it without knowing a
+  TUN exists, and its half-close semantics are the type's own — an exhausted
+  read is the peer's FIN, a shutdown write sends one.
+- **Backpressure is TCP's own window, never a drop.** A datagram may be dropped
+  under load because a stub resolver retries; a byte may not, because a dropped
+  byte is a corrupted response. The pump reserves channel capacity *before*
+  reading a socket, so when the consumer is slow the bytes stay in `smoltcp`'s
+  receive buffer, the advertised window shrinks, and the peer stops sending.
+  The bound is enforced by declining to read, which is the mechanism TCP
+  provides for exactly this.
+- The datapath captures a terminated flow's packets into a pooled queue and the
+  reactor forwards them, mirroring DNS interception exactly: the core captures,
+  the shell polls, the effect happens elsewhere, and the reply re-enters as an
+  ordinary tunnel-bound write. `Telemetry::TerminationDropped` counts a full
+  terminator queue or a session that planned termination without one.
+
+**One defect the bridge found and fixed.** A connection is published as soon as
+its listener commits, which is `SYN-RECEIVED` — one ACK before it can carry
+bytes. `smoltcp` reports neither `may_recv` nor `may_send` there, so the first
+`recv` read as `Closed`: the consumer saw end-of-stream before the stream
+existed and tore every connection down on arrival. `LocalStack` now names the
+pre-established states explicitly, so `Closed` means "never again" rather than
+"not yet", and a regression test holds the line.
 
 ### P14: MITM, allowlist-only
 
@@ -890,10 +912,10 @@ CA-to-resolver-to-server-to-upstream chain, proven without a device.
 
 **Still to build:** the upstream *dialer* — a TCP connect plus rustls client
 handshake to the real server, bypassing the tunnel exactly as the DNS
-upstream's `TunnelBypass` does — and the reactor integration that drives
-`LocalStack`, terminates each accepted stream, dials its upstream, and spawns a
-`run_exchange` per connection. The exchange itself takes both streams as
-arguments, so those two are the remaining seams, not new protocol code. The
+upstream's `TunnelBypass` does — and the session assembly that consumes
+`Accepted`, applies `InterceptPolicy`, and either terminates and runs an
+exchange or splices. Every piece each of those composes now exists and is
+tested; what remains is the wiring between them, not new protocol code. The
 32-stream p99 gate and the pin-bypass device test
 ([Verification](verification.md) item 1) are device-bound and unexercised.
 
