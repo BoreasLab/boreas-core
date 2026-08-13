@@ -32,7 +32,10 @@
 //!   [`VersionCrossings`] still counts, because a gate that can only be
 //! satisfied and never checked is not a gate.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::{
     io::{AsyncReadExt, copy_bidirectional},
@@ -41,9 +44,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Accepted, DomainName, EgressError, InterceptDecision, InterceptPolicy, Interceptor, Prefixed,
-    RequestFilter, StreamEgress, Target, VersionCrossings, Wire, run_exchange,
-    transport::client_tls_config,
+    Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, InterceptDecision,
+    InterceptPolicy, Interceptor, Leg, NoCosmetics, Prefixed, RequestFilter, RewriteFailures,
+    Rewriting, Standing, StreamBudget, StreamEgress, Target, Tier, VersionCrossings, Wire,
+    classify, run_exchange, transport::client_tls_config,
 };
 
 /// A TLS record carrying handshake messages.
@@ -217,13 +221,32 @@ pub enum SpliceReason {
     /// The client said nothing conclusive before the deadline, or sent more
     /// than one record's worth without completing one.
     Undecided,
+    /// Allowlisted, and interception is known not to work here. The
+    /// machine-maintained half of the decision, and the one that lets the
+    /// hand-maintained half grow.
+    Demoted(Demotion),
 }
 
 /// What became of one connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Handling {
-    Intercepted { host: DomainName, wire: Wire },
-    Spliced { reason: SpliceReason },
+    /// Terminated and served, at the tier the host's history permitted.
+    Intercepted {
+        host: DomainName,
+        wire: Wire,
+        tier: Tier,
+    },
+    Spliced {
+        reason: SpliceReason,
+    },
+    /// The connection failed in a way that proved interception cannot work
+    /// here, and the proof was recorded. Not an error: the connection is lost
+    /// either way, and what distinguishes this from a failure is that the next
+    /// one will not repeat it.
+    Demoted {
+        host: DomainName,
+        cause: Demotion,
+    },
 }
 
 #[derive(Debug)]
@@ -289,7 +312,20 @@ pub struct Sessions {
     pub egress: Arc<dyn StreamEgress>,
     pub filter: Arc<dyn RequestFilter>,
     pub crossings: Arc<VersionCrossings>,
+    /// What interception has been observed to fail at, per host. The
+    /// machine-maintained counterpart to `policy`: that one says which hosts a
+    /// human chose to intercept, this one says which of them it turned out to
+    /// work for.
+    pub demotions: Arc<Demotions>,
     pub limits: SessionLimits,
+    /// Where element-hiding rules come from. [`NoCosmetics`] by default, which
+    /// makes the HTML tier inert rather than absent — a deployment with no
+    /// cosmetic lists pays one virtual call per intercepted response and
+    /// nothing else. In production this is the same
+    /// [`RuleEngine`](crate::RuleEngine) that answers `filter`, so both tiers
+    /// read one compiled index.
+    cosmetic: Arc<dyn CosmeticSource>,
+    budget: StreamBudget,
     /// One client configuration per wire, so the upstream leg can offer
     /// exactly the protocol the client settled on. Built once: a `ClientConfig`
     /// parses the trust anchors, which is not a per-connection cost.
@@ -310,7 +346,10 @@ impl Sessions {
             egress,
             filter,
             crossings: Arc::new(VersionCrossings::new()),
+            demotions: Arc::new(Demotions::new()),
             limits,
+            cosmetic: Arc::new(NoCosmetics),
+            budget: StreamBudget::default(),
             upstream: [
                 client_tls_config(&[b"http/1.1".to_vec()], &[])?,
                 client_tls_config(&[b"h2".to_vec()], &[])?,
@@ -326,6 +365,36 @@ impl Sessions {
             client_tls_config(&[b"h2".to_vec()], extra_roots)?,
         ];
         Ok(self)
+    }
+
+    /// Applies compiled cosmetic rules to intercepted responses.
+    ///
+    /// Separate from [`Self::new`] because the rule set is swapped rather than
+    /// edited: a list rebuild produces a new [`RuleEngine`](crate::RuleEngine)
+    /// and a new `Sessions`, so no connection ever observes a half-applied list.
+    #[must_use]
+    pub fn with_cosmetic_rules(
+        mut self,
+        cosmetic: Arc<dyn CosmeticSource>,
+        budget: StreamBudget,
+    ) -> Self {
+        self.cosmetic = cosmetic;
+        self.budget = budget;
+        self
+    }
+
+    /// The HTML tier this connection gets, given what the host's history
+    /// permits. [`Tier::Splice`] cannot reach here — it is answered before any
+    /// termination — and maps to the same inert value as [`Tier::Inspect`].
+    fn rewriting(&self, tier: Tier, failures: &Arc<RewriteFailures>) -> Rewriting {
+        match tier {
+            Tier::Rewrite => Rewriting::On {
+                source: Arc::clone(&self.cosmetic),
+                budget: self.budget,
+                failures: Arc::clone(failures),
+            },
+            Tier::Inspect | Tier::Splice => Rewriting::Off,
+        }
     }
 
     fn upstream_config(&self, wire: Wire) -> Arc<rustls::ClientConfig> {
@@ -376,18 +445,43 @@ pub async fn serve_session(
         )
         .await;
     }
+    // **The allowlist says a human chose this host; the standing says whether
+    // that choice worked.** P14 could only ask the first question, which is why
+    // its list had to stay short enough to maintain by hand.
+    let standing = sessions.demotions.standing(host.as_str(), Instant::now());
+    if let Standing::Limited(cause) = standing
+        && cause.tier() == Tier::Splice
+    {
+        return splice(
+            sessions,
+            server,
+            peeked,
+            stream,
+            SpliceReason::Demoted(cause),
+        )
+        .await;
+    }
+    let tier = standing.tier();
 
     // **The client's handshake comes first, and the order is forced.** The
     // upstream leg must offer exactly one ALPN — that is what makes a crossed
     // version unrepresentable rather than merely counted — and the protocol to
     // offer is the one the client settles on, which is not known until its
     // handshake completes.
+    //
+    // It is also what makes the first failed connection unrecoverable: by the
+    // time the client rejects the forged leaf, the leaf has been sent, and no
+    // bytes remain to splice with. That cost is stated in [`crate::Demotions`]
+    // and is the reason demotion is measured on the *retry*.
     let replayed = Prefixed::new(peeked, stream);
-    let (client, wire) = sessions
-        .interceptor
-        .terminate(replayed)
-        .await
-        .map_err(SessionError::ClientHandshake)?;
+    let (client, wire) = match sessions.interceptor.terminate(replayed).await {
+        Ok(terminated) => terminated,
+        Err(error) => {
+            return learn(&sessions, &host, Leg::Client, error, |error| {
+                SessionError::ClientHandshake(error)
+            });
+        }
+    };
 
     let target = Target::Domain {
         host: host.clone(),
@@ -400,14 +494,22 @@ pub async fn serve_session(
         .map_err(SessionError::Upstream)?;
     let server_name = rustls::pki_types::ServerName::try_from(host.as_str().to_owned())
         .map_err(|_| SessionError::Upstream(EgressError::Proxy(crate::ProxyError::Address)))?;
-    let upstream = tokio_rustls::TlsConnector::from(sessions.upstream_config(wire))
+    let upstream = match tokio_rustls::TlsConnector::from(sessions.upstream_config(wire))
         .connect(server_name, upstream)
         .await
-        .map_err(|error| SessionError::Upstream(EgressError::Io(error.kind())))?;
+    {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            return learn(&sessions, &host, Leg::Upstream, error, |error| {
+                SessionError::Upstream(EgressError::Io(error.kind()))
+            });
+        }
+    };
 
     // An error here is the exchange ending, which includes every ordinary way a
     // connection closes, so it is reported as the handling that happened rather
     // than as a failure of the session.
+    let failures = Arc::new(RewriteFailures::new());
     let _ = run_exchange(
         host.as_str(),
         wire,
@@ -415,9 +517,46 @@ pub async fn serve_session(
         upstream,
         Arc::clone(&sessions.filter),
         Arc::clone(&sessions.crossings),
+        sessions.rewriting(tier, &failures),
     )
     .await;
-    Ok(Handling::Intercepted { host, wire })
+    // A rewrite that gave up is the last thing this connection proved, and it
+    // is read once here rather than reported from inside a body poll — the
+    // exchange has ended, which is the first moment acting on it is possible.
+    if failures.count() > 0 {
+        sessions
+            .demotions
+            .record(host.as_str(), Demotion::RewriteExhausted, Instant::now());
+    }
+    Ok(Handling::Intercepted { host, wire, tier })
+}
+
+/// Records what a failed handshake proved, if it proved anything.
+///
+/// A conclusive failure is not an error of the session. The connection is lost
+/// either way; what distinguishes the two outcomes is whether the next
+/// connection to this host will repeat it, and a recorded demotion is exactly
+/// the promise that it will not. Everything else — a reset, a timeout, a peer
+/// that vanished — proves nothing and stays an error.
+fn learn(
+    sessions: &Sessions,
+    host: &DomainName,
+    leg: Leg,
+    error: std::io::Error,
+    otherwise: impl FnOnce(std::io::Error) -> SessionError,
+) -> Result<Handling, SessionError> {
+    match classify(leg, &error) {
+        Some(cause) => {
+            sessions
+                .demotions
+                .record(host.as_str(), cause, Instant::now());
+            Ok(Handling::Demoted {
+                host: host.clone(),
+                cause,
+            })
+        }
+        None => Err(otherwise(error)),
+    }
 }
 
 /// Reads until the client's first bytes are conclusive, the deadline passes, or
@@ -880,6 +1019,7 @@ mod end_to_end {
             Handling::Intercepted {
                 host: DomainName::new(ALLOWED).unwrap(),
                 wire: Wire::Http1,
+                tier: Tier::Rewrite,
             }
         );
         assert_eq!(
@@ -932,6 +1072,131 @@ mod end_to_end {
             Handling::Spliced {
                 reason: SpliceReason::NotAllowlisted
             }
+        );
+    }
+
+    /// **The P15 through-line.** A client that does not trust the Boreas root —
+    /// a pinned app, or any client the user did not install the root into —
+    /// rejects the forged leaf. That first connection is lost and cannot be
+    /// otherwise: the leaf has been sent by the time the alert arrives. What
+    /// P15 buys is the *second* connection, which splices, and the assertion is
+    /// on the bytes that reach the origin rather than on the decision.
+    #[tokio::test]
+    async fn a_client_that_refuses_the_forged_leaf_demotes_the_host() {
+        let (origin, seen) = start_recording_origin().await;
+        let authority = Arc::new(CertificateAuthority::generate().unwrap());
+        let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
+
+        // A client trusting only an unrelated root, which is what a pinned
+        // client looks like from here.
+        let (unrelated, ..) = origin_certificate("elsewhere.example");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(unrelated))
+            .unwrap();
+        let config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+
+        let (client_side, terminated) = bridge::duplex();
+        let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
+        let refused = tokio_rustls::TlsConnector::from(Arc::clone(&config))
+            .connect(
+                rustls::pki_types::ServerName::try_from(ALLOWED).unwrap(),
+                client_side,
+            )
+            .await;
+        assert!(refused.is_err(), "the client must reject an unknown root");
+
+        let handling = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the session finishes")
+            .unwrap()
+            .expect("a refusal is a handling, not a failure of the session");
+        assert_eq!(
+            handling,
+            Handling::Demoted {
+                host: DomainName::new(ALLOWED).unwrap(),
+                cause: Demotion::LeafRejected,
+            }
+        );
+        assert_eq!(
+            sessions.demotions.standing(ALLOWED, Instant::now()).tier(),
+            Tier::Splice,
+            "the host must stop being intercepted"
+        );
+
+        // **The retry, which is what the gate measures.** The same allowlisted
+        // host now passes through untouched, so the client speaks to the origin
+        // itself and the pin it was protecting is never challenged again.
+        let (mut client_side, terminated) = bridge::duplex();
+        let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
+        let hello = super::tests::client_hello(Some(ALLOWED));
+        client_side.write_all(&hello).await.unwrap();
+
+        let mut echoed = vec![0u8; hello.len()];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut client_side, &mut echoed),
+        )
+        .await
+        .expect("the origin answers")
+        .unwrap();
+        assert_eq!(
+            echoed, hello,
+            "the demoted splice altered the client's bytes"
+        );
+        assert_eq!(*seen.lock().await, hello);
+
+        drop(client_side);
+        let handling = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the session finishes")
+            .unwrap()
+            .expect("the session succeeds");
+        assert_eq!(
+            handling,
+            Handling::Spliced {
+                reason: SpliceReason::Demoted(Demotion::LeafRejected),
+            }
+        );
+    }
+
+    /// Transport trouble must not demote, or a bad minute of network would
+    /// disable filtering for half a day. A client that opens a TLS record and
+    /// vanishes is exactly that case.
+    #[tokio::test]
+    async fn a_client_that_vanishes_mid_handshake_proves_nothing() {
+        let (origin, _) = start_recording_origin().await;
+        let authority = Arc::new(CertificateAuthority::generate().unwrap());
+        let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
+
+        let (mut client_side, terminated) = bridge::duplex();
+        let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
+        client_side
+            .write_all(&super::tests::client_hello(Some(ALLOWED)))
+            .await
+            .unwrap();
+        drop(client_side);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the session finishes")
+            .unwrap();
+        assert!(
+            outcome.is_err(),
+            "a dead connection is an error, not a lesson"
+        );
+        assert_eq!(
+            sessions.demotions.standing(ALLOWED, Instant::now()),
+            Standing::Unrestricted,
+            "nothing may be recorded against the host"
         );
     }
 

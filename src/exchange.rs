@@ -42,7 +42,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::{VersionCrossings, Wire};
+use crate::{Rewriting, VersionCrossings, Wire};
 
 /// The response body the proxy yields, uniform across forwarded and synthesized
 /// responses so one service can return either. Upstream bodies (`Incoming`) and
@@ -114,11 +114,6 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn boxed_incoming(body: Incoming) -> ProxyBody {
-    body.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
-        .boxed()
-}
-
 fn boxed_full(bytes: &'static [u8]) -> ProxyBody {
     Full::new(Bytes::from_static(bytes))
         .map_err(|never| match never {})
@@ -182,11 +177,15 @@ async fn forward(
     filter: Arc<dyn RequestFilter>,
     crossings: Arc<VersionCrossings>,
     wire: Wire,
+    rewriting: Rewriting,
 ) -> Result<Response<ProxyBody>, Infallible> {
     if filter.decide(&host, &request) == FilterVerdict::Block {
         return Ok(blocked());
     }
     strip_hop_by_hop(request.headers_mut());
+    // Asked *after* the hop-by-hop sweep, because the field it sets is one the
+    // sweep would otherwise be free to remove.
+    rewriting.prepare(&host, request.headers_mut());
 
     // The upstream wire equals the client wire by construction: the record is
     // the proof, and the P14 gate reads its count.
@@ -195,7 +194,9 @@ async fn forward(
     match upstream.send(request).await {
         Ok(mut response) => {
             strip_hop_by_hop(response.headers_mut());
-            Ok(response.map(boxed_incoming))
+            // The HTML tier, which decides for itself whether this response is
+            // one it can read and forwards it untouched when it is not.
+            Ok(rewriting.apply(&host, response))
         }
         Err(_) => Ok(bad_gateway()),
     }
@@ -215,6 +216,7 @@ pub async fn run_exchange<C, U>(
     upstream: U,
     filter: Arc<dyn RequestFilter>,
     crossings: Arc<VersionCrossings>,
+    rewriting: Rewriting,
 ) -> io::Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -222,8 +224,8 @@ where
 {
     let host = host.into();
     match wire {
-        Wire::Http1 => serve_h1(host, client, upstream, filter, crossings).await,
-        Wire::Http2 => serve_h2(host, client, upstream, filter, crossings).await,
+        Wire::Http1 => serve_h1(host, client, upstream, filter, crossings, rewriting).await,
+        Wire::Http2 => serve_h2(host, client, upstream, filter, crossings, rewriting).await,
     }
 }
 
@@ -233,6 +235,7 @@ async fn serve_h1<C, U>(
     upstream: U,
     filter: Arc<dyn RequestFilter>,
     crossings: Arc<VersionCrossings>,
+    rewriting: Rewriting,
 ) -> io::Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -254,6 +257,7 @@ where
             Arc::clone(&filter),
             Arc::clone(&crossings),
             Wire::Http1,
+            rewriting.clone(),
         )
     });
 
@@ -270,6 +274,7 @@ async fn serve_h2<C, U>(
     upstream: U,
     filter: Arc<dyn RequestFilter>,
     crossings: Arc<VersionCrossings>,
+    rewriting: Rewriting,
 ) -> io::Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -290,6 +295,7 @@ where
             Arc::clone(&filter),
             Arc::clone(&crossings),
             Wire::Http2,
+            rewriting.clone(),
         )
     });
 
@@ -403,6 +409,7 @@ mod tests {
                 upstream_client,
                 Arc::new(BlockPrefix("/ads/")),
                 crossings_for_exchange,
+                Rewriting::Off,
             )
             .await
             .expect("exchange runs");
@@ -473,6 +480,7 @@ mod tests {
                 upstream_client,
                 Arc::new(AllowAll),
                 crossings_for_exchange,
+                Rewriting::Off,
             )
             .await
             .expect("exchange runs");

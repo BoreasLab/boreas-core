@@ -34,9 +34,17 @@ The core currently provides:
 - session assembly: a terminated connection is classified from its TLS
   ClientHello, then either intercepted or spliced byte for byte, with fail-open
   a property of the type rather than of the control flow
+- automatic demotion along a three-point lattice — rewrite, inspect, splice —
+  driven by conclusive TLS refusals, so a host that cannot be intercepted stops
+  being intercepted without anyone editing a list
+- URL and element-hiding rules through Brave's `adblock` engine, with request
+  context read from what the client actually sends rather than guessed
+- streaming HTML rewriting on `lol_html` under a per-stream memory budget, where
+  a bail-out costs no bytes, an `integrity=` element is never touched, and CSP
+  is widened by exactly the hash of the stylesheet Boreas injected
 
-The platform on-device gates, the remaining filtering tiers, automatic demotion,
-and body rewriting are still to come.
+The platform on-device gates, content-encoding decompression, and generic
+cosmetic filtering are still to come.
 
 ## Documentation
 

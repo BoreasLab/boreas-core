@@ -1,6 +1,7 @@
 mod bridge;
 mod ca;
 mod datapath;
+mod demote;
 mod device;
 mod dns;
 mod egress;
@@ -15,6 +16,8 @@ mod platform;
 mod pool;
 mod quic;
 mod reassembly;
+mod rewrite;
+mod rules;
 mod session;
 mod shadowsocks;
 mod shell;
@@ -32,6 +35,7 @@ use std::{error::Error, fmt};
 pub use bridge::BridgedStream;
 pub use ca::{CaError, CertificateAuthority, MitmResolver};
 pub use datapath::{Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Side, Transmit};
+pub use demote::{Demotion, Demotions, Leg, Standing, Tier, classify};
 pub use device::{Device, Harness, SimDevice};
 pub use dns::{
     AlpnOutcome, AlpnPolicy, AnswerPolicy, Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy,
@@ -66,6 +70,12 @@ pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use quic::{H3Response, Handshake, QuicConnection, client_config};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
+pub use rewrite::{
+    CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable, Rewritable,
+    RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, permit_inline_style,
+    rewritable,
+};
+pub use rules::RuleEngine;
 pub use session::{
     Handling, Introduction, SessionError, SessionLimits, Sessions, SpliceReason, introduce,
     run_sessions, serve_session,

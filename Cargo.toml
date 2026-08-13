@@ -20,6 +20,36 @@ hyper-util = { version = "0.1.20", features = ["tokio", "server", "client", "htt
 h2 = "0.4.15"
 http = "1.5.0"
 httparse = "1.10.1"
+# The P16 HTML tier. `lol_html` is Cloudflare's production streaming rewriter,
+# which is what [Filtering](docs/filtering.md) names: it parses without a DOM,
+# so a response is transformed as it arrives rather than buffered whole, and it
+# carries the two things a proxy actually needs from such a thing — a hard
+# memory ceiling per stream, and a bail-out that flushes what it was holding
+# instead of losing it. `encoding_rs` and `base64` come with it and are named
+# here because this crate calls them directly: the first to turn a `charset`
+# label into an encoding, the second to write the `'sha256-...'` source that
+# widens a Content-Security-Policy by exactly the style Boreas injects.
+base64 = "0.22.1"
+encoding_rs = "0.8.35"
+lol_html = "3.0.1"
+# The rule engine, as [Filtering](docs/filtering.md) specifies: `adblock`
+# decides and `lol_html` transforms. Brave's implementation is the one shipping
+# in a browser against the same lists Boreas targets, and it covers the two
+# faculties the name tier counts as deferred — full URL matching with
+# `$third-party`, `$script`, and `$domain=` options, and hostname-scoped
+# cosmetic rules — neither of which is a parser worth writing twice.
+#
+# **`single-thread` is a default feature and must be off.** It swaps the
+# engine's `Arc`s for `Rc`s, which costs `Send + Sync`; the crate's own static
+# assertions only hold with it disabled, and a `!Sync` engine cannot be shared
+# across a multi-threaded reactor. The other two defaults are kept: the
+# embedded public suffix list is what makes `$third-party` mean what the list
+# author meant, and regex handling is needed for the patterns the name tier
+# defers as `Deferred::Pattern`.
+adblock = { version = "0.13.2", default-features = false, features = [
+    "embedded-domain-resolver",
+    "full-regex-handling",
+] }
 octets = "0.3.6"
 quiche = "0.29.3"
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }

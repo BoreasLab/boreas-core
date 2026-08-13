@@ -200,6 +200,22 @@ unsupported encoding, memory exhaustion, and parser strictness failures demote
 the host to splice. Challenge detection and automatic demotion belong in M3,
 not as post-launch polish.
 
+**Amendment proposed by P15, pending sign-off.** Demoting every one of those to
+splice trades the URL tier for the HTML tier, which is the wrong direction: a
+document whose rewrite blew its memory budget says nothing about whether that
+host's requests can be filtered, and filtering carries most of the product's
+value. `src/demote.rs` therefore demotes along a three-point lattice —
+`Splice < Inspect < Rewrite` — where the TLS-level failures reach `Splice` as
+written and a rewrite failure stops at `Inspect`. Unsupported encoding is not a
+demotion at all under that reading: it disqualifies the *body*, which is what
+"splice unchanged" in the P16 gate already describes, and demoting the host for
+one compressed response would disable filtering across a whole site.
+
+Challenge-page detection is **not implemented**, and the reason is that no
+signal available here says a challenge is attributable to interception. The
+TLS-level causes P15 records are exact; a heuristic that read a genuine `403`
+as an interstitial would silently disable filtering on a working host.
+
 Acceptance:
 
 - Boreas block rate is at least AdGuard's on the fixed 200-site corpus using

@@ -988,6 +988,65 @@ and P15 breaks it: P14 ships narrow enough that manual allowlist maintenance is
 tractable, P15 makes maintenance automatic, and only then does the allowlist
 broaden toward the parity corpus.
 
+**Status: complete in-process. The corpus and crawl gates are device-bound.**
+Delivered in `src/demote.rs`, wired through `src/session.rs`:
+
+- **The remedy is a lattice, not a switch.** `Tier` is a three-point chain —
+  `Splice < Inspect < Rewrite` — and recording an observation is its meet, so
+  demotion is idempotent, commutative, and associative and the order failures
+  arrive in cannot change where a host ends up. The middle point earns its
+  place: an HTML rewrite that blows its budget must not cost the URL filtering,
+  which carries far more of the product's value than any cosmetic rule.
+    This is a **proposed amendment** to [Filtering](filtering.md), which says
+  unsupported encoding and memory exhaustion "demote the host to splice". Taken
+  literally that trades the higher tier for the lower one. It needs sign-off.
+- **Demotion only ever does less, which is what decides how evidence is
+  weighed.** A false positive costs coverage on one host until its entry
+  expires; a false negative leaves a site broken for as long as the user keeps
+  visiting. So `classify` is generous about which TLS refusals count — every
+  alert but `close_notify` and `user_canceled`, because an alert is a peer
+  deliberately refusing a handshake it will be offered again — and admits
+  nothing that merely looks like bad luck. A reset, a timeout, a refused
+  connection: none of them proves anything about interception, and demoting on
+  them would let a bad minute of Wi-Fi disable filtering for half a day.
+- **The causes are observations, not inferences.** `LeafRejected`,
+  `UpstreamRefusedProxy`, `UpstreamUntrusted`, `ProtocolRefused`, and
+  `RewriteExhausted`. Several distinct server behaviours — a client-certificate
+  challenge, address reputation, TLS fingerprinting — are indistinguishable
+  from here and share one remedy, so they share one variant rather than being
+  guessed apart into three that would each be a claim the code cannot support.
+- `Standing` derives its tier from its cause rather than storing the two side
+  by side, so a standing that claims a tier its cause does not justify cannot
+  be constructed. Expiry is **per cause**, which is what stops a lapsed
+  short-lived observation from hiding a live long-lived one.
+- **`ProtocolRefused` is what P14's no-crossing invariant costs, and why it is
+  affordable.** Offering exactly one ALPN upstream is what makes a crossed HTTP
+  version unrepresentable. When a server will not speak what the client chose,
+  that invariant cannot be satisfied — and the answer is to stand aside and let
+  them negotiate directly, which is strictly better than bridging.
+- **One connection is the price and it cannot be less.** The evidence that
+  interception fails *is* the failed handshake, and by then the forged leaf has
+  been sent or the client already terminated. Nothing un-sends those. The
+  reordering that would recover it — dial upstream first, learn its ALPN, then
+  offer the client exactly that — was considered and rejected here: it makes
+  Boreas open an upstream connection for every intercepted flow before knowing
+  the client will proceed, which is an observable change to the network
+  footprint and a restructuring of P14 rather than an addition to it.
+
+**Gate met, in-process.** A real `rustls` client trusting an unrelated root
+rejects the forged leaf; the session reports `Handling::Demoted` rather than an
+error, and **the retry to the same allowlisted host splices** — asserted on the
+bytes reaching the origin, not on the decision. A companion test drops a client
+mid-handshake and asserts that *nothing* is recorded, which is the half that
+protects filtering from a flaky network. Reverting the classifier's client arm
+makes the first test fail with `AlertReceived(UnknownCA)`, which is also the
+confirmation that the classification matches a real handshake rather than a
+hand-built error.
+
+**Still device-bound:** AdGuard parity on the 200-site corpus, the 99 percent
+demotion-success measurement, and the top-500 crawl. Each needs a device and a
+corpus rather than more code.
+
 **Gate:** the M3 product gate — AdGuard parity on the 200-site corpus, measured
 separately for Chrome, WebView, and one Chromium alternative. Automatic
 demotion succeeds at least 99 percent of the time. Top-500 crawl shows zero
@@ -1000,6 +1059,75 @@ Boreas-attributable breakage.
 `lol_html` under per-stream budgets, content and character encoding handling,
 CSP relaxation, SRI preservation. Rewriters constructed only after `text/html`
 is confirmed. Memory settings and strict bail-out wired to fail open.
+
+**Status: complete in-process, less content-encoding decompression.**
+Delivered in `src/rewrite.rs` and `src/rules.rs`:
+
+- **`adblock` decides and `lol_html` transforms**, which is the boundary
+  [Filtering](filtering.md) already drew. Brave's engine is the one shipping in
+  a browser against the same subscriptions Boreas targets, and it supplies both
+  faculties the name tier counts as deferred: full URL matching with request
+  context, and hostname-scoped cosmetic rules. A first attempt here hand-rolled
+  a cosmetic-rule compiler and was **replaced** — a second implementation of
+  Adblock syntax would differ from the reference in ways no test here finds.
+- **`single-thread` is an `adblock` default feature and must be off.** It swaps
+  the engine's `Arc`s for `Rc`s, costing `Send + Sync`; the crate's own static
+  assertions hold only with it disabled, and a `!Sync` engine cannot be shared
+  across a multi-threaded reactor.
+- **Request context is read from the client, not guessed.** `$third-party`,
+  `$script`, and `$image` decide most of a real list. Because Boreas terminates
+  TLS it sees `Sec-Fetch-Dest`, which names the resource kind the fetch was
+  made for and cannot be forged by page script, and `Referer`, which names the
+  document it was made from. Absent both, the request is typed `other` and
+  treated as first-party — the reading that blocks least.
+- **Rewritability is a parse, not a check.** `Rewritable` carries the character
+  encoding and is the only way to obtain a rewriter, so "construct a rewriter
+  only after `text/html` is confirmed" is a property of the types.
+- **The budget is memory, not bytes.** A large document costs only throughput;
+  what threatens the process is *held* state, which `lol_html`'s limiter bounds
+  exactly. A separate total-bytes cap would add a failure mode with no clean
+  recovery while guarding nothing the memory limiter does not.
+- **Relaxing CSP means adding one hash and nothing else.** The injected
+  stylesheet is named by its own `'sha256-...'`, which is narrower than a nonce
+  — a nonce admits any content bearing it. Inheriting from `default-src` emits
+  a *new* `style-src` rather than widening the fallback, which governs scripts
+  and frames too. And a policy already permitting inline styles through
+  `'unsafe-inline'` is left alone, because in CSP Level 3 adding a hash makes
+  `'unsafe-inline'` inert and would revoke the permission the page relies on.
+
+**Deliberately not built, and recorded rather than hidden:**
+
+- **No decompressor.** `Rewriting::prepare` sets `Accept-Encoding: identity` on
+  document navigations for hosts that have rules, so the documents Boreas
+  intends to rewrite arrive readable. Subresources — the bulk of a page's bytes
+  — keep their compression, and a host with no rules pays nothing. Adding a
+  decoder is one arm of a closed sum.
+- **No generic cosmetic rules, which is the engine's design rather than a
+  shortcut.** `url_cosmetic_resources` deliberately returns only the
+  host-specific set; the generic set is indexed by class and id token, to be
+  queried with the tokens a document actually contains, because it is far too
+  large to ship per page. A browser collects those from the DOM. A streaming
+  rewriter could collect them as it walks the document and inject a second
+  stylesheet before `</body>` — CSS does not care where a rule was declared —
+  which is a real follow-up, not an impossibility.
+- **No challenge-page detection.** [Filtering](filtering.md) lists it among the
+  demotion triggers. The TLS-level signals P15 uses are exact; a heuristic that
+  mistook a genuine `403` for an interstitial would disable filtering on a
+  working host, and there is no reliable signal that a challenge is
+  *attributable to interception*.
+
+**Gate met, in-process.** Every disqualifying condition — compressed, not HTML,
+UTF-16, untyped, a host with no rules — is asserted to return the body **byte
+for byte** and the headers unchanged, rather than merely to report itself as
+unmodified. An element bearing `integrity=` survives a rule that matches it
+while an unsigned sibling does not. A budget too small to hold the document
+produces output **exactly equal to the input** — the rules match nothing and
+the document has no `<head>`, so rewriting is the identity and the equality is
+exact — and counts one failure, which the session turns into a
+`RewriteExhausted` demotion to `Tier::Inspect`. Ambiguous markup, the one
+failure `lol_html` refuses to continue through, ends the body *visibly*: a
+client told the message did not finish retries, and by then the host is
+demoted and the retry is clean.
 
 **Gate:** unsupported encodings splice unchanged; no `integrity=` protected
 subresource is modified; memory exhaustion demotes rather than fails.
