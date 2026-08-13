@@ -67,3 +67,17 @@ jobs:
             cargo fuzz run "$target" -- -max_total_time=60
           done
         working-directory: .
+
+  deny:
+    name: advisories and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # No repository config: cargo-deny's built-in defaults already error on
+      # RustSec vulnerability and notice advisories, fail on unmaintained
+      # crates, and deny an unknown registry or git source. `bans` is left out
+      # because its knobs both default to `warn`, so it can never fail a run,
+      # and `licenses` is left out deliberately.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories sources
