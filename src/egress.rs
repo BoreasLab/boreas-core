@@ -36,7 +36,7 @@ use gotatun::{
 
 use crate::{
     Accepts, BufferPool, CapabilityError, DatagramFidelity, EgressCapabilities, Mtu, NatBehavior,
-    Pooled,
+    Pooled, ProxyError,
 };
 
 /// An egress that accepts whole IP packets, such as WireGuard or MASQUE
@@ -91,11 +91,147 @@ pub trait PacketEgress: Send {
     }
 }
 
+/// A domain name as a proxy protocol carries it: at most 255 bytes, because
+/// that is what a single length octet can describe on the SOCKS5, Shadowsocks,
+/// VLESS, and TUIC wires alike.
+///
+/// Refined rather than a bare `String`: the wire limit is an invariant every
+/// encoder would otherwise have to re-check, and an over-long name would be
+/// discovered as a truncated address on the far side rather than as a rejected
+/// configuration here.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DomainName(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomainNameError {
+    Empty,
+    TooLong(usize),
+    /// A NUL byte, which no name has and every C-shaped parser downstream
+    /// would misread.
+    Interior,
+}
+
+impl DomainName {
+    /// The one boundary untrusted text crosses to become a name.
+    pub fn new(name: impl Into<String>) -> Result<Self, DomainNameError> {
+        let name = name.into();
+        match name.len() {
+            0 => Err(DomainNameError::Empty),
+            length if length > 255 => Err(DomainNameError::TooLong(length)),
+            _ if name.as_bytes().contains(&0) => Err(DomainNameError::Interior),
+            _ => Ok(Self(name)),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Always 255 or fewer, which is what makes the single length octet on
+    /// every proxy wire safe to write without a second check.
+    pub fn wire_len(&self) -> u8 {
+        self.0.len() as u8
+    }
+}
+
+impl std::fmt::Display for DomainName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Where a flow is bound.
+///
+/// A name is kept as a name when the client supplied one, rather than being
+/// resolved here and sent as an address. Two reasons, and both are properties
+/// of the product: the exit resolves in its own DNS view, so a CDN answers
+/// with a nearby edge instead of one near the client; and a name resolved
+/// locally would leak the destination to the local resolver the tunnel exists
+/// to bypass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Ip(std::net::SocketAddr),
+    Domain { host: DomainName, port: u16 },
+}
+
+impl Target {
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Ip(address) => address.port(),
+            Self::Domain { port, .. } => *port,
+        }
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(address) => write!(f, "{address}"),
+            Self::Domain { host, port } => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
+/// The byte stream a stream egress hands back: exactly what `hyper` and the
+/// interception exchange already consume, so a proxied flow and a direct one
+/// are the same type to everything above.
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+/// A future returned through a trait object. Boxing is a per-flow cost, paid
+/// once at connect and amortised over every byte the flow then carries, which
+/// is why it is acceptable here and would not be on the packet path.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A datagram association through a proxy: the UDP half of an egress, as
+/// SOCKS5's UDP ASSOCIATE, Shadowsocks, and VLESS all provide it.
+///
+/// Send and receive name the *target*, because a proxied datagram carries its
+/// destination in the payload rather than in the socket: one association
+/// serves every peer the flow talks to, which is what makes an
+/// endpoint-independent mapping expressible at all.
+pub trait DatagramAssociation: Send + Sync {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<(), EgressError>>;
+
+    /// Returns the payload length written into `buf` and where it came from.
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<(usize, Target), EgressError>>;
+}
+
 /// An egress that accepts L4 flows, such as SOCKS5 or Shadowsocks.
-pub trait StreamEgress: Send {
+///
+/// This is also the seam local termination dials through: interception
+/// terminates the client's connection and then needs one to the real server,
+/// and "open a byte stream to this target" is the same question a proxy
+/// answers. A direct TCP dialer is the identity instance of it.
+pub trait StreamEgress: Send + Sync {
     /// The capability claim the planner sees. The accepted layer is not part
     /// of it: the [`Egress`] variant already says so.
     fn capabilities(&self) -> EgressCapabilities;
+
+    /// Opens a byte stream to `target`.
+    fn connect<'a>(
+        &'a self,
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>>;
+
+    /// Opens a datagram association.
+    ///
+    /// The default refuses, which is the honest answer for an egress whose
+    /// [`EgressCapabilities::datagram_fidelity`] is
+    /// [`DatagramFidelity::None`](crate::DatagramFidelity::None): those two
+    /// statements must agree, and an egress that does not implement this has
+    /// already said so in its claim.
+    fn associate(&self) -> BoxFuture<'_, Result<Box<dyn DatagramAssociation>, EgressError>> {
+        Box::pin(async { Err(EgressError::DatagramsUnsupported) })
+    }
 }
 
 /// A configured egress implementation. The variant determines the accepted
@@ -187,6 +323,13 @@ pub enum EgressError {
     /// A MASQUE tunnel could not be configured or driven. Construction-time or
     /// protocol-level, never a per-packet condition.
     Masque,
+    /// This egress carries no datagrams, which its capability claim already
+    /// says: `datagram_fidelity` is `None` and `associate` refuses.
+    DatagramsUnsupported,
+    /// The proxy refused, or spoke something this client could not parse.
+    Proxy(ProxyError),
+    /// The transport under the proxy failed: no route, refused, reset.
+    Io(std::io::ErrorKind),
 }
 
 impl std::fmt::Display for EgressError {
@@ -198,11 +341,26 @@ impl std::fmt::Display for EgressError {
             // names the variant, which is what an operator needs.
             Self::WireGuard(error) => write!(f, "WireGuard failure: {error:?}"),
             Self::Masque => f.write_str("MASQUE tunnel failure"),
+            Self::DatagramsUnsupported => f.write_str("this egress carries no datagrams"),
+            Self::Proxy(error) => write!(f, "proxy failure: {error}"),
+            Self::Io(kind) => write!(f, "transport failure: {kind}"),
         }
     }
 }
 
 impl std::error::Error for EgressError {}
+
+impl From<std::io::Error> for EgressError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+impl From<ProxyError> for EgressError {
+    fn from(error: ProxyError) -> Self {
+        Self::Proxy(error)
+    }
+}
 
 impl From<WireGuardError> for EgressError {
     fn from(error: WireGuardError) -> Self {
@@ -566,6 +724,15 @@ mod tests {
         // conflict reported where the implementations are known.
         struct NoStreams;
         impl StreamEgress for NoStreams {
+            fn connect<'a>(
+                &'a self,
+                _target: &'a crate::Target,
+            ) -> crate::BoxFuture<'a, Result<Box<dyn crate::AsyncStream>, EgressError>>
+            {
+                // This fixture exists to be chained against, never dialled.
+                Box::pin(async { Err(EgressError::DatagramsUnsupported) })
+            }
+
             fn capabilities(&self) -> EgressCapabilities {
                 EgressCapabilities {
                     datagram_fidelity: DatagramFidelity::Native,

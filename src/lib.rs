@@ -13,6 +13,7 @@ mod platform;
 mod pool;
 mod reassembly;
 mod shell;
+mod socks5;
 mod stream;
 mod terminate;
 mod udp;
@@ -32,8 +33,9 @@ pub use dns::{
     write_failure, write_refusal, write_response,
 };
 pub use egress::{
-    Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
-    WireGuardConfig, WireGuardEgress,
+    AsyncStream, BoxFuture, DatagramAssociation, DomainName, DomainNameError, Egress, EgressEmit,
+    EgressError, PacketEgress, StreamEgress, Target, WIREGUARD_OVERHEAD_BYTES, WireGuardConfig,
+    WireGuardEgress,
 };
 pub use exchange::{AllowAll, FilterVerdict, ProxyBody, RequestFilter, run_exchange};
 pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
@@ -52,6 +54,10 @@ pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
 pub use shell::{
     AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry, Termination,
+};
+pub use socks5::{
+    Credentials, CredentialsError, Decoded, ProxyError, Reply, Socks5Config, Socks5Egress,
+    decode_address, decode_datagram, encode_address, encode_datagram,
 };
 pub use stream::{LocalStack, StreamError, StreamId, Terminated, TerminationLimits};
 pub use terminate::{Accepted, TerminatedStream, run_terminator};
