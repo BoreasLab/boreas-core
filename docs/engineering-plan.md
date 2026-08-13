@@ -792,28 +792,97 @@ convergence *measurement* — that a real browser re-races to TCP within one
 window — needs the browser and the device this environment does not have and is
 **unexercised**.
 
+### P13.5: Local TCP termination
+
+The phase open item 8 said the plan was missing. It integrates `smoltcp` and
+delivers `TransportPath::LocalTermination` for real — the byte stream every
+input to P14 is downstream of.
+
+**Status: substrate complete in-process; the device gate is unexercised, like
+P9's and P10's.** Delivered:
+
+- `src/stream.rs`, `LocalStack`, a sans-io TCP terminator. It owns no socket,
+  no task, and no clock, exactly as the rest of the core: client packets enter
+  as borrowed slices, reply packets leave as owned buffers, and time enters as
+  an `Instant` argument to `poll`. A `smoltcp` socket set is the state machine
+  underneath — gap 9, admitted as a real dependency rather than measured in an
+  example — and `LocalStack` is the seam that keeps its poll-driven, mutable
+  world from leaking into the reactor.
+- **Any-IP is load-bearing.** A terminating proxy answers a SYN addressed to an
+  arbitrary upstream server, not to an address the interface owns, so the
+  interface runs in `smoltcp`'s any-IP mode and its listeners bind the port
+  with no local address. The destination the client dialled is recovered from
+  the SYN and used as the reply's source; `Terminated` carries both endpoints,
+  because the MITM layer needs the server name to forge a leaf and the client
+  address to tear down.
+- **The socket set is the bound.** One listening socket accepts one connection
+  and becomes it, so the pool is replenished on every accept up to a fixed
+  ceiling. A SYN arriving with the ceiling reached finds no listener and is
+  refused with a RST — connection refused, which a browser retries — rather
+  than growing state without limit. This is the P6 socket-count budget
+  expressed as an admission rule.
+
+**Gate met, in-process:** `src/stream.rs` drives a real `smoltcp` client
+through a full three-way handshake against the terminator over the virtual
+clock, then bidirectional application bytes, a graceful close observed as a
+distinct `Closed` from "nothing yet", and the socket-ceiling refusal. The
+device gate — the same handshake over a real TUN — needs the device this
+environment does not have.
+
+**Still deferred here:** wiring `LocalStack` into the reactor. The terminator
+is driven directly in its tests, the way `Datapath` is; the async bridge that
+feeds it from the running reactor and spawns a MITM task per accepted stream is
+not yet built. Nothing depends on that wiring for the substrate's correctness,
+which is the point of testing it sans-io first.
+
 ### P14: MITM, allowlist-only
 
 User-store CA lifecycle, rustls, `rcgen` leaf generation, h1 and h2
 interception. Deliberately narrow: an explicit allowlist, manually maintained.
 
-**Status: blocked on local TCP termination, which is a missing phase rather
-than a missing decision.** Interception needs a byte stream to terminate, and
-this crate has none: `smoltcp` is still a dev-dependency, exercised only by
-`examples/smoltcp_scaling.rs`, and P10 recorded that its integration is gated
-on re-measurement under live traffic ([Verification](verification.md) item 6),
-which is device-bound. Every other input to P14 — an allowlist, a CA, a leaf
-generator, an `http`-shaped exchange — is downstream of having a stream, so
-building them first would be building against a substrate whose shape is not
-yet fixed. **The plan needs a phase between P10 and P14 that integrates
-smoltcp and delivers `TransportPath::LocalTermination` for real.** It is
-recorded as an open item below rather than silently absorbed into P14.
+**Status: the CA and the terminating TLS server are complete in-process; the
+h1/h2 exchange and its upstream leg, and the reactor wiring, remain. The device
+gate is unexercised.** Delivered:
 
-**The dependency half is done.** `rustls` 0.23 is admitted, on the `ring`
-provider already in the graph for WireGuard, so no second crypto provider is
-shipped to a target that counts bytes. `tokio-rustls` and `webpki-roots` come
-with it. That was the decision open item 6 asked for, and it is what let P11's
-encrypted transports land; `rcgen` and `h2` wait for the stream.
+- `src/ca.rs`, the CA lifecycle. `CertificateAuthority::generate` builds an
+  `rcgen` root on the `ring` provider and one long-lived leaf key; `leaf_for`
+  mints a per-host certificate over that shared key, so a host costs one
+  signature rather than a P-256 keygen — the interception-proxy design.
+  `root_der` is the only way the root's public identity leaves the process, for
+  the platform layer to install into the user store, and the private half never
+  does. `MitmResolver` is the rustls `ResolvesServerCert`, with a bounded
+  FIFO leaf cache keyed on the attacker-suppliable SNI. A leaf it cannot forge
+  is an `Option::None`, which rustls answers by failing the handshake — the
+  fail-open path, not a leak.
+- `src/mitm.rs`, the terminating TLS server and the milestone's two typed
+  invariants. `Interceptor` presents a forged leaf for any SNI and negotiates
+  h2-by-preference or http/1.1, no h3. `InterceptPolicy` is the explicit,
+  case-insensitive, exact-match allowlist — everything not named is spliced.
+  `VersionCrossings` counts any exchange whose client and upstream wires differ,
+  which the design never produces; `Wire` is closed at two members precisely
+  because there is no h3 to bridge to.
+
+**The dependency half is done.** `rustls` 0.23 and now `rcgen` 0.14 are both on
+the `ring` provider already in the graph for WireGuard, so no second crypto
+provider ships. `smoltcp` was promoted from a dev-dependency to a real one for
+P13.5.
+
+**Gate met, in-process:** `src/mitm.rs` drives a real rustls client that trusts
+the Boreas root through a handshake against the interceptor, validates the
+forged leaf for an arbitrary SNI, negotiates h2, and exchanges plaintext the
+server decrypts — the whole CA-to-resolver-to-server chain, proven without a
+device. The version-crossing counter's law is unit-tested: same-version
+exchanges leave it at zero.
+
+**Still to build:** the `http`-shaped h1/h2 request/response exchange over the
+terminated TLS, its upstream TLS leg to the real server, and the reactor
+integration that drives `LocalStack` and spawns an exchange per accepted
+stream. The 32-stream p99 gate and the pin-bypass device test
+([Verification](verification.md) item 1) are device-bound and unexercised.
+
+**The `ring`/`rcgen` decision half was already recorded.** `rustls` 0.23 is on
+the `ring` provider already in the graph for WireGuard, which is what let P11's
+encrypted transports land; `rcgen` now joins it on the same provider.
 
 **Scope reduction proposed here.** [Filtering](filtering.md) specifies a neutral
 `Exchange` model with three wire adapters, justified by quiche and `tokio-quiche`
@@ -961,11 +1030,14 @@ Record outcomes in [Verification](verification.md).
    provider already in the graph, and P11's DoT and DoH landed on it.
    `hickory-resolver` was not needed once the transports turned out to be a few
    hundred lines each.
-8. **The plan is missing a phase between P10 and P14: smoltcp integration and
-   real local termination.** P14 cannot start without a byte stream, and P6's
-   scaling verdict is explicitly provisional pending re-measurement under live
-   traffic. Insert it, sequence its device-bound measurement, and only then
-   schedule P14.
+8. ~~**The plan is missing a phase between P10 and P14: smoltcp integration and
+   real local termination.** P14 cannot start without a byte stream.~~
+   **Inserted as P13.5.** `smoltcp` is promoted to a real dependency and
+   `LocalStack` in `src/stream.rs` delivers `TransportPath::LocalTermination`
+   for real, gated in-process. Two device-bound measurements remain open under
+   it: P6's scaling verdict re-measured under the terminator's live socket set
+   rather than the idle-device example, and the reactor wiring's own on-device
+   run. Both wait on the device the environment does not have.
 7. Whether Boreas should rewrite the transaction id it sends upstream. Today
    the client's own id travels out, and the ephemeral source port carries the
    anti-spoofing entropy. Rewriting is transparent — `write_response` takes the

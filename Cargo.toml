@@ -7,7 +7,20 @@ license = "AGPL-3.0-only"
 [dependencies]
 etherparse = "0.21.0"
 gotatun = { version = "0.8.1", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Local TCP termination (the substrate P14 MITM runs on) is a smoltcp socket set
+# driven by the datapath. sans-io and no_std-friendly: it owns no socket and no
+# clock, so it composes into the pure-core discipline rather than fighting it.
+# `any-ip` is load-bearing — a terminating proxy answers SYNs addressed to
+# arbitrary upstream servers, not to an address this interface owns.
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "alloc",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+] }
 # Named features rather than "full": the shell needs a runtime, bounded
 # channels, a timer, and the `select!`/`pin!` macros, and nothing else. Boreas
 # cross-compiles to Android, where every unused tokio driver is dead weight in
@@ -26,14 +39,8 @@ wintun-bindings = "0.7.39"
 # `test-util` provides the paused clock the P8 timer gate needs: virtual time
 # is what lets the test assert wakeup counts without waiting an hour.
 tokio = { version = "1.53.1", features = ["test-util"] }
-# The P6 scaling measurement (examples/smoltcp_scaling.rs). A dev-dependency:
-# it never links into the library, and `cargo deny` still checks its license.
-smoltcp = { version = "0.13.1", default-features = false, features = [
-    "alloc",
-    "medium-ip",
-    "proto-ipv4",
-    "socket-tcp",
-] }
+# smoltcp is now a normal dependency (local TCP termination), so the P6 scaling
+# example and the termination tests share the one linked copy.
 
 [lib]
 path = "src/lib.rs"

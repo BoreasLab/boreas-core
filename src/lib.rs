@@ -1,19 +1,23 @@
+mod ca;
 mod datapath;
 mod device;
 mod dns;
 mod egress;
 mod filter;
+mod mitm;
 mod packet;
 mod path;
 mod platform;
 mod pool;
 mod reassembly;
 mod shell;
+mod stream;
 mod udp;
 mod upstream;
 
 use std::{error::Error, fmt};
 
+pub use ca::{CaError, CertificateAuthority, MitmResolver};
 pub use datapath::{Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Side, Transmit};
 pub use device::{Device, Harness, SimDevice};
 pub use dns::{
@@ -29,6 +33,7 @@ pub use egress::{
     WireGuardConfig, WireGuardEgress,
 };
 pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
+pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
 pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 #[cfg(unix)]
@@ -38,6 +43,7 @@ pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
 pub use shell::{AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry};
+pub use stream::{LocalStack, StreamError, StreamId, Terminated, TerminationLimits};
 pub use upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
     DotUpstream, TunnelBypass, UpstreamError,

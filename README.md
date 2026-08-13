@@ -16,9 +16,12 @@ The core currently provides:
 - allocation-free IPv4 and IPv6 ingress classification
 - explicit packet, stream, datagram, ICMP, and reassembly actions
 - endpoint-independent UDP mapping state with bounded, non-blocking buffers
+- sans-io local TCP termination over a bounded smoltcp socket set
+- a user-store CA and a terminating TLS server that forges per-host leaves
 
-Platform adapters, TCP termination, filtering, and egress implementations are
-still under construction.
+The h1/h2 exchange over terminated TLS, its upstream leg, and the reactor
+integration that drives termination live are under construction, as are the
+platform on-device gates, the remaining filtering tiers, and egress breadth.
 
 ## Documentation
 
