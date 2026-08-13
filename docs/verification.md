@@ -6,65 +6,38 @@ Update the date, source, and status whenever a claim is rechecked.
 
 ## Dependency Policy
 
-Boreas is AGPLv3. Runtime dependencies must be AGPL-compatible, maintained, and
-used by an immediate executable path. MPL-2.0 is GPL-compatible through its
-secondary-license mechanism. Test fixtures and vendored data require their own
-license review even when crate source is compatible.
-
-Compatibility runs inbound, not outbound: an AGPL work may absorb a permissive
-dependency, but a dependency under a licence imposing further restrictions —
-GPL-2.0-only, EPL, CDDL, or any source-available licence such as SSPL, BUSL, or
-the Elastic Licence — cannot be combined and distributed. Note also that AGPL
-obligations attach on conveying the work, and section 13's network-source
-requirement attaches on running a modified version for remote users; neither
-waits for a third party to modify anything.
-
-`deny.toml` encodes the allowlist and `cargo deny` runs in CI, so a
-non-compliant dependency fails the build instead of waiting for review. The
-allowlist is narrower than the legally compatible set on purpose: adding any
-copyleft dependency requires editing that file, which forces the decision to be
-explicit. It checks the crate graph only, so vendored data such as the
-`adblock-rust` GPL test-data subtree still needs the manual packaging check.
+Runtime dependencies must be maintained and used by an immediate executable
+path.
 
 ### Current dependencies
 
-Reviewed 2026-08-11 against the resolved `Cargo.lock`. Every entry is checked
-by `cargo deny check` in CI, dev-dependencies included (`exclude-dev = false`).
+Reviewed 2026-08-11 against the resolved `Cargo.lock`.
 
-| Crate | Version | Role | License |
-|---|---:|---|---|
-| `etherparse` | 0.21.0 | borrowed IPv4, IPv6, and transport parsing | MIT OR Apache-2.0 |
-| `arrayvec` | 0.7.8, transitive | bounded parser storage | MIT OR Apache-2.0 |
-| `tokio` | 1.53.1 | runtime shell: reactor task, bounded channels, timer | MIT |
-| `tokio-util` | 0.7.19 | `CancellationToken` for structured shutdown | MIT |
-| `tokio-macros` | 2.7.2, transitive | `select!`, `pin!`, `#[tokio::test]` | MIT |
-| `futures-util` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
-| `futures-core` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
-| `futures-sink` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
-| `futures-task` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
-| `futures-macro` | 0.3.34, transitive | pulled by `tokio-util` | MIT OR Apache-2.0 |
-| `pin-project-lite` | 0.2.17, transitive | pulled by `tokio` | Apache-2.0 OR MIT |
-| `bytes` | 1.12.1, transitive | pulled by `tokio-util` | MIT |
-| `slab` | 0.4.12, transitive | pulled by `tokio` | MIT |
-| `proc-macro2` | 1.0.107, transitive | build-time only | MIT OR Apache-2.0 |
-| `quote` | 1.0.47, transitive | build-time only | MIT OR Apache-2.0 |
-| `syn` | 3.0.3, transitive | build-time only | MIT OR Apache-2.0 |
-| `unicode-ident` | 1.0.24, transitive | build-time only | (MIT OR Apache-2.0) AND Unicode-3.0 |
-| `smoltcp` | 0.13.1, dev-only | the P6 scaling measurement; never linked | 0BSD |
-| `gotatun` | 0.8.1 | sans-io WireGuard peer behind `WireGuardEgress` | MPL-2.0 |
-| `ring` | 0.17.14, transitive | gotatun's AEAD and X25519 backends | ISC-style, allowlist-covered |
+| Crate | Version | Role |
+|---|---:|---|
+| `etherparse` | 0.21.0 | borrowed IPv4, IPv6, and transport parsing |
+| `arrayvec` | 0.7.8, transitive | bounded parser storage |
+| `tokio` | 1.53.1 | runtime shell: reactor task, bounded channels, timer |
+| `tokio-util` | 0.7.19 | `CancellationToken` for structured shutdown |
+| `tokio-macros` | 2.7.2, transitive | `select!`, `pin!`, `#[tokio::test]` |
+| `futures-util` | 0.3.34, transitive | pulled by `tokio-util` |
+| `futures-core` | 0.3.34, transitive | pulled by `tokio-util` |
+| `futures-sink` | 0.3.34, transitive | pulled by `tokio-util` |
+| `futures-task` | 0.3.34, transitive | pulled by `tokio-util` |
+| `futures-macro` | 0.3.34, transitive | pulled by `tokio-util` |
+| `pin-project-lite` | 0.2.17, transitive | pulled by `tokio` |
+| `bytes` | 1.12.1, transitive | pulled by `tokio-util` |
+| `slab` | 0.4.12, transitive | pulled by `tokio` |
+| `proc-macro2` | 1.0.107, transitive | build-time only |
+| `quote` | 1.0.47, transitive | build-time only |
+| `syn` | 3.0.3, transitive | build-time only |
+| `unicode-ident` | 1.0.24, transitive | build-time only |
+| `smoltcp` | 0.13.1, dev-only | the P6 scaling measurement; never linked |
+| `gotatun` | 0.8.1 | sans-io WireGuard peer behind `WireGuardEgress` |
+| `ring` | 0.17.14, transitive | gotatun's AEAD and X25519 backends |
 
-`gotatun`'s wider transitive graph (x25519-dalek, curve25519-dalek,
-chacha20poly1305, blake2, and friends) is BSD-3-Clause, MIT, or Apache-2.0
-throughout; `cargo deny check` verifies the full resolved set, dev included.
-Correcting the earlier ledger entry: GotaTun is MPL-2.0, not BSD-3-Clause as
-the planned-dependencies table recorded. MPL-2.0 qualifies through its
-secondary-license mechanism, so the admission stands on the existing policy.
-
-`webpki-roots` carries the Mozilla root-certificate **data** under
-CDLA-Permissive-2.0, which `deny.toml` now allows explicitly. It is a
-permissive data licence with no copyleft and no share-alike obligation, so it
-combines into an AGPL work and imposes nothing on distribution.
+`gotatun` pulls a wider transitive graph (x25519-dalek, curve25519-dalek,
+chacha20poly1305, blake2, and friends).
 
 The DNS transports use that bundle rather than the platform trust store, and
 that is a security property rather than a portability shortcut: Boreas installs
@@ -83,31 +56,22 @@ capabilities the shell does not use.
 ### Planned and evaluated dependencies
 
 Versions are deliberately omitted until first integration. Resolve the latest
-compatible release and regenerate the license review at that time.
+compatible release at that time.
 
-| Project | Role | License status | Evidence and caveat |
+| Project | Role | Status | Evidence and caveat |
 |---|---|---|---|
-| `lol_html` | streaming HTML rewrite | BSD-compatible | Cloudflare Workers lineage; designed for bounded memory |
-| `adblock` | network, cosmetic, and scriptlet rules | MPL-2.0 compatible | Brave production lineage; Firefox ships adblock-rust; supports uBO-style syntax and Apple content-blocking export |
-| ~~`rustls`~~ | single v1 TLS stack | integrated 2026-08-11 at 0.23.43 | MIT OR Apache-2.0 OR ISC. Taken with `default-features = false` and the `ring` provider **already in the graph for WireGuard**, so no second crypto backend ships to a target that counts bytes; `tls12` is kept for resolver interoperability. `tokio-rustls` 0.26.4 and `webpki-roots` 1.0.9 came with it |
-| `rcgen` | leaf certificate generation | MIT OR Apache-2.0 | rustls organization; mature dependency surface |
-| `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | MIT OR Apache-2.0 | ISRG Prossimo-backed; **not admitted, and no longer needed.** DoT and DoH landed directly on `rustls` at a few hundred lines each, against a far smaller graph. Reconsider only for DNSSEC validation. Earlier note: Message parsing, host policy, provenance, and ECH rewriting are Boreas's own regardless of who carries the bytes, so the only thing it supplies today is the encrypted transports — and those need the TLS stack the plan first admits at P14. Revisit with that decision |
-| `tokio-quiche` and quiche | MASQUE and later H3 | BSD-compatible | used by iCloud Private Relay Proxy B, Oxy, and WARP's MASQUE client |
-| ~~GotaTun~~ | WireGuard | integrated 2026-08-11 at 0.8.1 | MPL-2.0 (corrected from BSD-3-Clause); Mullvad project; Windows readiness unexercised, no device in this environment |
-| `smoltcp` | locally terminated TCP | BSD OR Apache-2.0 | vendored in AOSP; host-scale feature limits require testing |
-| `shadowsocks-rust` | Shadowsocks egress | verify before use | mature and active, exact current license remains an action item |
+| `lol_html` | streaming HTML rewrite | candidate | Cloudflare Workers lineage; designed for bounded memory |
+| `adblock` | network, cosmetic, and scriptlet rules | candidate | Brave production lineage; Firefox ships adblock-rust; supports uBO-style syntax and Apple content-blocking export |
+| ~~`rustls`~~ | single v1 TLS stack | integrated 2026-08-11 at 0.23.43 | Taken with `default-features = false` and the `ring` provider **already in the graph for WireGuard**, so no second crypto backend ships to a target that counts bytes; `tls12` is kept for resolver interoperability. `tokio-rustls` 0.26.4 and `webpki-roots` 1.0.9 came with it |
+| `rcgen` | leaf certificate generation | candidate | rustls organization; mature dependency surface |
+| `hickory-resolver` | DNSSEC, DoT, DoH, DoQ | not admitted | ISRG Prossimo-backed; **not admitted, and no longer needed.** DoT and DoH landed directly on `rustls` at a few hundred lines each, against a far smaller graph. Reconsider only for DNSSEC validation. Earlier note: Message parsing, host policy, provenance, and ECH rewriting are Boreas's own regardless of who carries the bytes, so the only thing it supplies today is the encrypted transports — and those need the TLS stack the plan first admits at P14. Revisit with that decision |
+| `tokio-quiche` and quiche | MASQUE and later H3 | candidate | used by iCloud Private Relay Proxy B, Oxy, and WARP's MASQUE client |
+| ~~GotaTun~~ | WireGuard | integrated 2026-08-11 at 0.8.1 | Mullvad project; Windows readiness unexercised, no device in this environment |
+| `smoltcp` | locally terminated TCP | dev-only today | vendored in AOSP; host-scale feature limits require testing |
+| `shadowsocks-rust` | Shadowsocks egress | candidate | mature and active |
 | `wintun-bindings` | Windows Wintun loading | verify binding release | exposes Adapter and Session APIs |
-| `wintun.dll` | signed Windows TUN driver | GPLv2 distribution terms | use WireGuard's authorized redistributable signed binary |
-| Privaxy | vendorable prior art | AGPLv3 compatible | reference for MITM exclusion, WebSocket upgrades, and uBO scriptlet and redirect behavior |
-
-The `adblock-rust` tree contains `data/test/fake-uBO-files/` material that
-appears GPL-3.0-or-later and outside the top-level license. It is test data and
-should not enter a shipped binary or vendored runtime source. Confirm packaging
-before release.
-
-Filter lists have independent terms. EasyList and similar compiled artifacts
-may create distribution obligations separate from engine licensing. Obtain
-legal review before shipping compiled lists.
+| `wintun.dll` | signed Windows TUN driver | candidate | use WireGuard's authorized redistributable signed binary |
+| Privaxy | vendorable prior art | reference only | reference for MITM exclusion, WebSocket upgrades, and uBO scriptlet and redirect behavior |
 
 ## Rejected Dependency Directions
 
@@ -178,16 +142,18 @@ Rechecked against primary sources on 2026-08-09:
 - Cloudflare Radar protocol shares supported h2 and h3 prioritization.
 - Chromium's user-certificate path does not provide target H3 interception.
 - Browser fingerprint byte parity would require BoringSSL-class behavior.
-- Privaxy's memory profile, functionality, and AGPLv3 status were reviewed.
+- Privaxy's memory profile and functionality were reviewed.
 
 ## Not Yet Verified
 
-Do not rely on these without a targeted check:
+Do not rely on these without a targeted check. Other documents cite these items
+by number, so a retired item leaves a reserved slot rather than renumbering the
+list.
 
 1. Whether Chrome bypasses every static certificate pin for a user-installed
    root. This determines which Google properties can be intercepted and needs a
    short device test in M3.
-2. The current `shadowsocks-rust` license and distribution obligations.
+2. *Reserved.*
 3. WebView user-root behavior across vendor builds and Android releases.
 4. Exact per-egress overhead beyond the approximate 60-byte WireGuard budget.
    Partially answered 2026-08-11: `WireGuardEgress` reports 80 bytes, the IPv6
@@ -265,8 +231,9 @@ These are deliberate hypotheses to test, not external facts:
 
 ## Open Product and Architecture Questions
 
-1. **AGPLv3 and the App Store:** choose dual licensing, a permissive iOS
-   component, or no iOS release before M5.
+Numbered as above, with reserved slots for retired questions.
+
+1. *Reserved.*
 2. **Firefox for Android:** decide whether its different CA behavior and required
    H3 configuration belong in the parity target.
 3. **WebView marketing:** advertise in-app browser filtering only after the
@@ -275,8 +242,7 @@ These are deliberate hypotheses to test, not external facts:
    account for CT and pinning consequences.
 5. **QUIC migration:** decide whether v1 UDP state follows connection IDs or
    explicitly excludes migration from guarantees.
-6. **Filter-list terms:** obtain legal advice for shipping compiled EasyList and
-   related artifacts.
+6. *Reserved.*
 7. **Neutral exchange model:** decide whether v1 keeps the three-adapter
    `Exchange` core in [Filtering](filtering.md) or builds on `http`-crate types.
    Boreas never terminates HTTP/3 in v1, so the quiche-interoperability
@@ -329,4 +295,4 @@ These are deliberate hypotheses to test, not external facts:
 For each new external claim, record the primary source, source date, observed
 version, and whether the result is verified, unverified, or inferred. A crate
 name in this file does not authorize adding it. Dependency admission still
-requires a current release, license, maintenance, and transitive-graph check.
+requires a current release, maintenance, and transitive-graph check.

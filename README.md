@@ -71,7 +71,3 @@ run them; without it they skip loudly rather than fail.
 ```sh
 BOREAS_SINGBOX=/path/to/sing-box cargo test --test interop
 ```
-
-## License
-
-[GNU Affero General Public License v3.0](LICENSE)

@@ -13,7 +13,7 @@
 //!
 //! **Opt-in, and skipped rather than failed when absent.** The binary is a
 //! development tool, not a dependency: it is never linked, never distributed,
-//! and runs out of process, so its licence does not reach this crate. Point
+//! and runs out of process. Point
 //! `BOREAS_SINGBOX` at it to run these; without it they report that they were
 //! skipped and pass, so a machine without the reference still has a green
 //! suite.

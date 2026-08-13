@@ -77,11 +77,7 @@ transport family, and Hysteria2.
 
 ### M5: iOS Separate Track
 
-Build content-blocker compilation and a DNS-only VPN after resolving App Store
-licensing.
-
-**Prerequisite:** resolve the AGPLv3 and App Store decision in
-[Verification](verification.md). If it remains unresolved, iOS does not ship.
+Build content-blocker compilation and a DNS-only VPN.
 
 Research outputs such as ablations, fingerprint-breakage measurements, and a
 pinning census come from milestone instrumentation rather than separate work.

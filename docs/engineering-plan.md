@@ -359,8 +359,7 @@ time; a malformed packet and a crafted TCP option list are counted, not fatal;
 a datagram producer is never blocked and a refusal frees its buffer; control
 messages reach the core in order. 50 tests, plus `clamp_mss` and `datapath`
 fuzz targets on the untrusted paths and a one-minute-per-target fuzz smoke job
-in CI. fmt, clippy, and `cargo deny` clean, the last now including
-dev-dependencies. tokio is taken with named features rather than `full`; the
+in CI. fmt and clippy clean. tokio is taken with named features rather than `full`; the
 full graph is recorded in [Verification](verification.md).
 
 **Unlocks:** P9, P10.
@@ -512,7 +511,7 @@ fast path. The M1 product gate (single-interface client on Android and Windows
 hardware) needs the devices this environment does not have and is
 **unexercised**, same as P9's. A Windows CI job now compiles the Wintun
 adapter and GotaTun together, because ring's C build ended the local
-cross-check. 59 tests, fmt, clippy, and `cargo deny` clean.
+cross-check. 59 tests, fmt, and clippy clean.
 
 ## Tier 3: Filtering and Egress Breadth
 
@@ -610,8 +609,7 @@ A, AAAA, HTTPS, and SVCB are all covered. The `dns` fuzz target ran 7.16M
 executions clean over query and answer bytes that need not agree with each
 other, asserting that a written response re-parses and that a stripped answer
 never still publishes an ECH configuration; the `datapath` target now also
-drives interception and answer synthesis. 75 tests, fmt, clippy, and
-`cargo deny` clean.
+drives interception and answer synthesis. 75 tests, fmt, and clippy clean.
 
 **Unlocks:** P12 consumes the same `watch`-swappable `Arc<HostPolicy>`; P13
 reads `SVCPARAM_ALPN` from the same SvcParam walk this phase added.
@@ -1227,8 +1225,7 @@ cipher: a derivation truncated for the 128-bit suite, or the wrong `ring`
 algorithm selected, would show on one and not the others.
 
 **The reference is a development tool, not a dependency.** It is never linked,
-never distributed, and runs out of process, so its licence does not reach this
-crate. The tests are opt-in through `BOREAS_SINGBOX` and *skip loudly* rather
+never distributed, and runs out of process. The tests are opt-in through `BOREAS_SINGBOX` and *skip loudly* rather
 than fail when it is absent, so a machine without it still has a green suite
 and no one mistakes a green run for a verified one.
 
@@ -1409,8 +1406,7 @@ lands the same way Shadowsocks now has: written from the reference source, then
 made to satisfy a server this project did not write.
 
 **Gate:** the M4 product gate. Non-native fidelity tunnels zero QUIC datagrams.
-A mid-session MASQUE fallback to HTTP/2 re-steers without dropping flows. Resolve
-the `shadowsocks-rust` license item before it ships.
+A mid-session MASQUE fallback to HTTP/2 re-steers without dropping flows.
 
 **Completes M4.**
 
@@ -1471,12 +1467,12 @@ syscall**.
 | M2 | P11–P12 | visible ad blocking across applications, no CA |
 | M3 | P13–P15 | AdGuard parity on the fixed corpus |
 | M4 | P16–P17 | filtering composes with the target egress set |
-| M5 | separate track | blocked on the AGPLv3 and App Store decision |
+| M5 | separate track | content blocking and DNS-only VPN on iOS |
 
 P1 through P7 carry no external dependency beyond `etherparse` and test-only
 crates. Every dependency in [Verification](verification.md) is first admitted at
-P8 or later, so the license and maintenance review for each one happens against a
-working core rather than a plan.
+P8 or later, so the maintenance review for each one happens against a working
+core rather than a plan.
 
 ## Open Items This Plan Adds
 

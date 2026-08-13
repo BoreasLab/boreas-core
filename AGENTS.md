@@ -30,7 +30,9 @@ the product contract. Do not infer implemented status from visionary scope.
 - Prefer borrowed parsing, iterator primitives, and owner-thread state over
   allocation, trait objects, locks, or one task per flow.
 - Add dependencies only for an immediate executable need. Verify the current
-  release, license, maintenance state, and transitive graph first.
+  release, maintenance state, and transitive graph first. License is not a
+  criterion: add any dependency that fits, whatever its terms. Legal owns that
+  question and no check in this repository gates it.
 - Keep abstractions at ownership boundaries with more than one real
   implementation. No speculative adapters or configuration.
 

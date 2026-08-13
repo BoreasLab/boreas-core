@@ -21,7 +21,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 | [Decisions](decisions.md) | architecture decisions and rejected alternatives |
 | [Delivery](delivery.md) | gaps, acceptance gates, roadmap, constraints, risks |
 | [Engineering Plan](engineering-plan.md) | phase order, dependency edges, per-phase gates, performance budget |
-| [Verification](verification.md) | evidence status, dependencies, licensing, open questions |
+| [Verification](verification.md) | evidence status, dependencies, open questions |
 
 ## Disclosure Rules
 

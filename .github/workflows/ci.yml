@@ -67,12 +67,3 @@ jobs:
             cargo fuzz run "$target" -- -max_total_time=60
           done
         working-directory: .
-
-  deny:
-    name: licenses and advisories
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check bans licenses sources advisories

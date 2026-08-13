@@ -70,18 +70,13 @@ Safari content blocking is the enforcement point for page-level filtering.
 The VPN performs DNS filtering and network policy only. This avoids forcing an
 HTTP interception engine into the 50 MB `NEPacketTunnelProvider` budget.
 
-AGPLv3 and App Store terms may be incompatible. Resolve licensing through a
-dual-licensed or permissively licensed iOS component, or explicitly decide not
-to ship iOS, before M5 implementation begins.
-
 ## Platform Acceptance
 
 - Android and Windows feed identical packet fixtures into the Rust core.
 - Device adapters contain no filtering or egress policy.
 - Egress sockets cannot loop back into the VPN.
 - Adapter shutdown cancels child work and releases OS resources deterministically.
-- Wintun distribution uses the authorized signed binary and satisfies its
-  license obligations.
+- Wintun distribution uses the authorized signed binary.
 - Android CA UX installs only to the user store.
 - Platform-specific behavior is represented as capability or events, not hidden
   branches in shared policy.
