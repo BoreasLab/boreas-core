@@ -179,6 +179,144 @@ pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unp
 
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> AsyncStream for T {}
 
+/// A stream that yields a prefix before anything the underlying stream has.
+///
+/// **This exists because a handshake reader over-reads, and the surplus is
+/// payload.** Every proxy in this crate reads a variable-length reply from a
+/// byte stream, so it must read *at least* the reply and may read past it —
+/// TCP does not preserve the sender's boundaries, and a server-first protocol
+/// (SSH, SMTP, IMAP) sends its banner the instant the proxy connects, which
+/// arrives coalesced into the same segment as the reply for exactly the flows
+/// where it matters most. Discarding the surplus truncates the response with no
+/// error anywhere, so the decoder reports how many bytes it consumed and the
+/// rest is replayed here.
+///
+/// O(1) per read, and the prefix is freed as soon as it is drained.
+pub struct Prefixed<S> {
+    prefix: bytes::Bytes,
+    inner: S,
+}
+
+impl<S> Prefixed<S> {
+    /// Wraps `inner` only when there is something to replay, so the common case
+    /// of an exact read costs neither an allocation nor an extra layer of
+    /// polling.
+    pub fn new(prefix: Vec<u8>, inner: S) -> Either<Prefixed<S>, S> {
+        if prefix.is_empty() {
+            Either::Right(inner)
+        } else {
+            Either::Left(Self {
+                prefix: prefix.into(),
+                inner,
+            })
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Prefixed<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.prefix.is_empty() {
+            use bytes::Buf;
+            let moved = buf.remaining().min(this.prefix.len());
+            buf.put_slice(&this.prefix[..moved]);
+            this.prefix.advance(moved);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prefixed<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// One of two stream types, so a wrapper can be skipped when it would be
+/// nothing but a passthrough. A sum rather than boxing: the choice is made once
+/// per flow and the variant is known statically at every use.
+pub enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<L, R> tokio::io::AsyncRead for Either<L, R>
+where
+    L: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Left(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::Right(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<L, R> tokio::io::AsyncWrite for Either<L, R>
+where
+    L: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Left(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::Right(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Left(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::Right(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Left(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::Right(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 /// A future returned through a trait object. Boxing is a per-flow cost, paid
 /// once at connect and amortised over every byte the flow then carries, which
 /// is why it is acceptable here and would not be on the packet path.
@@ -323,6 +461,10 @@ pub enum EgressError {
     /// A MASQUE tunnel could not be configured or driven. Construction-time or
     /// protocol-level, never a per-packet condition.
     Masque,
+    /// A QUIC connection could not be established, authenticated, or driven —
+    /// the transport under a QUIC-based egress rather than that egress's own
+    /// protocol, which is why it is distinct from [`Self::Proxy`].
+    Quic,
     /// This egress carries no datagrams, which its capability claim already
     /// says: `datagram_fidelity` is `None` and `associate` refuses.
     DatagramsUnsupported,
@@ -341,6 +483,7 @@ impl std::fmt::Display for EgressError {
             // names the variant, which is what an operator needs.
             Self::WireGuard(error) => write!(f, "WireGuard failure: {error:?}"),
             Self::Masque => f.write_str("MASQUE tunnel failure"),
+            Self::Quic => f.write_str("QUIC connection failure"),
             Self::DatagramsUnsupported => f.write_str("this egress carries no datagrams"),
             Self::Proxy(error) => write!(f, "proxy failure: {error}"),
             Self::Io(kind) => write!(f, "transport failure: {kind}"),

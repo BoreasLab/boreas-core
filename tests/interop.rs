@@ -31,9 +31,9 @@ use std::{
 };
 
 use boreas_core::{
-    DirectSockets, Method, NatBehavior, PlainTransport, PreSharedKey, ShadowsocksConfig,
-    ShadowsocksEgress, Socks5Config, Socks5Egress, StreamEgress, Target, UserId, VlessConfig,
-    VlessEgress,
+    DirectSockets, Hysteria2Config, Hysteria2Egress, Method, NatBehavior, PlainTransport,
+    PreSharedKey, ShadowsocksConfig, ShadowsocksEgress, Socks5Config, Socks5Egress, StreamEgress,
+    Target, UserId, VlessConfig, VlessEgress,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -57,6 +57,70 @@ fn skipped(test: &str) {
 struct Reference {
     child: Child,
     _dir: TempDir,
+}
+
+/// A self-signed certificate for the reference server to present, and the trust
+/// anchor this client verifies it against.
+///
+/// **Verification stays on.** Turning it off would make the test pass on a
+/// server presenting anything at all, and for a protocol whose authentication
+/// rides inside TLS that would quietly remove the property under test.
+/// `quiche` loads trust anchors only from PEM files, so they go to disk.
+struct Certificate {
+    certificate: PathBuf,
+    key: PathBuf,
+    _dir: TempDir,
+}
+
+impl Certificate {
+    const NAME: &'static str = "reference.example";
+
+    fn generate() -> Self {
+        let key = rcgen::KeyPair::generate().expect("a key pair");
+        let mut params =
+            rcgen::CertificateParams::new(vec![Self::NAME.to_owned()]).expect("valid parameters");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, Self::NAME);
+        let certificate = params.self_signed(&key).expect("a self-signed leaf");
+
+        let dir = TempDir::new();
+        let certificate_path = dir.path().join("reference.crt");
+        let key_path = dir.path().join("reference.key");
+        std::fs::write(&certificate_path, pem("CERTIFICATE", certificate.der())).unwrap();
+        std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).unwrap();
+        Self {
+            certificate: certificate_path,
+            key: key_path,
+            _dir: dir,
+        }
+    }
+}
+
+/// Wraps DER as PEM. Written out rather than enabling `rcgen`'s `pem` feature,
+/// which would pull a base64 crate in for four lines of work.
+fn pem(label: &str, der: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::new();
+    for chunk in der.chunks(3) {
+        let mut block = [0u8; 3];
+        block[..chunk.len()].copy_from_slice(chunk);
+        let bits = u32::from_be_bytes([0, block[0], block[1], block[2]]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                encoded.push(ALPHABET[((bits >> (18 - index * 6)) & 0x3f) as usize] as char);
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    let wrapped = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n")
 }
 
 impl Drop for Reference {
@@ -353,4 +417,130 @@ async fn vless_interoperates_with_the_reference_server() {
         .expect("the reference answers")
         .expect("the response arrives");
     assert_eq!(&buf, b"vless interop");
+}
+
+/// Hysteria2 against the reference, which is the first test in this file that
+/// exercises a QUIC connection of our own driving rather than a TCP socket.
+///
+/// Everything the protocol newly depends on rides on this: the QUIC handshake,
+/// the HTTP/3 authentication exchange and its status 233, the decision to drop
+/// the HTTP/3 layer before opening a proxy stream, the driver's stream pump in
+/// both directions, and the request and response frame codecs. A mistake in any
+/// of them is a server that refuses or a stream that never delivers.
+///
+/// **Two flows, deliberately.** They must share one QUIC connection and land on
+/// *different* stream ids; a driver that reused an id or opened a second
+/// connection would still pass a single-flow test.
+#[tokio::test]
+async fn hysteria2_interoperates_with_the_reference_server() {
+    let Some(binary) = reference_binary() else {
+        return skipped("hysteria2_interoperates_with_the_reference_server");
+    };
+    let echo = start_echo().await;
+    let port = free_port();
+    let password = "interop-password";
+    let certificate = Certificate::generate();
+    let config = format!(
+        r#"{{
+  "log": {{"level": "error"}},
+  "inbounds": [{{
+    "type": "hysteria2",
+    "listen": "127.0.0.1",
+    "listen_port": {port},
+    "users": [{{"password": "{password}"}}],
+    "tls": {{
+      "enabled": true,
+      "server_name": "{name}",
+      "certificate_path": "{cert}",
+      "key_path": "{key}"
+    }}
+  }}],
+  "outbounds": [{{"type": "direct"}}]
+}}"#,
+        name = Certificate::NAME,
+        cert = certificate.certificate.display(),
+        key = certificate.key.display(),
+    );
+    // No TCP port to probe: Hysteria2 listens on UDP, and there is no
+    // connectionless equivalent of a completed handshake. Readiness is
+    // established by the client's own retry loop below.
+    let _reference = Reference::start(&binary, &config, &[]);
+
+    let egress = Hysteria2Egress::new(
+        Hysteria2Config {
+            server: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            server_name: Certificate::NAME.to_owned(),
+            password: password.to_owned(),
+            nat_behavior: NatBehavior::EndpointIndependent,
+        },
+        DirectSockets,
+        {
+            let anchor = certificate.certificate.clone();
+            Box::new(move || {
+                let mut config = Hysteria2Egress::<DirectSockets>::quic_config()?;
+                config
+                    .load_verify_locations_from_file(anchor.to_str().expect("a UTF-8 path"))
+                    .expect("the trust anchor loads");
+                Ok(config)
+            })
+        },
+    );
+
+    let mut first = dial_with_retries(&egress, &Target::Ip(echo)).await;
+    first.write_all(b"hysteria interop").await.unwrap();
+    first.flush().await.unwrap();
+
+    let mut buf = [0u8; 16];
+    tokio::time::timeout(Duration::from_secs(10), first.read_exact(&mut buf))
+        .await
+        .expect("the reference answers")
+        .expect("the response arrives");
+    assert_eq!(&buf, b"hysteria interop");
+
+    // A second flow over the same connection. It exercises the stream id
+    // allocator and proves the authentication is not repeated per flow.
+    let mut second = egress
+        .connect(&Target::Ip(echo))
+        .await
+        .expect("the second flow opens on the established connection");
+    second.write_all(b"second").await.unwrap();
+    second.flush().await.unwrap();
+    let mut buf = [0u8; 6];
+    tokio::time::timeout(Duration::from_secs(10), second.read_exact(&mut buf))
+        .await
+        .expect("the reference answers the second flow")
+        .expect("the response arrives");
+    assert_eq!(&buf, b"second");
+
+    // The first stream must still work after the second opened, which is what
+    // separates a multiplexed connection from a serially reused one.
+    first.write_all(b"again").await.unwrap();
+    first.flush().await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(10), first.read_exact(&mut buf))
+        .await
+        .expect("the first flow is still live")
+        .expect("the response arrives");
+    assert_eq!(&buf, b"again");
+}
+
+/// Dials until the reference's UDP listener is up.
+///
+/// A QUIC client cannot tell "not listening yet" from "packet lost" — that is
+/// what makes UDP readiness unprobeable — so the retry is the readiness check.
+/// The timeout is short so a genuinely dead server fails fast rather than
+/// sitting through the handshake's own deadline.
+async fn dial_with_retries(
+    egress: &impl StreamEgress,
+    target: &Target,
+) -> Box<dyn boreas_core::AsyncStream> {
+    for attempt in 0..10 {
+        match tokio::time::timeout(Duration::from_secs(3), egress.connect(target)).await {
+            Ok(Ok(stream)) => return stream,
+            Ok(Err(error)) if attempt == 9 => panic!("the reference refused Hysteria2: {error}"),
+            Err(_) if attempt == 9 => panic!("the reference never completed a QUIC handshake"),
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    unreachable!("the loop either returns or panics on its last attempt")
 }

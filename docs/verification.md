@@ -209,8 +209,7 @@ Do not rely on these without a targeted check:
    data transfer and the mobile target remain unmeasured, so the verdict is
    provisional until P7's hot-path work re-measures under traffic.
 7. SOCKS5 UDP ASSOCIATE support among servers users actually operate.
-8. Claimed Hysteria2 and TUIC throughput and P95 improvements on the Boreas
-   workload.
+8. Claimed Hysteria2 throughput and P95 improvements on the Boreas workload.
 9. Whether one TLS connection per DNS query is acceptable on a real page load.
    Measured 2026-08-11 against a live resolver (`examples/resolve.rs`, aarch64
    dev VM, release): Do53 1.9 ms; DoT 10.7 ms cold and 4.9 ms resumed; DoH

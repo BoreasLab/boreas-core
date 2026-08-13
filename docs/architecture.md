@@ -23,7 +23,7 @@
                              v
 + Capability-typed egress ---------------------------------+
 | L3: WireGuard, MASQUE CONNECT-IP                          |
-| L4: SOCKS5, Shadowsocks, VLESS, Hysteria2, TUIC           |
+| L4: SOCKS5, Shadowsocks, VLESS, Hysteria2                 |
 +-----------------------------------------------------------+
 ```
 

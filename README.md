@@ -5,8 +5,8 @@ filtering with user-selected encrypted egress on one system VPN interface.
 
 The v1 product targets non-rooted Android and Windows. It uses one raw-IP
 datapath for DNS and network filtering, browser and WebView HTTPS filtering,
-and egress through WireGuard, MASQUE, SOCKS5, Shadowsocks, and later
-VLESS-family transports.
+and egress through WireGuard, MASQUE, SOCKS5, Shadowsocks, Hysteria2, and later
+Reality.
 
 ## Status
 
@@ -23,8 +23,11 @@ The core currently provides:
 - a reactor bridge presenting each terminated connection as an async stream,
   with backpressure carried by TCP's own window rather than by dropping bytes
 - MASQUE CONNECT-IP egress over a sans-io QUIC stack, alongside WireGuard
-- SOCKS5 with UDP ASSOCIATE, Shadowsocks 2022, and VLESS over TCP, on one dial
-  seam shared with local termination, each verified against a reference server
+- a QUIC stream driver presenting each `quiche` bidirectional stream as an async
+  stream, sharing the terminator's bridge and its backpressure discipline
+- SOCKS5 with UDP ASSOCIATE, Shadowsocks 2022, VLESS, and Hysteria2 over TCP, on
+  one dial seam shared with local termination, each verified against a reference
+  server
 
 The upstream dialer (TCP plus TLS with tunnel bypass) and the session assembly
 that chooses between interception and splice are under construction, as are the

@@ -24,10 +24,24 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
-/// What the test proxy demands of its clients.
+/// What the test proxy demands of its clients, and what it sends them.
 #[derive(Clone)]
 struct ProxyPolicy {
     credentials: Option<(String, String)>,
+    /// Bytes written *in the same `write_all` as the CONNECT reply*, standing
+    /// in for a server-first protocol's banner. The single write is the point:
+    /// it is what makes the reply and the payload arrive in one segment, which
+    /// is the case a reply reader that over-reads and discards gets wrong.
+    banner: &'static [u8],
+}
+
+impl ProxyPolicy {
+    fn open() -> Self {
+        Self {
+            credentials: None,
+            banner: b"",
+        }
+    }
 }
 
 /// Reads the client's greeting and answers with a method, performing RFC 1929
@@ -101,7 +115,12 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<(u8, Target)> {
 }
 
 /// Writes a reply with the given code and bound address.
-async fn write_reply(stream: &mut TcpStream, code: u8, bound: SocketAddr) -> std::io::Result<()> {
+async fn write_reply(
+    stream: &mut TcpStream,
+    code: u8,
+    bound: SocketAddr,
+    trailer: &[u8],
+) -> std::io::Result<()> {
     let mut out = vec![5, code, 0];
     match bound {
         SocketAddr::V4(address) => {
@@ -114,6 +133,7 @@ async fn write_reply(stream: &mut TcpStream, code: u8, bound: SocketAddr) -> std
         }
     }
     out.extend_from_slice(&bound.port().to_be_bytes());
+    out.extend_from_slice(trailer);
     stream.write_all(&out).await
 }
 
@@ -132,19 +152,23 @@ async fn serve(mut stream: TcpStream, policy: ProxyPolicy) {
             let Target::Ip(address) = target else {
                 // A CONNECT to a name would need resolution; the test dials by
                 // address so the proxy stays a proxy.
-                write_reply(&mut stream, 4, ([0, 0, 0, 0], 0).into())
+                write_reply(&mut stream, 4, ([0, 0, 0, 0], 0).into(), b"")
                     .await
                     .unwrap();
                 return;
             };
             let mut upstream = TcpStream::connect(address).await.unwrap();
-            write_reply(&mut stream, 0, address).await.unwrap();
+            write_reply(&mut stream, 0, address, policy.banner)
+                .await
+                .unwrap();
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
         }
         3 => {
             let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let relay_address = relay.local_addr().unwrap();
-            write_reply(&mut stream, 0, relay_address).await.unwrap();
+            write_reply(&mut stream, 0, relay_address, b"")
+                .await
+                .unwrap();
 
             // The relay outlives the request but not the control connection,
             // which is the lifetime RFC 1928 §7 specifies.
@@ -220,7 +244,7 @@ fn egress(proxy: SocketAddr, credentials: Option<Credentials>) -> Socks5Egress<D
 #[tokio::test]
 async fn connect_reaches_the_target_and_carries_bytes_both_ways() {
     let echo = start_echo().await;
-    let proxy = start_proxy(ProxyPolicy { credentials: None }).await;
+    let proxy = start_proxy(ProxyPolicy::open()).await;
     let egress = egress(proxy, None);
 
     let target = Target::Ip(echo);
@@ -235,6 +259,7 @@ async fn connect_reaches_the_target_and_carries_bytes_both_ways() {
 async fn authentication_is_performed_when_the_proxy_requires_it() {
     let echo = start_echo().await;
     let proxy = start_proxy(ProxyPolicy {
+        banner: b"",
         credentials: Some(("boreas".to_owned(), "secret".to_owned())),
     })
     .await;
@@ -274,7 +299,7 @@ async fn authentication_is_performed_when_the_proxy_requires_it() {
 
 #[tokio::test]
 async fn udp_associate_relays_datagrams_with_their_targets() {
-    let proxy = start_proxy(ProxyPolicy { credentials: None }).await;
+    let proxy = start_proxy(ProxyPolicy::open()).await;
     let egress = Arc::new(egress(proxy, None));
 
     let association = egress.associate().await.expect("the relay is established");
@@ -301,4 +326,62 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
     .expect("the reply decodes");
     assert_eq!(&buf[..read], b"\x12\x34query");
     assert_eq!(from, target, "the reply names the peer it came from");
+}
+
+/// **The regression test for a reply reader that over-reads.**
+///
+/// A SOCKS5 reply's length lives inside the reply, so a client must read at
+/// least the reply and may read past it. A server-first protocol — SSH, SMTP,
+/// IMAP — sends its banner the instant the proxy dials the target, and the
+/// proxy forwards it, so the banner arrives in the same segment as the reply
+/// for exactly the flows where it matters. A client that decodes the reply and
+/// then throws the buffer away loses the banner, with no error anywhere: the
+/// connection simply appears to have skipped the greeting it was waiting for.
+///
+/// The test proxy writes the reply and the banner in one `write_all`, which is
+/// what makes the coalescing deterministic rather than a matter of timing.
+#[tokio::test]
+async fn a_banner_coalesced_with_the_reply_is_not_swallowed() {
+    const BANNER: &[u8] = b"SSH-2.0-Boreas\r\n";
+
+    let echo = start_echo().await;
+    let proxy = start_proxy(ProxyPolicy {
+        credentials: None,
+        banner: BANNER,
+    })
+    .await;
+
+    let mut stream = egress(proxy, None)
+        .connect(&Target::Ip(echo))
+        .await
+        .expect("connect succeeds");
+
+    // Bounded, because the failure this guards against is a *hang*: a
+    // discarded banner leaves the reader waiting for bytes that were already
+    // consumed and thrown away, and a test that hangs reports nothing useful.
+    let mut greeting = vec![0u8; BANNER.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut greeting),
+    )
+    .await
+    .expect("the banner arrives rather than being waited for forever")
+    .expect("the banner survives the reply reader");
+    assert_eq!(
+        greeting, BANNER,
+        "the bytes that followed the reply must be delivered, not discarded"
+    );
+
+    // And the stream still works afterwards: the replayed prefix must not
+    // displace what the underlying socket goes on to deliver.
+    stream.write_all(b"after").await.unwrap();
+    let mut echoed = [0u8; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("the stream still carries bytes after the replayed prefix")
+    .unwrap();
+    assert_eq!(&echoed, b"after");
 }

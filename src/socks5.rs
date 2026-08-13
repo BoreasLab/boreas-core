@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     AsyncStream, BoxFuture, DatagramAssociation, DatagramFidelity, DomainName, EgressCapabilities,
-    EgressError, NatBehavior, StreamEgress, Target, TunnelBypass,
+    EgressError, NatBehavior, Prefixed, StreamEgress, Target, TunnelBypass,
 };
 
 /// The only protocol version this crate speaks, and the only one that exists.
@@ -52,11 +52,18 @@ const METHOD_UNACCEPTABLE: u8 = 0xff;
 /// What a SOCKS5 exchange can get wrong. Distinct from a transport failure,
 /// which is [`EgressError::Io`]: this names a peer that answered, but not with
 /// something this protocol admits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Not `Copy`, because [`Self::Denied`] carries the server's own explanation.
+/// That text is the one thing an operator has when a proxy refuses a flow for a
+/// reason of its own devising, and dropping it to keep the type a machine word
+/// would be trading the diagnostic for nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyError {
     /// A version byte that is not 5 (or not 1 in sub-negotiation). Almost
     /// always something that is not a SOCKS5 proxy at all.
     Version(u8),
+    /// The server refused to open a stream and said why, in its own words.
+    /// Hysteria2's refusals are free text rather than a code table.
+    Denied(String),
     /// The proxy accepted none of the authentication methods offered.
     NoAcceptableMethod,
     /// The proxy selected a method that was never offered.
@@ -87,6 +94,7 @@ impl std::fmt::Display for ProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Version(version) => write!(f, "peer is not SOCKS5 (version {version})"),
+            Self::Denied(reason) => write!(f, "server refused the stream: {reason}"),
             Self::NoAcceptableMethod => f.write_str("no acceptable authentication method"),
             Self::UnexpectedMethod(method) => write!(f, "proxy chose unoffered method {method}"),
             Self::AuthFailed => f.write_str("authentication rejected"),
@@ -350,6 +358,15 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<(Target, &[u8]), ProxyError> {
 /// that turns "not yet" into another read, so no decoder has to know about I/O
 /// and no caller has to re-implement framing. A peer that closes mid-message
 /// is `UnexpectedEof` rather than a silent partial parse.
+/// **`buf` carries the surplus out, and it must not be discarded.** A reply's
+/// length lives inside the reply, so this reads *at least* one message and may
+/// read past it — TCP does not preserve the sender's boundaries. What follows
+/// the message is the connection's first payload bytes: a server-first protocol
+/// sends its banner as soon as the proxy connects, and it arrives coalesced
+/// into the same segment as the reply. So the message is drained from the front
+/// and whatever remains stays in `buf` for the caller to replay through
+/// [`Prefixed`], which is also what makes calling this twice on one connection
+/// correct.
 async fn read_message<S, T>(
     stream: &mut S,
     buf: &mut Vec<u8>,
@@ -358,11 +375,13 @@ async fn read_message<S, T>(
 where
     S: AsyncStream,
 {
-    buf.clear();
     let mut chunk = [0u8; 512];
     loop {
         match decode(buf)? {
-            Decoded::Complete { value, .. } => return Ok(value),
+            Decoded::Complete { value, consumed } => {
+                buf.drain(..consumed);
+                return Ok(value);
+            }
             Decoded::Incomplete => {}
         }
         let read = stream.read(&mut chunk).await?;
@@ -405,7 +424,10 @@ impl<B: TunnelBypass> Socks5Egress<B> {
     /// Opens a connection to the proxy and completes the greeting and, when
     /// required, authentication. Shared by both commands, because RFC 1928
     /// makes them identical up to the request byte.
-    async fn negotiate(&self) -> Result<tokio::net::TcpStream, EgressError> {
+    ///
+    /// The buffer comes back with the negotiation's surplus still in it, so the
+    /// caller keeps reading where this stopped rather than from an empty one.
+    async fn negotiate(&self) -> Result<(tokio::net::TcpStream, Vec<u8>), EgressError> {
         let mut stream = self.bypass.tcp(self.config.proxy).await?;
         let mut out = Vec::with_capacity(4);
         encode_greeting(self.config.credentials.as_ref(), &mut out);
@@ -447,7 +469,7 @@ impl<B: TunnelBypass> Socks5Egress<B> {
                 return Err(ProxyError::AuthFailed.into());
             }
         }
-        Ok(stream)
+        Ok((stream, buf))
     }
 }
 
@@ -476,23 +498,25 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            let mut stream = self.negotiate().await?;
+            let (mut stream, mut buf) = self.negotiate().await?;
             let mut out = Vec::with_capacity(32);
             encode_request(CMD_CONNECT, target, &mut out);
             stream.write_all(&out).await?;
 
-            let mut buf = Vec::with_capacity(64);
             // The bound address the proxy reports is discarded: this client
             // never needs to name its own side of a CONNECT, and keeping it
             // would invite treating it as authoritative for the target.
             let _bound = read_message(&mut stream, &mut buf, decode_reply).await?;
-            Ok(Box::new(stream) as Box<dyn AsyncStream>)
+            // Whatever followed the reply is the target's first payload — a
+            // server-first banner, most often — so it is replayed rather than
+            // dropped.
+            Ok(Box::new(Prefixed::new(buf, stream)) as Box<dyn AsyncStream>)
         })
     }
 
     fn associate(&self) -> BoxFuture<'_, Result<Box<dyn DatagramAssociation>, EgressError>> {
         Box::pin(async move {
-            let mut control = self.negotiate().await?;
+            let (mut control, mut buf) = self.negotiate().await?;
             // RFC 1928 §7: the address here is where *this client* will send
             // from. All-zeroes means "not yet known", which is what a client
             // behind an unpredictable source port must say.
@@ -501,7 +525,6 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
             encode_request(CMD_UDP_ASSOCIATE, &unspecified, &mut out);
             control.write_all(&out).await?;
 
-            let mut buf = Vec::with_capacity(64);
             let relay = read_message(&mut control, &mut buf, decode_reply).await?;
             // The relay must be reachable as an address; a proxy naming its
             // relay by domain would need a resolution this layer will not do.

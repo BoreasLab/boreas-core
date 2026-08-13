@@ -44,6 +44,11 @@ webpki-roots = "1"
 wintun-bindings = "0.7.39"
 
 [dev-dependencies]
+# The interop tests need a certificate for the reference server to present, and
+# `quiche` loads trust anchors only from PEM files. `rcgen` is already a normal
+# dependency for the interception CA; listing it here too is what makes it
+# reachable from an integration test, and Cargo links the one copy.
+rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 # `test-util` provides the paused clock the P8 timer gate needs: virtual time
 # is what lets the test assert wakeup counts without waiting an hour.
 tokio = { version = "1.53.1", features = ["test-util"] }

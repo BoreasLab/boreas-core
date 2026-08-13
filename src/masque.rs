@@ -38,7 +38,7 @@ use quiche::h3::NameValue;
 
 use crate::{
     BufferPool, DatagramFidelity, EgressCapabilities, EgressEmit, EgressError, NatBehavior,
-    PacketEgress,
+    PacketEgress, varint,
 };
 
 /// The CONNECT-IP context ID for a full IP packet, fixed by RFC 9484 §6.
@@ -127,8 +127,8 @@ pub enum TunnelState {
 /// the caller's buffer and no allocation of its own.
 pub fn encode_ip_datagram(flow_id: u64, packet: &[u8], out: &mut Vec<u8>) {
     out.clear();
-    put_varint(flow_id, out);
-    put_varint(IP_PACKET_CONTEXT, out);
+    varint::put(flow_id, out);
+    varint::put(IP_PACKET_CONTEXT, out);
     out.extend_from_slice(packet);
 }
 
@@ -138,49 +138,15 @@ pub fn encode_ip_datagram(flow_id: u64, packet: &[u8], out: &mut Vec<u8>) {
 /// context 0: another context is a capsule this tunnel does not implement, and
 /// another flow is not ours to interpret. O(1) — two varints and a slice.
 pub fn decode_ip_datagram(datagram: &[u8], expected_flow_id: u64) -> Option<&[u8]> {
-    let (flow_id, rest) = get_varint(datagram)?;
+    let (flow_id, rest) = varint::get(datagram)?;
     if flow_id != expected_flow_id {
         return None;
     }
-    let (context, packet) = get_varint(rest)?;
+    let (context, packet) = varint::get(rest)?;
     if context != IP_PACKET_CONTEXT {
         return None;
     }
     (!packet.is_empty()).then_some(packet)
-}
-
-/// RFC 9000 §16 variable-length integer encoding: the two leading bits select
-/// a 1, 2, 4, or 8 byte form, and the shortest form that fits is used.
-fn put_varint(value: u64, out: &mut Vec<u8>) {
-    match value {
-        0..=63 => out.push(value as u8),
-        64..=16_383 => out.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes()),
-        16_384..=1_073_741_823 => {
-            out.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes())
-        }
-        _ => out.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes()),
-    }
-}
-
-/// The decoding half, returning the value and the bytes after it. Total: a
-/// truncated varint is `None` rather than a panic, because these bytes come
-/// from the network.
-fn get_varint(bytes: &[u8]) -> Option<(u64, &[u8])> {
-    let first = *bytes.first()?;
-    let length = 1usize << (first >> 6);
-    let encoded = bytes.get(..length)?;
-    let value = encoded
-        .iter()
-        .fold(u64::from(first) & 0x3f, |value, &byte| {
-            (value << 8) | u64::from(byte)
-        });
-    // The fold above re-consumed the first byte's low bits; undo that for the
-    // multi-byte forms by masking the accumulated width.
-    let value = match length {
-        1 => u64::from(first) & 0x3f,
-        _ => value & ((1u64 << (length as u32 * 8 - 2)) - 1),
-    };
-    Some((value, &bytes[length..]))
 }
 
 /// A MASQUE CONNECT-IP tunnel as a sans-io packet egress.
@@ -212,7 +178,7 @@ impl MasqueEgress {
     /// The connection is the caller's to configure — ALPN, certificate
     /// verification, datagram queues, and transport parameters are deployment
     /// policy, not this type's — so it is passed in rather than built here.
-    /// [`client_config`] provides the settings CONNECT-IP requires.
+    /// [`MasqueEgress::client_config`] provides the settings CONNECT-IP requires.
     pub fn new(
         conn: quiche::Connection,
         config: MasqueConfig,
@@ -510,8 +476,8 @@ mod tests {
 
         // Context 1 is a capsule this tunnel does not implement.
         let mut other_context = Vec::new();
-        put_varint(4, &mut other_context);
-        put_varint(1, &mut other_context);
+        varint::put(4, &mut other_context);
+        varint::put(1, &mut other_context);
         other_context.extend_from_slice(&packet);
         assert_eq!(decode_ip_datagram(&other_context, 4), None);
 
@@ -519,8 +485,8 @@ mod tests {
         assert_eq!(decode_ip_datagram(&[], 0), None);
         assert_eq!(decode_ip_datagram(&[0x40], 0), None);
         let mut empty_payload = Vec::new();
-        put_varint(4, &mut empty_payload);
-        put_varint(0, &mut empty_payload);
+        varint::put(4, &mut empty_payload);
+        varint::put(0, &mut empty_payload);
         assert_eq!(decode_ip_datagram(&empty_payload, 4), None);
     }
 
@@ -846,24 +812,5 @@ mod tests {
             vec![packet.to_vec()],
             "the tunnelled packet came back exactly as it went out"
         );
-    }
-
-    #[test]
-    fn varints_use_the_shortest_form_rfc_9000_allows() {
-        let widths = [
-            (0u64, 1usize),
-            (63, 1),
-            (64, 2),
-            (16_383, 2),
-            (16_384, 4),
-            (1_073_741_823, 4),
-            (1_073_741_824, 8),
-        ];
-        for (value, width) in widths {
-            let mut encoded = Vec::new();
-            put_varint(value, &mut encoded);
-            assert_eq!(encoded.len(), width, "value {value} encodes in {width}");
-            assert_eq!(get_varint(&encoded), Some((value, &[][..])));
-        }
     }
 }

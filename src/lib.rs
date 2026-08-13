@@ -1,3 +1,4 @@
+mod bridge;
 mod ca;
 mod datapath;
 mod device;
@@ -5,12 +6,14 @@ mod dns;
 mod egress;
 mod exchange;
 mod filter;
+mod hysteria2;
 mod masque;
 mod mitm;
 mod packet;
 mod path;
 mod platform;
 mod pool;
+mod quic;
 mod reassembly;
 mod shadowsocks;
 mod shell;
@@ -19,10 +22,12 @@ mod stream;
 mod terminate;
 mod udp;
 mod upstream;
+mod varint;
 mod vless;
 
 use std::{error::Error, fmt};
 
+pub use bridge::BridgedStream;
 pub use ca::{CaError, CertificateAuthority, MitmResolver};
 pub use datapath::{Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Side, Transmit};
 pub use device::{Device, Harness, SimDevice};
@@ -36,11 +41,15 @@ pub use dns::{
 };
 pub use egress::{
     AsyncStream, BoxFuture, DatagramAssociation, DomainName, DomainNameError, Egress, EgressEmit,
-    EgressError, PacketEgress, StreamEgress, Target, WIREGUARD_OVERHEAD_BYTES, WireGuardConfig,
-    WireGuardEgress,
+    EgressError, Either, PacketEgress, Prefixed, StreamEgress, Target, WIREGUARD_OVERHEAD_BYTES,
+    WireGuardConfig, WireGuardEgress,
 };
 pub use exchange::{AllowAll, FilterVerdict, ProxyBody, RequestFilter, run_exchange};
 pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
+pub use hysteria2::{
+    Hysteria2Config, Hysteria2Egress, QuicConfigFactory, TcpResponse, decode_tcp_response,
+    encode_tcp_request,
+};
 pub use masque::{
     CloseReason, MASQUE_OVERHEAD_BYTES, MasqueConfig, MasqueEgress, TunnelState,
     decode_ip_datagram, encode_ip_datagram,
@@ -53,6 +62,7 @@ pub use platform::AndroidTun;
 #[cfg(windows)]
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
+pub use quic::{H3Response, Handshake, QuicConnection, client_config};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
 pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
 pub use shell::{

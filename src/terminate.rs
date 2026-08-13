@@ -15,7 +15,9 @@
 //! when the consuming channel has already reserved capacity. When it has not,
 //! bytes stay in `smoltcp`'s receive buffer, the advertised window shrinks, and
 //! the peer stops sending. The bound is enforced by refusing to read, which is
-//! exactly the mechanism TCP provides for it.
+//! exactly the mechanism TCP provides for it. The channels and the stream that
+//! rides on them are [`crate::bridge`]'s, shared with the QUIC driver, which
+//! needs the same hand-off for a different state machine.
 //!
 //! **The pump is a sweep, and its cost is bounded by the socket ceiling.** One
 //! pass costs O(live connections) channel probes, and
@@ -25,34 +27,19 @@
 //! measurement shows the sweep on the profile; at the tens-to-hundreds of
 //! connections the ceiling admits, the probe is cheaper than the bookkeeping.
 
-use std::{
-    collections::HashMap,
-    io,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Notify, mpsc},
     time::{Instant as TokioInstant, sleep_until},
 };
-use tokio_util::sync::{CancellationToken, PollSender};
+use tokio_util::sync::CancellationToken;
 
-use crate::{LocalStack, Pooled, StreamError, StreamId, Terminated};
-
-/// Bytes moved in one chunk between the pump and a stream task. A cap on the
-/// copy the pump performs per probe, so one busy connection cannot monopolize a
-/// sweep; the channel depth times this is the per-connection buffer the bridge
-/// adds on top of `smoltcp`'s own.
-const CHUNK: usize = 16 * 1024;
-
-/// Chunks in flight per direction, per connection. Small on purpose: the
-/// socket buffer is the real window, and this only smooths the hand-off.
-const STREAM_DEPTH: usize = 8;
+use crate::{
+    LocalStack, Pooled, StreamError, StreamId, Terminated,
+    bridge::{CHUNK, Plumbing, pair},
+};
 
 /// One accepted connection: what it is, and the stream that serves it.
 ///
@@ -71,104 +58,11 @@ pub struct Accepted {
 /// TCP segments. Closing the write half sends FIN, and an exhausted read half
 /// is the peer's FIN — so the type's `AsyncRead`/`AsyncWrite` contract carries
 /// the connection's half-close semantics rather than hiding them.
-#[derive(Debug)]
-pub struct TerminatedStream {
-    inbound: mpsc::Receiver<Bytes>,
-    /// `None` once the write half is shut down: dropping the sender is what
-    /// tells the pump to send FIN, so shutdown is expressed by ownership rather
-    /// than by a flag the pump would have to poll.
-    outbound: Option<PollSender<Bytes>>,
-    /// Wakes the pump after a write, so a stream task never waits for the next
-    /// packet or timer to have its bytes delivered.
-    wake: Arc<Notify>,
-    /// The unconsumed tail of a chunk larger than the last read buffer.
-    pending: Bytes,
-}
-
-impl AsyncRead for TerminatedStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.pending.is_empty() {
-            match this.inbound.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => this.pending = chunk,
-                // The pump dropped its sender: the peer sent FIN, and an empty
-                // read is how `AsyncRead` spells end of stream.
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        let moved = buf.remaining().min(this.pending.len());
-        buf.put_slice(&this.pending[..moved]);
-        this.pending.advance(moved);
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncWrite for TerminatedStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let Some(sender) = this.outbound.as_mut() else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the write half is shut down",
-            )));
-        };
-        match sender.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let moved = buf.len().min(CHUNK);
-                sender
-                    .send_item(Bytes::copy_from_slice(&buf[..moved]))
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the pump is gone"))?;
-                this.wake.notify_one();
-                Poll::Ready(Ok(moved))
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the pump is gone",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    /// Bytes are already queued for the pump; there is no buffer of our own to
-    /// force out, and waiting for the client to acknowledge them is not what
-    /// flush means here.
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        // Dropping the sender is the signal: the pump sees a closed channel,
-        // drains what was queued, and only then sends FIN.
-        this.outbound = None;
-        this.wake.notify_one();
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// The pump's half of one connection's plumbing.
-struct Plumbing {
-    /// Client bytes toward the task. `None` once the peer's FIN has been
-    /// observed and the task has been given its end-of-stream.
-    to_task: Option<mpsc::Sender<Bytes>>,
-    from_task: mpsc::Receiver<Bytes>,
-    /// A chunk the socket's send buffer could not take in full. Held here so
-    /// the next sweep resumes exactly where this one stopped, which is what
-    /// makes a partial write lossless.
-    pending_out: Option<Bytes>,
-    /// Set once the task's sender is gone and everything it wrote has been
-    /// handed to the socket, so FIN is sent exactly once.
-    finished: bool,
-}
+///
+/// The name is the local one for [`crate::BridgedStream`]: the QUIC driver
+/// hands back the same type for the same reasons, and only the pump behind it
+/// differs.
+pub type TerminatedStream = crate::BridgedStream;
 
 /// Drives the terminator until cancelled.
 ///
@@ -236,14 +130,7 @@ async fn service(
     stack.poll(Instant::now());
 
     while let Some(terminated) = stack.poll_accept() {
-        let (to_task, inbound) = mpsc::channel(STREAM_DEPTH);
-        let (outbound, from_task) = mpsc::channel(STREAM_DEPTH);
-        let stream = TerminatedStream {
-            inbound,
-            outbound: Some(PollSender::new(outbound)),
-            wake: Arc::clone(wake),
-            pending: Bytes::new(),
-        };
+        let (stream, plumbing) = pair(Arc::clone(wake));
         // A consumer that cannot take the connection is one that has gone away;
         // aborting is the honest answer, because nothing will ever serve it.
         if accepted
@@ -254,15 +141,7 @@ async fn service(
             stack.abort(terminated.id);
             continue;
         }
-        conns.insert(
-            terminated.id,
-            Plumbing {
-                to_task: Some(to_task),
-                from_task,
-                pending_out: None,
-                finished: false,
-            },
-        );
+        conns.insert(terminated.id, plumbing);
     }
 
     for (&id, plumbing) in conns.iter_mut() {

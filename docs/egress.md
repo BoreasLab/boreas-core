@@ -77,16 +77,20 @@ Implementation order:
 2. Shadowsocks
 3. VLESS with TLS, Reality, and XTLS-Vision
 4. Hysteria2
-5. TUIC
 
 VLESS plus Reality is a priority for mainland China because it disguises
-traffic as a normal HTTPS visit and is widely deployed. Hysteria2 and TUIC are
-expected to improve throughput by 10 to 30 percent and P95 latency by 20 to 40
-percent when loss is at least 1 percent and RTT is at least 100 ms. Those ranges
-are claims to benchmark, not acceptance without local evidence.
+traffic as a normal HTTPS visit and is widely deployed. Hysteria2 is expected
+to improve throughput by 10 to 30 percent and P95 latency by 20 to 40 percent
+when loss is at least 1 percent and RTT is at least 100 ms. Those ranges are
+claims to benchmark, not acceptance without local evidence.
 
 Deferred:
 
+- TUIC, because its authentication token is a TLS keying-material export and
+  `quiche` exposes no exporter. Supporting it would mean either patching
+  `quiche` upstream or shipping `quinn` as a second QUIC stack for one
+  protocol. A tier-2 protocol does not earn either; see the engineering plan's
+  P17 notes for the full finding.
 - VMess
 - mKCP, due to low performance and recognizable brute-force encryption
 - meek, due to very low throughput

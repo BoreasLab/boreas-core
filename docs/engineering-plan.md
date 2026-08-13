@@ -1088,47 +1088,78 @@ separate, and a test asserts the two formats do not converge. Confirmed against
 the reference's own source before a line was written, and then against the
 running server.
 
-**TUIC is blocked on a missing `quiche` capability, and the order must swap.**
-TUIC v5 authenticates with a token defined as the *TLS keying material
-exporter* over the session, keyed by the user's UUID as label and the password
-as context — `handshakeState.TLS.ExportKeyingMaterial` in the reference, on
-both client and server. `quiche` 0.29 exposes no exporter: there is no
+**TUIC is dropped, and the reason is a rule rather than a defeat.** TUIC v5
+authenticates with a token defined as the *TLS keying material exporter* over
+the session, keyed by the user's UUID as label and the password as context —
+`handshakeState.TLS.ExportKeyingMaterial` in the reference, on both client and
+server. `quiche` 0.29 exposes no exporter: there is no
 `export_keying_material` anywhere in its API, and the only access it grants to
 the underlying `boring::ssl::SslRef` is *inside a handshake callback*, which
 runs before the handshake completes and therefore before the exporter secret
 this token needs exists. TUIC cannot be built on the QUIC stack this crate
 already carries.
 
-Three ways out, in the order they should be considered:
+The ways out were to patch `quiche` upstream, or to ship `quinn` and `rustls`
+as a second QUIC stack for this one protocol. Both were declined, and the
+principle is worth stating because it will be applied again:
 
-1. **Add the exporter to `quiche`.** It holds the `SSL` internally, so
-   `Connection::export_keying_material` is a small, obviously correct addition
-   and a plausible upstream contribution. This keeps one QUIC stack.
-2. **Use `quinn` with `rustls` for TUIC alone.** `rustls` exposes the exporter
-   directly, but this ships a second QUIC stack to a target that counts bytes,
-   and [Verification](verification.md) already records `quinn`'s maintenance
-   concentration as a risk.
-3. **Defer TUIC.** It is the least deployed of the four and the only one with
-   this obstacle.
+> A courtesy protocol may not restructure the plan, add a second implementation
+> of something the crate already has, or depend on a change landing in someone
+> else's repository. Egress breadth is graded — WireGuard and MASQUE are the
+> product, and the proxy protocols are compatibility with an existing ecosystem.
+> A protocol that cannot be reached from the existing substrate is declined
+> rather than accommodated.
 
-**Hysteria2 has no such obstacle and should precede it.** Its authentication is
-an ordinary HTTP/3 exchange — a `POST` to `https://hysteria/auth` carrying a
-`Hysteria-Auth` header, answered with status 233 — which is the same `quiche::h3`
-machinery P17's MASQUE work already uses. Its proxying is a QUIC bidirectional
-stream carrying a varint-framed request (`FrameTypeTCPRequest`, address,
-padding) and a status-and-message response.
+TUIC is the least deployed of the protocols considered here and the only one
+that fails this test, so it is out of scope. Nothing else in the plan depended
+on it; the QUIC stream driver below was never its alone.
 
-It does need one piece of infrastructure that does not exist yet: a **QUIC
-stream driver**. Every stream egress so far obtains a `TcpStream` from the
-tunnel bypass, but Hysteria2's streams live inside a QUIC connection, so
-something must own the UDP socket and the `quiche::Connection` and expose each
-bidirectional stream as an `AsyncRead + AsyncWrite`. That is structurally the
-bridge `src/terminate.rs` already builds for smoltcp — bounded channels, a
-pump, backpressure from the protocol's own window — and TUIC would reuse it if
-option 1 above unblocks it.
+**Hysteria2 had no such obstacle, and it is complete for TCP.** Authentication
+is an ordinary HTTP/3 exchange — a `POST` to `https://hysteria/auth` carrying a
+`Hysteria-Auth` header, answered with status 233 — on the same `quiche::h3`
+machinery MASQUE already uses. Proxying is a QUIC bidirectional stream carrying
+a varint-framed request (frame type `0x401`, address, padding) and a
+status-and-message response. Interop-verified: `tests/interop.rs` runs two
+concurrent flows over one connection against a real sing-box server, over TLS
+this client verifies against a generated anchor rather than trusting blindly.
 
-**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, the QUIC
-stream driver, Hysteria2, TUIC, and Reality. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
+**It needed one piece of infrastructure, and `src/quic.rs` is now it.** Every
+stream egress before this obtained a `TcpStream` from the tunnel bypass, but
+Hysteria2's streams live inside a QUIC connection, so something must own the UDP
+socket and the `quiche::Connection` and expose each bidirectional stream as an
+`AsyncRead + AsyncWrite`. That is structurally the bridge `src/terminate.rs`
+already builds for `smoltcp`, so the two now share it: `src/bridge.rs` holds the
+bounded channels, the stream type, and the `poll_read`/`poll_write` contract,
+and each driver keeps its own pump because `smoltcp` and `quiche` genuinely
+disagree about how a peer's FIN and a partial write are reported.
+
+**The connection is three types, so it cannot be used out of order.**
+`Handshake::establish` returns only once TLS has completed, `Handshake::http3`
+performs the one authenticating request, and `Handshake::drive` consumes the
+handshake to yield the handle that opens streams. This is not ceremony: HTTP/3
+and Hysteria2's proxy framing *must not* share a connection's readable set,
+because `0x401` is an unknown HTTP/3 frame type and HTTP/3 requires unknown
+frames be skipped along with their length — so an h3 parser left running would
+silently swallow the address and padding as an extension frame it was told to
+ignore. Making the h3 phase a value that gets consumed is what makes that
+mistake unrepresentable rather than merely avoided.
+
+**A latent truncation bug turned up while writing this, and it was in shipped
+code.** A reply whose length lives inside itself forces a reader to read *at
+least* the reply and possibly past it; `read_message` decoded the reply and
+cleared its buffer, discarding the surplus. That surplus is payload: a
+server-first protocol — SSH, SMTP, IMAP — sends its banner the instant the
+proxy dials the target, and it arrives coalesced into the same segment as the
+reply, for exactly the flows where it matters. The symptom is not an error but
+a *hang*, with the client waiting for a greeting that was already consumed and
+thrown away. `Decoded::Complete` had carried `consumed` all along; nothing read
+it. The reader now drains only the message, and `Prefixed` replays the rest.
+`tests/socks5.rs` pins it with a proxy that writes reply and banner in one
+`write_all`, which is what makes the coalescing deterministic rather than a
+matter of timing.
+
+**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, Hysteria2
+UDP, and Reality. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
 proxy that performs one, and the M4 product gate needs the device.
 
 **On Reality specifically, a half-implementation is worse than none.** Its
