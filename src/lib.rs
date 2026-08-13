@@ -12,6 +12,7 @@ mod path;
 mod platform;
 mod pool;
 mod reassembly;
+mod shadowsocks;
 mod shell;
 mod socks5;
 mod stream;
@@ -52,6 +53,7 @@ pub use platform::AndroidTun;
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
+pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
 pub use shell::{
     AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry, Termination,
 };

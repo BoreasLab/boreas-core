@@ -23,6 +23,8 @@ The core currently provides:
 - a reactor bridge presenting each terminated connection as an async stream,
   with backpressure carried by TCP's own window rather than by dropping bytes
 - MASQUE CONNECT-IP egress over a sans-io QUIC stack, alongside WireGuard
+- SOCKS5 with UDP ASSOCIATE, and Shadowsocks 2022 over TCP, on one dial seam
+  shared with local termination
 
 The upstream dialer (TCP plus TLS with tunnel bypass) and the session assembly
 that chooses between interception and splice are under construction, as are the

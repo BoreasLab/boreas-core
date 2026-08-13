@@ -1016,10 +1016,55 @@ an HTTP Datagram and returns byte-identical. The proxy in that test validates
 the request rather than rubber-stamping it, so a malformed CONNECT would fail
 the test rather than pass it silently.
 
-**Still to build:** SOCKS5 with UDP ASSOCIATE, Shadowsocks, VLESS/Reality,
-Hysteria2, TUIC; the `StreamEgress` trait still has no implementation. The
-mid-session MASQUE-to-HTTP/2 fallback re-steer needs a proxy that performs one,
-and the M4 product gate needs the device.
+**The dial seam, delivered with SOCKS5.** `StreamEgress` was an empty stub, and
+local termination still needed an upstream dialer; those are the same question —
+*open a byte stream to this target* — so the trait now answers it and a proxied
+flow and a direct one are one abstraction to everything above. `Target` keeps a
+name as a name rather than resolving it locally, because the exit should resolve
+in its own DNS view and a local resolution would leak the destination to the
+resolver the tunnel exists to bypass. `DomainName` refines the 255-byte limit
+that SOCKS5, Shadowsocks, VLESS, and TUIC all share.
+
+**SOCKS5 (RFC 1928) is complete, including UDP ASSOCIATE.** A pure codec and a
+thin driver: decoders return `Incomplete` rather than erroring on a short read,
+because a reply's length lives inside the reply, and the law that *every proper
+prefix decodes as `Incomplete`* is tested across all four address forms. The
+association holds its control connection, whose lifetime RFC 1928 §7 makes the
+association's. Gate met in-process against a proxy that validates rather than
+rubber-stamps: CONNECT, authentication with both failure modes, and a datagram
+that round-trips carrying its target.
+
+**Shadowsocks 2022 (SIP022) is complete for TCP.** The 2022 edition rather than
+the older AEAD construction, and for a security reason rather than a
+preference: SIP004 derives its key with `EVP_BytesToKey`, carries no timestamp,
+and has no replay defence. AEAD comes from `ring`, already the crate's one
+provider; BLAKE3 is a new dependency and an unavoidable one, because it *is*
+the key-derivation function the protocol names. Nonces are a counter this code
+owns, so `LessSafeKey` is the correct API and `Session` is the type that keeps
+key and counter together — a nonce reused against a key destroys AEAD security
+entirely, and separate variables are how that happens.
+
+**Shadowsocks wire compatibility is unverified, and that is a real gap.** The
+tests drive this implementation against itself, which proves the framing is
+self-consistent and that every guard fires — salt echo, clock skew in both
+directions, reflected request, truncated header, counter desynchronisation —
+but a misreading of SIP022 would satisfy both halves equally. Verification
+against `shadowsocks-rust` or a deployed server is required before it ships and
+cannot be performed in this environment. The SOCKS5 and MASQUE gates do not
+carry this caveat: the first is checked against an independently written RFC
+1928 proxy, and the second against a real `quiche` server.
+
+**Still to build:** the Shadowsocks UDP packet format, and VLESS/Reality,
+Hysteria2, and TUIC. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
+proxy that performs one, and the M4 product gate needs the device.
+
+**On Reality specifically, a half-implementation is worse than none.** Its
+entire purpose is to be indistinguishable from a TLS handshake to a real site,
+so an approximation is not a partially working transport — it is a *fingerprint*
+that marks the traffic more clearly than plain TLS would. It should land only
+with a measured indistinguishability check, which is what
+[Delivery](delivery.md) already means by keeping the VLESS family at late-M4
+priority and isolating private protocol code.
 
 **Gate:** the M4 product gate. Non-native fidelity tunnels zero QUIC datagrams.
 A mid-session MASQUE fallback to HTTP/2 re-steers without dropping flows. Resolve

@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-only"
 
 [dependencies]
+blake3 = { version = "1.8.6", default-features = false }
 bytes = "1.12.1"
 etherparse = "0.21.0"
 gotatun = { version = "0.8.1", default-features = false, features = ["ring"] }
@@ -14,6 +15,7 @@ hyper-util = { version = "0.1.20", features = ["tokio", "server", "client", "htt
 octets = "0.3.6"
 quiche = "0.29.3"
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
+ring = "0.17.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Local TCP termination (the substrate P14 MITM runs on) is a smoltcp socket set
 # driven by the datapath. sans-io and no_std-friendly: it owns no socket and no

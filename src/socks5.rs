@@ -70,6 +70,17 @@ pub enum ProxyError {
     /// A datagram this association cannot deliver: RFC 1928 §7 fragmentation,
     /// which no modern proxy emits and which this client does not reassemble.
     Fragmented,
+    /// An AEAD operation failed: a bad key length, or a chunk that did not
+    /// authenticate. Fatal to a counter-based stream, which cannot resynchronise.
+    Crypto,
+    /// A Shadowsocks header that is not the shape its type claims.
+    Header,
+    /// A peer whose clock is too far from ours for the replay window to mean
+    /// anything.
+    Stale { skew: u64 },
+    /// A response echoing a salt that is not the one we sent: another
+    /// session's traffic, replayed at us.
+    SaltMismatch,
 }
 
 impl std::fmt::Display for ProxyError {
@@ -82,6 +93,10 @@ impl std::fmt::Display for ProxyError {
             Self::Refused(reply) => write!(f, "request refused: {reply:?}"),
             Self::Address => f.write_str("malformed address"),
             Self::Fragmented => f.write_str("fragmented datagram"),
+            Self::Crypto => f.write_str("AEAD failure"),
+            Self::Header => f.write_str("malformed header"),
+            Self::Stale { skew } => write!(f, "peer clock differs by {skew}s"),
+            Self::SaltMismatch => f.write_str("response echoed another session's salt"),
         }
     }
 }
