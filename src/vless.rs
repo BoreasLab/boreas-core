@@ -7,10 +7,11 @@
 //! and it is why this module is mostly a codec.
 //!
 //! **The transport is a seam, and that is the point.** VLESS over plain TCP,
-//! over TLS, and over Reality differ only in how the byte stream underneath is
-//! obtained, so [`ProxyTransport`] names exactly that and nothing else. Reality then
-//! becomes another implementation of one trait rather than a change to this
-//! file — which is the factoring the phase order was chosen for.
+//! over TLS, over WebSocket, over gRPC and over QUIC differ only in how the
+//! byte stream underneath is obtained, so [`ProxyTransport`] names exactly that
+//! and nothing else. Every one of them is an implementation of that one trait
+//! in [`crate::transport`] rather than a change to this file, which is what
+//! lets this module stay a codec while the transport family grows.
 //!
 //! **The address encoding is *not* SOCKS5's, and the difference is silent.**
 //! VMess and VLESS write the **port before** the address, and their type bytes
@@ -26,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
     AsyncStream, BoxFuture, DatagramFidelity, Decoded, DomainName, EgressCapabilities, EgressError,
-    NatBehavior, ProxyError, StreamEgress, Target, TunnelBypass,
+    NatBehavior, ProxyError, ProxyTransport, StreamEgress, Target,
 };
 
 /// The only VLESS version, and the only one the reference implementations
@@ -105,40 +106,6 @@ impl std::fmt::Display for UserId {
             write!(f, "{byte:02x}")?;
         }
         Ok(())
-    }
-}
-
-/// How a proxy protocol obtains the byte stream it speaks over.
-///
-/// The one seam that separates *what is said* from *what carries it*. VLESS
-/// over TCP, over TLS, and over Reality are the same protocol on three
-/// transports, so they are one implementation and three of these.
-pub trait ProxyTransport: Send + Sync {
-    fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>>;
-}
-
-/// A plain TCP transport through the tunnel bypass.
-///
-/// Correct for VLESS behind a transport that already provides confidentiality,
-/// and for tests. On its own it is cleartext, which is why the type says
-/// `Plain` rather than something that could be mistaken for secure.
-pub struct PlainTransport<B> {
-    server: SocketAddr,
-    bypass: B,
-}
-
-impl<B: TunnelBypass> PlainTransport<B> {
-    pub fn new(server: SocketAddr, bypass: B) -> Self {
-        Self { server, bypass }
-    }
-}
-
-impl<B: TunnelBypass + 'static> ProxyTransport for PlainTransport<B> {
-    fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
-        Box::pin(async move {
-            let stream = self.bypass.tcp(self.server).await?;
-            Ok(Box::new(stream) as Box<dyn AsyncStream>)
-        })
     }
 }
 

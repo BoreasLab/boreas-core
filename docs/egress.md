@@ -75,11 +75,13 @@ Implementation order:
 
 1. SOCKS5, including UDP ASSOCIATE
 2. Shadowsocks
-3. VLESS with TLS, Reality, and XTLS-Vision
+3. VLESS, with the whole V2Ray transport family beneath it: TLS, WebSocket,
+   HTTPUpgrade, gRPC, HTTP/2, and QUIC, each composing over the next rather than
+   re-deriving the layers below it
 4. Hysteria2
 
-VLESS plus Reality is a priority for mainland China because it disguises
-traffic as a normal HTTPS visit and is widely deployed. Hysteria2 is expected
+VLESS over WebSocket or HTTPUpgrade behind TLS is what makes a deployment
+survive a CDN, which is the practical reason to carry the family. Hysteria2 is expected
 to improve throughput by 10 to 30 percent and P95 latency by 20 to 40 percent
 when loss is at least 1 percent and RTT is at least 100 ms. Those ranges are
 claims to benchmark, not acceptance without local evidence.
@@ -91,10 +93,15 @@ Deferred:
   `quiche` upstream or shipping `quinn` as a second QUIC stack for one
   protocol. A tier-2 protocol does not earn either; see the engineering plan's
   P17 notes for the full finding.
+- Reality, because its client must reach inside a TLS ClientHello — extract the
+  ephemeral X25519 key, seal auth data into the session id under the serialized
+  hello, and patch the serialization — under a browser fingerprint. `rustls`
+  offers none of that and the only Rust fork that comes close is unmaintained
+  and a minor version behind. Replacing this crate's TLS foundation for one
+  transport is out; see the engineering plan's P17 notes.
 - VMess
 - mKCP, due to low performance and recognizable brute-force encryption
 - meek, due to very low throughput
-- gRPC transport
 
 Many Xray-family transports are private, widely deployed protocols with
 non-standard or invalid wire semantics. Support them for user value, but do not

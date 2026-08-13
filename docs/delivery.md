@@ -28,7 +28,7 @@
 | 9 | smoltcp socket-set scaling | M |
 | 10 | complete L4 UDP NAT and RFC 4787 conformance | M |
 | 11 | SOCKS5 client and UDP ASSOCIATE | S |
-| 12 | VLESS/Reality/XTLS-Vision and Hysteria2 | L |
+| 12 | VLESS with the V2Ray transport family, and Hysteria2 | L |
 | 13 | CA lifecycle and user-store installation UX | S |
 | 14 | filter-list build pipeline | S |
 
@@ -70,8 +70,8 @@ the browser's QUIC/TCP race.
 
 ### M4: Egress Breadth, weeks 15-20
 
-Add MASQUE CONNECT-IP, SOCKS5, and Shadowsocks, followed by VLESS/Reality and
-Hysteria2.
+Add MASQUE CONNECT-IP, SOCKS5, and Shadowsocks, followed by VLESS with its
+transport family, and Hysteria2.
 
 **Gate:** filtering composes with the target egress set.
 

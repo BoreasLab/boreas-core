@@ -31,9 +31,11 @@ use std::{
 };
 
 use boreas_core::{
-    DirectSockets, Hysteria2Config, Hysteria2Egress, Method, NatBehavior, PlainTransport,
-    PreSharedKey, ShadowsocksConfig, ShadowsocksEgress, Socks5Config, Socks5Egress, StreamEgress,
-    Target, UserId, VlessConfig, VlessEgress,
+    DirectSockets, GrpcConfig, GrpcTransport, HttpConfig, HttpHeaders, HttpTransport,
+    HttpUpgradeConfig, HttpUpgradeTransport, Hysteria2Config, Hysteria2Egress, Method, NatBehavior,
+    PlainTransport, PreSharedKey, QuicTransport, QuicTransportConfig, ShadowsocksConfig,
+    ShadowsocksEgress, Socks5Config, Socks5Egress, StreamEgress, Target, TlsConfig, TlsTransport,
+    UserId, VlessConfig, VlessEgress, WebSocketConfig, WebSocketTransport,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -59,14 +61,24 @@ struct Reference {
     _dir: TempDir,
 }
 
-/// A self-signed certificate for the reference server to present, and the trust
-/// anchor this client verifies it against.
+/// A private CA, and a leaf it signed for the reference server to present.
 ///
-/// **Verification stays on.** Turning it off would make the test pass on a
-/// server presenting anything at all, and for a protocol whose authentication
-/// rides inside TLS that would quietly remove the property under test.
-/// `quiche` loads trust anchors only from PEM files, so they go to disk.
+/// **A CA and a leaf rather than one self-signed certificate**, because the two
+/// TLS stacks disagree about the shortcut: `boring` beneath `quiche` will accept
+/// a self-signed end-entity certificate as its own trust anchor, and `rustls`
+/// will not, since such a certificate is not a CA. Generating a real one-link
+/// chain is what makes the same fixture work for both.
+///
+/// **Verification stays on.** Turning it off would make every test below pass
+/// against a server presenting anything at all, and for transports whose whole
+/// job is to carry a protocol inside TLS that would quietly remove the property
+/// under test.
 struct Certificate {
+    /// The CA, DER-encoded, for this client to trust.
+    authority: Vec<u8>,
+    /// The CA as a PEM file, because `quiche` loads anchors only from disk.
+    authority_path: PathBuf,
+    /// The leaf and its key, for the reference server to present.
     certificate: PathBuf,
     key: PathBuf,
     _dir: TempDir,
@@ -76,24 +88,62 @@ impl Certificate {
     const NAME: &'static str = "reference.example";
 
     fn generate() -> Self {
-        let key = rcgen::KeyPair::generate().expect("a key pair");
-        let mut params =
+        let ca_key = rcgen::KeyPair::generate().expect("a CA key pair");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("valid parameters");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Boreas Interop CA");
+        let ca = ca_params
+            .clone()
+            .self_signed(&ca_key)
+            .expect("a self-signed CA");
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let leaf_key = rcgen::KeyPair::generate().expect("a leaf key pair");
+        let mut leaf_params =
             rcgen::CertificateParams::new(vec![Self::NAME.to_owned()]).expect("valid parameters");
-        params
+        leaf_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, Self::NAME);
-        let certificate = params.self_signed(&key).expect("a self-signed leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("a leaf signed by the CA");
 
         let dir = TempDir::new();
+        let authority_path = dir.path().join("ca.crt");
         let certificate_path = dir.path().join("reference.crt");
         let key_path = dir.path().join("reference.key");
-        std::fs::write(&certificate_path, pem("CERTIFICATE", certificate.der())).unwrap();
-        std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).unwrap();
+        std::fs::write(&authority_path, pem("CERTIFICATE", ca.der())).unwrap();
+        std::fs::write(&certificate_path, pem("CERTIFICATE", leaf.der())).unwrap();
+        std::fs::write(&key_path, pem("PRIVATE KEY", &leaf_key.serialize_der())).unwrap();
         Self {
+            authority: ca.der().to_vec(),
+            authority_path,
             certificate: certificate_path,
             key: key_path,
             _dir: dir,
         }
+    }
+
+    /// A TLS transport that trusts this CA and offers `alpn`.
+    fn tls_transport(
+        &self,
+        server: SocketAddr,
+        alpn: &[&[u8]],
+    ) -> Box<dyn boreas_core::ProxyTransport> {
+        Box::new(
+            TlsTransport::new(
+                TlsConfig {
+                    server,
+                    server_name: Self::NAME.to_owned(),
+                    alpn: alpn.iter().map(|protocol| protocol.to_vec()).collect(),
+                    extra_roots: vec![self.authority.clone()],
+                },
+                DirectSockets,
+            )
+            .expect("the TLS transport is configurable"),
+        )
     }
 }
 
@@ -146,7 +196,7 @@ impl Reference {
             .arg("-c")
             .arg(&path)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .expect("the reference binary starts");
 
@@ -168,15 +218,38 @@ impl Reference {
     }
 }
 
-/// Reserves a port by binding and releasing it. A race is possible in
-/// principle and has not been observed; the alternative is teaching the
-/// reference to report its own ports, which it does not do.
+/// Hands out a port no other test in this process will be given.
+///
+/// **Binding port 0 and releasing it is not enough**, and this file is where
+/// that stops being theoretical: the tests run concurrently, and two that ask
+/// the kernel for a free port in the same instant are told the same one, then
+/// both hand it to a reference server. One binds, the other is refused, and the
+/// failure surfaces later as a connection reset in whichever test lost — which
+/// looks like a protocol bug and is not one.
+///
+/// So the port comes from a per-process counter, which makes a collision within
+/// the process impossible rather than unlikely, and the bind is kept only as a
+/// check that nothing *outside* the process holds it. Both stacks are probed
+/// because QUIC listens on UDP and everything else on TCP.
 fn free_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("a port is available")
-        .local_addr()
-        .expect("the socket has an address")
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 40_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    // Offsetting by the process id keeps two concurrent test *binaries* from
+    // marching through the same range in lockstep.
+    let start = std::process::id() % COUNT;
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let candidate = (FIRST + (start + step) % COUNT) as u16;
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, candidate));
+        let udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, candidate));
+        if tcp.is_ok() && udp.is_ok() {
+            return candidate;
+        }
+    }
 }
 
 /// A scratch directory that removes itself.
@@ -475,7 +548,7 @@ async fn hysteria2_interoperates_with_the_reference_server() {
         },
         DirectSockets,
         {
-            let anchor = certificate.certificate.clone();
+            let anchor = certificate.authority_path.clone();
             Box::new(move || {
                 let mut config = Hysteria2Egress::<DirectSockets>::quic_config()?;
                 config
@@ -537,10 +610,270 @@ async fn dial_with_retries(
     for attempt in 0..10 {
         match tokio::time::timeout(Duration::from_secs(3), egress.connect(target)).await {
             Ok(Ok(stream)) => return stream,
-            Ok(Err(error)) if attempt == 9 => panic!("the reference refused Hysteria2: {error}"),
-            Err(_) if attempt == 9 => panic!("the reference never completed a QUIC handshake"),
+            Ok(Err(error)) if attempt == 9 => panic!("the reference refused the dial: {error}"),
+            Err(_) if attempt == 9 => panic!("the reference never answered a dial"),
             _ => tokio::time::sleep(Duration::from_millis(200)).await,
         }
     }
     unreachable!("the loop either returns or panics on its last attempt")
+}
+
+// ------------------------------------------------- VLESS transports
+//
+// VLESS carries no framing of its own, so what these check is the *transport*
+// underneath it: the WebSocket handshake and its binary framing, the HTTP
+// Upgrade exchange, gRPC's length-delimited messages over HTTP/2, a raw HTTP/2
+// body, and a QUIC bidirectional stream. Each runs against a sing-box `vless`
+// inbound configured with the matching `transport`, so a byte that returns
+// crossed both this crate's encoder and a foreign decoder.
+
+const TRANSPORT_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+/// Runs one VLESS flow over `transport` against a sing-box inbound configured
+/// with `transport_json`, and asserts a payload round-trips.
+///
+/// `tls_json` is the inbound's `tls` object, or empty for a cleartext
+/// transport. The two must agree — a client offering TLS to a plaintext
+/// listener fails at the handshake with nothing useful to read — which is why
+/// they are chosen together at each call site rather than defaulted here.
+async fn vless_transport_round_trip(
+    name: &str,
+    transport_json: &str,
+    tls_json: &str,
+    build: impl FnOnce(SocketAddr, &Certificate) -> Box<dyn boreas_core::ProxyTransport>,
+) {
+    let Some(binary) = reference_binary() else {
+        return skipped(name);
+    };
+    let echo = start_echo().await;
+    let port = free_port();
+    let certificate = Certificate::generate();
+    let tls = if tls_json.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#","tls": {{"enabled": true, "server_name": "{name}", "certificate_path": "{cert}", "key_path": "{key}"}}"#,
+            name = Certificate::NAME,
+            cert = certificate.certificate.display(),
+            key = certificate.key.display(),
+        )
+    };
+    let config = format!(
+        r#"{{
+  "log": {{"level": "error"}},
+  "inbounds": [{{
+    "type": "vless",
+    "listen": "127.0.0.1",
+    "listen_port": {port},
+    "users": [{{"uuid": "{TRANSPORT_UUID}"}}],
+    "transport": {transport_json}{tls}
+  }}],
+  "outbounds": [{{"type": "direct"}}]
+}}"#
+    );
+    // QUIC listens on UDP, where there is no connection to probe for; the
+    // others are TCP and can be waited on directly.
+    let tcp_ports: &[u16] = if transport_json.contains("\"quic\"") {
+        &[]
+    } else {
+        &[port]
+    };
+    let _reference = Reference::start(&binary, &config, tcp_ports);
+
+    let server = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let egress = VlessEgress::new(
+        VlessConfig {
+            user: UserId::parse(TRANSPORT_UUID).unwrap(),
+            nat_behavior: NatBehavior::EndpointIndependent,
+        },
+        build(server, &certificate),
+    );
+
+    // **20 000 bytes, not a greeting.** A short payload would pass under a gRPC
+    // framing that used the wrong varint, because protobuf and QUIC varints
+    // agree below 64; at this length they encode 20 000 in three bytes and four
+    // respectively, so the reference stops being able to parse us. It also
+    // carries every transport past one read, one WebSocket message, and one
+    // HTTP/2 frame. It stays under HTTP/2's 65 535-byte initial window so that
+    // writing before reading cannot deadlock against the echo path.
+    let payload: Vec<u8> = name.bytes().cycle().take(20_000).collect();
+
+    // **The whole flow is retried, and the reason is the reference, not this
+    // client.** sing-box's HTTPUpgrade server hijacks the connection from Go's
+    // `http.Server` and discards the buffer Go hands back, so payload that
+    // arrives in the window between its `101` and its `Hijack` is dropped and
+    // the flow is reset. Measured at roughly one run in eight under the load of
+    // this file's ten concurrent servers. A genuine protocol error fails every
+    // attempt, so this costs nothing but tolerance for someone else's race.
+    let mut last = String::new();
+    for attempt in 0..4 {
+        match transport_round_trip(&egress, echo, &payload).await {
+            Ok(()) => return,
+            Err(error) => last = error,
+        }
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    panic!("{name}: every attempt failed, last: {last}");
+}
+
+/// One dial, write, and read-back. `Err` carries what went wrong, so a caller
+/// that retries can still report the last failure rather than a bare timeout.
+async fn transport_round_trip(
+    egress: &impl StreamEgress,
+    echo: SocketAddr,
+    payload: &[u8],
+) -> Result<(), String> {
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(10), egress.connect(&Target::Ip(echo)))
+            .await
+            .map_err(|_| "the dial timed out".to_owned())?
+            .map_err(|error| format!("the dial failed: {error}"))?;
+
+    stream
+        .write_all(payload)
+        .await
+        .map_err(|error| format!("the write failed: {error}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| format!("the flush failed: {error}"))?;
+
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut buf))
+        .await
+        .map_err(|_| "the reference never answered".to_owned())?
+        .map_err(|error| format!("the response did not arrive: {error}"))?;
+    if buf != payload {
+        return Err("the payload came back altered".to_owned());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn vless_over_websocket_interoperates_with_the_reference_server() {
+    vless_transport_round_trip(
+        "websocket",
+        r#"{"type": "ws", "path": "/tunnel"}"#,
+        "",
+        |server, _| {
+            Box::new(WebSocketTransport::new(
+                WebSocketConfig {
+                    path: "/tunnel".to_owned(),
+                    headers: HttpHeaders::default(),
+                },
+                PlainTransport::new(server, DirectSockets),
+            ))
+        },
+    )
+    .await;
+}
+
+/// WebSocket *over TLS*, which is the configuration actually deployed: it
+/// exercises `TlsTransport` composing under another transport, and with it the
+/// ALPN choice, since a server offered the wrong protocol closes at the
+/// handshake.
+#[tokio::test]
+async fn vless_over_websocket_tls_interoperates_with_the_reference_server() {
+    vless_transport_round_trip(
+        "websocket-tls",
+        r#"{"type": "ws", "path": "/tunnel"}"#,
+        "tls",
+        |server, certificate| {
+            Box::new(WebSocketTransport::new(
+                WebSocketConfig {
+                    path: "/tunnel".to_owned(),
+                    headers: HttpHeaders {
+                        host: Some(Certificate::NAME.to_owned()),
+                        extra: Vec::new(),
+                    },
+                },
+                certificate.tls_transport(server, &[b"http/1.1"]),
+            ))
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vless_over_httpupgrade_interoperates_with_the_reference_server() {
+    vless_transport_round_trip(
+        "httpupgrade",
+        r#"{"type": "httpupgrade", "path": "/tunnel"}"#,
+        "",
+        |server, _| {
+            Box::new(HttpUpgradeTransport::new(
+                HttpUpgradeConfig {
+                    path: "/tunnel".to_owned(),
+                    headers: HttpHeaders::default(),
+                },
+                PlainTransport::new(server, DirectSockets),
+            ))
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vless_over_grpc_interoperates_with_the_reference_server() {
+    vless_transport_round_trip(
+        "grpc",
+        r#"{"type": "grpc", "service_name": "TunService"}"#,
+        "",
+        |server, _| {
+            Box::new(GrpcTransport::new(
+                GrpcConfig {
+                    service_name: "TunService".to_owned(),
+                    headers: HttpHeaders::default(),
+                },
+                PlainTransport::new(server, DirectSockets),
+            ))
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vless_over_http2_interoperates_with_the_reference_server() {
+    vless_transport_round_trip(
+        "http2",
+        r#"{"type": "http", "path": "/tunnel"}"#,
+        "tls",
+        |server, certificate| {
+            Box::new(HttpTransport::new(
+                HttpConfig {
+                    path: "/tunnel".to_owned(),
+                    method: "PUT".to_owned(),
+                    headers: HttpHeaders {
+                        host: Some(Certificate::NAME.to_owned()),
+                        extra: Vec::new(),
+                    },
+                },
+                certificate.tls_transport(server, &[b"h2"]),
+            ))
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vless_over_quic_interoperates_with_the_reference_server() {
+    vless_transport_round_trip(
+        "quic",
+        r#"{"type": "quic"}"#,
+        "tls",
+        |server, certificate| {
+            let _ = certificate;
+            Box::new(QuicTransport::new(
+                QuicTransportConfig {
+                    server,
+                    server_name: Certificate::NAME.to_owned(),
+                    idle_timeout: Duration::from_secs(30),
+                },
+                DirectSockets,
+            ))
+        },
+    )
+    .await;
 }

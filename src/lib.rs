@@ -20,6 +20,7 @@ mod shell;
 mod socks5;
 mod stream;
 mod terminate;
+mod transport;
 mod udp;
 mod upstream;
 mod varint;
@@ -79,9 +80,14 @@ pub use upstream::{
     DotUpstream, TunnelBypass, UpstreamError,
 };
 
+pub use transport::{
+    GrpcConfig, GrpcTransport, HttpConfig, HttpHeaders, HttpTransport, HttpUpgradeConfig,
+    HttpUpgradeTransport, PlainTransport, ProxyTransport, QuicTransport, QuicTransportConfig,
+    TlsConfig, TlsTransport, WebSocketConfig, WebSocketTransport,
+};
 pub use vless::{
-    PlainTransport, ProxyTransport, UserId, UserIdError, VlessConfig, VlessEgress,
-    decode_addr_port, decode_response, encode_addr_port, encode_request,
+    UserId, UserIdError, VlessConfig, VlessEgress, decode_addr_port, decode_response,
+    encode_addr_port, encode_request,
 };
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};

@@ -118,7 +118,20 @@ impl AsyncRead for BridgedStream {
         let this = self.get_mut();
         if this.pending.is_empty() {
             match this.inbound.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => this.pending = chunk,
+                Poll::Ready(Some(chunk)) => {
+                    this.pending = chunk;
+                    // **Taking a chunk frees a permit, and the driver must be
+                    // told.** A driver that filled this channel stopped reading
+                    // from its socket, which is how backpressure is applied —
+                    // but it then sleeps until its next timer, and nothing else
+                    // will wake it, because the peer has been told to stop
+                    // sending and so no packet is coming either. Without this
+                    // the connection stalls until the idle timeout: observed as
+                    // a 30-second hang under load, and invisible without it
+                    // because the channel only fills when the consumer is
+                    // slower than the wire.
+                    this.wake.notify_one();
+                }
                 // The driver dropped its sender: the peer sent FIN, and an
                 // empty read is how `AsyncRead` spells end of stream.
                 Poll::Ready(None) => return Poll::Ready(Ok(())),

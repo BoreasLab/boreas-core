@@ -12,6 +12,14 @@ gotatun = { version = "0.8.1", default-features = false, features = ["ring"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.11.0", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "client", "http1", "http2"] }
+# HTTP/2 for the gRPC and HTTP VLESS transports, and `http`/`httparse` for
+# building their requests and reading the HTTPUpgrade response. All three are
+# already in the graph beneath `hyper`, so naming them here adds no code to the
+# artefact — it only stops us reaching through a re-export for types we use
+# directly.
+h2 = "0.4.15"
+http = "1.5.0"
+httparse = "1.10.1"
 octets = "0.3.6"
 quiche = "0.29.3"
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
@@ -35,6 +43,17 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
 # the shipped artefact.
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The WebSocket VLESS transport. `default-features = false` drops `connect` and
+# every TLS feature: this crate supplies the already-connected, already-TLS
+# stream, so all that is wanted from here is the protocol itself — the
+# handshake, frame masking, and the ping/pong and close state machine. It is
+# the one genuinely new dependency the transport family needs, and it is the
+# ecosystem's standard: ~62M recent downloads and released 2026-07.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# Trait-only crates, for the `Stream` and `Sink` the WebSocket adapter polls.
+# Deliberately not `futures-util`: only the two traits are needed.
+futures-core = "0.3"
+futures-sink = "0.3"
 tokio-util = { version = "0.7.19", features = ["rt"] }
 webpki-roots = "1"
 

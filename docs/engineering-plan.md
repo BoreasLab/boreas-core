@@ -978,7 +978,7 @@ Hysteria2. Each reports live capability through P3's `replan`.
 
 **Status: MASQUE CONNECT-IP, SOCKS5, Shadowsocks, VLESS, and Hysteria2 are
 complete for their stream paths and interop-verified. TUIC is dropped and
-Reality is blocked; both findings are recorded below.** Delivered:
+Reality is dropped; both findings are recorded below.** Delivered:
 
 - `src/masque.rs`, a CONNECT-IP tunnel as a `PacketEgress`. CONNECT-IP carries
   *whole IP packets*, so it joins WireGuard on the existing packet seam rather
@@ -1071,13 +1071,14 @@ crate. The tests are opt-in through `BOREAS_SINGBOX` and *skip loudly* rather
 than fail when it is absent, so a machine without it still has a green suite
 and no one mistakes a green run for a verified one.
 
-**VLESS is complete for TCP, and it introduces the seam Reality needs.** VLESS
+**VLESS is complete for TCP, and it introduces the seam the transports use.** VLESS
 is a stateless authentication header carrying no encryption of its own, by
 design: it runs *inside* a transport that already provides it. So the transport
 is a trait — `ProxyTransport`, "obtain the byte stream I speak over" — and VLESS
-over TCP, over TLS, and over Reality are one protocol implementation and three
-transports. Reality therefore lands as a new `ProxyTransport` rather than as a
-change to `src/vless.rs`, which is what the phase order was chosen for.
+over TCP, over TLS, over WebSocket, over gRPC and over QUIC are one protocol
+implementation and five transports. Each therefore lands as a new
+`ProxyTransport` rather than as a change to `src/vless.rs`, which is what the
+phase order was chosen for.
 
 **The VLESS address encoding is not SOCKS5's, and the difference is silent.**
 VMess and VLESS write the **port before** the address, and two of their three
@@ -1159,61 +1160,91 @@ it. The reader now drains only the message, and `Prefixed` replays the rest.
 `write_all`, which is what makes the coalescing deterministic rather than a
 matter of timing.
 
-**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, Hysteria2
-UDP, and Reality. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
+**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, and Hysteria2
+UDP. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
 proxy that performs one, and the M4 product gate needs the device.
 
-**On Reality specifically, a half-implementation is worse than none.** Its
-entire purpose is to be indistinguishable from a TLS handshake to a real site,
-so an approximation is not a partially working transport — it is a *fingerprint*
-that marks the traffic more clearly than plain TLS would. It should land only
-with a measured indistinguishability check, which is what
-[Delivery](delivery.md) already means by keeping the VLESS family at late-M4
-priority and isolating private protocol code.
-
-**Reality needs a TLS stack Rust does not have, and the finding is worse than
-TUIC's.** Read from `Xray-core/transport/internet/reality/reality.go`, the
-client must, in order: build a ClientHello *without sending it*
-(`uConn.BuildHandshakeState()`); reach into it for the **X25519 ephemeral
-private key** (`HandshakeState.State13.KeyShareKeys.Ecdhe`); ECDH that against
-the server's Reality public key; AES-GCM seal authentication data into
-`hello.SessionId`, using the hello's own `Random[20:]` as the nonce and **the
-serialized `hello.Raw` as additional authenticated data**; and then byte-patch
-the already-serialized hello at `hello.Raw[39:]` before it goes out. On top of
-that the hello must carry a *browser* fingerprint, since a handshake that
-authenticates perfectly but looks like `rustls` defeats the entire purpose.
+**Reality is dropped.** Its whole purpose is to be indistinguishable from a TLS
+handshake to a real site, so a half-implementation is not a partially working
+transport — it is a *fingerprint* that marks the traffic more clearly than plain
+TLS would. And a full one is out of reach: read from
+`Xray-core/transport/internet/reality/reality.go`, the client must build a
+ClientHello *without sending it* (`uConn.BuildHandshakeState()`), reach into it
+for the **X25519 ephemeral private key**
+(`HandshakeState.State13.KeyShareKeys.Ecdhe`), ECDH that against the server's
+Reality public key, AES-GCM seal authentication data into `hello.SessionId`
+using the hello's own `Random[20:]` as the nonce and **the serialized
+`hello.Raw` as additional authenticated data**, and then byte-patch the
+already-serialized hello at `hello.Raw[39:]`. On top of that the hello must
+carry a *browser* fingerprint, since a handshake that authenticates perfectly
+but looks like `rustls` defeats the entire purpose.
 
 `rustls` exposes none of this, and its issue asking for ClientHello
 customization (#1932) is closed as a duplicate rather than implemented. The only
-Rust option found is [`craftls`](https://crates.io/crates/craftls), a `rustls`
-fork — and it fails on every axis that matters: one release ever
-(`0.0.2`, January 2024), roughly 2,600 downloads in total, and it forks `rustls`
-**0.22** while this crate is on **0.23**. Adopting it means a global
-`[patch.crates-io]` that redirects *every* TLS in the product — the interception
-CA's server, DoT, DoH, the `hyper` client — onto an unmaintained two-year-old
-fork, pinned back a minor version and off the security-update path. And it would
-still be insufficient: `craftls` customises fingerprint *shape*; it does not
-hand out the ephemeral private key or let a caller patch the serialized hello,
-so it would need forking again on top.
+Rust option is [`craftls`](https://crates.io/crates/craftls), a `rustls` fork
+with one release ever (`0.0.2`, January 2024), roughly 2,600 downloads, and a
+fork point of `rustls` **0.22** against this crate's **0.23**. Adopting it means
+a global `[patch.crates-io]` redirecting *every* TLS in the product — the
+interception CA's server, DoT, DoH, the `hyper` client — onto an unmaintained
+fork, pinned back a minor version and off the security-update path; and it would
+still be insufficient, because it customises fingerprint *shape* rather than
+exposing the ephemeral key or the serialized hello. That is not a new dependency
+but a replacement of the crate's TLS foundation, maintained by us, for one
+transport, so it falls to the same rule that dropped TUIC.
 
-By the rule stated for TUIC above, this is out: it is not a new dependency but a
-replacement of the crate's TLS foundation, maintained by us, for one transport.
+**What replaced it is transport breadth, which was the better trade.** VLESS is
+a header and then bytes; everything that makes a deployment survive a hostile
+network lives *under* it. `src/transport.rs` now implements the whole set
+sing-box offers — `ws`, `httpupgrade`, `grpc`, `http`, `quic` — beneath an
+optional TLS layer, and each is interop-verified against a sing-box `vless`
+inbound configured for it.
 
-**The recommendation is VLESS over ordinary TLS instead, and it is nearly
-free.** `ProxyTransport` is a one-method trait, and `TlsDialer` in
-`src/upstream.rs` already does exactly this dial with `tokio-rustls`,
-`webpki-roots`, and the `ring` provider — all in the graph. A `TlsTransport`
-alongside `PlainTransport` is on the order of sixty lines and no new
-dependencies, and VLESS-over-TLS is a widely deployed configuration in its own
-right. What it does not provide is Reality's indistinguishability, which is a
-real loss for the mainland China case and a product decision rather than an
-engineering one.
+**The family is closed under composition, and the types say so.** A transport is
+one method, so a transport that wraps another is a transport, and TLS is not a
+flag on five configurations but a sixth transport the others are built over.
+sing-box reaches the same arrangement by threading a `tlsConfig` through every
+constructor and branching on it five times; making the layer a value removes
+those branches and, with them, the possibility of a transport that forgets to
+apply the TLS it was handed. `Box<dyn ProxyTransport>` is itself a transport, so
+a chain whose shape comes from a configuration file can still be assembled.
+
+**One new dependency for the whole family.** `tokio-tungstenite` supplies the
+WebSocket protocol — framing, masking, and the ping/pong and close state
+machine, which are exactly what a hand-rolled version gets subtly wrong — at
+~62M recent downloads and a release this July. `h2`, `http`, and `httparse` were
+already in the graph beneath `hyper`, so naming them directly adds no code.
+Written here instead: the ~80-line projection of a WebSocket *message* stream
+onto a *byte* stream, which the available adapter crates would have needed a
+`futures-io`-to-`tokio-io` shim to provide.
+
+**Three defects surfaced, and two were ours.**
+
+- **A wakeup was missing from the bridge, and it hung QUIC for 30 seconds.**
+  When a consumer's inbound channel fills, the driver stops reading its socket —
+  that is how backpressure is applied — but it then sleeps until its next timer,
+  and no packet is coming either, because the peer has been told to stop
+  sending. Draining the channel has to wake the driver, and did not. It was
+  invisible until a 20 KB payload under load made the consumer slower than the
+  wire; `terminate.rs` had the same hole, hidden by its 250 ms fallback timer,
+  where it cost latency rather than a hang.
+- **Awaiting the HTTP/2 response inside `dial` deadlocks.** The server does not
+  answer until it has read the proxy header out of the request body, and the
+  protocol above does not write that header until `dial` returns. sing-box runs
+  its `RoundTrip` on a goroutine for this reason; the downlink here is a state
+  that resolves on first read, which also spares the flow a round trip.
+- **The third is sing-box's.** Its HTTPUpgrade server hijacks the connection
+  from Go's `http.Server` and discards the buffer Go hands back, so payload
+  arriving between its `101` and its `Hijack` is lost and the flow is reset —
+  about one run in eight under this file's load. A delay before the first write
+  would narrow that window without closing it, at a cost on every connection, so
+  this client writes immediately as the reference client does and the test
+  retries. Confirmed by measurement: a 50 ms delay took the failure rate to
+  0/10, which identifies the race without justifying the sleep.
 
 The interop harness is what makes the remaining protocols tractable rather than
 guesswork. sing-box is built with `with_quic` and `with_utls`, so it serves
-VLESS, Reality, and Hysteria2 as well; Reality is Xray-core's invention,
-so Xray belongs beside it as the authority on that one. Each remaining protocol
-lands the same way Shadowsocks now has: written from the specification, then
+VLESS and Hysteria2 as well, and every V2Ray transport under them. Each protocol
+lands the same way Shadowsocks now has: written from the reference source, then
 made to satisfy a server this project did not write.
 
 **Gate:** the M4 product gate. Non-native fidelity tunnels zero QUIC datagrams.
