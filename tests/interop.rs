@@ -31,8 +31,9 @@ use std::{
 };
 
 use boreas_core::{
-    DirectSockets, Method, NatBehavior, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress,
-    Socks5Config, Socks5Egress, StreamEgress, Target,
+    DirectSockets, Method, NatBehavior, PlainTransport, PreSharedKey, ShadowsocksConfig,
+    ShadowsocksEgress, Socks5Config, Socks5Egress, StreamEgress, Target, UserId, VlessConfig,
+    VlessEgress,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -301,4 +302,55 @@ async fn socks5_interoperates_with_the_reference_server() {
         .expect("the reference answers")
         .expect("the response arrives");
     assert_eq!(&buf, b"socks interop");
+}
+
+/// VLESS against the reference. This is the protocol whose address encoding
+/// most invites a silent error — the port precedes the address and two of the
+/// three family bytes disagree with SOCKS5 — so a foreign server reading the
+/// destination back is exactly the check that matters.
+///
+/// A domain target rather than an address, because the domain form is the one
+/// that would be misread as IPv6 if the family bytes were taken from RFC 1928.
+#[tokio::test]
+async fn vless_interoperates_with_the_reference_server() {
+    let Some(binary) = reference_binary() else {
+        return skipped("vless_interoperates_with_the_reference_server");
+    };
+    let echo = start_echo().await;
+    let port = free_port();
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let config = format!(
+        r#"{{
+  "log": {{"level": "error"}},
+  "inbounds": [{{
+    "type": "vless",
+    "listen": "127.0.0.1",
+    "listen_port": {port},
+    "users": [{{"uuid": "{uuid}"}}]
+  }}],
+  "outbounds": [{{"type": "direct"}}]
+}}"#
+    );
+    let _reference = Reference::start(&binary, &config, &[port]);
+
+    let egress = VlessEgress::new(
+        VlessConfig {
+            user: UserId::parse(uuid).unwrap(),
+            nat_behavior: NatBehavior::EndpointIndependent,
+        },
+        PlainTransport::new(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), DirectSockets),
+    );
+
+    let Ok(mut stream) = egress.connect(&Target::Ip(echo)).await else {
+        panic!("the reference server refused the VLESS request");
+    };
+    stream.write_all(b"vless interop").await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = [0u8; 13];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+        .await
+        .expect("the reference answers")
+        .expect("the response arrives");
+    assert_eq!(&buf, b"vless interop");
 }

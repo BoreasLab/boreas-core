@@ -1070,7 +1070,25 @@ crate. The tests are opt-in through `BOREAS_SINGBOX` and *skip loudly* rather
 than fail when it is absent, so a machine without it still has a green suite
 and no one mistakes a green run for a verified one.
 
-**Still to build:** the Shadowsocks UDP packet format, and VLESS/Reality,
+**VLESS is complete for TCP, and it introduces the seam Reality needs.** VLESS
+is a stateless authentication header carrying no encryption of its own, by
+design: it runs *inside* a transport that already provides it. So the transport
+is a trait — `ProxyTransport`, "obtain the byte stream I speak over" — and VLESS
+over TCP, over TLS, and over Reality are one protocol implementation and three
+transports. Reality therefore lands as a new `ProxyTransport` rather than as a
+change to `src/vless.rs`, which is what the phase order was chosen for.
+
+**The VLESS address encoding is not SOCKS5's, and the difference is silent.**
+VMess and VLESS write the **port before** the address, and two of their three
+family bytes disagree with RFC 1928: `0x02` is a domain here and IPv6 there,
+`0x03` is IPv6 here and a domain there. Sharing the SOCKS5 encoder would have
+produced a header that parses *successfully* into the wrong destination for
+every name and every IPv6 host — a bug with no error message. The encoders are
+separate, and a test asserts the two formats do not converge. Confirmed against
+the reference's own source before a line was written, and then against the
+running server.
+
+**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, and Reality,
 Hysteria2, and TUIC. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
 proxy that performs one, and the M4 product gate needs the device.
 

@@ -19,6 +19,7 @@ mod stream;
 mod terminate;
 mod udp;
 mod upstream;
+mod vless;
 
 use std::{error::Error, fmt};
 
@@ -66,6 +67,11 @@ pub use terminate::{Accepted, TerminatedStream, run_terminator};
 pub use upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
     DotUpstream, TunnelBypass, UpstreamError,
+};
+
+pub use vless::{
+    PlainTransport, ProxyTransport, UserId, UserIdError, VlessConfig, VlessEgress,
+    decode_addr_port, decode_response, encode_addr_port, encode_request,
 };
 
 pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
