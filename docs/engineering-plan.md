@@ -973,11 +973,12 @@ subresource is modified; memory exhaustion demotes rather than fails.
 
 ### P17: Egress breadth
 
-MASQUE CONNECT-IP, SOCKS5 with UDP ASSOCIATE, Shadowsocks, then VLESS/Reality,
-Hysteria2, TUIC. Each reports live capability through P3's `replan`.
+MASQUE CONNECT-IP, SOCKS5 with UDP ASSOCIATE, Shadowsocks, then VLESS and
+Hysteria2. Each reports live capability through P3's `replan`.
 
-**Status: MASQUE CONNECT-IP is complete in-process; the rest of the phase is
-not started.** Delivered:
+**Status: MASQUE CONNECT-IP, SOCKS5, Shadowsocks, VLESS, and Hysteria2 are
+complete for their stream paths and interop-verified. TUIC is dropped and
+Reality is blocked; both findings are recorded below.** Delivered:
 
 - `src/masque.rs`, a CONNECT-IP tunnel as a `PacketEgress`. CONNECT-IP carries
   *whole IP packets*, so it joins WireGuard on the existing packet seam rather
@@ -1023,7 +1024,7 @@ flow and a direct one are one abstraction to everything above. `Target` keeps a
 name as a name rather than resolving it locally, because the exit should resolve
 in its own DNS view and a local resolution would leak the destination to the
 resolver the tunnel exists to bypass. `DomainName` refines the 255-byte limit
-that SOCKS5, Shadowsocks, VLESS, and TUIC all share.
+that SOCKS5, Shadowsocks, and VLESS all share.
 
 **SOCKS5 (RFC 1928) is complete, including UDP ASSOCIATE.** A pure codec and a
 thin driver: decoders return `Incomplete` rather than erroring on a short read,
@@ -1170,9 +1171,47 @@ with a measured indistinguishability check, which is what
 [Delivery](delivery.md) already means by keeping the VLESS family at late-M4
 priority and isolating private protocol code.
 
+**Reality needs a TLS stack Rust does not have, and the finding is worse than
+TUIC's.** Read from `Xray-core/transport/internet/reality/reality.go`, the
+client must, in order: build a ClientHello *without sending it*
+(`uConn.BuildHandshakeState()`); reach into it for the **X25519 ephemeral
+private key** (`HandshakeState.State13.KeyShareKeys.Ecdhe`); ECDH that against
+the server's Reality public key; AES-GCM seal authentication data into
+`hello.SessionId`, using the hello's own `Random[20:]` as the nonce and **the
+serialized `hello.Raw` as additional authenticated data**; and then byte-patch
+the already-serialized hello at `hello.Raw[39:]` before it goes out. On top of
+that the hello must carry a *browser* fingerprint, since a handshake that
+authenticates perfectly but looks like `rustls` defeats the entire purpose.
+
+`rustls` exposes none of this, and its issue asking for ClientHello
+customization (#1932) is closed as a duplicate rather than implemented. The only
+Rust option found is [`craftls`](https://crates.io/crates/craftls), a `rustls`
+fork — and it fails on every axis that matters: one release ever
+(`0.0.2`, January 2024), roughly 2,600 downloads in total, and it forks `rustls`
+**0.22** while this crate is on **0.23**. Adopting it means a global
+`[patch.crates-io]` that redirects *every* TLS in the product — the interception
+CA's server, DoT, DoH, the `hyper` client — onto an unmaintained two-year-old
+fork, pinned back a minor version and off the security-update path. And it would
+still be insufficient: `craftls` customises fingerprint *shape*; it does not
+hand out the ephemeral private key or let a caller patch the serialized hello,
+so it would need forking again on top.
+
+By the rule stated for TUIC above, this is out: it is not a new dependency but a
+replacement of the crate's TLS foundation, maintained by us, for one transport.
+
+**The recommendation is VLESS over ordinary TLS instead, and it is nearly
+free.** `ProxyTransport` is a one-method trait, and `TlsDialer` in
+`src/upstream.rs` already does exactly this dial with `tokio-rustls`,
+`webpki-roots`, and the `ring` provider — all in the graph. A `TlsTransport`
+alongside `PlainTransport` is on the order of sixty lines and no new
+dependencies, and VLESS-over-TLS is a widely deployed configuration in its own
+right. What it does not provide is Reality's indistinguishability, which is a
+real loss for the mainland China case and a product decision rather than an
+engineering one.
+
 The interop harness is what makes the remaining protocols tractable rather than
 guesswork. sing-box is built with `with_quic` and `with_utls`, so it serves
-VLESS, Reality, Hysteria2, and TUIC as well; Reality is Xray-core's invention,
+VLESS, Reality, and Hysteria2 as well; Reality is Xray-core's invention,
 so Xray belongs beside it as the authority on that one. Each remaining protocol
 lands the same way Shadowsocks now has: written from the specification, then
 made to satisfy a server this project did not write.
