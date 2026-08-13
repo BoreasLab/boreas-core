@@ -109,6 +109,35 @@ pub(crate) fn pair(wake: Arc<Notify>) -> (BridgedStream, Plumbing) {
     )
 }
 
+/// Two streams wired to each other, for driving a consumer that expects a
+/// [`BridgedStream`] without standing up the driver that normally produces one.
+///
+/// There is no pump between them: each side's outbound sender *is* the other's
+/// inbound receiver, so the halves carry bytes directly. That makes this a
+/// faithful stand-in for the real thing on everything the consumer can observe
+/// — chunking, backpressure at [`DEPTH`], and half-close by dropping a sender —
+/// while owning no socket and no state machine.
+#[cfg(test)]
+pub(crate) fn duplex() -> (BridgedStream, BridgedStream) {
+    let wake = Arc::new(Notify::new());
+    let (left_in, left_out) = mpsc::channel(DEPTH);
+    let (right_in, right_out) = mpsc::channel(DEPTH);
+    (
+        BridgedStream {
+            inbound: left_out,
+            outbound: Some(PollSender::new(right_in)),
+            wake: Arc::clone(&wake),
+            pending: Bytes::new(),
+        },
+        BridgedStream {
+            inbound: right_out,
+            outbound: Some(PollSender::new(left_in)),
+            wake,
+            pending: Bytes::new(),
+        },
+    )
+}
+
 impl AsyncRead for BridgedStream {
     fn poll_read(
         self: Pin<&mut Self>,

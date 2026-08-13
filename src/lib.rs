@@ -15,6 +15,7 @@ mod platform;
 mod pool;
 mod quic;
 mod reassembly;
+mod session;
 mod shadowsocks;
 mod shell;
 mod socks5;
@@ -65,6 +66,10 @@ pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use quic::{H3Response, Handshake, QuicConnection, client_config};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
+pub use session::{
+    Handling, Introduction, SessionError, SessionLimits, Sessions, SpliceReason, introduce,
+    run_sessions, serve_session,
+};
 pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
 pub use shell::{
     AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry, Termination,

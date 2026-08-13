@@ -862,9 +862,7 @@ pre-established states explicitly, so `Closed` means "never again" rather than
 User-store CA lifecycle, rustls, `rcgen` leaf generation, h1 and h2
 interception. Deliberately narrow: an explicit allowlist, manually maintained.
 
-**Status: the CA and the terminating TLS server are complete in-process; the
-h1/h2 exchange and its upstream leg, and the reactor wiring, remain. The device
-gate is unexercised.** Delivered:
+**Status: complete in-process; the device gate is unexercised.** Delivered:
 
 - `src/ca.rs`, the CA lifecycle. `CertificateAuthority::generate` builds an
   `rcgen` root on the `ring` provider and one long-lived leaf key; `leaf_for`
@@ -910,14 +908,49 @@ reaches the origin, a `/ads/` path is answered `403` and never does. The
 version-crossing counter stays zero across both. This is the whole
 CA-to-resolver-to-server-to-upstream chain, proven without a device.
 
-**Still to build:** the upstream *dialer* — a TCP connect plus rustls client
-handshake to the real server, bypassing the tunnel exactly as the DNS
-upstream's `TunnelBypass` does — and the session assembly that consumes
-`Accepted`, applies `InterceptPolicy`, and either terminates and runs an
-exchange or splices. Every piece each of those composes now exists and is
-tested; what remains is the wiring between them, not new protocol code. The
-32-stream p99 gate and the pin-bypass device test
-([Verification](verification.md) item 1) are device-bound and unexercised.
+**Session assembly is complete, and with it P14's in-process scope.**
+`src/session.rs` consumes a terminated connection, applies `InterceptPolicy`,
+and either terminates and runs an exchange or splices. The upstream dialer it
+needed turned out to be `StreamEgress`, delivered with SOCKS5 — an intercepted
+connection's upstream leg goes through the same egress as everything else,
+because interception changes what Boreas can *read*, never where traffic exits.
+
+**The host is not known when a connection arrives, and that was the real work.**
+A terminated flow carries an address and a port; the allowlist names hosts. The
+name is in the TLS ClientHello's SNI, which arrives in the client's first bytes,
+before any handshake this process takes part in. So `introduce` reads those
+bytes without consuming them and `Prefixed` — the type the SOCKS5 over-read bug
+produced — puts them back, either for `rustls` to read the very ClientHello it
+parsed, or for a splice to deliver unaltered.
+
+**Fail open is a property of the type rather than of the control flow.**
+`Introduction` has three shapes and only one can lead to interception: a TLS
+record, carrying an SNI, naming an allowlisted host. Everything else — an
+unlisted name, a ClientHello with no SNI, bytes that are not TLS, a client
+silent past the deadline — reaches a splice with a reason recorded. The parser
+has no error case at all: it can only fail to *recognise*, and non-recognition
+is splice. A parser with an error case would force every caller to pick a
+fallback, and one of them would eventually pick the wrong one.
+
+**No version is crossed by construction, not by agreement.** The client's ALPN
+settles the wire; the upstream leg is then offered that one protocol and no
+other, so a server unwilling to speak it fails the handshake visibly rather than
+negotiating something else and leaving the exchange to bridge. `VersionCrossings`
+still counts, because a gate that can only be satisfied and never checked is not
+a gate.
+
+**Gate met, in-process, on the whole chain.** A real `rustls` client trusting
+only the Boreas root speaks TLS to a connection classified from its SNI alone;
+the forged leaf validates, the request crosses an upstream TLS connection to a
+real origin on a real socket, and the origin's body returns. Two more tests
+assert the fail-open half on *bytes* rather than on the decision, because a
+splice that rewrote anything would still report itself as a splice: an unlisted
+host's ClientHello and a cleartext request each arrive at the origin
+byte-identical. The crossing counter stays zero.
+
+**Still device-bound:** the 32-stream p99 gate and the pin-bypass test
+([Verification](verification.md) item 1), which need hardware rather than more
+code.
 
 **The `ring`/`rcgen` decision half was already recorded.** `rustls` 0.23 is on
 the `ring` provider already in the graph for WireGuard, which is what let P11's

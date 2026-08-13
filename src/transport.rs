@@ -142,30 +142,43 @@ impl<B: TunnelBypass> TlsTransport<B> {
         let server_name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
             .map_err(|_| ProxyError::Address)?
             .to_owned();
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        for anchor in config.extra_roots {
-            roots
-                .add(rustls::pki_types::CertificateDer::from(anchor))
-                .map_err(|_| EgressError::Proxy(ProxyError::Crypto))?;
-        }
-
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|_| EgressError::Quic)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        client.alpn_protocols = config.alpn;
-
+        let client = client_tls_config(&config.alpn, &config.extra_roots)?;
         Ok(Self {
             server: config.server,
             server_name,
-            config: Arc::new(client),
+            config: client,
             bypass,
         })
     }
+}
+
+/// A verifying `rustls` client configuration offering `alpn`.
+///
+/// Shared by [`TlsTransport`] and by the interception path's upstream leg,
+/// which needs the same anchors and the same provider but supplies its own
+/// already-connected stream. Building it is not free — the anchor set is parsed
+/// here — so a caller holds the `Arc` for the life of a configuration rather
+/// than rebuilding one per connection.
+pub fn client_tls_config(
+    alpn: &[Vec<u8>],
+    extra_roots: &[Vec<u8>],
+) -> Result<Arc<rustls::ClientConfig>, EgressError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for anchor in extra_roots {
+        roots
+            .add(rustls::pki_types::CertificateDer::from(anchor.clone()))
+            .map_err(|_| EgressError::Proxy(ProxyError::Crypto))?;
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|_| EgressError::Quic)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.alpn_protocols = alpn.to_vec();
+    Ok(Arc::new(client))
 }
 
 impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {

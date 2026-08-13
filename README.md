@@ -31,10 +31,12 @@ The core currently provides:
 - a composable VLESS transport family — TLS, WebSocket, HTTPUpgrade, gRPC,
   HTTP/2, and QUIC — where each transport wraps another rather than re-deriving
   the layers beneath it
+- session assembly: a terminated connection is classified from its TLS
+  ClientHello, then either intercepted or spliced byte for byte, with fail-open
+  a property of the type rather than of the control flow
 
-The upstream dialer (TCP plus TLS with tunnel bypass) and the session assembly
-that chooses between interception and splice are under construction, as are the
-platform on-device gates, the remaining filtering tiers, and egress breadth.
+The platform on-device gates, the remaining filtering tiers, automatic demotion,
+and body rewriting are still to come.
 
 ## Documentation
 
