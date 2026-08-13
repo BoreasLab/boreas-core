@@ -976,6 +976,51 @@ subresource is modified; memory exhaustion demotes rather than fails.
 MASQUE CONNECT-IP, SOCKS5 with UDP ASSOCIATE, Shadowsocks, then VLESS/Reality,
 Hysteria2, TUIC. Each reports live capability through P3's `replan`.
 
+**Status: MASQUE CONNECT-IP is complete in-process; the rest of the phase is
+not started.** Delivered:
+
+- `src/masque.rs`, a CONNECT-IP tunnel as a `PacketEgress`. CONNECT-IP carries
+  *whole IP packets*, so it joins WireGuard on the existing packet seam rather
+  than needing a new layer, and the planner reaches it through the capability
+  claim it already understands.
+- **`quiche` rather than `tokio-quiche`, and the reason is the seam.**
+  [Verification](verification.md) pre-authorised both. Only plain `quiche` is
+  sans-io — `recv`, `send`, `on_timeout`, no sockets of its own — which is the
+  exact shape `PacketEgress` already is; `tokio-quiche` owns its own I/O and
+  would have to be driven beside the reactor instead of by it. It is also the
+  stack Cloudflare's own WARP client speaks, so the wire is exercised against a
+  real deployment rather than only a specification.
+- The two framings are a pure codec. RFC 9297 prefixes every HTTP Datagram with
+  a Quarter Stream ID; RFC 9484 prefixes the payload with a Context ID, where
+  0 means "an IP packet". `encode_ip_datagram` and `decode_ip_datagram` are
+  that codec and are tested without a connection, across every varint width.
+- **The tunnel's states are a closed sum, so an unusable tunnel cannot be
+  written to.** A flow id exists only inside `TunnelState::Established`, which
+  *is* the proof that the proxy answered `2xx`; there is no path that encodes a
+  datagram earlier, because the number it needs does not exist yet.
+- `:protocol` is configuration, not a constant: RFC 9484 registers
+  `connect-ip` and Cloudflare WARP expects `cf-connect-ip`, so a deployment
+  selects rather than patches. The proxy's NAT behavior is configuration for
+  the same reason — it is the proxy's property, unobservable from here, and a
+  hard-coded optimistic claim would be an unmeasured assertion in the one place
+  the planner trusts.
+- Capabilities report the *measured* datagram ceiling from `quiche` once the
+  connection exists, falling back to the static overhead estimate before that.
+  A datagram that will not fit is dropped rather than fragmented, because QUIC
+  forbids fragmenting one, which is precisely what that ceiling exists to say.
+
+**Gate met, in-process:** `src/masque.rs` drives a real `quiche` client through
+a real handshake against a real `quiche` server, sends an Extended CONNECT
+carrying `:protocol = connect-ip`, and asserts that a whole IP packet crosses as
+an HTTP Datagram and returns byte-identical. The proxy in that test validates
+the request rather than rubber-stamping it, so a malformed CONNECT would fail
+the test rather than pass it silently.
+
+**Still to build:** SOCKS5 with UDP ASSOCIATE, Shadowsocks, VLESS/Reality,
+Hysteria2, TUIC; the `StreamEgress` trait still has no implementation. The
+mid-session MASQUE-to-HTTP/2 fallback re-steer needs a proxy that performs one,
+and the M4 product gate needs the device.
+
 **Gate:** the M4 product gate. Non-native fidelity tunnels zero QUIC datagrams.
 A mid-session MASQUE fallback to HTTP/2 re-steers without dropping flows. Resolve
 the `shadowsocks-rust` license item before it ships.
@@ -1061,10 +1106,17 @@ Record outcomes in [Verification](verification.md).
    reads one packet per wakeup. It needs a non-blocking read on `AsyncDevice`,
    which both adapters can supply, and its metric (packets per wakeup) is
    device-bound. Decide it against the M1 on-device run, not before.
-5. The egress tick is an unconditional 4 Hz wakeup, at parity with GotaTun's
+5. ~~The egress tick is an unconditional 4 Hz wakeup, at parity with GotaTun's
    own device and the largest fixed wakeup cost in the shell. Replacing it
-   with an egress-declared next deadline requires GotaTun to expose one; carry
-   this into the battery measurement.
+   with an egress-declared next deadline requires GotaTun to expose one.~~
+   **Resolved by P17's MASQUE work:** `PacketEgress::next_deadline` now exists
+   and the reactor folds it into the one timer it already arms. WireGuard keeps
+   the default `None`, because its timers round to the second and the cadence
+   is the whole truth for it; QUIC returns `quiche`'s own moving deadline,
+   because a retransmission missed for a fixed interval is a stalled tunnel.
+   The 4 Hz cadence remains as the worst-case bound. Whether GotaTun can
+   declare a deadline of its own is still open, and still belongs to the
+   battery measurement.
 6. ~~P11's encrypted upstreams need a TLS stack the plan first admits at
    P14.~~ **Decided 2026-08-11:** `rustls` is admitted early, on the `ring`
    provider already in the graph, and P11's DoT and DoH landed on it.

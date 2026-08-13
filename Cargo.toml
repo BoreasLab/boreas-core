@@ -11,6 +11,8 @@ gotatun = { version = "0.8.1", default-features = false, features = ["ring"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.11.0", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "client", "http1", "http2"] }
+octets = "0.3.6"
+quiche = "0.29.3"
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Local TCP termination (the substrate P14 MITM runs on) is a smoltcp socket set

@@ -75,6 +75,20 @@ pub trait PacketEgress: Send {
     /// its own cadence, so the shell arms a timer rather than knowing any
     /// protocol's timer granularity.
     fn tick_interval(&self) -> Duration;
+
+    /// The next instant this egress must be ticked, when it can name one more
+    /// precisely than its cadence.
+    ///
+    /// WireGuard rounds its timers to the second, so a fixed interval is the
+    /// whole truth for it and the default `None` is correct. QUIC's timer is a
+    /// deadline that moves with loss recovery, so a MASQUE egress that could
+    /// only be ticked on a cadence would either burn wakeups or miss a
+    /// retransmission. The reactor folds this into the one timer it already
+    /// arms, which is what keeps the wakeup budget a property of the session
+    /// rather than of each protocol.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 /// An egress that accepts L4 flows, such as SOCKS5 or Shadowsocks.
@@ -170,6 +184,9 @@ pub enum EgressError {
     /// The tunnel itself failed, e.g. `ConnectionExpired` once the handshake
     /// has been retried past its limit.
     WireGuard(WireGuardError),
+    /// A MASQUE tunnel could not be configured or driven. Construction-time or
+    /// protocol-level, never a per-packet condition.
+    Masque,
 }
 
 impl std::fmt::Display for EgressError {
@@ -180,6 +197,7 @@ impl std::fmt::Display for EgressError {
             // GotaTun's error type is a plain enum without `Display`; Debug
             // names the variant, which is what an operator needs.
             Self::WireGuard(error) => write!(f, "WireGuard failure: {error:?}"),
+            Self::Masque => f.write_str("MASQUE tunnel failure"),
         }
     }
 }

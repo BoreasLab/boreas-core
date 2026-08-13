@@ -706,8 +706,14 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         // reporting tick, the egress's tick, and its input sources.
         let mut reply: Option<Vec<u8>> = None;
         let core_deadline = datapath.poll_timeout().map(TokioInstant::from_std);
+        // The egress may name a deadline more precisely than its cadence —
+        // QUIC's loss-recovery timer moves, where WireGuard's rounds to the
+        // second — so it joins the fold rather than being approximated by the
+        // tick interval. One timer still serves every deadline in the session.
+        let egress_deadline = egress.next_deadline().map(TokioInstant::from_std);
         let wake = core_deadline
             .into_iter()
+            .chain(egress_deadline)
             .chain([next_flush, next_tick])
             .min()
             .unwrap_or(next_flush);
@@ -804,7 +810,13 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         if core_deadline.is_some_and(|deadline| deadline <= TokioInstant::from_std(now)) {
             datapath.on_timeout(now);
         }
-        if TokioInstant::from_std(now) >= next_tick {
+        // Tick on the egress's own deadline as well as its cadence: a QUIC
+        // retransmission missed because the fixed interval had not elapsed is
+        // a stalled tunnel, and the cadence remains the worst-case bound.
+        let egress_due = egress
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= now);
+        if TokioInstant::from_std(now) >= next_tick || egress_due {
             if egress.tick(&mut emits).is_err() {
                 counters.egress_rejected += 1;
             }

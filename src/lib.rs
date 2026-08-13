@@ -5,6 +5,7 @@ mod dns;
 mod egress;
 mod exchange;
 mod filter;
+mod masque;
 mod mitm;
 mod packet;
 mod path;
@@ -36,6 +37,10 @@ pub use egress::{
 };
 pub use exchange::{AllowAll, FilterVerdict, ProxyBody, RequestFilter, run_exchange};
 pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
+pub use masque::{
+    CloseReason, MASQUE_OVERHEAD_BYTES, MasqueConfig, MasqueEgress, TunnelState,
+    decode_ip_datagram, encode_ip_datagram,
+};
 pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
 pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
