@@ -20,7 +20,6 @@ The core currently provides:
 - a user-store CA and a terminating TLS server that forges per-host leaves
 - an h1/h2 interception exchange on hyper, with a URL-tier filter seam, that
   never bridges HTTP versions
-
 - a reactor bridge presenting each terminated connection as an async stream,
   with backpressure carried by TCP's own window rather than by dropping bytes
 - MASQUE CONNECT-IP egress over a sans-io QUIC stack, alongside WireGuard
