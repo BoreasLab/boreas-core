@@ -1088,8 +1088,47 @@ separate, and a test asserts the two formats do not converge. Confirmed against
 the reference's own source before a line was written, and then against the
 running server.
 
-**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, and Reality,
-Hysteria2, and TUIC. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
+**TUIC is blocked on a missing `quiche` capability, and the order must swap.**
+TUIC v5 authenticates with a token defined as the *TLS keying material
+exporter* over the session, keyed by the user's UUID as label and the password
+as context — `handshakeState.TLS.ExportKeyingMaterial` in the reference, on
+both client and server. `quiche` 0.29 exposes no exporter: there is no
+`export_keying_material` anywhere in its API, and the only access it grants to
+the underlying `boring::ssl::SslRef` is *inside a handshake callback*, which
+runs before the handshake completes and therefore before the exporter secret
+this token needs exists. TUIC cannot be built on the QUIC stack this crate
+already carries.
+
+Three ways out, in the order they should be considered:
+
+1. **Add the exporter to `quiche`.** It holds the `SSL` internally, so
+   `Connection::export_keying_material` is a small, obviously correct addition
+   and a plausible upstream contribution. This keeps one QUIC stack.
+2. **Use `quinn` with `rustls` for TUIC alone.** `rustls` exposes the exporter
+   directly, but this ships a second QUIC stack to a target that counts bytes,
+   and [Verification](verification.md) already records `quinn`'s maintenance
+   concentration as a risk.
+3. **Defer TUIC.** It is the least deployed of the four and the only one with
+   this obstacle.
+
+**Hysteria2 has no such obstacle and should precede it.** Its authentication is
+an ordinary HTTP/3 exchange — a `POST` to `https://hysteria/auth` carrying a
+`Hysteria-Auth` header, answered with status 233 — which is the same `quiche::h3`
+machinery P17's MASQUE work already uses. Its proxying is a QUIC bidirectional
+stream carrying a varint-framed request (`FrameTypeTCPRequest`, address,
+padding) and a status-and-message response.
+
+It does need one piece of infrastructure that does not exist yet: a **QUIC
+stream driver**. Every stream egress so far obtains a `TcpStream` from the
+tunnel bypass, but Hysteria2's streams live inside a QUIC connection, so
+something must own the UDP socket and the `quiche::Connection` and expose each
+bidirectional stream as an `AsyncRead + AsyncWrite`. That is structurally the
+bridge `src/terminate.rs` already builds for smoltcp — bounded channels, a
+pump, backpressure from the protocol's own window — and TUIC would reuse it if
+option 1 above unblocks it.
+
+**Still to build:** the Shadowsocks UDP packet format, VLESS UDP, the QUIC
+stream driver, Hysteria2, TUIC, and Reality. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
 proxy that performs one, and the M4 product gate needs the device.
 
 **On Reality specifically, a half-implementation is worse than none.** Its
