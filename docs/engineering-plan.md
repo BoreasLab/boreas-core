@@ -1044,15 +1044,31 @@ owns, so `LessSafeKey` is the correct API and `Session` is the type that keeps
 key and counter together — a nonce reused against a key destroys AEAD security
 entirely, and separate variables are how that happens.
 
-**Shadowsocks wire compatibility is unverified, and that is a real gap.** The
-tests drive this implementation against itself, which proves the framing is
-self-consistent and that every guard fires — salt echo, clock skew in both
-directions, reflected request, truncated header, counter desynchronisation —
-but a misreading of SIP022 would satisfy both halves equally. Verification
-against `shadowsocks-rust` or a deployed server is required before it ships and
-cannot be performed in this environment. The SOCKS5 and MASQUE gates do not
-carry this caveat: the first is checked against an independently written RFC
-1928 proxy, and the second against a real `quiche` server.
+**Wire compatibility is now checked against a reference implementation, and
+doing so immediately found a real bug.** `tests/interop.rs` runs the egresses
+against [sing-box](https://github.com/SagerNet/sing-box), an independent
+implementation of every protocol this phase carries. Self-testing proves
+self-consistency and nothing about the wire: a misreading of a specification
+satisfies both halves of a self-test equally.
+
+The first run proved the point. SOCKS5 interoperated immediately; Shadowsocks
+was rejected outright with `bad request: missing payload or padding`. SIP022
+requires a request to carry padding *or* an initial payload — with neither, the
+encrypted header's length leaks the address length exactly, which is what the
+padding exists to blur. `connect` returns before the caller has written
+anything, so there is no initial payload and padding is therefore mandatory
+rather than optional; it is now randomly sized. No amount of self-testing would
+have surfaced this, because both halves would have agreed to omit it.
+
+All three cipher suites are covered, since they differ in key length and
+cipher: a derivation truncated for the 128-bit suite, or the wrong `ring`
+algorithm selected, would show on one and not the others.
+
+**The reference is a development tool, not a dependency.** It is never linked,
+never distributed, and runs out of process, so its licence does not reach this
+crate. The tests are opt-in through `BOREAS_SINGBOX` and *skip loudly* rather
+than fail when it is absent, so a machine without it still has a green suite
+and no one mistakes a green run for a verified one.
 
 **Still to build:** the Shadowsocks UDP packet format, and VLESS/Reality,
 Hysteria2, and TUIC. The mid-session MASQUE-to-HTTP/2 fallback re-steer needs a
@@ -1065,6 +1081,13 @@ that marks the traffic more clearly than plain TLS would. It should land only
 with a measured indistinguishability check, which is what
 [Delivery](delivery.md) already means by keeping the VLESS family at late-M4
 priority and isolating private protocol code.
+
+The interop harness is what makes the remaining protocols tractable rather than
+guesswork. sing-box is built with `with_quic` and `with_utls`, so it serves
+VLESS, Reality, Hysteria2, and TUIC as well; Reality is Xray-core's invention,
+so Xray belongs beside it as the authority on that one. Each remaining protocol
+lands the same way Shadowsocks now has: written from the specification, then
+made to satisfy a server this project did not write.
 
 **Gate:** the M4 product gate. Non-native fidelity tunnels zero QUIC datagrams.
 A mid-session MASQUE fallback to HTTP/2 re-steers without dropping flows. Resolve

@@ -36,7 +36,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::{
+    aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::SecureRandom,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
@@ -226,16 +229,29 @@ fn check_timestamp(theirs: u64, ours: u64) -> Result<(), EgressError> {
     Ok(())
 }
 
+/// The largest padding SIP022 permits in a request header.
+const MAX_PADDING: usize = 900;
+
 /// Builds the variable-length request header: target, padding, then whatever
-/// payload the caller wants to ride along with it.
+/// payload rides along with it.
 ///
-/// Padding is permitted up to 900 bytes; this client sends none, which the
-/// specification allows, and says so with an explicit zero rather than by
-/// omitting the field.
-fn encode_request_body(target: &Target, initial: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(initial.len() + 32);
+/// **A request must carry padding or an initial payload, and may not be empty
+/// of both.** SIP022 requires it and a reference server rejects the violation
+/// outright with "missing payload or padding": with neither, the header's
+/// encrypted length would leak the address length exactly, which is what the
+/// padding is there to blur. The caller supplies the padding bytes rather than
+/// this function generating them, so the encoder stays pure and the randomness
+/// stays at the one boundary that performs effects.
+fn encode_request_body(target: &Target, padding: &[u8], initial: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        !padding.is_empty() || !initial.is_empty(),
+        "SIP022 forbids a request with neither padding nor payload"
+    );
+    debug_assert!(padding.len() <= MAX_PADDING);
+    let mut body = Vec::with_capacity(initial.len() + padding.len() + 32);
     encode_address(target, &mut body);
-    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&(padding.len() as u16).to_be_bytes());
+    body.extend_from_slice(padding);
     body.extend_from_slice(initial);
     body
 }
@@ -323,12 +339,23 @@ impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
             // A fresh random salt per session: it is the only input that makes
             // two sessions under one pre-shared key different, so it comes from
             // the system CSPRNG and nowhere else.
+            let random = ring::rand::SystemRandom::new();
             let mut salt = vec![0u8; method.salt_len()];
-            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
-                .map_err(|_| ProxyError::Crypto)?;
+            random.fill(&mut salt).map_err(|_| ProxyError::Crypto)?;
             let mut writer = Session::new(method, &self.config.key.subkey(&salt))?;
 
-            let body = encode_request_body(target, &[]);
+            // No initial payload here — `connect` returns before the caller
+            // has written anything — so padding is mandatory rather than
+            // optional, and its length is randomised so the header's size
+            // carries no information about the address inside it.
+            let mut length_pick = [0u8; 2];
+            random
+                .fill(&mut length_pick)
+                .map_err(|_| ProxyError::Crypto)?;
+            let padding_len = 1 + usize::from(u16::from_be_bytes(length_pick)) % MAX_PADDING;
+            let mut padding = vec![0u8; padding_len];
+            random.fill(&mut padding).map_err(|_| ProxyError::Crypto)?;
+            let body = encode_request_body(target, &padding, &[]);
             let body_len = u16::try_from(body.len()).map_err(|_| ProxyError::Header)?;
             let mut fixed = encode_request_fixed(now_seconds(), body_len);
             writer.seal(&mut fixed)?;
@@ -659,7 +686,8 @@ mod tests {
     #[test]
     fn a_request_body_carries_the_target_and_an_explicit_padding_length() {
         let target = Target::Ip("192.0.2.1:443".parse().unwrap());
-        let body = encode_request_body(&target, b"GET /");
+        // With an initial payload, no padding is required.
+        let body = encode_request_body(&target, &[], b"GET /");
         // ATYP + 4 address + 2 port + 2 padding length + payload.
         assert_eq!(body.len(), 1 + 4 + 2 + 2 + 5);
         assert_eq!(
@@ -668,6 +696,13 @@ mod tests {
             "padding length is explicit"
         );
         assert_eq!(&body[9..], b"GET /");
+
+        // With no payload, padding carries SIP022's requirement instead, and
+        // its length is declared where the reader expects it. A request with
+        // neither is what the reference server rejects outright.
+        let padded = encode_request_body(&target, &[0xab; 16], &[]);
+        assert_eq!(&padded[7..9], &16u16.to_be_bytes());
+        assert_eq!(padded.len(), 1 + 4 + 2 + 2 + 16);
 
         let fixed = encode_request_fixed(1_800_000_000, body.len() as u16);
         assert_eq!(fixed.len(), 11);

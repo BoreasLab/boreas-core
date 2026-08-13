@@ -47,6 +47,15 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+Proxy protocols are additionally checked against an independent implementation,
+because a self-test proves self-consistency and nothing about the wire. Point
+`BOREAS_SINGBOX` at a [sing-box](https://github.com/SagerNet/sing-box) binary to
+run them; without it they skip loudly rather than fail.
+
+```sh
+BOREAS_SINGBOX=/path/to/sing-box cargo test --test interop
+```
+
 ## License
 
 [GNU Affero General Public License v3.0](LICENSE)
