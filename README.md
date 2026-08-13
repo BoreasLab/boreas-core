@@ -18,10 +18,13 @@ The core currently provides:
 - endpoint-independent UDP mapping state with bounded, non-blocking buffers
 - sans-io local TCP termination over a bounded smoltcp socket set
 - a user-store CA and a terminating TLS server that forges per-host leaves
+- an h1/h2 interception exchange on hyper, with a URL-tier filter seam, that
+  never bridges HTTP versions
 
-The h1/h2 exchange over terminated TLS, its upstream leg, and the reactor
-integration that drives termination live are under construction, as are the
-platform on-device gates, the remaining filtering tiers, and egress breadth.
+The upstream dialer (TCP plus TLS with tunnel bypass) and the reactor
+integration that drives termination and the exchange live are under
+construction, as are the platform on-device gates, the remaining filtering
+tiers, and egress breadth.
 
 ## Documentation
 

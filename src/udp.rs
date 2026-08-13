@@ -429,7 +429,10 @@ mod tests {
         );
 
         // And both still expire at their own deadlines, in order.
-        assert_eq!(table.expire(start + Duration::from_secs(599)), Vec::new());
+        assert_eq!(
+            table.expire(start + Duration::from_secs(599)),
+            Vec::<u16>::new()
+        );
         assert_eq!(table.expire(start + Duration::from_secs(601)), vec![1]);
         assert_eq!(table.expire(start + Duration::from_secs(689)), vec![2]);
         assert!(table.is_empty());

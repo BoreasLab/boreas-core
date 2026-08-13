@@ -3,6 +3,7 @@ mod datapath;
 mod device;
 mod dns;
 mod egress;
+mod exchange;
 mod filter;
 mod mitm;
 mod packet;
@@ -32,6 +33,7 @@ pub use egress::{
     Egress, EgressEmit, EgressError, PacketEgress, StreamEgress, WIREGUARD_OVERHEAD_BYTES,
     WireGuardConfig, WireGuardEgress,
 };
+pub use exchange::{AllowAll, FilterVerdict, ProxyBody, RequestFilter, run_exchange};
 pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
 pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
 pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};

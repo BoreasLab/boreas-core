@@ -861,28 +861,46 @@ gate is unexercised.** Delivered:
   `VersionCrossings` counts any exchange whose client and upstream wires differ,
   which the design never produces; `Wire` is closed at two members precisely
   because there is no h3 to bridge to.
+- `src/exchange.rs`, the h1/h2 request/response half, on `hyper`. `run_exchange`
+  serves the client on the ALPN-chosen wire and forwards each request to an
+  upstream connection of *the same* wire, so no version is bridged — the h2
+  sender is cloned per stream, never locked, keeping the per-stream
+  independence the h2 contract demands. `RequestFilter` is the URL-tier seam:
+  it finally has a URL, which the name tier lacked, so the `adblock` engine and
+  P12's deferred URL tier plug in here. Hop-by-hop headers are stripped both
+  ways; a blocked request is answered `403` without touching upstream; an
+  upstream failure is a visible `502`, because connection-level fail-open —
+  never terminating a host likely to break — is the allowlist's job above this
+  layer, not this layer's.
 
-**The dependency half is done.** `rustls` 0.23 and now `rcgen` 0.14 are both on
-the `ring` provider already in the graph for WireGuard, so no second crypto
-provider ships. `smoltcp` was promoted from a dev-dependency to a real one for
-P13.5.
+**The dependency half is done.** `rustls` 0.23, `rcgen` 0.14, and `hyper` 1.x
+with `h2` are all on the `ring` provider / `tokio` ecosystem already in the
+graph, so no second crypto or async stack ships. `smoltcp` was promoted from a
+dev-dependency to a real one for P13.5. `hyper`/`h2` are deliberately not
+hand-rolled: parsing h1, framing h2, and multiplexing are a solved problem, and
+Boreas's novel part is the datapath and termination beneath them.
 
-**Gate met, in-process:** `src/mitm.rs` drives a real rustls client that trusts
-the Boreas root through a handshake against the interceptor, validates the
-forged leaf for an arbitrary SNI, negotiates h2, and exchanges plaintext the
-server decrypts — the whole CA-to-resolver-to-server chain, proven without a
-device. The version-crossing counter's law is unit-tested: same-version
-exchanges leave it at zero.
+**Gate met, in-process:** two end-to-end tests carry a real rustls client that
+trusts the Boreas root through the interceptor and the exchange to a fake
+origin — one over h1, one over h2. Each validates the forged leaf for an
+arbitrary SNI, and the h1 test also proves the URL filter: an allowed path
+reaches the origin, a `/ads/` path is answered `403` and never does. The
+version-crossing counter stays zero across both. This is the whole
+CA-to-resolver-to-server-to-upstream chain, proven without a device.
 
-**Still to build:** the `http`-shaped h1/h2 request/response exchange over the
-terminated TLS, its upstream TLS leg to the real server, and the reactor
-integration that drives `LocalStack` and spawns an exchange per accepted
-stream. The 32-stream p99 gate and the pin-bypass device test
+**Still to build:** the upstream *dialer* — a TCP connect plus rustls client
+handshake to the real server, bypassing the tunnel exactly as the DNS
+upstream's `TunnelBypass` does — and the reactor integration that drives
+`LocalStack`, terminates each accepted stream, dials its upstream, and spawns a
+`run_exchange` per connection. The exchange itself takes both streams as
+arguments, so those two are the remaining seams, not new protocol code. The
+32-stream p99 gate and the pin-bypass device test
 ([Verification](verification.md) item 1) are device-bound and unexercised.
 
 **The `ring`/`rcgen` decision half was already recorded.** `rustls` 0.23 is on
 the `ring` provider already in the graph for WireGuard, which is what let P11's
-encrypted transports land; `rcgen` now joins it on the same provider.
+encrypted transports land; `rcgen` and `hyper` now join it on the same
+provider and runtime.
 
 **Scope reduction proposed here.** [Filtering](filtering.md) specifies a neutral
 `Exchange` model with three wire adapters, justified by quiche and `tokio-quiche`
