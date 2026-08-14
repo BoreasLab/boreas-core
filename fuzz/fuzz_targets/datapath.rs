@@ -42,8 +42,12 @@ fn datapath(accepts: Accepts, dns: DnsPolicy) -> Datapath {
             datagram_buffer_capacity: NonZeroUsize::new(4).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.
-            steering_backstop: Duration::from_secs(60),
-            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+            inspection_window: Duration::from_secs(60),
+            max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+            inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
+            // No re-originated connections exist under a fuzz harness, so
+            // there is no source-port range to exclude from inspection.
+            origination_ports: None,
         },
         // Small on purpose: the fuzzer should reach the exhaustion path,
         // where a forwarded packet is a counted drop rather than a panic.

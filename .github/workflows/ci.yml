@@ -69,6 +69,12 @@ jobs:
       # cargo-fuzz needs nightly for the sanitizer instrumentation.
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      # Before the install, because it is the cheap half. The fuzz crate is a
+      # separate workspace — `cargo clippy --all-targets` in the check job
+      # never compiles it — so a library change that breaks a fuzz target
+      # surfaces here, in seconds, rather than after cargo-fuzz has built.
+      - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 

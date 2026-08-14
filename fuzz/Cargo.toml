@@ -7,6 +7,16 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# `cargo fuzz` keeps this crate out of the root workspace, because its
+# dependencies and its RUSTFLAGS are not ones an ordinary build wants. The
+# consequence is that `[patch]` does not reach here: patches apply only to the
+# workspace that declares them, so without this stanza the graph resolves
+# `quiche` against `boring 4.x`, meets `boreas-core`'s own `boring 5.2`, and
+# fails on `links = "boringssl"`. The path is the same generated tree the root
+# points at; see ../vendor/README.md.
+[patch.crates-io]
+quiche = { path = "../vendor/quiche" }
+
 [dependencies]
 libfuzzer-sys = "0.4"
 

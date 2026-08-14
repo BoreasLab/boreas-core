@@ -44,10 +44,16 @@ the product contract. Do not infer implemented status from visionary scope.
 4. Run the focused check immediately, then run:
 
 ```sh
+uv run scripts/vendor.py --check
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+`fuzz/` is its own workspace, so `--all-targets` above does not reach it: a
+renamed field compiles here and breaks there, and `[patch.crates-io]` has to be
+declared in both. Its check is last because it is the slow one.
 
 Update the owning document when a decision, constraint, acceptance criterion,
 dependency, risk, or verification status changes. Record unresolved claims in
