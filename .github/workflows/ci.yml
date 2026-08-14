@@ -26,6 +26,19 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # scripts/vendor.py carries its own PEP 723 environment — an interpreter
+      # floor and an empty dependency set — and uv is what honours it, so CI
+      # and a contributor's checkout execute the same interpreter.
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      # vendor/<name>/ is generated from vendor/patches/<name>.patch, and these
+      # are what prove it still is. No network and no build, so they run first
+      # and cost seconds: a tree edited by hand, or a patch nobody
+      # re-materialised, fails here rather than riding into a commit.
+      - run: uv run scripts/vendor.py --check
+      - run: uv run scripts/vendor.py --selftest
+      - run: uvx ruff@0.16.1 check scripts/vendor.py
+      - run: uvx ruff@0.16.1 format --check scripts/vendor.py
 
       # The three commands AGENTS.md requires before any change lands.
       # clippy runs as a rustc wrapper, so -D warnings also fails plain

@@ -1,0 +1,33 @@
+# Crates this workspace patches, and why.
+#
+# One entry per crates.io dependency that needs a change upstream has not made.
+# `scripts/vendor.py` reads this file, fetches the pristine package, applies
+# `vendor/patches/<name>.patch`, and materialises `vendor/<name>/` — which the
+# root `Cargo.toml` then points `[patch.crates-io]` at.
+#
+# **There is no version here, deliberately.** The version an entry vendors is
+# whatever the root `Cargo.toml` requires of that crate, resolved against
+# crates.io. One version, in the file a Rust reader already opens to find it,
+# and no second place for it to disagree with.
+#
+# Everything else is derived from the entry's name too — `vendor/<name>/` and
+# `vendor/patches/<name>.patch` — so an entry cannot name a directory that
+# holds a different crate. What is left to write down is the part no tool can
+# infer: why the patch exists, and what would make it unnecessary.
+#
+# `retires` is prose for a human, but it is not the mechanism: `vendor.py`
+# reports an entry as retired when its patch *reverse-applies* to the pristine
+# package, which is a decidable fact meaning upstream has adopted the change.
+
+[patch.quiche]
+reason = """
+`boring-sys` declares `links = "boringssl"`, and Cargo admits exactly one such \
+package per dependency graph. quiche pins `boring = "^4.3"`, so that pin binds \
+every other crate here — including Boreas's own originating-TLS seam, which \
+must be BoringSSL because rustls has no supported way to shape a ClientHello. \
+What 4.x binds it to is a BoringSSL from May 2023, whose newest key agreement \
+is `X25519_KYBER768_DRAFT00`; Chrome retired that codepoint and has sent \
+`X25519MLKEM768` since Chrome 131. Mirroring a client's hello onto a stack \
+that cannot express its supported_groups defeats the point of mirroring it.
+"""
+retires = "quiche accepts boring 5, at which point this entry and vendor/quiche should both be deleted and the [patch.crates-io] stanza dropped from Cargo.toml."

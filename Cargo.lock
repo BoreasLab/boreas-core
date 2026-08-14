@@ -253,6 +253,7 @@ dependencies = [
  "adblock",
  "base64",
  "blake3",
+ "boring",
  "brotli-decompressor",
  "bytes",
  "encoding_rs",
@@ -275,6 +276,7 @@ dependencies = [
  "rustls",
  "smoltcp",
  "tokio",
+ "tokio-boring",
  "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
@@ -284,9 +286,9 @@ dependencies = [
 
 [[package]]
 name = "boring"
-version = "4.22.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b0e3bc837369e9e662d3845c374ac3771b054d4bc2dee5457591198d16d684c"
+checksum = "47bf58283ad1560da95ab8dcbb6c71e18a89df30e6011e3582ddf755abe55c4a"
 dependencies = [
  "bitflags 2.13.1",
  "boring-sys",
@@ -297,9 +299,9 @@ dependencies = [
 
 [[package]]
 name = "boring-sys"
-version = "4.22.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15aad385759d3da2737772aefb391332227bef7cb71fb85c106cadd9d1e63a98"
+checksum = "6993efa9d9f0ebf3b0c02c8e868cfe37d0854cd021d51204480a91ce23d6e444"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1750,8 +1752,6 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 [[package]]
 name = "quiche"
 version = "0.29.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61166d27591eb7cb1310eec2b8fc6ae0e0686e9e4ed742a3ffc6317171175e7d"
 dependencies = [
  "boring",
  "bytes",
@@ -2266,6 +2266,17 @@ dependencies = [
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-boring"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80b0cb8797d5f375289c1d478929ac08f98c535d6d000dcd01de05ad703782cd"
+dependencies = [
+ "boring",
+ "boring-sys",
+ "tokio",
 ]
 
 [[package]]

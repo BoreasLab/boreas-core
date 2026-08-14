@@ -1,0 +1,18 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 40f847e..0f9c7b0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -108,7 +108,12 @@ name = "server"
+ path = "examples/server.rs"
+ 
+ [dependencies.boring]
+-version = "4.3"
++# BOREAS: raised from "4.3". `boring-sys` declares `links = "boringssl"`, which
++# Cargo admits exactly once per dependency graph, so upstream's pin binds
++# Boreas's own originating-TLS seam as well -- and boring 4.x vendors a
++# BoringSSL from May 2023 that predates X25519MLKEM768, the group every current
++# Chrome offers. See vendor/README.md for the full argument.
++version = "5.2"
+ optional = true
+ 
+ [dependencies.bytes]

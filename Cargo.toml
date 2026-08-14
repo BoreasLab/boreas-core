@@ -3,6 +3,21 @@ name = "boreas-core"
 version = "0.1.0"
 edition = "2024"
 
+# Crates this workspace patches. Each path here is a *generated* tree:
+# `scripts/vendor.py` fetches the pristine crates.io package and applies
+# `vendor/patches/<name>.patch` to it, and `vendor/Vendor.lock` records the
+# digests that tie the two together, which `--check` verifies in CI. The
+# version each entry vendors is the requirement under `[dependencies]` below —
+# there is deliberately no second place to write one.
+#
+# `quiche` is here because `boring-sys` declares `links = "boringssl"`, which
+# Cargo permits once per graph, so quiche's `boring = "^4.3"` would otherwise
+# bind Boreas's own originating-TLS seam to a BoringSSL from May 2023 that
+# predates `X25519MLKEM768`. `vendor/README.md` carries the argument and says
+# what retires the entry.
+[patch.crates-io]
+quiche = { path = "vendor/quiche" }
+
 [dependencies]
 blake3 = { version = "1.8.6", default-features = false }
 bytes = "1.12.1"
@@ -31,6 +46,26 @@ httparse = "1.10.1"
 base64 = "0.22.1"
 encoding_rs = "0.8.35"
 lol_html = "3.0.1"
+# BoringSSL, for every TLS handshake Boreas *initiates*.
+#
+# The invariant is one sentence: **rustls is the server and BoringSSL is the
+# client.** Terminating the local browser has no fidelity requirement — the peer
+# is an application on this device, and nothing fingerprints it — so that leg
+# keeps rustls and its memory safety. Every leg that dials out is fingerprinted
+# by whoever answers, and rustls has no supported way to shape a ClientHello:
+# extension order, GREASE placement, and JA3/JA4-matching hellos are long-
+# standing open requests (rustls#1421, #1501, #1932, #2498), and `Acceptor` only
+# lets you *read* a peer's. BoringSSL is what Chrome itself speaks, so matching
+# it is configuration rather than reimplementation.
+#
+# **This is not a new C dependency; it is a promotion.** `quiche` already links
+# BoringSSL through this same crate, so the artefact gains no library — it gains
+# a direct edge to one that was already there. See `[patch.crates-io]` above for
+# why the version had to move, and `src/mirror.rs` for what is done with it.
+#
+# `tokio-boring` is the async adapter, versioned in lockstep by its authors.
+boring = "5.2"
+tokio-boring = "5.2"
 # Content-coding decoders for the HTML tier, and **decoders only**.
 #
 # A compressed document is opaque to a rewriter, and `Accept-Encoding: identity`

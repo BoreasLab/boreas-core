@@ -1,0 +1,212 @@
+# Keep every entry in vendor/Vendor.toml at the newest release its root
+# Cargo.toml requirement admits.
+#
+# `scripts/vendor.py` does the work and this file is that script on a schedule.
+# All it adds is the schedule, the gate, and the one permission that writes.
+#
+# Contract: every entry ends in exactly one status line — updated, current,
+# retire, conflict, or failed. `retire` and `conflict` are also ::warning::s
+# naming what to look at. Nothing here fails a scheduled run; the next one
+# retries.
+#
+# Least privilege, and the split is load-bearing here rather than decorative.
+# Re-vendoring downloads third-party packages, and the gate that proves them
+# good runs `cargo test`, which executes their build scripts. So:
+#
+#   - `vendor` holds `contents: read` and checks out with
+#     `persist-credentials: false`. It is the only job that fetches a tarball
+#     or runs cargo, so it is the only job where foreign code executes — and it
+#     has no credential worth taking. It hands its result on as an artifact.
+#   - `commit` holds the sole `contents: write`, downloads that artifact, and
+#     runs git. It executes nothing from any vendored crate.
+#
+# The gate runs here rather than in a pull request because commits made with
+# GITHUB_TOKEN do not trigger other workflows: a PR raised by this job would
+# sit with no CI on it. For the same reason this cannot recurse.
+#
+# These commits are **not GitHub-signed** — the tree is thousands of files, and
+# the Git Data API route the skills workflow uses would need one blob upload
+# each. A ruleset requiring signed commits needs this workflow's actor as a
+# bypass actor, or the schedule off and `scripts/vendor.py` run by hand.
+
+name: Sync vendored crates
+
+on:
+  schedule:
+    # Weekly (UTC), off the top of the hour to dodge cron congestion. A
+    # patched crate releases every few months, so a daily run would be almost
+    # entirely no-ops on a job that rebuilds BoringSSL when it is not.
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      entries:
+        description: >-
+          Space-separated entry names to sync. Default: every entry in
+          vendor/Vendor.toml.
+        type: string
+        required: false
+        default: ""
+
+# Deny-all baseline; each job re-grants the minimum it needs.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vendor:
+    name: re-vendor and gate
+    runs-on: ubuntu-latest
+    # Generous: a changed lockfile misses the cache, and the miss rebuilds
+    # BoringSSL from source before a single test runs.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
+      summary: ${{ steps.sync.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # This job runs foreign build scripts; it must not hold a token they
+          # could reach through the git credential helper.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # scripts/vendor.py carries its own PEP 723 environment; uv honours it,
+      # so this job runs the interpreter the script asks for.
+      - uses: astral-sh/setup-uv@v9
+
+      - name: Check the tool's own pure core
+        run: uv run scripts/vendor.py --selftest
+
+      - name: Re-vendor
+        id: sync
+        env:
+          # Read through the environment, never spliced into the script:
+          # `entries` is caller-supplied and arrives as data.
+          ENTRIES: ${{ inputs.entries }}
+        run: |
+          set -uo pipefail
+          note() { printf '%s\n' "$1" | tee -a "${GITHUB_STEP_SUMMARY}"; }
+
+          # Untrusted: an operator-supplied name reaches nothing but this guard
+          # and, past it, an argv slot. The tool rejects unknown names itself;
+          # this refuses shapes that are not entry names at all. An absent
+          # input must stay an empty array rather than one empty argument,
+          # which the tool would read as an entry named "".
+          names=()
+          [ -z "${ENTRIES//[[:space:]]/}" ] || read -r -a names <<<"${ENTRIES}"
+          for name in "${names[@]}"; do
+            case "${name}" in
+              *[!a-zA-Z0-9_-]*) note "- Not synced: \`${name}\` is not an entry name."; exit 0 ;;
+            esac
+          done
+
+          # The exit status is a closed sum; eliminate it rather than trusting
+          # a zero. 2 means an entry needs a human, which is an outcome and not
+          # a failure of this run.
+          status=0
+          uv run scripts/vendor.py "${names[@]}" > "${RUNNER_TEMP}/report.tsv" || status=$?
+
+          updated=false
+          while IFS=$'\t' read -r kind name detail; do
+            [ -n "${kind}" ] || continue
+            case "${kind}" in
+              updated) updated=true; note "- **${name}**: Updated: ${detail}." ;;
+              current) note "- **${name}**: Already current at ${detail}." ;;
+              retire|conflict)
+                m="${name}: ${kind}: ${detail}"
+                echo "::warning::${m}"; note "- **${name}**: \`${kind}\`: ${detail}." ;;
+              *) echo "::warning::${name}: ${kind}: ${detail}"; note "- **${name}**: ${kind}: ${detail}." ;;
+            esac
+          done < "${RUNNER_TEMP}/report.tsv"
+
+          [ "${status}" -le 2 ] || { note '- Not synced: the vendor tool failed; see the log.'; exit 0; }
+          printf 'updated=%s\n' "${updated}" >> "${GITHUB_OUTPUT}"
+          { echo 'summary<<TSV'; cat "${RUNNER_TEMP}/report.tsv"; echo TSV; } >> "${GITHUB_OUTPUT}"
+
+      - name: Gate
+        if: steps.sync.outputs.updated == 'true'
+        run: |
+          set -euo pipefail
+          # The same commands CI runs, in the same order, plus the check that
+          # the freshly written tree matches the lock that describes it.
+          uv run scripts/vendor.py --check
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-features
+
+      - name: Hand the result on
+        if: steps.sync.outputs.updated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendored
+          path: |
+            vendor/
+            Cargo.lock
+          retention-days: 1
+          include-hidden-files: true
+
+  commit:
+    name: commit and push
+    needs: vendor
+    if: needs.vendor.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # sole grant, in the job that runs no vendored code
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: vendored
+          path: ${{ runner.temp }}/vendored
+
+      - name: Commit and push
+        env:
+          BRANCH: ${{ github.ref_name }}
+          REPORT: ${{ needs.vendor.outputs.summary }}
+        run: |
+          set -euo pipefail
+          note() { printf '%s\n' "$1" | tee -a "${GITHUB_STEP_SUMMARY}"; }
+
+          # Replace wholesale rather than merge: the vendored tree is derived,
+          # so the artefact is authoritative and a leftover file from the old
+          # version would otherwise survive into the new one.
+          rm -rf vendor
+          cp -a "${RUNNER_TEMP}/vendored/vendor" vendor
+          cp -a "${RUNNER_TEMP}/vendored/Cargo.lock" Cargo.lock
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Only these two paths may move. Staging them explicitly is what
+          # keeps "the sync job touched something else" unrepresentable.
+          git add vendor Cargo.lock
+          git diff --cached --quiet && { note '- No tree change to commit.'; exit 0; }
+
+          # The report names which entries moved; it is data from a prior job's
+          # output, so it reaches the message through a file rather than argv.
+          # Subject first, then a blank line: `-F` takes the whole message, and
+          # combining it with `-m` is an error rather than a concatenation.
+          {
+            echo 'chore(deps): Re-vendor patched crates'
+            echo
+            printf '%s\n' "${REPORT}" \
+              | awk -F'\t' '$1 == "updated" { printf "- %s: %s\n", $2, $3 }'
+            echo
+            echo "Regenerated by scripts/vendor.py. Each vendored tree is derived from"
+            echo "vendor/patches/<name>.patch applied to the pristine crates.io package,"
+            echo "and vendor/Vendor.lock records the digests tying the two together."
+          } > "${RUNNER_TEMP}/body.txt"
+
+          git commit -F "${RUNNER_TEMP}/body.txt"
+          git push origin "HEAD:${BRANCH}"
+          note "- Pushed the re-vendored tree to \`${BRANCH}\`."

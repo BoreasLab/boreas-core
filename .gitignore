@@ -2,3 +2,10 @@
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/corpus/
+
+# scripts/vendor.py is imported by its own doctests, and CPython writes a cache
+# beside any module it imports. Derived, machine-specific, and version-tagged:
+# never wanted in the tree.
+__pycache__/
+*.py[cod]
+.ruff_cache/
