@@ -3,14 +3,14 @@
 //! per-flow buffers stay lazy.
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::Ipv4Addr,
     num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
 use boreas_core::{
     Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy,
-    InternalEndpoint, Mtu, NatBehavior,
+    Mtu, NatBehavior,
 };
 
 fn udp_frame(flow: u32) -> Vec<u8> {
@@ -43,8 +43,10 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.
-            steering_backstop: Duration::from_secs(60),
-            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+            inspection_window: Duration::from_secs(60),
+            max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+            inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
+            origination_ports: None,
         },
         BufferPool::new(
             NonZeroUsize::new(1500).unwrap(),
@@ -59,24 +61,45 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
     // Open 10,000 flows over 10 seconds, then flood every flow with 10
     // refreshes each. The expiry index must hold one slot per flow, not one
     // per packet.
+    //
+    // Each packet is also a datagram the flow queues for the egress, so the
+    // drain runs alongside — which is what a shell does, and what returns the
+    // pooled payloads. Draining is part of the gate rather than a nuisance:
+    // a datapath that queued 110,000 payloads without a drain would be holding
+    // exactly the unbounded state this test exists to refuse.
+    let mut opened = 0;
+    let mut drained = 0;
+    let mut harvest = |path: &mut Datapath| {
+        while path.poll_datagram().is_some() {
+            drained += 1;
+        }
+        while let Some(event) = path.poll_event() {
+            if matches!(event, boreas_core::FlowEvent::DatagramOpened(_)) {
+                opened += 1;
+            }
+        }
+    };
+
     for flow in 0..flows {
         path.on_tun_packet(&udp_frame(flow), start + Duration::from_millis(flow as u64))
             .unwrap();
+        harvest(&mut path);
     }
     for round in 0..10 {
         for flow in 0..flows {
             let now =
                 start + Duration::from_secs(10 + round * 10) + Duration::from_millis(flow as u64);
             path.on_tun_packet(&udp_frame(flow), now).unwrap();
+            harvest(&mut path);
         }
     }
 
-    // Drain the open events without asserting order beyond the count.
-    let mut events = 0;
-    while path.poll_event().is_some() {
-        events += 1;
-    }
-    assert_eq!(events, flows as usize);
+    assert_eq!(opened, flows as usize, "one open event per flow, ever");
+    assert_eq!(
+        drained,
+        (flows * 11) as usize,
+        "every client datagram reached the egress drain"
+    );
 
     // Nothing expires inside the idle window of the last refresh.
     let last_refresh = start + Duration::from_secs(100) + Duration::from_millis(flows as u64);
@@ -84,21 +107,13 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
     // Every flow saw its last refresh at or before last_refresh, so by
     // last_refresh + 121s all of them are gone.
     path.on_timeout(last_refresh + Duration::from_secs(121));
-    let endpoint = InternalEndpoint {
-        address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        port: 10_000,
-    };
-    let pool = BufferPool::new(
-        NonZeroUsize::new(1500).unwrap(),
-        NonZeroUsize::new(4).unwrap(),
-    );
-    assert_eq!(
-        path.send_datagram(
-            endpoint,
-            pool.take(&[1]).unwrap(),
-            last_refresh + Duration::from_secs(122)
+    path.on_tun_packet(&udp_frame(0), last_refresh + Duration::from_secs(122))
+        .unwrap();
+    assert!(
+        matches!(
+            path.poll_event(),
+            Some(boreas_core::FlowEvent::DatagramOpened(_))
         ),
-        Ok(boreas_core::SendOutcome::Buffered),
         "a fresh flow can be created after mass expiry"
     );
 }

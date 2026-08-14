@@ -10,12 +10,14 @@ mod filter;
 mod hysteria2;
 mod masque;
 mod mitm;
+mod origin;
 mod packet;
 mod path;
 mod platform;
 mod pool;
 mod quic;
 mod reassembly;
+mod relay;
 mod rewrite;
 mod rules;
 mod session;
@@ -34,7 +36,10 @@ use std::{error::Error, fmt};
 
 pub use bridge::BridgedStream;
 pub use ca::{CaError, CertificateAuthority, MitmResolver};
-pub use datapath::{Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Side, Transmit};
+pub use datapath::{
+    DEFAULT_INSPECTED_PORTS, Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Outbound, Side,
+    Transmit,
+};
 pub use demote::{Demotion, Demotions, Leg, Standing, Tier, classify};
 pub use device::{Device, Harness, SimDevice};
 pub use dns::{
@@ -46,11 +51,13 @@ pub use dns::{
     write_failure, write_refusal, write_response,
 };
 pub use egress::{
-    AsyncStream, BoxFuture, DatagramAssociation, DomainName, DomainNameError, Egress, EgressEmit,
-    EgressError, Either, PacketEgress, Prefixed, StreamEgress, Target, WIREGUARD_OVERHEAD_BYTES,
-    WireGuardConfig, WireGuardEgress,
+    Association, AsyncStream, BoxFuture, DatagramSink, DatagramSource, DomainName, DomainNameError,
+    Egress, EgressEmit, EgressError, Either, PacketEgress, Prefixed, StreamEgress, Target,
+    WIREGUARD_OVERHEAD_BYTES, WireGuardConfig, WireGuardEgress,
 };
-pub use exchange::{AllowAll, FilterVerdict, ProxyBody, RequestFilter, run_exchange};
+pub use exchange::{
+    AllowAll, AltSvc, FilterVerdict, ProxyBody, RequestFilter, run_exchange, steer_alt_svc,
+};
 pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
 pub use hysteria2::{
     Hysteria2Config, Hysteria2Egress, QuicConfigFactory, TcpResponse, decode_tcp_response,
@@ -61,6 +68,10 @@ pub use masque::{
     decode_ip_datagram, encode_ip_datagram,
 };
 pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
+pub use origin::{
+    Assembly, DEFAULT_ORIGINATION_PORTS, NoPacketEgress, OriginationPorts, PortRangeError,
+    TunnelledDialer, assemble,
+};
 pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 #[cfg(unix)]
@@ -70,10 +81,11 @@ pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use quic::{H3Response, Handshake, QuicConnection, client_config};
 pub use reassembly::{Fragment, PushOutcome, Reassembler};
+pub use relay::{Inbound, Relay, RelayCounts, RelayLimits, run_relay};
 pub use rewrite::{
-    CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable, Rewritable,
-    RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, permit_inline_style,
-    rewritable,
+    Coding, CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable, Rewritable,
+    RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, Undecodable,
+    permit_inline_style, rewritable,
 };
 pub use rules::RuleEngine;
 pub use session::{
@@ -81,9 +93,7 @@ pub use session::{
     run_sessions, serve_session,
 };
 pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
-pub use shell::{
-    AsyncDevice, AsyncNetwork, Control, Datagram, Session, Shell, Telemetry, Termination,
-};
+pub use shell::{AsyncDevice, AsyncNetwork, Control, Session, Shell, Telemetry, Termination};
 pub use socks5::{
     Credentials, CredentialsError, Decoded, ProxyError, Reply, Socks5Config, Socks5Egress,
     decode_address, decode_datagram, encode_address, encode_datagram,
@@ -92,7 +102,7 @@ pub use stream::{LocalStack, StreamError, StreamId, Terminated, TerminationLimit
 pub use terminate::{Accepted, TerminatedStream, run_terminator};
 pub use upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
-    DotUpstream, TunnelBypass, UpstreamError,
+    DoqUpstream, DotUpstream, TunnelBypass, UpstreamError,
 };
 
 pub use transport::{
@@ -221,6 +231,49 @@ impl EgressCapabilities {
 pub enum FilterPolicy {
     PassThrough,
     InspectHttp,
+}
+
+/// Whether *this flow* is one the session must terminate in order to inspect
+/// it.
+///
+/// **A session property and a flow property are different things, and
+/// collapsing them is what cost the packet fast path.** [`FilterPolicy`] says
+/// whether inspection is enabled at all; this says whether the flow in front of
+/// us is a candidate for it. Enabling inspection used to route *every* flow —
+/// every UDP datagram, every SSH and IMAP connection, every TCP flow to a host
+/// nobody asked to inspect — through local termination, which is both the
+/// opposite of the architecture's ">90 percent packet-native" claim and, for
+/// the protocols the local stack does not listen for, a connection refused.
+///
+/// Like [`Backstop`], it is computed by the caller against live state rather
+/// than inside [`plan_flow`], because it is a lookup and not a property of the
+/// configuration: keeping it a value keeps the planner a total function of
+/// values. The state it is looked up in is the set of addresses the resolver
+/// saw an inspected host resolve to — which is exactly what
+/// [Filtering](../docs/filtering.md) means by "DNS is the durable
+/// no-decryption policy signal", and the only signal available before a
+/// connection this session has not yet terminated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inspection {
+    /// A TCP flow to an address of an inspected host, on a port interception
+    /// serves. The only shape that can require termination on its own.
+    Candidate,
+    /// Everything else, which is nearly everything.
+    Excluded,
+}
+
+impl Inspection {
+    /// Every verdict. The sum is closed at two, so a caller can memoize a
+    /// function of it as an array and there is no key to miss.
+    pub const ALL: [Self; 2] = [Self::Candidate, Self::Excluded];
+
+    /// This verdict's position in [`Self::ALL`].
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Candidate => 0,
+            Self::Excluded => 1,
+        }
+    }
 }
 
 /// Whether this session answers DNS itself.
@@ -388,14 +441,27 @@ pub fn route_planned(transport: Transport, plan: FlowPlan) -> IngressAction {
     }
 }
 
+/// Plans one flow.
+///
+/// Three facts decide the transport path, and they are read in exactly this
+/// order:
+///
+/// 1. a flow this session must inspect is terminated locally, whatever the
+///    egress accepts — that is what inspection *is*;
+/// 2. an egress that accepts only flows terminates everything, because there is
+///    no packet to forward;
+/// 3. everything else takes the packet fast path, which is the case the
+///    architecture expects to cover more than nine flows in ten.
 pub fn plan_flow(
     filter: FilterPolicy,
+    inspection: Inspection,
     accepts: Accepts,
     egress: EgressCapabilities,
     path_mtu: Mtu,
 ) -> Result<FlowPlan, PlanError> {
-    let transport = match (filter, accepts) {
-        (FilterPolicy::PassThrough, Accepts::IpPackets) => {
+    let inspected = filter == FilterPolicy::InspectHttp && inspection == Inspection::Candidate;
+    let transport = match (inspected, accepts) {
+        (false, Accepts::IpPackets) => {
             let inner_mtu = path_mtu
                 .get()
                 .checked_sub(egress.overhead_bytes)
@@ -403,7 +469,7 @@ pub fn plan_flow(
                 .and_then(|bytes| Mtu::new(bytes).map_err(PlanError::InnerMtu))?;
             TransportPath::PacketFastPath { inner_mtu }
         }
-        _ => TransportPath::LocalTermination,
+        (true, _) | (false, Accepts::Flows) => TransportPath::LocalTermination,
     };
 
     // RFC 9000 requires a 1200-byte datagram end to end. On the packet path that
@@ -417,7 +483,10 @@ pub fn plan_flow(
             .and_then(|bytes| Mtu::new(bytes).ok()),
     };
 
-    let quic = if filter == FilterPolicy::InspectHttp {
+    // Steering is per flow for the same reason termination is: an inspected
+    // host reached over h3 is a host whose interception silently never fires,
+    // and a host nobody inspects has no reason to lose HTTP/3 at all.
+    let quic = if inspected {
         QuicPolicy::SteerToHttp2(SteeringReason::InspectionRequired)
     } else if egress.datagram_fidelity != DatagramFidelity::Native {
         QuicPolicy::SteerToHttp2(SteeringReason::DatagramFidelity)
@@ -439,19 +508,26 @@ pub fn plan_flow(
 pub fn replan(
     current: &FlowPlan,
     filter: FilterPolicy,
+    inspection: Inspection,
     accepts: Accepts,
     next: EgressCapabilities,
     path_mtu: Mtu,
 ) -> Result<Replan, PlanError> {
+    // A terminated flow does not prove the egress accepts only flows: under
+    // inspection a packet egress terminates too. So the layer a flow needs is
+    // read from its plan *and* from why it got that plan, and a flow the egress
+    // can still carry is not torn down for a layer it never depended on.
+    let inspected = filter == FilterPolicy::InspectHttp && inspection == Inspection::Candidate;
     let flow_layer = match current.transport {
         TransportPath::PacketFastPath { .. } => Accepts::IpPackets,
+        TransportPath::LocalTermination if inspected => accepts,
         TransportPath::LocalTermination => Accepts::Flows,
     };
     if accepts != flow_layer {
         return Ok(Replan::Teardown);
     }
 
-    let next_plan = plan_flow(filter, accepts, next, path_mtu)?;
+    let next_plan = plan_flow(filter, inspection, accepts, next, path_mtu)?;
     // Crossing the transport boundary re-originates the flow's bytes; no live
     // flow survives it. A PacketFastPath whose inner MTU merely moved is the
     // same transport with a new budget, handled by MTU machinery, not teardown.
@@ -602,6 +678,7 @@ mod tests {
                         };
                         let Ok(plan) = plan_flow(
                             FilterPolicy::PassThrough,
+                            Inspection::Excluded,
                             Accepts::IpPackets,
                             capabilities,
                             mtu(path),
@@ -637,6 +714,7 @@ mod tests {
         for fidelity in FIDELITIES {
             let live = plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 EgressCapabilities {
                     max_datagram_size: Some(1500),
@@ -652,6 +730,7 @@ mod tests {
             let result = replan(
                 &live,
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 next,
                 mtu(1500),
@@ -667,9 +746,14 @@ mod tests {
                     result,
                     Ok(Replan::Resteer {
                         reason: SteeringReason::DatagramFidelity,
-                        plan:
-                            plan_flow(FilterPolicy::PassThrough, Accepts::Flows, next, mtu(1500),)
-                                .unwrap(),
+                        plan: plan_flow(
+                            FilterPolicy::PassThrough,
+                            Inspection::Excluded,
+                            Accepts::Flows,
+                            next,
+                            mtu(1500),
+                        )
+                        .unwrap(),
                     }),
                     "Native to {fidelity:?} must re-steer, never drop"
                 );
@@ -681,6 +765,7 @@ mod tests {
     fn replan_tears_down_only_unsurvivable_changes() {
         let packet_plan = plan_flow(
             FilterPolicy::PassThrough,
+            Inspection::Excluded,
             Accepts::IpPackets,
             egress(DatagramFidelity::Native, 60),
             mtu(1500),
@@ -692,6 +777,7 @@ mod tests {
             replan(
                 &packet_plan,
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 egress(DatagramFidelity::Native, 60),
                 mtu(1500),
@@ -705,6 +791,7 @@ mod tests {
             replan(
                 &packet_plan,
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::IpPackets,
                 egress(DatagramFidelity::Native, 300),
                 mtu(1500),
@@ -717,6 +804,7 @@ mod tests {
             replan(
                 &packet_plan,
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::IpPackets,
                 egress(DatagramFidelity::Native, 100),
                 mtu(1500),
@@ -729,6 +817,7 @@ mod tests {
     fn fragments_never_reach_l4_admission() {
         let native_l3_plan = plan_flow(
             FilterPolicy::PassThrough,
+            Inspection::Excluded,
             Accepts::IpPackets,
             egress(DatagramFidelity::Native, 0),
             mtu(1500),
@@ -791,6 +880,7 @@ mod tests {
     fn the_backstop_refuses_quic_only_outward_and_only_while_open() {
         let plan = plan_flow(
             FilterPolicy::PassThrough,
+            Inspection::Excluded,
             Accepts::IpPackets,
             egress(DatagramFidelity::Native, 0),
             mtu(1500),
@@ -866,6 +956,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::IpPackets,
                 native_l3,
                 mtu(1500)
@@ -878,19 +969,42 @@ mod tests {
             })
         );
 
+        // **Inspection is a property of the flow, not of the session.** A
+        // candidate terminates and loses QUIC; every other flow on the same
+        // inspecting session keeps the packet fast path and keeps HTTP/3.
         assert_eq!(
             plan_flow(
                 FilterPolicy::InspectHttp,
+                Inspection::Candidate,
                 Accepts::IpPackets,
                 native_l3,
                 mtu(1500)
-            )
-            .map(|plan| plan.quic),
-            Ok(QuicPolicy::SteerToHttp2(SteeringReason::InspectionRequired))
+            ),
+            Ok(FlowPlan {
+                transport: TransportPath::LocalTermination,
+                quic: QuicPolicy::SteerToHttp2(SteeringReason::InspectionRequired),
+            })
+        );
+        assert_eq!(
+            plan_flow(
+                FilterPolicy::InspectHttp,
+                Inspection::Excluded,
+                Accepts::IpPackets,
+                native_l3,
+                mtu(1500)
+            ),
+            Ok(FlowPlan {
+                transport: TransportPath::PacketFastPath {
+                    inner_mtu: mtu(1440)
+                },
+                quic: QuicPolicy::PassThrough,
+            }),
+            "a flow nobody asked to inspect must not pay for inspection"
         );
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 egress(DatagramFidelity::Emulated, 60),
                 mtu(1500),
@@ -908,6 +1022,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 native_l4,
                 mtu(1500)
@@ -919,6 +1034,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 EgressCapabilities {
                     max_datagram_size: Some(1000),
@@ -932,6 +1048,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::Flows,
                 EgressCapabilities {
                     max_datagram_size: Some(1400),
@@ -948,6 +1065,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::IpPackets,
                 native_l3,
                 mtu(1300)
@@ -957,6 +1075,7 @@ mod tests {
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
+                Inspection::Excluded,
                 Accepts::IpPackets,
                 egress(DatagramFidelity::Native, 60_000),
                 mtu(1500),
@@ -1029,6 +1148,7 @@ mod tests {
         let native_l3 = egress(DatagramFidelity::Native, 60);
         let packet_plan = plan_flow(
             FilterPolicy::PassThrough,
+            Inspection::Excluded,
             Accepts::IpPackets,
             native_l3,
             mtu(1500),
@@ -1036,6 +1156,7 @@ mod tests {
         .unwrap();
         let flow_plan = plan_flow(
             FilterPolicy::PassThrough,
+            Inspection::Excluded,
             Accepts::Flows,
             native_l3,
             mtu(1500),

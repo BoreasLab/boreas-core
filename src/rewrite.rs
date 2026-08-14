@@ -88,9 +88,9 @@ const CSP: &str = "content-security-policy";
 /// Why a response body will be forwarded untouched.
 ///
 /// Recorded rather than collapsed to a boolean, because these have very
-/// different futures: [`Self::ContentCoded`] is a decoder away, and
-/// [`Self::NotHtml`] is the overwhelming majority of every real workload and
-/// wants to stay cheap.
+/// different futures: [`Self::ContentCoded`] names a coding no decoder here
+/// covers, and [`Self::NotHtml`] is the overwhelming majority of every real
+/// workload and wants to stay cheap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotRewritable {
     /// The status carries no body, or carries only a range of one. Rewriting a
@@ -98,9 +98,9 @@ pub enum NotRewritable {
     NoWholeBody,
     /// Not `text/html`.
     NotHtml,
-    /// The body is compressed. This build carries no decompressor, so the
-    /// bytes are opaque; [`Rewriting::prepare`] is what keeps documents on the
-    /// hosts that matter from arriving this way.
+    /// The body is compressed with a coding this build cannot read — `zstd`, a
+    /// private coding, or two codings stacked. Fail-open, exactly as an
+    /// unsupported charset is.
     ContentCoded,
     /// A `charset` that a streaming, ASCII-compatible rewriter cannot read —
     /// UTF-16 in either order, ISO-2022-JP, `replacement` — or a label no
@@ -113,14 +113,52 @@ impl fmt::Display for NotRewritable {
         f.write_str(match self {
             Self::NoWholeBody => "the response carries no whole body",
             Self::NotHtml => "the response is not text/html",
-            Self::ContentCoded => "the body is compressed",
+            Self::ContentCoded => "the body carries an unreadable content coding",
             Self::UnsupportedCharset => "the character encoding is not ASCII-compatible",
         })
     }
 }
 
-/// Proof that a response body may be rewritten, carrying the encoding to read
-/// it with.
+/// A content coding this build can read.
+///
+/// **A closed sum, and the point of closing it is that the decoder is chosen by
+/// elimination rather than by a lookup that can miss.** A `Coding` value *is*
+/// the proof that a decoder exists for the body, so [`Rewritable`] carries one
+/// and the rewriter constructor cannot be reached without it. Everything the
+/// sum does not name — `zstd`, a private coding, two codings stacked — is not a
+/// `Coding` at all and lands in [`NotRewritable::ContentCoded`], which forwards
+/// the body byte for byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coding {
+    /// No coding, or `identity`. The common case and the free one.
+    Identity,
+    /// RFC 1952 gzip, which is what `Accept-Encoding: gzip` gets.
+    Gzip,
+    /// RFC 1950 zlib, spelled `deflate` on the wire. Some servers send raw
+    /// RFC 1951 instead; the decoder accepts the header-bearing form, and a
+    /// raw stream fails the rewrite and forwards what it was holding, which is
+    /// the same graceful bail-out every other decode failure takes.
+    Deflate,
+    /// RFC 7932 Brotli, which is what CDNs serve HTML as.
+    Brotli,
+}
+
+impl Coding {
+    /// The coding a `Content-Encoding` token names, or `None` for one no
+    /// decoder here covers.
+    fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "" | "identity" => Some(Self::Identity),
+            "gzip" | "x-gzip" => Some(Self::Gzip),
+            "deflate" => Some(Self::Deflate),
+            "br" => Some(Self::Brotli),
+            _ => None,
+        }
+    }
+}
+
+/// Proof that a response body may be rewritten, carrying the character encoding
+/// to read it with and the content coding to decode it from.
 ///
 /// The only way to build one is [`rewritable`], and the only way to build a
 /// rewriter is to hold one — so "construct a rewriter only after `text/html` is
@@ -128,13 +166,22 @@ impl fmt::Display for NotRewritable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rewritable {
     encoding: AsciiCompatibleEncoding,
+    coding: Coding,
+}
+
+impl Rewritable {
+    /// The content coding the body arrives under.
+    #[must_use]
+    pub fn coding(self) -> Coding {
+        self.coding
+    }
 }
 
 /// Reads a response's headers as permission to rewrite its body, or as a
 /// reason not to.
 ///
 /// O(bytes of the `Content-Type` and `Content-Encoding` fields), one pass, no
-/// allocation.
+/// allocation beyond the coding token's lower-casing.
 pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable, NotRewritable> {
     if status.is_informational()
         || matches!(
@@ -144,17 +191,24 @@ pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable,
     {
         return Err(NotRewritable::NoWholeBody);
     }
-    // `identity` is the only coding whose bytes this build can read. Several
-    // codings may be listed, and any one of them is enough to make the body
-    // opaque.
-    if headers
+    // `Content-Encoding` is an ordered list of codings applied in turn. One
+    // effective coding is what this decodes; a stack of two is not refused for
+    // being hard but for being vanishingly rare and impossible to get subtly
+    // wrong by forwarding instead.
+    let mut coding = Coding::Identity;
+    for token in headers
         .get_all(CONTENT_ENCODING)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
-        .any(|coding| !matches!(coding.trim(), "" | "identity"))
     {
-        return Err(NotRewritable::ContentCoded);
+        match (coding, Coding::from_token(token)) {
+            (_, None) => return Err(NotRewritable::ContentCoded),
+            (_, Some(Coding::Identity)) => {}
+            (Coding::Identity, Some(named)) => coding = named,
+            // A second non-identity coding on top of the first.
+            (_, Some(_)) => return Err(NotRewritable::ContentCoded),
+        }
     }
 
     let content_type = headers
@@ -174,7 +228,7 @@ pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable,
             .and_then(AsciiCompatibleEncoding::new)
             .ok_or(NotRewritable::UnsupportedCharset)?,
     };
-    Ok(Rewritable { encoding })
+    Ok(Rewritable { encoding, coding })
 }
 
 /// Splits a media type from its `charset` parameter. Total: a malformed
@@ -475,6 +529,126 @@ impl RewriteFailures {
 // The rewriting body
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Content-coding decode
+// ---------------------------------------------------------------------------
+
+/// How large a Brotli decoder's ring buffer is. The format's window can reach
+/// 16 MiB, but a decoder only needs a buffer to *stage* output in, and 64 KiB
+/// is comfortably more than one chunk of a document — so this bounds the
+/// decoder's own footprint the way [`StreamBudget`] bounds the rewriter's.
+const BROTLI_BUFFER_BYTES: usize = 64 * 1024;
+
+/// A push-driven decoder for one response body.
+///
+/// **Push, not pull, because the body already is.** `hyper` hands over chunks
+/// as they arrive; a `Read`-shaped decoder would need a thread or a buffer to
+/// invert that, and both are the wrong answer on a per-stream path. Each
+/// variant is a `Write` adapter over a `Vec` this type owns, so a chunk goes in
+/// and whatever plain bytes it produced come straight back out.
+///
+/// The `Vec` is cleared rather than replaced between chunks, so a body costs
+/// one growth to its high-water mark and no allocation after that.
+enum Decoder {
+    /// No decoding: the input slice *is* the output, so this variant owns
+    /// nothing and copies nothing.
+    Identity,
+    Gzip(Box<flate2::write::GzDecoder<Vec<u8>>>),
+    Deflate(Box<flate2::write::ZlibDecoder<Vec<u8>>>),
+    Brotli(Box<brotli_decompressor::DecompressorWriter<Vec<u8>>>),
+}
+
+/// The compressed stream was malformed or truncated.
+///
+/// One variant, because there is one response: stop rewriting and forward what
+/// is left. Distinguishing "bad header" from "bad block" would change nothing a
+/// caller does.
+#[derive(Debug)]
+pub struct Undecodable;
+
+impl fmt::Display for Undecodable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the compressed body could not be decoded")
+    }
+}
+
+impl std::error::Error for Undecodable {}
+
+impl Decoder {
+    fn new(coding: Coding) -> Self {
+        match coding {
+            Coding::Identity => Self::Identity,
+            Coding::Gzip => Self::Gzip(Box::new(flate2::write::GzDecoder::new(Vec::new()))),
+            Coding::Deflate => Self::Deflate(Box::new(flate2::write::ZlibDecoder::new(Vec::new()))),
+            Coding::Brotli => Self::Brotli(Box::new(brotli_decompressor::DecompressorWriter::new(
+                Vec::new(),
+                BROTLI_BUFFER_BYTES,
+            ))),
+        }
+    }
+
+    /// Pushes one chunk through and borrows out whatever plain bytes it
+    /// produced. The borrow ends before [`Self::clear`], which is what lets the
+    /// staging buffer be reused rather than reallocated.
+    ///
+    /// O(bytes) in the chunk, amortised no allocation.
+    fn decode<'a>(&'a mut self, chunk: &'a [u8]) -> Result<&'a [u8], Undecodable> {
+        use std::io::Write;
+        match self {
+            Self::Identity => Ok(chunk),
+            Self::Gzip(decoder) => {
+                decoder.write_all(chunk).map_err(|_| Undecodable)?;
+                Ok(decoder.get_ref())
+            }
+            Self::Deflate(decoder) => {
+                decoder.write_all(chunk).map_err(|_| Undecodable)?;
+                Ok(decoder.get_ref())
+            }
+            Self::Brotli(decoder) => {
+                decoder.write_all(chunk).map_err(|_| Undecodable)?;
+                Ok(decoder.get_ref())
+            }
+        }
+    }
+
+    /// Closes the stream and borrows out the last bytes it was holding. A
+    /// decoder that cannot finish is one whose body was truncated on the wire.
+    fn finish(&mut self) -> Result<&[u8], Undecodable> {
+        match self {
+            Self::Identity => Ok(&[]),
+            Self::Gzip(decoder) => {
+                decoder.try_finish().map_err(|_| Undecodable)?;
+                Ok(decoder.get_ref())
+            }
+            Self::Deflate(decoder) => {
+                decoder.try_finish().map_err(|_| Undecodable)?;
+                Ok(decoder.get_ref())
+            }
+            Self::Brotli(decoder) => {
+                decoder.close().map_err(|_| Undecodable)?;
+                Ok(decoder.get_ref())
+            }
+        }
+    }
+
+    /// Retires the bytes the last `decode` or `finish` handed out, keeping the
+    /// allocation.
+    fn clear(&mut self) {
+        match self {
+            Self::Identity => {}
+            Self::Gzip(decoder) => decoder.get_mut().clear(),
+            Self::Deflate(decoder) => decoder.get_mut().clear(),
+            Self::Brotli(decoder) => decoder.get_mut().clear(),
+        }
+    }
+
+    /// Whether this decoder changes the bytes at all. A body whose coding is
+    /// `identity` needs no header edit and no error path.
+    fn is_identity(&self) -> bool {
+        matches!(self, Self::Identity)
+    }
+}
+
 /// Where the rewriter's output lands between polls. Shared with the rewriter,
 /// which owns its sink and never gives it back.
 #[derive(Clone)]
@@ -523,6 +697,13 @@ enum Stage {
 pub struct RewritingBody<B> {
     inner: B,
     stage: Mutex<Stage>,
+    /// The content-coding decoder in front of the rewriter.
+    ///
+    /// **Decode and rewrite are two stages, not one, and the order is forced:**
+    /// a rewriter cannot find a tag in a Brotli stream. The decoder is behind
+    /// the same `Mutex` discipline as the stage — reached only through
+    /// `&mut self` from `poll_frame` — so it needs no lock of its own.
+    decoder: Decoder,
     sink: Arc<Mutex<Vec<u8>>>,
     failures: Arc<RewriteFailures>,
 }
@@ -537,21 +718,47 @@ impl<B> RewritingBody<B> {
         (!sink.is_empty()).then(|| Bytes::from(std::mem::take(&mut *sink)))
     }
 
-    /// Feeds one chunk, moving the stage on if the rewriter gives up.
+    /// Feeds one chunk: decode it, then rewrite it, moving the stage on if
+    /// either gives up.
     ///
-    /// `Err` means the rewriter stopped while holding bytes: a graceful
-    /// bail-out has already flushed everything it was given, so it returns
-    /// `Ok` and merely stops rewriting.
+    /// `Err` means the document cannot be completed — the rewriter stopped
+    /// while holding bytes, or the compressed stream is unreadable and the
+    /// plaintext after it is unrecoverable. A graceful rewriter bail-out has
+    /// already flushed everything it was given, so it returns `Ok` and merely
+    /// stops rewriting.
     fn feed(&mut self, data: &[u8]) -> Result<(), Truncated> {
-        let stage = self
-            .stage
-            .get_mut()
-            .unwrap_or_else(|poison| poison.into_inner());
-        match stage {
-            Stage::Rewriting(rewriter) => match rewriter.write(data) {
+        let Self {
+            stage,
+            decoder,
+            sink,
+            failures,
+            ..
+        } = self;
+        let stage = stage.get_mut().unwrap_or_else(|poison| poison.into_inner());
+        // A body already past the rewriter needs no decode: the raw stage
+        // forwards the *decoded* remainder, and once the stage has ended there
+        // is nothing left to forward at all.
+        if matches!(stage, Stage::Ended) {
+            return Ok(());
+        }
+
+        let decoded = match decoder.decode(data) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                // A truncated or corrupt compressed stream leaves nothing to
+                // forward: the bytes after it cannot be recovered, so the body
+                // ends visibly rather than silently short.
+                failures.record();
+                *stage = Stage::Ended;
+                return Err(Truncated);
+            }
+        };
+
+        let outcome = match stage {
+            Stage::Rewriting(rewriter) => match rewriter.write(decoded) {
                 Ok(()) => Ok(()),
                 Err(error) => {
-                    self.failures.record();
+                    failures.record();
                     // The rewriter is poisoned after any error, so replacing
                     // the stage is what makes it unreachable rather than merely
                     // unused.
@@ -561,22 +768,58 @@ impl<B> RewritingBody<B> {
                 }
             },
             Stage::Raw => {
-                self.sink
-                    .lock()
+                sink.lock()
                     .unwrap_or_else(|poison| poison.into_inner())
-                    .extend_from_slice(data);
+                    .extend_from_slice(decoded);
                 Ok(())
             }
             Stage::Ended => Ok(()),
-        }
+        };
+        decoder.clear();
+        outcome
     }
 
-    /// Closes the rewriter once the inner body is exhausted.
+    /// Closes the decoder and the rewriter once the inner body is exhausted.
     fn finish(&mut self) -> Result<(), Truncated> {
-        let stage = self
-            .stage
-            .get_mut()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let Self {
+            stage,
+            decoder,
+            sink,
+            failures,
+            ..
+        } = self;
+        let stage = stage.get_mut().unwrap_or_else(|poison| poison.into_inner());
+
+        // The decoder first: it may still be holding the document's tail.
+        let tail = match decoder.finish() {
+            Ok(tail) => tail,
+            Err(_) => {
+                failures.record();
+                *stage = Stage::Ended;
+                return Err(Truncated);
+            }
+        };
+        if !tail.is_empty() {
+            match stage {
+                Stage::Rewriting(rewriter) => {
+                    if let Err(error) = rewriter.write(tail) {
+                        failures.record();
+                        let graceful = recoverable(&error);
+                        *stage = if graceful { Stage::Raw } else { Stage::Ended };
+                        if !graceful {
+                            return Err(Truncated);
+                        }
+                    }
+                }
+                Stage::Raw => sink
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .extend_from_slice(tail),
+                Stage::Ended => {}
+            }
+        }
+        decoder.clear();
+
         let ending = std::mem::replace(stage, Stage::Ended);
         let Stage::Rewriting(rewriter) = ending else {
             return Ok(());
@@ -584,7 +827,7 @@ impl<B> RewritingBody<B> {
         match (*rewriter).end() {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.failures.record();
+                failures.record();
                 recoverable(&error).then_some(()).ok_or(Truncated)
             }
         }
@@ -701,14 +944,21 @@ impl Rewriting {
 
     /// Asks upstream for a body this tier can read.
     ///
-    /// **This costs bandwidth, and the bound is what makes it acceptable.** A
-    /// compressed body is opaque to a build with no decompressor, so a document
-    /// Boreas intends to rewrite has to arrive uncompressed. Only requests that
-    /// say they want HTML are affected — a navigation, not the scripts, images,
-    /// and fonts that are the bulk of a page's bytes — and only on hosts that
-    /// actually have rules. `identity` is named explicitly rather than the
-    /// field being removed, because an absent `Accept-Encoding` means *any*
-    /// coding is acceptable, which is the opposite of what is wanted.
+    /// **An optimisation now, not a requirement.** A document that arrives
+    /// uncompressed costs no decode at all, which on a phone is the difference
+    /// worth asking for; a document that arrives compressed anyway is still
+    /// read, because [`Coding`] carries a decoder for the codings that matter.
+    /// That is the point of asking rather than depending: an origin that
+    /// ignores the request, a cache that answers from a compressed entry, and
+    /// an intermediary that recompresses are all outside this proxy's control,
+    /// and before there were decoders each of them silently lost the tier.
+    ///
+    /// Only requests that say they want HTML are affected — a navigation, not
+    /// the scripts, images, and fonts that are the bulk of a page's bytes — and
+    /// only on hosts that actually have rules. `identity` is named explicitly
+    /// rather than the field being removed, because an absent `Accept-Encoding`
+    /// means *any* coding is acceptable, which is the opposite of what is
+    /// wanted.
     pub fn prepare(&self, host: &str, headers: &mut HeaderMap) {
         if self.rules(host).is_none() {
             return;
@@ -743,11 +993,28 @@ impl Rewriting {
         };
 
         let inject = relax_policy(&mut parts.headers, &rules.source);
+        let decoder = Decoder::new(rewritable.coding);
+        if !decoder.is_identity() {
+            // **The response is emitted decoded, and the headers must say so.**
+            // Leaving `Content-Encoding` in place would tell the client to
+            // decompress plaintext; leaving `Content-Length` would state the
+            // compressed length of a body that is no longer compressed. Both
+            // are removed and the codec picks its own streaming framing, which
+            // is what [Filtering](../docs/filtering.md)'s step 6 asks for.
+            //
+            // Nothing is recompressed on the way out: the leg to the client is
+            // this device's own terminated connection, so those bytes never
+            // reach a network and shrinking them would spend battery to
+            // compress a memory copy.
+            parts.headers.remove(CONTENT_ENCODING);
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+        }
         let sink = Arc::new(Mutex::new(Vec::new()));
         let rewriter = build(&rules, rewritable, budget, inject, Sink(Arc::clone(&sink)));
         let body = RewritingBody {
             inner: body,
             stage: Mutex::new(Stage::Rewriting(Box::new(rewriter))),
+            decoder,
             sink,
             failures,
         };
@@ -911,13 +1178,36 @@ mod tests {
             Err(NotRewritable::NotHtml),
             "an untyped body is not assumed to be a document"
         );
-        assert_eq!(
-            rewritable(
-                StatusCode::OK,
-                &headers(&[("content-type", "text/html"), ("content-encoding", "gzip")])
-            ),
-            Err(NotRewritable::ContentCoded)
-        );
+        // A coding this build can read is not a refusal: it carries the
+        // decoder that will read it.
+        for (label, expected) in [
+            ("gzip", Coding::Gzip),
+            ("x-gzip", Coding::Gzip),
+            ("BR", Coding::Brotli),
+            ("deflate", Coding::Deflate),
+            ("identity", Coding::Identity),
+        ] {
+            assert_eq!(
+                rewritable(
+                    StatusCode::OK,
+                    &headers(&[("content-type", "text/html"), ("content-encoding", label)])
+                )
+                .map(Rewritable::coding),
+                Ok(expected),
+                "{label}"
+            );
+        }
+        // One this build cannot, and two stacked, both forward untouched.
+        for value in ["zstd", "gzip, br", "compress"] {
+            assert_eq!(
+                rewritable(
+                    StatusCode::OK,
+                    &headers(&[("content-type", "text/html"), ("content-encoding", value)])
+                ),
+                Err(NotRewritable::ContentCoded),
+                "{value}"
+            );
+        }
         assert_eq!(
             rewritable(
                 StatusCode::PARTIAL_CONTENT,
@@ -1151,6 +1441,22 @@ mod streaming {
         }
     }
 
+    /// A body over already-built `Bytes`, for a test whose chunks are binary
+    /// rather than text.
+    struct Bytes2(VecDeque<Bytes>);
+
+    impl Body for Bytes2 {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Ready(self.0.pop_front().map(|chunk| Ok(Frame::data(chunk))))
+        }
+    }
+
     impl Body for Chunks {
         type Data = Bytes;
         type Error = std::convert::Infallible;
@@ -1316,8 +1622,8 @@ mod streaming {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
         let document = "<html><body><div class=\"ad\">present</div></body></html>";
         for fields in [
-            // Compressed: opaque without a decoder.
-            &[("content-type", "text/html"), ("content-encoding", "gzip")][..],
+            // A coding no decoder here covers.
+            &[("content-type", "text/html"), ("content-encoding", "zstd")][..],
             // Not a document.
             &[("content-type", "application/json")][..],
             // A character encoding a streaming rewriter cannot read.
@@ -1384,6 +1690,89 @@ mod streaming {
         )
         .await;
         assert!(body.is_err(), "the truncation must be reported");
+        assert_eq!(failures.count(), 1);
+    }
+
+    /// Compresses `plain` as gzip, so the test states the bytes rather than
+    /// trusting a fixture blob.
+    fn gzipped(plain: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// **The gap this closes.** `Accept-Encoding: identity` is a request, and
+    /// a cache, an intermediary, or a non-compliant origin can all ignore it —
+    /// at which point a build with no decoder loses the whole HTML tier on that
+    /// response, silently. The document must be read, rewritten, and emitted
+    /// decoded, with the headers that described the compressed form removed.
+    #[tokio::test]
+    async fn a_compressed_document_is_decoded_rewritten_and_emitted_plain() {
+        let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
+        let document = "<html><body><p>keep</p><div class=\"ad\">gone</div></body></html>";
+        let compressed = gzipped(document);
+
+        // Split across a chunk boundary, so the decoder is exercised streaming
+        // rather than whole — which is the only place it can differ.
+        let split = compressed.len() / 2;
+        let mut response = Response::new(Bytes2(VecDeque::from([
+            Bytes::copy_from_slice(&compressed[..split]),
+            Bytes::copy_from_slice(&compressed[split..]),
+        ])));
+        *response.headers_mut() = headers(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-encoding", "gzip"),
+            ("content-length", "999"),
+        ]);
+        let (parts, body) = rewriting.apply(HOST, response).into_parts();
+        let out = body.collect().await.expect("the document completes");
+        let out = String::from_utf8(out.to_bytes().to_vec()).unwrap();
+
+        assert!(!out.contains("gone"), "the rule did not apply: {out}");
+        assert!(out.contains("<p>keep</p>"));
+        assert!(
+            parts.headers.get("content-encoding").is_none(),
+            "a decoded body must not still claim to be compressed"
+        );
+        assert!(
+            parts.headers.get("content-length").is_none(),
+            "the compressed length no longer describes this body"
+        );
+    }
+
+    /// A truncated compressed stream has no recoverable remainder, so the body
+    /// ends visibly rather than silently short — the same answer ambiguous
+    /// markup gets, and for the same reason.
+    #[tokio::test]
+    async fn a_truncated_compressed_body_ends_visibly() {
+        let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());
+        let compressed = gzipped("<html><body><div class=\"ad\">gone</div></body></html>");
+        let mut response = Response::new(Bytes2(VecDeque::from([Bytes::copy_from_slice(
+            &compressed[..compressed.len() / 2],
+        )])));
+        *response.headers_mut() =
+            headers(&[("content-type", "text/html"), ("content-encoding", "gzip")]);
+        let (_, body) = rewriting.apply(HOST, response).into_parts();
+        assert!(
+            body.collect().await.is_err(),
+            "a truncated stream must be reported, not silently shortened"
+        );
+        assert_eq!(failures.count(), 1);
+    }
+
+    /// A body whose bytes are not the coding its header claims fails the same
+    /// way: there is nothing to forward, so the failure is visible.
+    #[tokio::test]
+    async fn a_body_that_is_not_the_coding_it_claims_is_reported() {
+        let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());
+        let mut response = Response::new(Bytes2(VecDeque::from([Bytes::from_static(
+            b"<html>this is not gzip at all</html>",
+        )])));
+        *response.headers_mut() =
+            headers(&[("content-type", "text/html"), ("content-encoding", "gzip")]);
+        let (_, body) = rewriting.apply(HOST, response).into_parts();
+        assert!(body.collect().await.is_err());
         assert_eq!(failures.count(), 1);
     }
 

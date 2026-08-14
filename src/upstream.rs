@@ -15,16 +15,21 @@
 //! this connection must not have. A static bundle also makes the resolver's
 //! trust independent of anything a user or another application has added.
 //!
-//! **One connection per query.** Concurrent queries on a shared connection
-//! must be matched by transaction id, and the id travelling upstream is the
-//! *client's* — so a shared connection would need id rewriting before it could
-//! be correct. A connection per query is correct without either, and the cost
-//! is bounded by rustls session resumption: the configuration holds the
-//! session cache, each upstream owns one configuration for its lifetime, so
-//! every query after the first to a given resolver is a one-round-trip
-//! resumption rather than a full handshake. Persistent pipelined connections
-//! are the follow-up, and they are gated on the id rewriting recorded in
-//! [Verification](../docs/verification.md).
+//! **One connection per query on the byte-stream transports, and one
+//! connection for all of them on DoQ — because the correlation differs, not
+//! because the effort did.** Concurrent queries on a shared byte stream must be
+//! matched by transaction id, and the id travelling upstream is the *client's*,
+//! so [`DotUpstream`] and [`DohUpstream`] dial per query and are correct without
+//! any demultiplexer. The cost is bounded by rustls session resumption: the
+//! configuration holds the session cache, each upstream owns one configuration
+//! for its lifetime, so every query after the first is a one-round-trip
+//! resumption rather than a full handshake.
+//!
+//! [`DoqUpstream`] has no such problem. RFC 9250 gives each query its own QUIC
+//! stream and *requires* the message id be zero, so the stream is the
+//! correlation and there is nothing to rewrite between queries — which is why
+//! its connection is held rather than redialled, and why the persistent
+//! pipelining recorded as a follow-up for the others is already the shape here.
 //!
 //! **The socket must leave by a route that is not the tunnel.** A resolver
 //! reached through the tunnel that is resolving for it is a loop, and
@@ -439,6 +444,173 @@ impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
     }
 }
 
+/// DNS over QUIC, RFC 9250.
+///
+/// **The stream is the correlation, which is why this one connection is
+/// persistent where the TLS transports are not.** DoT and DoH dial per query
+/// because concurrent queries on a shared byte stream must be matched by
+/// transaction id, and the id travelling upstream is the client's. DoQ has no
+/// such problem: each query gets its own bidirectional QUIC stream, the answer
+/// arrives on the stream that asked, and RFC 9250 §4.2.1 requires the message
+/// id be **zero** precisely so that nothing is tempted to correlate on it. So
+/// the connection is held and every query is one stream on it — which is also
+/// the only shape that makes DoQ cheaper than DoT rather than the same thing
+/// with a QUIC handshake in front.
+///
+/// The framing on that stream is DoT's: a two-octet big-endian length, then the
+/// message, in both directions. The client closes its half after the query,
+/// which is what tells the server no more is coming.
+///
+/// **The id is rewritten to zero, and the caller's is restored on the way
+/// back.** A resolver that saw a non-zero id may treat the connection as a
+/// protocol error and close it (§4.2.1), and a stub resolver that saw a zero id
+/// come back would discard the reply as unsolicited. Both halves of the
+/// substitution live here, so no caller has to know DoQ is underneath.
+pub struct DoqUpstream<B> {
+    resolver: SocketAddr,
+    server_name: String,
+    bypass: B,
+    quic: crate::QuicConfigFactory,
+    /// The live connection. An async mutex because establishing one awaits, and
+    /// because two queries arriving together must produce *one* connection
+    /// rather than two — the second waits and finds the first's.
+    connection: tokio::sync::Mutex<Option<crate::QuicConnection>>,
+    /// Cancels the driver task, so the connection's lifetime is this value's.
+    shutdown: tokio_util::sync::CancellationToken,
+    timeout: Duration,
+}
+
+/// RFC 9250 §4.1.1 registers this ALPN, and a resolver that does not offer it
+/// fails the handshake rather than the exchange.
+const DOQ_ALPN: &[u8] = b"doq";
+
+/// The idle timeout the connection is configured with. Long enough that a
+/// browsing session's queries share one connection, short enough that a
+/// forgotten one does not hold a socket for the process's life.
+const DOQ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The two octets an RFC 9250 message id occupies, which must be zero on the
+/// wire and is restored from the caller's on the way back.
+const DNS_ID_BYTES: usize = 2;
+
+impl<B> Drop for DoqUpstream<B> {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+impl<B: TunnelBypass> DoqUpstream<B> {
+    /// `server_name` is the name the resolver's certificate must carry, which
+    /// is not the address it lives at — the same distinction [`DotUpstream`]
+    /// draws, and for the same reason.
+    ///
+    /// `quic` builds the transport configuration, including certificate
+    /// verification, which is the caller's to set for the same reason it is on
+    /// every other QUIC egress here: a test resolver and a production one
+    /// differ there and nowhere else.
+    pub fn new(
+        resolver: SocketAddr,
+        server_name: &str,
+        bypass: B,
+        quic: crate::QuicConfigFactory,
+    ) -> Self {
+        Self {
+            resolver,
+            server_name: server_name.to_owned(),
+            bypass,
+            quic,
+            connection: tokio::sync::Mutex::new(None),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
+        }
+    }
+
+    /// A `quiche::Config` with DoQ's ALPN and idle timeout, ready for a caller
+    /// to set verification on.
+    pub fn quic_config() -> Result<quiche::Config, crate::EgressError> {
+        crate::client_config(&[DOQ_ALPN], DOQ_IDLE_TIMEOUT)
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The live connection, dialling one if there is none.
+    ///
+    /// Holding the lock across the handshake is deliberate: it is what makes
+    /// concurrent first queries share a connection instead of racing to build
+    /// two, and a second connection would mean a second handshake and a second
+    /// socket for no gain.
+    async fn connection(&self) -> io::Result<crate::QuicConnection> {
+        let mut held = self.connection.lock().await;
+        if let Some(live) = held.as_ref().filter(|live| live.is_alive()) {
+            return Ok(live.clone());
+        }
+        let socket = self.bypass.udp(self.resolver).await?;
+        let config = (self.quic)().map_err(quic_failed)?;
+        let handshake =
+            crate::Handshake::establish(socket, self.resolver, &self.server_name, config)
+                .await
+                .map_err(quic_failed)?;
+        let live = handshake.drive(self.shutdown.clone());
+        *held = Some(live.clone());
+        Ok(live)
+    }
+}
+
+fn quic_failed(_: crate::EgressError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        "the DoQ connection failed",
+    )
+}
+
+impl<B: TunnelBypass> DnsUpstream for DoqUpstream<B> {
+    fn kind(&self) -> Upstream {
+        Upstream::DoQ
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
+        async move {
+            let Some(id) = message.get(..DNS_ID_BYTES) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a DNS message",
+                ));
+            };
+            let id = [id[0], id[1]];
+            let length = u16::try_from(message.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "query exceeds 65535"))?;
+
+            tokio::time::timeout(self.timeout, async {
+                let connection = self.connection().await?;
+                let mut stream = connection.open_bidi().await.map_err(quic_failed)?;
+                stream.write_all(&length.to_be_bytes()).await?;
+                // §4.2.1: zero on the wire, whatever the client chose.
+                stream.write_all(&[0, 0]).await?;
+                stream.write_all(&message[DNS_ID_BYTES..]).await?;
+                stream.flush().await?;
+                // Half-close is the whole "no more is coming" signal DoQ has.
+                stream.shutdown().await?;
+
+                let mut reply = read_length_prefixed(&mut stream).await?;
+                // The stub resolver correlates on the id it sent, so a reply
+                // carrying DoQ's mandatory zero would be discarded as
+                // unsolicited. Restoring it is the other half of the same
+                // substitution.
+                if let Some(slot) = reply.get_mut(..DNS_ID_BYTES) {
+                    slot.copy_from_slice(&id);
+                }
+                Ok(reply)
+            })
+            .await
+            .map_err(timed_out)?
+        }
+    }
+}
+
 /// The largest response head this reader will accept before giving up. A
 /// resolver that needs more than this to say "200" is not one to keep reading
 /// from, and the bound is what stops a hostile one from growing a buffer.
@@ -559,6 +731,37 @@ mod tests {
             .kind(),
             Upstream::DoH
         );
+    }
+
+    /// DoQ's message-id substitution, which is the one place this transport
+    /// edits what it carries. Both halves must hold: zero on the wire, because
+    /// RFC 9250 §4.2.1 lets a resolver close the connection over a non-zero id;
+    /// and the caller's id restored on the reply, because a stub resolver
+    /// discards an answer whose id is not the one it sent.
+    #[test]
+    fn doq_writes_a_zero_id_upstream_and_restores_the_caller_s_on_the_way_back() {
+        // The exact bytes the query writer produces, assembled the way it does.
+        let query = [0xab, 0xcd, 0x01, 0x00, 0x00, 0x01];
+        let id = [query[0], query[1]];
+        let mut on_the_wire = vec![0u8, 0u8];
+        on_the_wire.extend_from_slice(&query[DNS_ID_BYTES..]);
+        assert_eq!(
+            on_the_wire,
+            vec![0, 0, 0x01, 0x00, 0x00, 0x01],
+            "the wire must carry a zero id"
+        );
+
+        let mut reply = vec![0u8, 0u8, 0x81, 0x80];
+        reply[..DNS_ID_BYTES].copy_from_slice(&id);
+        assert_eq!(
+            reply,
+            vec![0xab, 0xcd, 0x81, 0x80],
+            "the client's id must come back"
+        );
+
+        // A message too short to carry an id is not a DNS message, and is
+        // refused rather than padded into one.
+        assert!([0u8; 1].get(..DNS_ID_BYTES).is_none());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::{
 use boreas_core::{
     Accepts, AsyncDevice, AsyncNetwork, BufferPool, Control, DatagramFidelity, Datapath, DnsPolicy,
     DnsUpstream, EgressCapabilities, EgressEmit, EgressError, FilterPolicy, FlowEvent, HostPolicy,
-    InternalEndpoint, Mtu, NatBehavior, PacketEgress, SendOutcome, Session, Shell, Telemetry,
+    Inbound, InternalEndpoint, Mtu, NatBehavior, PacketEgress, Relay, Session, Shell, Telemetry,
     Upstream,
 };
 
@@ -50,8 +50,10 @@ fn datapath_on(accepts: Accepts, queue_depth: usize, pool: Arc<BufferPool>) -> D
             datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.
-            steering_backstop: Duration::from_secs(60),
-            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+            inspection_window: Duration::from_secs(60),
+            max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+            inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
+            origination_ports: None,
         },
         pool,
     )
@@ -77,6 +79,10 @@ struct MockDevice {
 }
 
 impl AsyncDevice for MockDevice {
+    fn mtu(&self) -> Mtu {
+        Mtu::new(1500).unwrap()
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn recv<'a>(
         &'a mut self,
@@ -102,12 +108,11 @@ impl AsyncDevice for MockDevice {
     fn send<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
+    ) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
         async move {
             self.sent.send(buf.to_vec()).await.map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sent sink closed")
-            })?;
-            Ok(buf.len())
+            })
         }
     }
 }
@@ -151,12 +156,11 @@ impl AsyncNetwork for MockNetwork {
     fn send<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
+    ) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
         async move {
             self.sent.send(buf.to_vec()).await.map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "network sink closed")
-            })?;
-            Ok(buf.len())
+            })
         }
     }
 }
@@ -289,6 +293,7 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
             termination: None,
+            relay: None,
         },
     );
 
@@ -332,6 +337,7 @@ async fn the_timer_is_armed_against_the_core_deadline_not_a_poll_interval() {
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
             termination: None,
+            relay: None,
         },
     );
 
@@ -367,6 +373,7 @@ async fn a_malformed_packet_is_counted_not_fatal() {
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
             termination: None,
+            relay: None,
         },
     );
     let wire = wire.inbound;
@@ -432,45 +439,82 @@ fn truncated_mss_syn() -> Vec<u8> {
     packet
 }
 
+/// **The L4 datagram path through the reactor.** On a flow-accepting egress a
+/// client datagram is not a packet to forward: it must reach the relay carrying
+/// the target the client addressed, and the reply must come back down the
+/// device as a whole IP packet from that peer. Neither half existed — the
+/// payload was queued and never drained, and there was nothing to drain it
+/// into.
 #[tokio::test]
-async fn a_datagram_producer_is_never_blocked_and_a_refusal_frees_its_buffer() {
-    let (device, _wire) = wire();
+async fn a_client_datagram_reaches_the_relay_and_its_reply_reaches_the_device() {
+    let (device, mut wire) = wire();
     let (net, _peer) = network();
-    let producer = pool(4);
-    // A flow-accepting egress so datagrams take the flow path rather than the
-    // packet fast path. The reactor keeps its own pool: this test measures the
-    // producer's budget, and a shared one would confuse the two.
+    let pool = pool(64);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel(8);
+
     let shell = Shell::start(
-        datapath_on(Accepts::Flows, 8, pool(64)),
+        datapath_on(Accepts::Flows, 8, Arc::clone(&pool)),
         Session {
             device,
             network: net,
-            egress: PassThroughEgress { pool: pool(64) },
+            egress: PassThroughEgress {
+                pool: Arc::clone(&pool),
+            },
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
             termination: None,
+            relay: Some(Relay {
+                outbound: out_tx,
+                inbound: in_rx,
+            }),
         },
     );
-    let pool = producer;
-    let endpoint = InternalEndpoint {
-        address: "192.0.2.1".parse().unwrap(),
-        port: 1234,
-    };
 
-    // Offering a datagram takes the pool budget and never awaits.
-    let outcome = shell.try_send_datagram(endpoint, pool.take(b"payload").unwrap());
-    assert_eq!(outcome, SendOutcome::Buffered);
-    assert!(pool.available() <= 4);
+    wire.inbound.send(udp_frame()).await.unwrap();
+    let outbound = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+        .await
+        .expect("the datagram reached the relay")
+        .expect("channel open");
+    assert_eq!(
+        outbound.target,
+        std::net::SocketAddr::from(([198, 51, 100, 2], 53)),
+        "the target the client addressed travels with the datagram"
+    );
+    assert_eq!(outbound.client.port, 1234);
+    assert_eq!(&*outbound.payload, &udp_frame()[28..]);
+    assert!(
+        wire.sent.try_recv().is_err(),
+        "a terminated datagram is consumed, not forwarded"
+    );
 
-    // Exhausting the pool is a `None`, not a wait: the producer decides.
-    let held: Vec<_> = std::iter::from_fn(|| pool.take(b"x")).collect();
-    assert!(pool.take(b"x").is_none());
-    assert!(pool.exhausted() >= 1);
-    drop(held);
+    // The reply, synthesized back into an IP packet addressed to the client.
+    in_tx
+        .send(Inbound {
+            client: outbound.client,
+            peer: InternalEndpoint {
+                address: "198.51.100.2".parse().unwrap(),
+                port: 53,
+            },
+            payload: pool.take(b"answer").unwrap(),
+        })
+        .await
+        .unwrap();
+    let returned = tokio::time::timeout(Duration::from_secs(2), wire.sent.recv())
+        .await
+        .expect("the reply reached the device")
+        .expect("channel open");
+    assert_eq!(&returned[12..16], &[198, 51, 100, 2], "source is the peer");
+    assert_eq!(
+        &returned[16..20],
+        &[192, 0, 2, 1],
+        "destination is the client"
+    );
+    assert_eq!(&returned[returned.len() - 6..], b"answer");
 
+    drop(outbound);
     shell.shutdown().await.expect("clean shutdown");
-    // Every buffer the shell held is released once the reactor is joined.
-    assert_eq!(pool.available(), 4);
+    assert_eq!(pool.available(), 64, "every buffer returned to the budget");
 }
 
 #[tokio::test]
@@ -487,6 +531,7 @@ async fn control_messages_reach_the_core_in_order() {
             upstream: NoUpstream,
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
             termination: None,
+            relay: None,
         },
     );
 

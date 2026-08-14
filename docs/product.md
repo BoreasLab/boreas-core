@@ -63,7 +63,10 @@ native enforcement point on each platform. It also removes the 50 MB
 
 ## Product Principles
 
-1. One interface must provide filtering and egress composition.
+1. One interface must provide filtering and egress composition. Assembling a
+   configured egress yields *both* effects a session needs — one that carries
+   packets and one that carries re-originated flows — so the composition is a
+   total function of the egress rather than a shape only some egresses admit.
 2. The common path must stay packet-native and cheap.
 3. Decryption is narrow, opt-in, browser-scoped, and fail-open.
 4. DNS is the durable no-decryption policy signal as ECH adoption grows.

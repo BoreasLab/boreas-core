@@ -19,18 +19,22 @@
 //! [`Target`] for why that is a product property and not an optimisation.
 //!
 //! **UDP ASSOCIATE keeps its control connection.** RFC 1928 §7 ties the
-//! association's lifetime to the TCP connection that requested it, so
-//! [`Socks5Association`] holds that stream open and drops it with the
-//! association. Losing it silently is how a UDP relay stops working minutes
+//! association's lifetime to the TCP connection that requested it, so the
+//! shared [`Relay`] holds that stream open and drops it with the last half of
+//! the association. Losing it silently is how a UDP relay stops working minutes
 //! after it appeared to start.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramAssociation, DatagramFidelity, DomainName, EgressCapabilities,
-    EgressError, NatBehavior, Prefixed, StreamEgress, Target, TunnelBypass,
+    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource,
+    DomainName, EgressCapabilities, EgressError, NatBehavior, Prefixed, StreamEgress, Target,
+    TunnelBypass,
 };
 
 /// The only protocol version this crate speaks, and the only one that exists.
@@ -514,7 +518,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
         })
     }
 
-    fn associate(&self) -> BoxFuture<'_, Result<Box<dyn DatagramAssociation>, EgressError>> {
+    fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
             let (mut control, mut buf) = self.negotiate().await?;
             // RFC 1928 §7: the address here is where *this client* will send
@@ -532,51 +536,93 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
                 return Err(ProxyError::Address.into());
             };
             let socket = self.bypass.udp(relay).await?;
-            Ok(Box::new(Socks5Association {
+            // Both halves keep the relay and the control connection alive:
+            // RFC 1928 §7 ends the association when the control connection
+            // closes, so its lifetime *is* the association's and neither half
+            // may outlive it.
+            let shared = Arc::new(Relay {
                 socket,
                 _control: control,
-            }) as Box<dyn DatagramAssociation>)
+            });
+            Ok(Association {
+                source: Box::new(Socks5Source {
+                    relay: Arc::clone(&shared),
+                    // One framing buffer for the association, sized to the
+                    // largest datagram a UDP payload length can describe. Per
+                    // association rather than per datagram, and exact rather
+                    // than generous: nothing larger can arrive, so a payload
+                    // this cannot hold does not exist.
+                    framed: vec![0u8; MAX_UDP_PAYLOAD],
+                }),
+                sink: shared,
+            })
         })
     }
 }
 
+/// The largest payload a UDP datagram can carry. The receive buffer is sized
+/// to it exactly, which is what makes a short read provably the sender's
+/// message rather than a truncation this client caused.
+const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
+
 /// One UDP ASSOCIATE relay, and the control connection that keeps it alive.
-struct Socks5Association {
+struct Relay {
     socket: tokio::net::UdpSocket,
-    /// Held, never read: RFC 1928 §7 ends the association when this closes, so
-    /// its lifetime *is* the association's. Named with an underscore because
-    /// holding it is the whole contribution.
+    /// Held, never read: its lifetime is the association's. Named with an
+    /// underscore because holding it is the whole contribution.
     _control: tokio::net::TcpStream,
 }
 
-impl DatagramAssociation for Socks5Association {
+impl DatagramSink for Relay {
     fn send_to<'a>(
         &'a self,
         payload: &'a [u8],
         target: &'a Target,
     ) -> BoxFuture<'a, Result<(), EgressError>> {
         Box::pin(async move {
-            let mut framed = Vec::with_capacity(payload.len() + 32);
+            // Sized once for the worst case this call can produce — the header
+            // is at most `4 + 256 + 2` bytes — so the encode never reallocates.
+            let mut framed = Vec::with_capacity(payload.len() + MAX_DATAGRAM_HEADER);
             encode_datagram(target, payload, &mut framed);
-            self.socket.send(&framed).await?;
-            Ok(())
+            whole_datagram(self.socket.send(&framed).await?, framed.len())
         })
     }
+}
 
+/// The receiving half: the relay plus the one framing buffer it decodes into.
+struct Socks5Source {
+    relay: Arc<Relay>,
+    framed: Vec<u8>,
+}
+
+/// RSV(2) + FRAG(1) + ATYP(1) + the longest address (a 255-byte name behind its
+/// length octet) + port(2).
+const MAX_DATAGRAM_HEADER: usize = 4 + 1 + 255 + 2;
+
+/// A datagram socket delivers a message or nothing; a partial send is a failure
+/// of the send, not a smaller message.
+fn whole_datagram(written: usize, expected: usize) -> Result<(), EgressError> {
+    if written == expected {
+        return Ok(());
+    }
+    Err(EgressError::Io(std::io::ErrorKind::WriteZero))
+}
+
+impl DatagramSource for Socks5Source {
     fn recv_from<'a>(
-        &'a self,
+        &'a mut self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, Result<(usize, Target), EgressError>> {
         Box::pin(async move {
-            // One extra hop through a scratch buffer, because the header is
-            // in front of the payload and the caller's buffer is sized for the
-            // payload alone.
-            let mut framed = vec![0u8; buf.len() + 512];
-            let read = self.socket.recv(&mut framed).await?;
-            let (from, payload) = decode_datagram(&framed[..read])?;
-            let moved = payload.len().min(buf.len());
-            buf[..moved].copy_from_slice(&payload[..moved]);
-            Ok((moved, from))
+            let read = self.relay.socket.recv(&mut self.framed).await?;
+            let (from, payload) = decode_datagram(&self.framed[..read])?;
+            if payload.len() > buf.len() {
+                return Err(EgressError::DatagramTooLarge {
+                    required: payload.len(),
+                });
+            }
+            buf[..payload.len()].copy_from_slice(payload);
+            Ok((payload.len(), from))
         })
     }
 }

@@ -8,7 +8,7 @@
 mod android {
     use std::io;
 
-    use crate::{AsyncDevice, Device, Mtu};
+    use crate::{AsyncDevice, Device, Mtu, shell::whole};
 
     /// Android's VpnService fd. Readiness comes from tokio's `AsyncFd`, so
     /// `recv` is cancel-safe: it registers interest and only reads when the
@@ -35,8 +35,11 @@ mod android {
             std::io::Read::read(&mut self.fd.get_mut(), buf)
         }
 
-        fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-            std::io::Write::write(&mut self.fd.get_mut(), buf)
+        fn send(&mut self, buf: &[u8]) -> io::Result<()> {
+            whole(
+                std::io::Write::write(&mut self.fd.get_mut(), buf)?,
+                buf.len(),
+            )
         }
 
         fn mtu(&self) -> Mtu {
@@ -45,6 +48,10 @@ mod android {
     }
 
     impl AsyncDevice for AndroidTun {
+        fn mtu(&self) -> Mtu {
+            self.mtu
+        }
+
         #[allow(clippy::manual_async_fn)]
         fn recv<'a>(
             &'a mut self,
@@ -65,12 +72,12 @@ mod android {
         fn send<'a>(
             &'a mut self,
             buf: &'a [u8],
-        ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
+        ) -> impl Future<Output = io::Result<()>> + Send + 'a {
             async move {
                 loop {
                     let mut guard = self.fd.writable_mut().await?;
                     match guard.try_io(|inner| std::io::Write::write(&mut inner.get_mut(), buf)) {
-                        Ok(result) => return result,
+                        Ok(result) => return whole(result?, buf.len()),
                         Err(_would_block) => continue,
                     }
                 }
@@ -133,7 +140,7 @@ mod windows {
             Ok(bytes.len())
         }
 
-        fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
+        fn send(&mut self, buf: &[u8]) -> io::Result<()> {
             let mut packet =
                 self.session
                     .allocate_send_packet(buf.len().try_into().map_err(|_| {
@@ -141,7 +148,7 @@ mod windows {
                     })?)?;
             packet.bytes_mut().copy_from_slice(buf);
             self.session.send_packet(packet);
-            Ok(buf.len())
+            Ok(())
         }
 
         fn mtu(&self) -> Mtu {
@@ -150,6 +157,10 @@ mod windows {
     }
 
     impl AsyncDevice for WintunDevice {
+        fn mtu(&self) -> Mtu {
+            self.mtu
+        }
+
         #[allow(clippy::manual_async_fn)]
         fn recv<'a>(
             &'a mut self,
@@ -197,7 +208,7 @@ mod windows {
         fn send<'a>(
             &'a mut self,
             buf: &'a [u8],
-        ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
+        ) -> impl Future<Output = io::Result<()>> + Send + 'a {
             async move { Device::send(self, buf) }
         }
     }

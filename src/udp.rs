@@ -186,6 +186,14 @@ impl<T> DatagramBuffer<T> {
         self.datagrams.pop_front()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.datagrams.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.datagrams.len()
+    }
+
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -232,6 +240,17 @@ impl<V> UdpFlowTable<V> {
 
     pub fn contains(&self, endpoint: &InternalEndpoint) -> bool {
         self.flows.contains_key(endpoint)
+    }
+
+    /// The live value for `endpoint`, without touching its deadline.
+    ///
+    /// Deliberately not a refresh: the caller that reaches for this has already
+    /// refreshed the mapping through
+    /// [`get_or_insert_with`](Self::get_or_insert_with), and refreshing twice
+    /// for one packet would make the idle timeout depend on how many times a
+    /// path happened to look the flow up.
+    pub fn get_mut(&mut self, endpoint: &InternalEndpoint) -> Option<&mut V> {
+        self.flows.get_mut(endpoint).map(|state| &mut state.value)
     }
 
     /// The earliest instant that may contain an expired flow. Conservative:

@@ -16,8 +16,8 @@ use std::{
 };
 
 use boreas_core::{
-    Credentials, DirectSockets, DomainName, NatBehavior, Socks5Config, Socks5Egress, StreamEgress,
-    Target, decode_datagram, encode_datagram,
+    Credentials, DirectSockets, DomainName, EgressError, NatBehavior, Socks5Config, Socks5Egress,
+    StreamEgress, Target, decode_datagram, encode_datagram,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -302,7 +302,7 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
     let proxy = start_proxy(ProxyPolicy::open()).await;
     let egress = Arc::new(egress(proxy, None));
 
-    let association = egress.associate().await.expect("the relay is established");
+    let mut association = egress.associate().await.expect("the relay is established");
     let target = Target::Domain {
         host: DomainName::new("example.com").unwrap(),
         port: 53,
@@ -312,6 +312,7 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
     // attributed to that same destination: the framing works in both
     // directions, which is the whole of RFC 1928 §7 that a client performs.
     association
+        .sink
         .send_to(b"\x12\x34query", &target)
         .await
         .expect("the datagram is relayed");
@@ -319,13 +320,37 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
     let mut buf = [0u8; 64];
     let (read, from) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        association.recv_from(&mut buf),
+        association.source.recv_from(&mut buf),
     )
     .await
     .expect("the relay answers")
     .expect("the reply decodes");
     assert_eq!(&buf[..read], b"\x12\x34query");
     assert_eq!(from, target, "the reply names the peer it came from");
+
+    // **The boundary is preserved or the read fails; it is never shortened.**
+    // A relay claiming native datagram fidelity that quietly delivered the
+    // first `n` bytes of a QUIC packet would satisfy every length check
+    // downstream and corrupt the connection anyway.
+    association
+        .sink
+        .send_to(&[0xab; 200], &target)
+        .await
+        .expect("the datagram is relayed");
+    let mut small = [0u8; 64];
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        association.source.recv_from(&mut small),
+    )
+    .await
+    .expect("the relay answers");
+    assert!(
+        matches!(
+            refused,
+            Err(EgressError::DatagramTooLarge { required: 200 })
+        ),
+        "an oversized datagram must be refused, not truncated: {refused:?}"
+    );
 }
 
 /// **The regression test for a reply reader that over-reads.**

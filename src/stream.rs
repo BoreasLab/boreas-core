@@ -7,8 +7,8 @@
 //! module is that terminator.
 //!
 //! It is sans-io in exactly the sense the rest of the core is: it owns no
-//! socket, no task, and no clock. Client packets enter as borrowed slices
-//! ([`push`](LocalStack::push)); reply packets leave as owned buffers
+//! socket, no task, and no clock. Client packets enter as pooled buffers
+//! ([`push`](LocalStack::push)); reply packets leave as pooled buffers
 //! ([`poll_transmit`](LocalStack::poll_transmit)); time enters as an `Instant`
 //! argument to [`poll`](LocalStack::poll). A `smoltcp` socket set is the TCP
 //! state machine underneath — the engineering plan's gap 9, admitted here for
@@ -34,6 +34,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     num::NonZeroUsize,
+    sync::Arc,
     time::Instant,
 };
 
@@ -45,7 +46,7 @@ use smoltcp::{
     wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address},
 };
 
-use crate::{InternalEndpoint, Mtu};
+use crate::{BufferPool, InternalEndpoint, Mtu, Pooled};
 
 /// Opaque handle to one terminated connection. A thin newtype over `smoltcp`'s
 /// own handle so a caller cannot fabricate one or reach past it into the socket
@@ -107,15 +108,27 @@ pub struct TerminationLimits {
 /// `inbound` is what the client sent (consumed by `smoltcp` on receive);
 /// `outbound` is what `smoltcp` produced for the client (drained by the shell).
 /// The queues are the whole I/O surface, which is what keeps this sans-io.
+///
+/// **Every buffer on both queues is on loan from the shared
+/// [`BufferPool`].** Three things follow, and all three were wrong before:
+/// an inbound packet arrives already pooled and is *moved* in rather than
+/// copied; an outbound segment costs no allocation, because a returned buffer
+/// keeps its capacity; and the outbound queue is bounded by the pool's budget
+/// instead of growing without limit whenever the reactor drains it more slowly
+/// than `smoltcp` fills it. Exhaustion is expressed the way `smoltcp` already
+/// expects — no transmit token — which is the same "try again next poll"
+/// backpressure a real NIC's full ring applies.
 struct QueueDevice {
-    inbound: VecDeque<Vec<u8>>,
-    outbound: VecDeque<Vec<u8>>,
+    inbound: VecDeque<Pooled>,
+    outbound: VecDeque<Pooled>,
+    pool: Arc<BufferPool>,
     mtu: usize,
 }
 
 /// Owns the received packet outright, so the receive token holds no borrow of
 /// the device and can be returned alongside a transmit token that does.
-struct QueueRx(Vec<u8>);
+/// Dropping it is what returns the buffer to the pool.
+struct QueueRx(Pooled);
 
 impl RxToken for QueueRx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -123,17 +136,25 @@ impl RxToken for QueueRx {
     }
 }
 
-/// Borrows only the outbound queue, so it coexists with a receive token that
-/// borrows nothing.
+/// A reserved buffer and the queue it will be pushed onto.
+///
+/// The buffer is reserved when the token is *issued*, not when it is consumed:
+/// `smoltcp` treats a token as a promise that the send will succeed, so the
+/// budget has to be spent before the promise is made.
 struct QueueTx<'a> {
-    outbound: &'a mut VecDeque<Vec<u8>>,
+    buffer: Pooled,
+    outbound: &'a mut VecDeque<Pooled>,
 }
 
 impl TxToken for QueueTx<'_> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut buf = vec![0u8; len];
-        let result = f(&mut buf);
-        self.outbound.push_back(buf);
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, len: usize, f: F) -> R {
+        // The device advertises an MTU no larger than a pool slice, so
+        // `smoltcp` cannot ask for a length this refuses; the branch is the
+        // proof rather than a recovery.
+        debug_assert!(len <= self.buffer.capacity_hint());
+        let _ = self.buffer.resize(len);
+        let result = f(&mut self.buffer);
+        self.outbound.push_back(self.buffer);
         result
     }
 }
@@ -143,19 +164,26 @@ impl Device for QueueDevice {
     type TxToken<'a> = QueueTx<'a>;
 
     fn receive(&mut self, _now: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // `pop_front` releases the borrow on `inbound` before `outbound` is
-        // borrowed, so the two tokens touch disjoint fields.
+        // The reply buffer is reserved *first*: a receive may produce a
+        // response, and reserving after the packet had been dequeued would
+        // leave a packet in hand with nowhere to put its answer. A refused
+        // reservation drops the buffer straight back and leaves the queue
+        // untouched, so the packet is still there on the next poll.
+        let buffer = self.pool.take_zeroed(0)?;
         let packet = self.inbound.pop_front()?;
         Some((
             QueueRx(packet),
             QueueTx {
+                buffer,
                 outbound: &mut self.outbound,
             },
         ))
     }
 
     fn transmit(&mut self, _now: SmolInstant) -> Option<Self::TxToken<'_>> {
+        let buffer = self.pool.take_zeroed(0)?;
         Some(QueueTx {
+            buffer,
             outbound: &mut self.outbound,
         })
     }
@@ -208,11 +236,25 @@ impl LocalStack {
     /// Builds a terminator listening on `ports`. `mtu` must match the tunnel the
     /// client's packets arrive on, so a segment the stack emits fits the path
     /// the reply travels back down.
-    pub fn new(mtu: Mtu, ports: &[u16], limits: TerminationLimits, base: Instant) -> Self {
+    ///
+    /// `pool` is the same budget the datapath draws on. The advertised MTU is
+    /// the smaller of `mtu` and a pool slice, so a segment `smoltcp` decides to
+    /// build always fits the buffer reserved for it — the device's capability
+    /// is derived from what the budget can actually carry rather than asserted
+    /// alongside it.
+    pub fn new(
+        mtu: Mtu,
+        ports: &[u16],
+        limits: TerminationLimits,
+        pool: Arc<BufferPool>,
+        base: Instant,
+    ) -> Self {
+        let carried = usize::from(mtu.get()).min(pool.slice_size().get());
         let mut device = QueueDevice {
             inbound: VecDeque::new(),
             outbound: VecDeque::new(),
-            mtu: usize::from(mtu.get()),
+            pool,
+            mtu: carried,
         };
 
         let config = Config::new(HardwareAddress::Ip);
@@ -256,14 +298,25 @@ impl LocalStack {
     }
 
     /// Enqueues one client packet for the next [`poll`](Self::poll).
-    pub fn push(&mut self, packet: &[u8]) {
-        self.device.inbound.push_back(packet.to_vec());
+    ///
+    /// Takes the buffer by value rather than copying out of a borrow: the
+    /// packet arrives from the datapath already on the shared budget, so moving
+    /// it in costs nothing and the copy it replaces was one per packet.
+    pub fn push(&mut self, packet: Pooled) {
+        self.device.inbound.push_back(packet);
     }
 
     /// The next reply packet bound for the client, if any. Terminal on the
-    /// tunnel side: it goes straight to the device.
-    pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+    /// tunnel side: it goes straight to the device, and dropping it there is
+    /// what returns its buffer to the pool.
+    pub fn poll_transmit(&mut self) -> Option<Pooled> {
         self.device.outbound.pop_front()
+    }
+
+    /// The budget this stack draws on, for a caller that has to stage a packet
+    /// onto it before [`push`](Self::push) will take one.
+    pub fn pool(&self) -> &Arc<BufferPool> {
+        &self.device.pool
     }
 
     /// A connection accepted since the last call.
@@ -512,6 +565,20 @@ pub(crate) mod tests {
         Mtu::new(MTU).unwrap()
     }
 
+    /// A budget larger than any of these exchanges needs, so exhaustion here
+    /// would be a defect rather than the backpressure path.
+    fn pool() -> Arc<BufferPool> {
+        BufferPool::new(
+            NonZeroUsize::new(usize::from(MTU)).unwrap(),
+            NonZeroUsize::new(256).unwrap(),
+        )
+    }
+
+    /// Builds a terminator on its own budget.
+    fn stack(ports: &[u16], limits: TerminationLimits, base: Instant) -> LocalStack {
+        LocalStack::new(mtu(), ports, limits, pool(), base)
+    }
+
     fn limits(max_sockets: usize, backlog: usize) -> TerminationLimits {
         TerminationLimits {
             max_sockets: NonZeroUsize::new(max_sockets).unwrap(),
@@ -554,6 +621,7 @@ pub(crate) mod tests {
             let mut device = QueueDevice {
                 inbound: VecDeque::new(),
                 outbound: VecDeque::new(),
+                pool: pool(),
                 mtu: usize::from(MTU),
             };
             let config = Config::new(HardwareAddress::Ip);
@@ -604,12 +672,17 @@ pub(crate) mod tests {
 
         /// Everything the client has put on the wire since the last call.
         pub(crate) fn take_outbound(&mut self) -> Vec<Vec<u8>> {
-            self.device.outbound.drain(..).collect()
+            self.device.outbound.drain(..).map(|p| p.to_vec()).collect()
         }
 
         /// Hands the client one packet from the wire.
-        pub(crate) fn deliver(&mut self, packet: Vec<u8>) {
-            self.device.inbound.push_back(packet);
+        pub(crate) fn deliver(&mut self, packet: &[u8]) {
+            let pooled = self
+                .device
+                .pool
+                .take(packet)
+                .expect("the client budget holds");
+            self.device.inbound.push_back(pooled);
         }
 
         /// Queues application bytes for the peer.
@@ -632,13 +705,14 @@ pub(crate) mod tests {
     /// millisecond offset, so the terminator's `Instant`-to-`smoltcp` mapping is
     /// exercised rather than bypassed.
     fn relay(server: &mut LocalStack, client: &mut Client, base: Instant, ms: u64) {
-        let outbound: Vec<Vec<u8>> = client.device.outbound.drain(..).collect();
+        let outbound: Vec<Vec<u8>> = client.take_outbound();
         for packet in outbound {
-            server.push(&packet);
+            let pooled = server.pool().take(&packet).expect("the budget holds");
+            server.push(pooled);
         }
         server.poll(base + Duration::from_millis(ms));
         while let Some(packet) = server.poll_transmit() {
-            client.device.inbound.push_back(packet);
+            client.deliver(&packet);
         }
         client.poll(SmolInstant::from_millis(i64::try_from(ms).unwrap()));
     }
@@ -661,7 +735,7 @@ pub(crate) mod tests {
     #[test]
     fn handshake_recovers_endpoints_then_streams_both_ways() {
         let base = Instant::now();
-        let mut server = LocalStack::new(mtu(), &[HTTPS], limits(64, 4), base);
+        let mut server = stack(&[HTTPS], limits(64, 4), base);
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
 
         let mut ms = pump(&mut server, &mut client, base, 0, 6);
@@ -703,14 +777,15 @@ pub(crate) mod tests {
         // is exactly the defect that made the bridge tear connections down on
         // arrival.
         let base = Instant::now();
-        let mut server = LocalStack::new(mtu(), &[HTTPS], limits(64, 4), base);
+        let mut server = stack(&[HTTPS], limits(64, 4), base);
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
 
         // One half-round: the client's SYN reaches the terminator, but its ACK
         // of the SYN-ACK never does, so the socket stays in SYN-RECEIVED.
         client.tick(); // emits the SYN
         for packet in client.take_outbound() {
-            server.push(&packet);
+            let pooled = server.pool().take(&packet).expect("the budget holds");
+            server.push(pooled);
         }
         server.poll(base);
         let accepted = server.poll_accept().expect("the listener committed");
@@ -731,7 +806,7 @@ pub(crate) mod tests {
     #[test]
     fn peer_close_is_observed_then_the_socket_is_reaped() {
         let base = Instant::now();
-        let mut server = LocalStack::new(mtu(), &[HTTPS], limits(64, 4), base);
+        let mut server = stack(&[HTTPS], limits(64, 4), base);
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
         let mut ms = pump(&mut server, &mut client, base, 0, 6);
         let id = server.poll_accept().expect("accepted").id;
@@ -769,7 +844,7 @@ pub(crate) mod tests {
         // three established connections, and there is no listener to accept a
         // fourth. This is the P6 admission rule as a test.
         let base = Instant::now();
-        let mut server = LocalStack::new(mtu(), &[HTTPS], limits(3, 1), base);
+        let mut server = stack(&[HTTPS], limits(3, 1), base);
         let mut clients: Vec<Client> = (0..5)
             .map(|i| Client::connect(Ipv4Addr::new(192, 0, 2, 10 + i), 49152, SERVER, HTTPS))
             .collect();

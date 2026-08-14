@@ -7,9 +7,9 @@
 //! **Backpressure is asymmetric, so the channels are separate.** Control
 //! messages are policy: a slow control plane should block its producer, so
 //! [`Control`] is awaited. Datagrams are traffic: blocking a UDP source turns
-//! loss into head-of-line delay, so [`Datagram`] is offered with `try_send`
-//! and a refusal is a drop. One channel cannot honour both disciplines, which
-//! is why there are two.
+//! loss into head-of-line delay, so every datagram channel is offered with
+//! `try_send` and a refusal is a drop. One channel cannot honour both
+//! disciplines, which is why they are separate.
 //!
 //! **A packet is not an error.** Every [`DatapathError`] describes one packet
 //! that did not make it — malformed input, a configuration that cannot plan,
@@ -46,9 +46,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit,
-    FlowEvent, HostPolicy, InternalEndpoint, Message, PacketEgress, Pooled, Provenance, QueryPlan,
-    Rcode, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses, plan_query,
-    upstream::DnsUpstream, write_failure, write_refusal, write_response,
+    FlowEvent, HostPolicy, Inbound, InternalEndpoint, Message, PacketEgress, Pooled, Provenance,
+    QueryPlan, Rcode, Relay, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses,
+    plan_query, upstream::DnsUpstream, write_failure, write_refusal, write_response,
 };
 
 /// Depth of both reactor channels. Bounded is the point; the exact depth trades
@@ -95,14 +95,6 @@ pub enum Control {
     /// first. [`Shell::shutdown`] uses the cancellation token instead, which
     /// needs no channel capacity and therefore cannot be refused.
     Shutdown,
-}
-
-/// A datagram bound for a flow. Bounded and **never awaited**: see the module
-/// documentation for why this is not a `Control` variant.
-#[derive(Debug)]
-pub struct Datagram {
-    pub endpoint: InternalEndpoint,
-    pub bytes: Pooled,
 }
 
 /// Telemetry out of the reactor. Bounded and best-effort: telemetry loss under
@@ -186,6 +178,15 @@ pub struct Session<D, N, E, U> {
     pub policy: watch::Receiver<Arc<HostPolicy>>,
     /// The local TCP terminator, when this session terminates flows.
     pub termination: Option<Termination>,
+    /// The datagram relay, when this session's egress accepts flows rather
+    /// than packets.
+    ///
+    /// An option for the same reason [`Termination`] is: a packet egress
+    /// carries a datagram as the packet it already is, so it needs no
+    /// association and no second task. A flow egress that carries no datagrams
+    /// at all also carries `None`, and its capability claim
+    /// (`datagram_fidelity: None`) is what already said so.
+    pub relay: Option<Relay>,
 }
 
 /// The local TCP terminator's two channels, from the reactor's side.
@@ -200,14 +201,14 @@ pub struct Termination {
     /// forward path treats congestion.
     pub packets: mpsc::Sender<Pooled>,
     /// Segments the terminator produced for the client. The reactor owns the
-    /// device, so they are written here rather than there.
-    pub replies: mpsc::Receiver<Vec<u8>>,
+    /// device, so they are written here rather than there — and dropping one
+    /// after the write is what returns its buffer to the shared budget.
+    pub replies: mpsc::Receiver<Pooled>,
 }
 
 /// A running reactor and the handles that talk to it.
 pub struct Shell {
     control: mpsc::Sender<Control>,
-    datagrams: mpsc::Sender<Datagram>,
     telemetry: mpsc::Receiver<Telemetry>,
     shutdown: CancellationToken,
     reactor: tokio::task::JoinHandle<io::Result<()>>,
@@ -220,11 +221,10 @@ impl Shell {
     /// platform adapters supply. The reactor owns the datapath by value, so no
     /// lock guards it and none can be held across an `await`.
     ///
-    /// Payload buffers are the caller's concern: a producer takes a [`Pooled`]
-    /// from its [`BufferPool`](crate::BufferPool) and hands it to
-    /// [`try_send_datagram`](Self::try_send_datagram). The reactor never
-    /// allocates payload bytes, which is what makes the pool's budget the real
-    /// bound on queue memory.
+    /// Payload buffers are never allocated here: every one of them is on loan
+    /// from the [`BufferPool`](crate::BufferPool) the datapath already owns,
+    /// which is what makes that budget the real bound on queue memory.
+    ///
     /// The reactor and the resolver are two tasks, and the split is
     /// load-bearing: a resolution is a network round trip, and awaiting one
     /// inside the reactor would stall every packet behind a slow upstream.
@@ -239,7 +239,6 @@ impl Shell {
         U: DnsUpstream + 'static,
     {
         let (control_tx, control_rx) = mpsc::channel(CHANNEL_DEPTH);
-        let (datagram_tx, datagram_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (telemetry_tx, telemetry_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (query_tx, query_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (answer_tx, answer_rx) = mpsc::channel(CHANNEL_DEPTH);
@@ -252,10 +251,12 @@ impl Shell {
             upstream,
             policy,
             termination,
+            relay,
         } = session;
 
         let resolver = tokio::spawn(resolver_loop(
             Arc::new(upstream),
+            Arc::clone(datapath.pool()),
             policy.clone(),
             query_rx,
             answer_tx,
@@ -273,18 +274,17 @@ impl Shell {
                 back: answer_rx,
             },
             control_rx,
-            datagram_rx,
             TelemetrySink {
                 channel: telemetry_tx,
                 lost: 0,
             },
             termination,
+            relay,
             shutdown.clone(),
         ));
 
         Self {
             control: control_tx,
-            datagrams: datagram_tx,
             telemetry: telemetry_rx,
             shutdown,
             reactor,
@@ -296,25 +296,6 @@ impl Shell {
     /// producers; the channel stays bounded however many exist.
     pub fn control(&self) -> mpsc::Sender<Control> {
         self.control.clone()
-    }
-
-    /// A datagram handle for a producer that wants to own its own `try_send`.
-    pub fn datagrams(&self) -> mpsc::Sender<Datagram> {
-        self.datagrams.clone()
-    }
-
-    /// Offers a datagram to the reactor without waiting. A full queue is a
-    /// drop, never a wait.
-    ///
-    /// The refused `Pooled` handle is dropped here, which returns its bytes to
-    /// the pool, so a saturated reactor cannot leak the budget. The outcome is
-    /// the caller's to count: the producer knows which flow it belongs to, and
-    /// the reactor never sees it.
-    pub fn try_send_datagram(&self, endpoint: InternalEndpoint, bytes: Pooled) -> SendOutcome {
-        match self.datagrams.try_send(Datagram { endpoint, bytes }) {
-            Ok(()) => SendOutcome::Buffered,
-            Err(_) => SendOutcome::Dropped,
-        }
     }
 
     /// The next telemetry observation, or `None` once the reactor has stopped.
@@ -355,6 +336,12 @@ impl Shell {
 /// a multi-threaded runtime; the trait is written with explicit future types
 /// because `async fn` in a public trait cannot promise that.
 pub trait AsyncDevice {
+    /// The MTU the interface is configured with. It sizes the reactor's receive
+    /// buffer, so a packet this device can legitimately present always fits:
+    /// a fixed constant would either waste memory on a small tunnel or truncate
+    /// a valid packet on a large one, and only the adapter knows which.
+    fn mtu(&self) -> crate::Mtu;
+
     /// Reads one packet into `buf`, returning its length.
     ///
     /// **Must be cancel-safe.** The reactor selects over this future alongside
@@ -368,10 +355,17 @@ pub trait AsyncDevice {
         buf: &'a mut [u8],
     ) -> impl Future<Output = io::Result<usize>> + Send + 'a;
 
-    /// Writes one packet. Called only from the reactor's drain phase, never
-    /// concurrently with itself, and never inside a `select!`.
-    fn send<'a>(&'a mut self, buf: &'a [u8])
-    -> impl Future<Output = io::Result<usize>> + Send + 'a;
+    /// Writes one packet **whole**. Called only from the reactor's drain phase,
+    /// never concurrently with itself, and never inside a `select!`.
+    ///
+    /// **The unit is the packet, so the result carries no byte count.** A TUN
+    /// write and a datagram send are both all-or-nothing at the OS boundary,
+    /// and there is no correct handling of "some of this IP packet reached the
+    /// wire": the remainder cannot be re-sent as a second packet, because it
+    /// carries no header. An implementation that observes a short write must
+    /// therefore report [`io::ErrorKind::WriteZero`] rather than return, which
+    /// is what makes the absent `usize` a guarantee instead of an omission.
+    fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a;
 }
 
 /// The network side of the fused interface: encapsulated datagrams to and from
@@ -393,9 +387,24 @@ pub trait AsyncNetwork {
         buf: &'a mut [u8],
     ) -> impl Future<Output = io::Result<usize>> + Send + 'a;
 
-    /// Writes one datagram to the peer. Called only from the drain phase.
-    fn send<'a>(&'a mut self, buf: &'a [u8])
-    -> impl Future<Output = io::Result<usize>> + Send + 'a;
+    /// Writes one datagram to the peer, whole. Called only from the drain
+    /// phase. See [`AsyncDevice::send`] for why the byte count is absent.
+    fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a;
+}
+
+/// Reports a short write as the failure it is.
+///
+/// The one place the `usize` an OS returns is turned back into the total
+/// contract the seams declare, so no caller downstream has to remember that
+/// "wrote some bytes" and "sent the packet" are different statements.
+pub(crate) fn whole(written: usize, expected: usize) -> io::Result<()> {
+    if written == expected {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WriteZero,
+        format!("wrote {written} of {expected} packet bytes"),
+    ))
 }
 
 /// A UDP socket already connected to the egress peer's endpoint. `recv` and
@@ -409,11 +418,11 @@ impl AsyncNetwork for tokio::net::UdpSocket {
         tokio::net::UdpSocket::recv(self, buf)
     }
 
-    fn send<'a>(
-        &'a mut self,
-        buf: &'a [u8],
-    ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
-        tokio::net::UdpSocket::send(self, buf)
+    // Written out rather than as an `async fn` so the returned future's `Send`
+    // bound is stated in the signature, which is what the trait requires.
+    #[allow(clippy::manual_async_fn)]
+    fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        async move { whole(tokio::net::UdpSocket::send(self, buf).await?, buf.len()) }
     }
 }
 
@@ -421,7 +430,11 @@ impl AsyncNetwork for tokio::net::UdpSocket {
 struct Answer {
     client: InternalEndpoint,
     resolver: InternalEndpoint,
-    message: Vec<u8>,
+    /// The response bytes, on the same budget as every other payload the
+    /// session holds. A `Vec` here would be per-query memory outside every
+    /// bound the crate states, which is precisely the memory a query flood
+    /// grows.
+    message: Pooled,
     resolution: Resolution,
     /// Addresses this answer resolved to for a steered host. Empty for every
     /// other verdict, so the index grows only by what inspection put in it.
@@ -443,6 +456,7 @@ struct Queries {
 /// them and no pooled buffer outlives the shell.
 async fn resolver_loop<U: DnsUpstream + 'static>(
     upstream: Arc<U>,
+    pool: Arc<crate::BufferPool>,
     policy: watch::Receiver<Arc<HostPolicy>>,
     mut queries: mpsc::Receiver<DnsQuery>,
     answers: mpsc::Sender<Answer>,
@@ -463,6 +477,7 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
             break;
         };
         let upstream = Arc::clone(&upstream);
+        let pool = Arc::clone(&pool);
         // One snapshot, taken as the query is admitted. The borrow is released
         // before the task is spawned, so no guard crosses an `await` and a
         // reload cannot change a decision half-way through it.
@@ -470,7 +485,7 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
         let answers = answers.clone();
         tracker.spawn(async move {
             let _permit = permit;
-            if let Some(answer) = resolve(upstream.as_ref(), policy.as_ref(), query).await {
+            if let Some(answer) = resolve(upstream.as_ref(), &pool, policy.as_ref(), query).await {
                 // Best-effort: a reactor that cannot accept the answer is one
                 // whose client has long since retried.
                 let _ = answers.try_send(answer);
@@ -484,10 +499,12 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
 
 /// Resolves one query: plan, consult (or do not), rewrite, explain.
 ///
-/// `None` only when the query is not a DNS message at all, which is a drop
-/// rather than an answer — there is no question to put in a response.
+/// `None` when the query is not a DNS message at all, or when the shared budget
+/// has no room to build a response — both are drops rather than answers, and a
+/// stub resolver retries a dropped query exactly as it does a lost datagram.
 async fn resolve<U: DnsUpstream>(
     upstream: &U,
+    pool: &Arc<crate::BufferPool>,
     policy: &HostPolicy,
     query: DnsQuery,
 ) -> Option<Answer> {
@@ -498,7 +515,7 @@ async fn resolve<U: DnsUpstream>(
     } = query;
     let request = Message::parse(&payload).ok()?;
     let question = *request.question();
-    let mut message = vec![0u8; MAX_DNS_RESPONSE];
+    let mut message = pool.take_zeroed(MAX_DNS_RESPONSE)?;
     let mut steered = Vec::new();
 
     let (len, resolution) = match plan_query(&question, policy) {
@@ -572,7 +589,9 @@ async fn resolve<U: DnsUpstream>(
         }
     };
 
-    message.truncate(len);
+    // Never grows: `len` is a prefix of the buffer just written, so the resize
+    // is a truncation and the pool's slice bound is already satisfied.
+    let _ = message.resize(len);
     Some(Answer {
         client,
         resolver,
@@ -650,9 +669,19 @@ impl Counters {
 ///
 /// `recv` is cancel-safe, so losing this arm of the reactor's `select!` to a
 /// busier one costs nothing: the next pass still sees the segment.
-async fn next_reply(termination: &mut Option<Termination>) -> Option<Vec<u8>> {
+async fn next_reply(termination: &mut Option<Termination>) -> Option<Pooled> {
     match termination {
         Some(termination) => termination.replies.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The relay's next datagram from the egress, or a future that never completes
+/// when this session has no relay. `recv` is cancel-safe, so losing this arm
+/// costs nothing.
+async fn next_inbound(relay: &mut Option<Relay>) -> Option<Inbound> {
+    match relay {
+        Some(relay) => relay.inbound.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -679,13 +708,17 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     mut policy: watch::Receiver<Arc<HostPolicy>>,
     mut queries: Queries,
     mut control: mpsc::Receiver<Control>,
-    mut datagrams: mpsc::Receiver<Datagram>,
     mut telemetry: TelemetrySink,
     mut termination: Option<Termination>,
+    mut relay: Option<Relay>,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
-    let mut tun_buf = vec![0u8; MAX_PACKET_BYTES];
-    let mut net_buf = vec![0u8; MAX_PACKET_BYTES];
+    // Both buffers are sized from the seam that fills them rather than from a
+    // constant: the device states its own MTU, and the egress states the
+    // largest datagram its peer can send it. A fixed 2 KiB was correct for a
+    // 1500-byte tunnel and silently wrong for anything larger.
+    let mut tun_buf = vec![0u8; usize::from(device.mtu().get())];
+    let mut net_buf = vec![0u8; egress.max_network_datagram()];
     // One emission sink for the life of the reactor. The egress appends and
     // the drain phase empties it, so a packet costs no allocation for the
     // container it travels in.
@@ -704,7 +737,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         // The core's own next deadline, not a poll interval. `None` means no
         // state machine has pending work, so the reactor waits only for its
         // reporting tick, the egress's tick, and its input sources.
-        let mut reply: Option<Vec<u8>> = None;
+        let mut reply: Option<Pooled> = None;
         let core_deadline = datapath.poll_timeout().map(TokioInstant::from_std);
         // The egress may name a deadline more precisely than its cadence —
         // QUIC's loss-recovery timer moves, where WireGuard's rounds to the
@@ -731,13 +764,16 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 Some(Control::Shutdown) | None => break,
             },
 
-            Some(datagram) = datagrams.recv() => {
-                let Datagram { endpoint, bytes } = datagram;
-                match datapath.send_datagram(endpoint, bytes, Instant::now()) {
+            // A datagram the relay carried back from the egress. It becomes
+            // a synthesized IP packet addressed to the mapping that sent it,
+            // which is the one place the core originates a packet for a flow
+            // rather than forwarding one.
+            Some(Inbound { client, peer, payload }) = next_inbound(&mut relay) => {
+                match datapath.deliver_datagram(client, peer, &payload, Instant::now()) {
                     Ok(SendOutcome::Buffered) => {}
-                    // The core already emitted `DatagramDropped`; the drain
-                    // phase below folds it into the counter.
-                    Ok(SendOutcome::Dropped) => {}
+                    // The core already counted the reason; a datagram whose
+                    // mapping has expired has no client left to receive it.
+                    Ok(SendOutcome::Dropped) => counters.datagrams_dropped += 1,
                     Err(_) => counters.packets_rejected += 1,
                 }
             }
@@ -769,7 +805,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             Some(answer) = queries.back.recv() => {
                 let Answer { client, resolver, message, resolution, steered } = answer;
                 if !steered.is_empty() {
-                    datapath.steer_addresses(&steered, Instant::now());
+                    datapath.inspect_addresses(&steered, Instant::now());
                 }
                 if datapath.answer_dns(client, resolver, &message).is_err() {
                     counters.packets_rejected += 1;
@@ -833,6 +869,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             &mut telemetry,
             &mut counters,
             &mut termination,
+            &mut relay,
         )
         .await?;
 
@@ -853,6 +890,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         &mut telemetry,
         &mut counters,
         &mut termination,
+        &mut relay,
     )
     .await?;
     counters.flush(&mut telemetry);
@@ -878,6 +916,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     telemetry: &mut TelemetrySink,
     counters: &mut Counters,
     termination: &mut Option<Termination>,
+    relay: &mut Option<Relay>,
 ) -> io::Result<()> {
     loop {
         for emit in emits.drain(..) {
@@ -920,6 +959,26 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     while let Some(query) = datapath.poll_query() {
         if queries.try_send(query).is_err() {
             counters.queries_dropped += 1;
+        }
+    }
+
+    // Client datagrams of terminated flows go to the relay, which lives in its
+    // own task because opening and writing an association awaits. Offered
+    // without waiting: a full queue is a counted drop, which is what a UDP
+    // source already expects.
+    //
+    // A session with no relay is one whose egress carries datagrams as packets
+    // — nothing is ever queued there — or one whose egress carries none at all,
+    // which its capability claim already stated. Both are counted rather than
+    // silently discarded, because the second is a misconfiguration.
+    while let Some(datagram) = datapath.poll_datagram() {
+        match relay {
+            Some(relay) => {
+                if relay.outbound.try_send(datagram).is_err() {
+                    counters.datagrams_dropped += 1;
+                }
+            }
+            None => counters.datagrams_dropped += 1,
         }
     }
 
@@ -966,8 +1025,3 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 
     Ok(())
 }
-
-/// Receive buffer size. A TUN device never presents more than its own MTU, and
-/// the largest MTU an IP header can describe is 65 535 bytes; 2 KiB covers
-/// every configuration Boreas sets up and is what the harness already assumes.
-const MAX_PACKET_BYTES: usize = 2048;

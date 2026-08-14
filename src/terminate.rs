@@ -77,7 +77,7 @@ pub type TerminatedStream = crate::BridgedStream;
 pub async fn run_terminator(
     mut stack: LocalStack,
     mut packets: mpsc::Receiver<Pooled>,
-    replies: mpsc::Sender<Vec<u8>>,
+    replies: mpsc::Sender<Pooled>,
     accepted: mpsc::Sender<Accepted>,
     shutdown: CancellationToken,
 ) {
@@ -97,12 +97,10 @@ pub async fn run_terminator(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             packet = packets.recv() => match packet {
-                Some(packet) => {
-                    stack.push(&packet);
-                    // The pooled buffer is released here, returning its bytes
-                    // to the shared budget as soon as the stack has copied them.
-                    drop(packet);
-                }
+                // Moved into the stack's inbound queue rather than copied out
+                // of it: the buffer is already on the shared budget, and it is
+                // released when `smoltcp` has consumed the packet.
+                Some(packet) => stack.push(packet),
                 None => break,
             },
             () = wake.notified() => {}
@@ -124,7 +122,7 @@ async fn service(
     conns: &mut HashMap<StreamId, Plumbing>,
     wake: &Arc<Notify>,
     buf: &mut [u8],
-    replies: &mpsc::Sender<Vec<u8>>,
+    replies: &mpsc::Sender<Pooled>,
     accepted: &mpsc::Sender<Accepted>,
 ) {
     stack.poll(Instant::now());
@@ -238,7 +236,7 @@ mod tests {
     /// the task split, the pump, the backpressure — is production code.
     struct Rig {
         packets: mpsc::Sender<Pooled>,
-        replies: mpsc::Receiver<Vec<u8>>,
+        replies: mpsc::Receiver<Pooled>,
         accepted: mpsc::Receiver<Accepted>,
         shutdown: CancellationToken,
         handle: tokio::task::JoinHandle<()>,
@@ -247,6 +245,12 @@ mod tests {
 
     impl Rig {
         fn start(ports: &[u16]) -> Self {
+            // One budget for the whole rig, exactly as production shares one
+            // between the datapath and the terminator.
+            let pool = BufferPool::new(
+                NonZeroUsize::new(2048).unwrap(),
+                NonZeroUsize::new(256).unwrap(),
+            );
             let stack = LocalStack::new(
                 Mtu::new(1500).unwrap(),
                 ports,
@@ -255,6 +259,7 @@ mod tests {
                     backlog: NonZeroUsize::new(2).unwrap(),
                     socket_buffer: NonZeroUsize::new(8192).unwrap(),
                 },
+                Arc::clone(&pool),
                 Instant::now(),
             );
             let (packets_tx, packets_rx) = mpsc::channel(64);
@@ -274,10 +279,7 @@ mod tests {
                 accepted: accepted_rx,
                 shutdown,
                 handle,
-                pool: BufferPool::new(
-                    NonZeroUsize::new(2048).unwrap(),
-                    NonZeroUsize::new(256).unwrap(),
-                ),
+                pool,
             }
         }
 
@@ -293,7 +295,7 @@ mod tests {
             while let Ok(Some(packet)) =
                 tokio::time::timeout(Duration::from_millis(50), self.replies.recv()).await
             {
-                out.push(packet);
+                out.push(packet.to_vec());
             }
             out
         }
@@ -322,7 +324,7 @@ mod tests {
                 rig.feed(&packet).await;
             }
             for packet in rig.drain().await {
-                client.deliver(packet);
+                client.deliver(&packet);
             }
             client.tick();
             if let Ok(next) = rig.accepted.try_recv() {
@@ -351,7 +353,7 @@ mod tests {
                 rig.feed(&packet).await;
             }
             for packet in rig.drain().await {
-                client.deliver(packet);
+                client.deliver(&packet);
             }
             client.tick();
             echoed.extend(client.take_received());

@@ -41,7 +41,7 @@ use tokio::{
     io::{AsyncReadExt, copy_bidirectional},
     sync::mpsc,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, InterceptDecision,
@@ -628,11 +628,21 @@ async fn splice(
 /// [`TerminationLimits::max_sockets`](crate::TerminationLimits) — the same
 /// admission rule that bounds the socket set. Nothing is spawned that the
 /// terminator has not already admitted.
+///
+/// **Every task is tracked, and this function does not return while one is
+/// alive.** A count bounded by the socket ceiling is not the same statement as
+/// a lifetime bounded by this call: detached tasks hold forged leaves, upstream
+/// TLS connections, and egress sockets, so a shutdown that merely stopped
+/// accepting would leave those open with nothing left to close them. Closing
+/// the tracker stops admission, the token cancels the children, and the wait is
+/// the proof — O(live connections) work, and the same space that was already
+/// admitted.
 pub async fn run_sessions(
     mut accepted: mpsc::Receiver<Accepted>,
     sessions: Arc<Sessions>,
     shutdown: CancellationToken,
 ) {
+    let tracker = TaskTracker::new();
     loop {
         let next = tokio::select! {
             () = shutdown.cancelled() => break,
@@ -644,13 +654,19 @@ pub async fn run_sessions(
         let server = std::net::SocketAddr::new(terminated.server.address, terminated.server.port);
         let sessions = Arc::clone(&sessions);
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             tokio::select! {
                 () = shutdown.cancelled() => {}
                 _ = serve_session(stream, server, sessions) => {}
             }
         });
     }
+
+    // Admission closes first, so nothing joins the set after the wait begins;
+    // then every child observes the same token this loop did.
+    tracker.close();
+    shutdown.cancel();
+    tracker.wait().await;
 }
 
 #[cfg(test)]

@@ -67,6 +67,18 @@ pub trait PacketEgress: Send {
         out: &mut Vec<EgressEmit>,
     ) -> Result<(), EgressError>;
 
+    /// The largest datagram this egress's peer can send it, which is what sizes
+    /// the reactor's network receive buffer.
+    ///
+    /// The default is the ceiling a UDP payload length field can express, which
+    /// is safe for every protocol and precise for none: over-sizing a receive
+    /// buffer costs one allocation for the life of the process, under-sizing it
+    /// truncates a valid datagram into a malformed one. An implementation that
+    /// knows its own framing overrides this with the real bound.
+    fn max_network_datagram(&self) -> usize {
+        usize::from(u16::MAX)
+    }
+
     /// Drives the implementation's own timers: handshake retries, rekeys,
     /// expiry, keepalives.
     fn tick(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError>;
@@ -113,13 +125,27 @@ pub enum DomainNameError {
 
 impl DomainName {
     /// The one boundary untrusted text crosses to become a name.
+    ///
+    /// **The name is normalized to lower case here, and that is the point of
+    /// having a boundary.** DNS labels and TLS server names are
+    /// case-insensitive, so `Example.com` and `example.com` are one host — and
+    /// every consumer that compared them as strings was lower-casing its input
+    /// again, once per connection, once per request, once per response. Doing
+    /// it once at construction makes "a `DomainName` is lower case" an
+    /// invariant those consumers can read instead of re-establish.
+    ///
+    /// O(bytes), with the allocation the caller was going to make anyway and
+    /// an in-place fold rather than a second one.
     pub fn new(name: impl Into<String>) -> Result<Self, DomainNameError> {
-        let name = name.into();
+        let mut name = name.into();
         match name.len() {
             0 => Err(DomainNameError::Empty),
             length if length > 255 => Err(DomainNameError::TooLong(length)),
             _ if name.as_bytes().contains(&0) => Err(DomainNameError::Interior),
-            _ => Ok(Self(name)),
+            _ => {
+                name.make_ascii_lowercase();
+                Ok(Self(name))
+            }
         }
     }
 
@@ -322,25 +348,49 @@ where
 /// is why it is acceptable here and would not be on the packet path.
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A datagram association through a proxy: the UDP half of an egress, as
-/// SOCKS5's UDP ASSOCIATE, Shadowsocks, and VLESS all provide it.
+/// The sending half of a datagram association through a proxy, as SOCKS5's UDP
+/// ASSOCIATE, Shadowsocks, and VLESS all provide it.
 ///
-/// Send and receive name the *target*, because a proxied datagram carries its
-/// destination in the payload rather than in the socket: one association
-/// serves every peer the flow talks to, which is what makes an
-/// endpoint-independent mapping expressible at all.
-pub trait DatagramAssociation: Send + Sync {
+/// Send names the *target*, because a proxied datagram carries its destination
+/// in the payload rather than in the socket: one association serves every peer
+/// the flow talks to, which is what makes an endpoint-independent mapping
+/// expressible at all.
+///
+/// `Sync`, and shared: every live flow sends through the one association.
+pub trait DatagramSink: Send + Sync {
     fn send_to<'a>(
         &'a self,
         payload: &'a [u8],
         target: &'a Target,
     ) -> BoxFuture<'a, Result<(), EgressError>>;
+}
 
+/// The receiving half.
+///
+/// **Owned by exactly one reader, and `&mut` says so.** Two readers of one
+/// datagram association would race for each arriving datagram, which is not a
+/// thing any caller wants; making the receive half affine states that in the
+/// type instead of in a comment, and it is also what lets an implementation
+/// hold its own framing buffer rather than allocating one per datagram.
+pub trait DatagramSource: Send {
     /// Returns the payload length written into `buf` and where it came from.
+    ///
+    /// A payload larger than `buf` is [`EgressError::DatagramTooLarge`], never
+    /// a short success: a datagram is an indivisible message, so half of one is
+    /// not a smaller one.
     fn recv_from<'a>(
-        &'a self,
+        &'a mut self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, Result<(usize, Target), EgressError>>;
+}
+
+/// One datagram association, split into the half that is shared and the half
+/// that is owned. The split is the ownership model, not a convenience: it is
+/// what makes concurrent sending safe without making concurrent receiving
+/// expressible.
+pub struct Association {
+    pub sink: Arc<dyn DatagramSink>,
+    pub source: Box<dyn DatagramSource>,
 }
 
 /// An egress that accepts L4 flows, such as SOCKS5 or Shadowsocks.
@@ -367,7 +417,7 @@ pub trait StreamEgress: Send + Sync {
     /// [`DatagramFidelity::None`](crate::DatagramFidelity::None): those two
     /// statements must agree, and an egress that does not implement this has
     /// already said so in its claim.
-    fn associate(&self) -> BoxFuture<'_, Result<Box<dyn DatagramAssociation>, EgressError>> {
+    fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async { Err(EgressError::DatagramsUnsupported) })
     }
 }
@@ -422,6 +472,24 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// reference implementation rather than inventing a number.
 const WIREGUARD_TICK: Duration = Duration::from_millis(250);
 
+/// The bytes a WireGuard data message adds to the packet it carries: a 16-byte
+/// message header (type, receiver index, counter) plus the 16-byte Poly1305
+/// tag. Handshake messages are all smaller than a full data message, so this
+/// bounds every datagram a peer can send.
+const WIREGUARD_FRAMING_BYTES: usize = 32;
+
+/// WireGuard pads a data payload up to a 16-byte multiple, so the largest
+/// message a peer can send is the padded MTU plus the framing above.
+const WIREGUARD_PADDING_ALIGNMENT: usize = 16;
+
+/// Buffers pre-allocated for the tunnel's own staging.
+///
+/// One packet is in the tunnel at a time on this reactor, so the steady state
+/// needs a handful; the pool grows on demand and recycles on drop, so this is a
+/// warm-up rather than a ceiling. Each buffer is GotaTun's default 4096 bytes,
+/// which is 64 KiB pre-allocated in total.
+const TUNNEL_BUFFERS: usize = 16;
+
 /// Static configuration for one WireGuard peer. Keys are fixed-size arrays,
 /// so validity is structural and there is nothing to validate at runtime.
 pub struct WireGuardConfig {
@@ -468,6 +536,11 @@ pub enum EgressError {
     /// This egress carries no datagrams, which its capability claim already
     /// says: `datagram_fidelity` is `None` and `associate` refuses.
     DatagramsUnsupported,
+    /// A datagram arrived that will not fit the buffer offered for it. Explicit
+    /// rather than a truncated success: the boundary of a datagram is the thing
+    /// a relay claiming native fidelity promises to preserve, and half a QUIC
+    /// packet is not a smaller QUIC packet.
+    DatagramTooLarge { required: usize },
     /// The proxy refused, or spoke something this client could not parse.
     Proxy(ProxyError),
     /// The transport under the proxy failed: no route, refused, reset.
@@ -485,6 +558,9 @@ impl std::fmt::Display for EgressError {
             Self::Masque => f.write_str("MASQUE tunnel failure"),
             Self::Quic => f.write_str("QUIC connection failure"),
             Self::DatagramsUnsupported => f.write_str("this egress carries no datagrams"),
+            Self::DatagramTooLarge { required } => {
+                write!(f, "the datagram needs {required} bytes of buffer")
+            }
             Self::Proxy(error) => write!(f, "proxy failure: {error}"),
             Self::Io(kind) => write!(f, "transport failure: {kind}"),
         }
@@ -516,7 +592,25 @@ impl From<WireGuardError> for EgressError {
 pub struct WireGuardEgress {
     tunn: Tunn,
     mtu: MtuWatcher,
+    /// The same number [`Self::mtu`] watches, kept as the refined type so the
+    /// receive-buffer bound can be read without the `&mut` the watcher's own
+    /// accessor requires.
+    inner_mtu: Mtu,
     pool: Arc<BufferPool>,
+    /// Scratch for [`Self::flush_queue`], kept so a call that finds nothing to
+    /// flush — which is nearly every call — costs no allocation.
+    queued: Vec<WgKind>,
+    /// GotaTun's own recycled buffers, for the packets handed *into* the
+    /// tunnel.
+    ///
+    /// **The second budget, and it is not a duplicate of the first.**
+    /// [`BufferPool`] holds what this crate owns — packets on their way to a
+    /// device or a socket. This one holds what `Tunn` owns while it encrypts or
+    /// decrypts, which is a different lifetime and a different allocator's
+    /// buffer type. Without it, every packet in either direction cost a
+    /// `BytesMut` allocation, which is exactly the per-packet heap cost the
+    /// engineering plan's budget forbids.
+    packets: gotatun::packet::PacketBufPool,
     /// IP packets encapsulated so far. This is the fast-path counter: every
     /// one of these is a packet that bypassed local termination entirely.
     fast_path_packets: u64,
@@ -538,7 +632,10 @@ impl WireGuardEgress {
                 Arc::new(RateLimiter::new(&our_public, HANDSHAKE_RATE_LIMIT)),
             ),
             mtu: MtuWatcher::new(config.inner_mtu.get()),
+            inner_mtu: config.inner_mtu,
             pool,
+            queued: Vec::new(),
+            packets: gotatun::packet::PacketBufPool::new(TUNNEL_BUFFERS),
             fast_path_packets: 0,
         }
     }
@@ -550,16 +647,39 @@ impl WireGuardEgress {
     }
 
     /// Packets queued while no session existed, encapsulated once one does.
+    ///
+    /// Staged through a scratch buffer because `get_queued_packets` borrows the
+    /// tunnel mutably and `network_emit` borrows the pool; the queue is bounded
+    /// by the tunnel's own depth and is empty on every packet but the one that
+    /// completes a handshake. The buffer is *taken out of* `self` and put back,
+    /// so it keeps its capacity across calls — this runs on every inbound
+    /// datagram and every tick, which is exactly where a fresh `Vec` per call
+    /// would be a steady-state cost with no steady-state work.
     fn flush_queue(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
-        // Collected before the pool is touched because `get_queued_packets`
-        // borrows the tunnel mutably; the queue is bounded by the tunnel's own
-        // depth and is empty on every packet but the one that completes a
-        // handshake.
-        let queued: Vec<WgKind> = self.tunn.get_queued_packets(&mut self.mtu).collect();
-        for kind in queued {
-            out.push(self.network_emit(kind)?);
+        let mut queued = std::mem::take(&mut self.queued);
+        queued.clear();
+        queued.extend(self.tunn.get_queued_packets(&mut self.mtu));
+        let result = queued
+            .drain(..)
+            .try_for_each(|kind| self.network_emit(kind).map(|emit| out.push(emit)));
+        self.queued = queued;
+        result
+    }
+
+    /// Stages `bytes` in a recycled tunnel buffer.
+    ///
+    /// Falls back to an owned copy for a packet larger than a pooled buffer,
+    /// which a jumbo-MTU tunnel can produce: correctness first, and the pool's
+    /// fixed slice is a performance property rather than a limit on what can be
+    /// carried.
+    fn stage(&self, bytes: &[u8]) -> Packet<[u8]> {
+        let mut packet = self.packets.get();
+        if packet.buf_mut().len() < bytes.len() {
+            return Packet::copy_from(bytes);
         }
-        Ok(())
+        packet.buf_mut()[..bytes.len()].copy_from_slice(bytes);
+        packet.truncate(bytes.len());
+        packet
     }
 
     fn network_emit(&self, kind: WgKind) -> Result<EgressEmit, EgressError> {
@@ -598,7 +718,7 @@ impl PacketEgress for WireGuardEgress {
         self.fast_path_packets += 1;
         let Some(kind) = self
             .tunn
-            .handle_outgoing_packet(Packet::copy_from(packet), Some(&mut self.mtu))
+            .handle_outgoing_packet(self.stage(packet), Some(&mut self.mtu))
         else {
             return Ok(());
         };
@@ -614,7 +734,8 @@ impl PacketEgress for WireGuardEgress {
         datagram: &[u8],
         out: &mut Vec<EgressEmit>,
     ) -> Result<(), EgressError> {
-        let kind = Packet::copy_from(datagram)
+        let kind = self
+            .stage(datagram)
             .try_into_wg()
             .map_err(|_| EgressError::MalformedNetworkPacket)?;
 
@@ -649,6 +770,14 @@ impl PacketEgress for WireGuardEgress {
 
     fn tick_interval(&self) -> Duration {
         WIREGUARD_TICK
+    }
+
+    /// A padded inner packet plus WireGuard's own framing. Exact rather than
+    /// the trait's 64 KiB default, because this is the egress the mobile target
+    /// runs and one buffer is one buffer.
+    fn max_network_datagram(&self) -> usize {
+        usize::from(self.inner_mtu.get()).next_multiple_of(WIREGUARD_PADDING_ALIGNMENT)
+            + WIREGUARD_FRAMING_BYTES
     }
 }
 
@@ -824,6 +953,38 @@ mod tests {
         let (mut fresh, _server) = pair(&pool);
         fresh.handle_tun_packet(&[0x45; 28], &mut out).unwrap();
         assert_eq!(out.len(), 1);
+    }
+
+    /// **The invariant every downstream comparison now reads instead of
+    /// re-establishing.** A name arrives from an SNI, a proxy configuration, or
+    /// a request header in whatever case its author chose; DNS and TLS treat
+    /// those as one host, so the boundary makes them one value. Every consumer
+    /// that used to lower-case its input per connection, per request, and per
+    /// response now compares borrowed.
+    #[test]
+    fn a_name_is_normalized_where_it_is_admitted() {
+        assert_eq!(
+            DomainName::new("Example.COM").unwrap().as_str(),
+            "example.com"
+        );
+        assert_eq!(
+            DomainName::new("Example.COM"),
+            DomainName::new("example.com"),
+            "one host is one value"
+        );
+        // The refinement still holds, and is checked on the original bytes.
+        assert_eq!(DomainName::new(""), Err(DomainNameError::Empty));
+        assert_eq!(
+            DomainName::new("A".repeat(256)),
+            Err(DomainNameError::TooLong(256))
+        );
+        assert_eq!(DomainName::new("A\0B"), Err(DomainNameError::Interior));
+        // Non-ASCII is left exactly as it was: an IDN is punycode on the wire,
+        // and case-folding beyond ASCII is not a thing DNS asks for.
+        assert_eq!(
+            DomainName::new("xn--Bcher-kva.example").unwrap().as_str(),
+            "xn--bcher-kva.example"
+        );
     }
 
     #[test]

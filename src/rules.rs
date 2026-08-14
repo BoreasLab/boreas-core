@@ -213,6 +213,19 @@ impl RequestFilter for RuleEngine {
 
 impl CosmeticSource for RuleEngine {
     fn rules(&self, host: &str) -> Option<Arc<HidingRules>> {
+        // **The hit path allocates nothing.** Every host reaching here came
+        // through `DomainName`, which lower-cases at construction, so the
+        // borrowed name is already the memo's key; the owned copy is built only
+        // for a caller that has not normalized, and only once more on a miss
+        // that has to insert.
+        if let Some(cached) = self
+            .cosmetic
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(host)
+        {
+            return cached.clone();
+        }
         let host = host.to_ascii_lowercase();
         if let Some(cached) = self
             .cosmetic

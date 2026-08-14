@@ -23,18 +23,22 @@
 | 4 | memory governor | S |
 | 5 | protocol steering and transient UDP/443 backstop | S |
 | 6 | ECH policy in the resolver | S |
-| 7 | header rewriting for CSP, SRI, encoding, and compression | M |
+| 7 | scriptlets and redirect resources; generic cosmetic rules | M |
 | 8 | fragment reassembly, PMTU, ICMP PTB generation and validation | M |
 | 9 | smoltcp socket-set scaling | M |
-| 10 | complete L4 UDP NAT and RFC 4787 conformance | M |
-| 11 | SOCKS5 client and UDP ASSOCIATE | S |
+| 10 | RFC 4787 conformance measurement against a live STUN server | S |
+| 11 | Shadowsocks, VLESS, and Hysteria2 datagram halves | M |
 | 12 | VLESS with the V2Ray transport family, and Hysteria2 | L |
 | 13 | CA lifecycle and user-store installation UX | S |
 | 14 | filter-list build pipeline | S |
 
 Gap 1 shrank because both v1 platforms share one raw-IP datapath. Gaps 3, 4,
-and 13 shrank after arbitrary app interception and iOS left v1 scope. Existing
-packet parsing and UDP state are foundations for gaps 8 and 10, not completion.
+and 13 shrank after arbitrary app interception and iOS left v1 scope. Gaps 10
+and 11 narrowed once the L4 datagram path landed: the relay drives one
+association per client mapping through whichever egress provides one, so what
+is left is measuring the mapping behaviour on a real network and implementing
+the datagram halves of the three proxy protocols that currently claim
+`DatagramFidelity::None`.
 
 ## Milestones
 

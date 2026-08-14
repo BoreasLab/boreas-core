@@ -89,8 +89,20 @@ impl InterceptPolicy {
     }
 
     /// Intercept only an exactly allowlisted host; splice everything else.
+    ///
+    /// **No allocation on the deciding path.** Every host reaching here came
+    /// through [`DomainName`](crate::DomainName), which lower-cases at
+    /// construction, so the borrowed name is already the key — and a
+    /// `HashSet<String>` probes on `&str` directly. The owned copy is the
+    /// fallback for a caller that has not normalized, which is a test and not
+    /// a connection.
     pub fn decide(&self, host: &str) -> InterceptDecision {
-        if self.allow.contains(&host.to_ascii_lowercase()) {
+        let found = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            self.allow.contains(&host.to_ascii_lowercase())
+        } else {
+            self.allow.contains(host)
+        };
+        if found {
             InterceptDecision::Intercept
         } else {
             InterceptDecision::Splice

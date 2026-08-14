@@ -10,7 +10,7 @@ use std::{
 
 use boreas_core::{
     Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy,
-    FlowEvent, InternalEndpoint, Mtu, NatBehavior, SendOutcome, SteeringReason,
+    FlowEvent, InternalEndpoint, Mtu, NatBehavior, SteeringReason,
 };
 
 const NOW: Duration = Duration::from_secs(1_000);
@@ -34,6 +34,12 @@ fn udp_frame() -> Vec<u8> {
 
 #[test]
 fn golden_replay_is_byte_exact() {
+    // A four-slice budget, so the queue's own bound and the pool's are both
+    // visible in the trace below.
+    let pool = BufferPool::new(
+        NonZeroUsize::new(1500).unwrap(),
+        NonZeroUsize::new(4).unwrap(),
+    );
     let mut path = Datapath::new(
         FilterPolicy::PassThrough,
         DnsPolicy::Forward,
@@ -47,13 +53,12 @@ fn golden_replay_is_byte_exact() {
             datagram_buffer_capacity: NonZeroUsize::new(2).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.
-            steering_backstop: Duration::from_secs(60),
-            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+            inspection_window: Duration::from_secs(60),
+            max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+            inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
+            origination_ports: None,
         },
-        BufferPool::new(
-            NonZeroUsize::new(1500).unwrap(),
-            NonZeroUsize::new(64).unwrap(),
-        ),
+        std::sync::Arc::clone(&pool),
     )
     .unwrap();
     let start = Instant::now() + NOW;
@@ -62,7 +67,8 @@ fn golden_replay_is_byte_exact() {
         port: 1234,
     };
 
-    // 1. A whole datagram opens a flow; no transmit on the terminated path.
+    // 1. A whole datagram opens a flow and queues its payload for the egress;
+    //    no transmit on the terminated path.
     path.on_tun_packet(&udp_frame(), start).unwrap();
     assert_eq!(
         path.poll_event(),
@@ -71,26 +77,12 @@ fn golden_replay_is_byte_exact() {
     );
     assert_eq!(path.poll_transmit(), None, "step 1 transmit");
 
-    // 2. Two datagrams buffer; the third drops and reports. Payload bytes come
-    //    from the shared pool, so the byte-exactness this test asserts covers
-    //    the budget accounting too.
-    let pool = BufferPool::new(
-        NonZeroUsize::new(1500).unwrap(),
-        NonZeroUsize::new(4).unwrap(),
-    );
-    assert_eq!(
-        path.send_datagram(endpoint, pool.take(&[1]).unwrap(), start),
-        Ok(SendOutcome::Buffered)
-    );
-    assert_eq!(
-        path.send_datagram(endpoint, pool.take(&[2]).unwrap(), start),
-        Ok(SendOutcome::Buffered)
-    );
+    // 2. A second datagram fills the per-flow queue; the third drops and
+    //    reports. Payload bytes come from the shared pool, so the
+    //    byte-exactness this test asserts covers the budget accounting too.
+    path.on_tun_packet(&udp_frame(), start).unwrap();
     assert_eq!(pool.available(), 2, "two queued payloads hold the budget");
-    assert_eq!(
-        path.send_datagram(endpoint, pool.take(&[3]).unwrap(), start),
-        Ok(SendOutcome::Dropped)
-    );
+    path.on_tun_packet(&udp_frame(), start).unwrap();
     assert_eq!(
         pool.available(),
         2,

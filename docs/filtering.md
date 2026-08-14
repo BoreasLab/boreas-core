@@ -81,17 +81,37 @@ origin. The transient UDP/443 backstop covers the rest: the addresses an
 inspected host resolves to refuse QUIC for a bounded window, so the browser's
 QUIC-versus-TCP race resolves to TCP within its own 300-to-500 ms window. TCP
 to the same address is untouched — it is the destination steering aims at — and
-the drop counter is the convergence signal. Alt-Svc *header* rewriting waits on
-interception, since the header only exists inside an HTTP response.
+the drop counter is the convergence signal.
 
-Encrypted upstreams are implemented in `src/upstream.rs`. DoT (RFC 7858) is
-complete; DoH (RFC 8484) speaks HTTP/1.1 rather than the HTTP/2 the RFC
-requires clients to support, an interim gap that closes when interception
-brings an `h2` stack. DoQ waits on the QUIC stack that arrives with egress
-breadth. The `Upstream` a verdict records distinguishes them precisely because
-the privacy claim differs per transport: DoT is encrypted and authenticated but
-runs on a port a hostile network can simply block, which is the difference DoH
-exists to cover.
+That address index carries a second fact from the same entry: a TCP flow to one
+of those addresses on an intercepted port is what makes the flow a candidate for
+inspection. Deriving both from one entry is what keeps them from disagreeing —
+refusing an address's QUIC so the browser re-races to TCP, and then forwarding
+that TCP past the interceptor, is a steering that achieves nothing.
+
+Alt-Svc *header* rewriting is implemented in `src/exchange.rs`, where the
+response head exists. `steer_alt_svc` removes every alternative whose protocol
+identifier names an HTTP/3 version — percent-decoded, so an encoded token
+cannot slip past — and withdraws the advertisement outright with `clear` when
+none survives. An empty field would say nothing and leave the client's cache in
+place, which is the case the backstop exists to cover; `clear` is what RFC 7838
+gives for saying it. A response advertising no h3 is left byte for byte.
+
+Encrypted upstreams are implemented in `src/upstream.rs`. DoT (RFC 7858) and
+DoQ (RFC 9250) are complete; DoH (RFC 8484) speaks HTTP/1.1 rather than the
+HTTP/2 the RFC requires clients to support, an interim gap that closes when
+interception brings an `h2` stack. The `Upstream` a verdict records
+distinguishes them precisely because the privacy claim differs per transport:
+DoT is encrypted and authenticated but runs on a port a hostile network can
+simply block, which is the difference DoH exists to cover.
+
+DoQ holds one connection and opens a stream per query, where DoT and DoH dial
+per query. That is not extra effort but a different correlation: RFC 9250 gives
+each query its own stream and requires the message id be zero, so there is
+nothing to demultiplex. The id substitution — zero on the wire, the client's
+restored on the reply — lives entirely in the transport, because a resolver may
+close a connection over a non-zero id and a stub resolver discards an answer
+whose id is not the one it sent.
 
 The resolver's trust anchors are Mozilla's bundle and not the platform store,
 because Boreas installs its own root into the user store for interception and a
@@ -181,17 +201,65 @@ Rewriting pipeline:
 2. Confirm `text/html` and a supported character encoding.
 3. Decode content encoding and character encoding.
 4. Rewrite under per-stream memory and strictness budgets.
-5. Re-encode characters and recompress with the original algorithm when
-   possible, otherwise gzip.
-6. Remove `Content-Length` and emit protocol-appropriate streaming framing.
+5. Re-encode characters. **Nothing is recompressed**, and that is a property of
+   where the bytes go rather than a shortcut: the leg from Boreas to the browser
+   is this device's own terminated connection, so recompressing would spend a
+   phone's battery to shrink a memory copy.
+6. Remove `Content-Encoding` and `Content-Length` and emit
+   protocol-appropriate streaming framing.
 
 Supported text must use an ASCII-compatible encoding. UTF-16LE, UTF-16BE,
 ISO-2022-JP, and `replacement` are unsupported and must splice unchanged.
 Wire `lol_html` memory settings and strict bail-out to a fail-open path.
 
+`Coding` is the closed sum of content codings a decoder exists for — identity,
+gzip, deflate, Brotli. Holding one *is* the proof that the body can be read, so
+the rewriter cannot be constructed without it; a coding the sum does not name,
+or two stacked, forwards untouched on the same fail-open path an unsupported
+charset takes. `Accept-Encoding: identity` remains a request, because a cache,
+an intermediary, or a non-compliant origin can all ignore it — which before the
+decoders existed lost the whole tier on that response, silently.
+
+**Preserving WebSocket upgrades is a property of the exchange's own sum.**
+`Connection` and `Upgrade` are hop-by-hop fields, and a proxy that swept them
+unconditionally would answer every WebSocket handshake with an ordinary
+response. `Handling` says which of the two an exchange is; the upgrade branch
+relays both fields, completes both handshakes, and splices the byte streams
+inside the exchange's own lifetime. On h2 the sum is inhabited only by the
+ordinary case: `SETTINGS_ENABLE_CONNECT_PROTOCOL` is never advertised, so RFC
+8441 extended CONNECT is not offered and a client wanting a WebSocket opens an
+h1 connection for it.
+
 Relax CSP only as narrowly as required for injected content. Never modify an
 `integrity=` protected subresource. Preserve WebSocket upgrades and exclude
 hosts from MITM when policy or observed failures require it.
+
+## Remaining Parity Work
+
+Two faculties of the M3 parity gate are **not implemented**, and neither is
+blocked by anything above.
+
+**Generic cosmetic rules.** `adblock` deliberately returns only the
+host-specific set from `url_cosmetic_resources`; the generic set is indexed by
+class and id token and is far too large to ship per page. A browser collects
+those tokens from the DOM. A streaming rewriter can collect them as it walks the
+document — a handler on `[class]` and `[id]` — query
+`Engine::hidden_class_id_selectors` with the tokens the document actually
+contains, and inject a second stylesheet at `</body>`.
+
+The one real obstacle is the Content-Security-Policy discipline above: the head
+stylesheet is admitted by the `'sha256-...'` of its own content, and the second
+stylesheet's content is not known when the response head is written, so its hash
+cannot be. The narrowest resolution is one nonce source covering both injected
+elements, which is strictly less permissive than `'unsafe-inline'` and keeps the
+stated law — the policy differs from the input by the insertion of one source
+expression into one directive. Until that is decided and measured, the HTML tier
+hides only host-specific selectors.
+
+**Scriptlets and redirect resources.** `url_cosmetic_resources` already returns
+`injected_script`, and the redirect syntax needs a typed resource-substitution
+stage in front of the upstream request rather than a body transformation. Both
+are additive to the tiers above.
 
 ## Failure Policy and Gates
 

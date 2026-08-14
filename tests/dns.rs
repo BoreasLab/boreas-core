@@ -103,6 +103,10 @@ struct MockDevice {
 }
 
 impl AsyncDevice for MockDevice {
+    fn mtu(&self) -> Mtu {
+        Mtu::new(1500).unwrap()
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn recv<'a>(
         &'a mut self,
@@ -124,10 +128,10 @@ impl AsyncDevice for MockDevice {
     fn send<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
+    ) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
         async move {
             let _ = self.sent.send(buf.to_vec()).await;
-            Ok(buf.len())
+            Ok(())
         }
     }
 }
@@ -148,9 +152,9 @@ impl AsyncNetwork for SilentNetwork {
     #[allow(clippy::manual_async_fn)]
     fn send<'a>(
         &'a mut self,
-        buf: &'a [u8],
-    ) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
-        async move { Ok(buf.len()) }
+        _buf: &'a [u8],
+    ) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
+        async move { Ok(()) }
     }
 }
 
@@ -259,8 +263,10 @@ fn datapath(pool: Arc<BufferPool>) -> Datapath {
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.
-            steering_backstop: Duration::from_secs(60),
-            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+            inspection_window: Duration::from_secs(60),
+            max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+            inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
+            origination_ports: None,
         },
         pool,
     )
@@ -321,6 +327,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
             },
             policy: tokio::sync::watch::channel(Arc::new(policy)).1,
             termination: None,
+            relay: None,
         },
     );
 
@@ -480,8 +487,10 @@ async fn a_forwarding_session_never_intercepts() {
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.
-            steering_backstop: Duration::from_secs(60),
-            max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+            inspection_window: Duration::from_secs(60),
+            max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+            inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
+            origination_ports: None,
         },
         Arc::clone(&pool),
     )
@@ -501,6 +510,7 @@ async fn a_forwarding_session_never_intercepts() {
             },
             policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
             termination: None,
+            relay: None,
         },
     );
 
@@ -545,6 +555,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
             },
             policy,
             termination: None,
+            relay: None,
         },
     );
 
@@ -681,6 +692,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
             },
             policy: tokio::sync::watch::channel(Arc::new(policy)).1,
             termination: None,
+            relay: None,
         },
     );
 

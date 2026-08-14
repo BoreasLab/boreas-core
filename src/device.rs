@@ -13,7 +13,9 @@ use crate::Mtu;
 
 pub trait Device {
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize>;
-    fn send(&mut self, buf: &[u8]) -> io::Result<usize>;
+    /// Writes one packet **whole**; see [`crate::AsyncDevice::send`] for why
+    /// the byte count is absent from the result rather than returned unchecked.
+    fn send(&mut self, buf: &[u8]) -> io::Result<()>;
     fn mtu(&self) -> Mtu;
 }
 
@@ -161,12 +163,12 @@ impl Device for SimDevice {
         Ok(packet.len())
     }
 
-    fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn send(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.loss_out > 0 && self.rng.below(self.loss_out) == 0 {
-            return Ok(buf.len()); // consumed, lost on the wire
+            return Ok(()); // consumed, lost on the wire
         }
         self.sent.push(buf.to_vec());
-        Ok(buf.len())
+        Ok(())
     }
 
     fn mtu(&self) -> Mtu {
@@ -289,8 +291,10 @@ mod tests {
                 datagram_buffer_capacity: NonZeroUsize::new(64).unwrap(),
                 // Long enough to outlast a browser's cached Alt-Svc entry for
                 // an origin, which is what the DNS rewrite alone cannot reach.
-                steering_backstop: Duration::from_secs(60),
-                max_steered_addresses: NonZeroUsize::new(256).unwrap(),
+                inspection_window: Duration::from_secs(60),
+                max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
+                inspected_ports: crate::DEFAULT_INSPECTED_PORTS,
+                origination_ports: None,
             },
             pool(),
         )

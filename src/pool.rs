@@ -166,6 +166,33 @@ impl DerefMut for Pooled {
     }
 }
 
+impl Pooled {
+    /// Resizes the buffer in place, zero-filling any growth.
+    ///
+    /// For a producer that spends its budget *before* it knows how many bytes
+    /// it will write — a `smoltcp` transmit token is handed out first and told
+    /// its length second — so the reservation and the length are two steps
+    /// rather than one. Never reallocates: the buffer already carries the
+    /// pool's slice capacity, and `len` beyond it is refused rather than grown
+    /// past the budget.
+    ///
+    /// Returns whether the length was admitted. O(len) for the fill, O(1)
+    /// otherwise.
+    #[must_use]
+    pub fn resize(&mut self, len: usize) -> bool {
+        if len > self.pool.slice_size.get() {
+            return false;
+        }
+        self.bytes.resize(len, 0);
+        true
+    }
+
+    /// The largest length [`Self::resize`] will admit.
+    pub fn capacity_hint(&self) -> usize {
+        self.pool.slice_size.get()
+    }
+}
+
 impl PartialEq for Pooled {
     fn eq(&self, other: &Self) -> bool {
         **self == **other
