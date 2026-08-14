@@ -44,10 +44,10 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, InterceptDecision,
-    InterceptPolicy, Interceptor, Leg, NoCosmetics, Prefixed, RequestFilter, RewriteFailures,
-    Rewriting, Standing, StreamBudget, StreamEgress, Target, Tier, VersionCrossings, Wire,
-    classify, run_exchange, transport::client_tls_config,
+    Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Hello,
+    InterceptDecision, InterceptPolicy, Interceptor, Leg, NoCosmetics, Originator, Prefixed,
+    RequestFilter, RewriteFailures, Rewriting, Standing, StreamBudget, StreamEgress, Target, Tier,
+    VersionCrossings, Wire, alpn_for, classify, run_exchange,
 };
 
 /// A TLS record carrying handshake messages.
@@ -55,9 +55,6 @@ const RECORD_HANDSHAKE: u8 = 0x16;
 /// The major version byte every TLS record since 1.0 carries, including 1.3,
 /// whose real version lives in an extension.
 const RECORD_MAJOR: u8 = 0x03;
-const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
-const EXTENSION_SERVER_NAME: u16 = 0x0000;
-const NAME_TYPE_HOST: u8 = 0x00;
 
 /// A TLS record's payload cannot exceed 2^14 bytes, so a ClientHello that has
 /// not arrived within one record plus its header is one this module will not
@@ -73,11 +70,13 @@ const MAX_RECORD: usize = (1 << 14) + 5;
 pub enum Introduction {
     /// Not enough bytes to tell yet. The caller reads more and asks again.
     Incomplete,
-    /// A TLS handshake record. `host` is the SNI when one is present and
-    /// well-formed, and `None` when the ClientHello carries no server name,
-    /// spans more than one record, or is malformed inside a complete record —
-    /// all of which are indistinguishable to a policy that needs a name.
-    Tls { host: Option<DomainName> },
+    /// A TLS handshake record, and everything it revealed. `host` is the SNI
+    /// when one is present and well-formed, and `None` when the ClientHello
+    /// carries no server name, spans more than one record, or is malformed
+    /// inside a complete record — all indistinguishable to a policy that needs
+    /// a name. The [`ClientProfile`] alongside it shapes the upstream hello,
+    /// and comes from the same bytes, so the two cannot disagree.
+    Tls(Hello),
     /// The first bytes are not a TLS handshake record: cleartext HTTP, or any
     /// other protocol on a port the datapath routed here.
     Plain,
@@ -105,106 +104,7 @@ pub fn introduce(bytes: &[u8]) -> Introduction {
     let Some(record) = bytes.get(5..5 + length) else {
         return Introduction::Incomplete;
     };
-    Introduction::Tls {
-        host: server_name(record),
-    }
-}
-
-/// Pulls the SNI out of one handshake record, or `None` for every reason a name
-/// might not be there.
-///
-/// One forward pass over the record; each step either advances or gives up, so
-/// this terminates on any input.
-fn server_name(record: &[u8]) -> Option<DomainName> {
-    let mut reader = Reader::new(record);
-    if reader.u8()? != HANDSHAKE_CLIENT_HELLO {
-        return None;
-    }
-    // A handshake body longer than this record is a ClientHello fragmented
-    // across records. Legal, vanishingly rare, and not reassembled here: the
-    // result is a splice, which is the safe answer rather than a wrong one.
-    let body = reader.u24().and_then(|length| reader.take(length))?;
-
-    let mut hello = Reader::new(body);
-    hello.take(2)?; // legacy_version
-    hello.take(32)?; // random
-    hello.vector_u8()?; // legacy_session_id
-    hello.vector_u16()?; // cipher_suites
-    hello.vector_u8()?; // legacy_compression_methods
-    let extensions = hello.vector_u16()?;
-
-    // Extensions are a sequence, not a map, so this is a scan. It is O(bytes)
-    // rather than O(extensions) times anything: each header is read once and
-    // its body skipped by length.
-    let mut reader = Reader::new(extensions);
-    while let Some(kind) = reader.u16() {
-        let body = reader.vector_u16()?;
-        if kind != EXTENSION_SERVER_NAME {
-            continue;
-        }
-        // ServerNameList: a vector of (name_type, opaque name). RFC 6066 allows
-        // at most one entry per type, and `host_name` is the only type defined,
-        // so the first one that matches is the answer.
-        let mut names = Reader::new(body.get(2..)?);
-        while let Some(name_type) = names.u8() {
-            let name = names.vector_u16()?;
-            if name_type == NAME_TYPE_HOST {
-                // The name crosses into the domain through the same smart
-                // constructor every other host does, so an over-long or
-                // NUL-bearing SNI is rejected here rather than downstream.
-                return std::str::from_utf8(name)
-                    .ok()
-                    .and_then(|host| DomainName::new(host).ok());
-            }
-        }
-        return None;
-    }
-    None
-}
-
-/// A forward cursor over untrusted bytes. Every accessor is total: it returns
-/// `None` rather than panicking, so the parser above never indexes.
-struct Reader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    fn take(&mut self, length: usize) -> Option<&'a [u8]> {
-        let taken = self.bytes.get(..length)?;
-        self.bytes = &self.bytes[length..];
-        Some(taken)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|byte| byte[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        self.take(2)
-            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn u24(&mut self) -> Option<usize> {
-        self.take(3).map(|bytes| {
-            usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2])
-        })
-    }
-
-    /// A length-prefixed vector with a one-byte length, returning its body.
-    fn vector_u8(&mut self) -> Option<&'a [u8]> {
-        let length = usize::from(self.u8()?);
-        self.take(length)
-    }
-
-    /// A length-prefixed vector with a two-byte length, returning its body.
-    fn vector_u16(&mut self) -> Option<&'a [u8]> {
-        let length = usize::from(self.u16()?);
-        self.take(length)
-    }
+    Introduction::Tls(crate::read_hello(record))
 }
 
 /// Why a connection was spliced. Recorded rather than discarded: "spliced"
@@ -326,10 +226,12 @@ pub struct Sessions {
     /// read one compiled index.
     cosmetic: Arc<dyn CosmeticSource>,
     budget: StreamBudget,
-    /// One client configuration per wire, so the upstream leg can offer
-    /// exactly the protocol the client settled on. Built once: a `ClientConfig`
-    /// parses the trust anchors, which is not a per-connection cost.
-    upstream: [Arc<rustls::ClientConfig>; 2],
+    /// The originating TLS client. **BoringSSL, not rustls**, and the split is
+    /// the point: the terminating side faces an application on this device and
+    /// nothing fingerprints it, while this side faces an origin and a CDN. It
+    /// is one value because it memoises a built connector per profile and ALPN,
+    /// and parsing the trust anchors is not a per-connection cost.
+    originator: Arc<Originator>,
 }
 
 impl Sessions {
@@ -350,20 +252,14 @@ impl Sessions {
             limits,
             cosmetic: Arc::new(NoCosmetics),
             budget: StreamBudget::default(),
-            upstream: [
-                client_tls_config(&[b"http/1.1".to_vec()], &[])?,
-                client_tls_config(&[b"h2".to_vec()], &[])?,
-            ],
+            originator: Arc::new(Originator::new()),
         })
     }
 
     /// Trusts `extra_roots` in addition to the bundled anchors on the upstream
     /// leg. For a test origin, or a deployment behind a private CA.
     pub fn with_upstream_roots(mut self, extra_roots: &[Vec<u8>]) -> Result<Self, EgressError> {
-        self.upstream = [
-            client_tls_config(&[b"http/1.1".to_vec()], extra_roots)?,
-            client_tls_config(&[b"h2".to_vec()], extra_roots)?,
-        ];
+        self.originator = Arc::new(Originator::new().with_extra_roots(extra_roots));
         Ok(self)
     }
 
@@ -396,13 +292,6 @@ impl Sessions {
             Tier::Inspect | Tier::Splice => Rewriting::Off,
         }
     }
-
-    fn upstream_config(&self, wire: Wire) -> Arc<rustls::ClientConfig> {
-        match wire {
-            Wire::Http1 => Arc::clone(&self.upstream[0]),
-            Wire::Http2 => Arc::clone(&self.upstream[1]),
-        }
-    }
 }
 
 /// Serves one terminated connection to completion.
@@ -423,9 +312,12 @@ pub async fn serve_session(
     let port = server.port();
     let (introduction, peeked, stream) = peek(stream, sessions.limits.peek_timeout).await;
 
-    let host = match introduction {
-        Introduction::Tls { host: Some(host) } => host,
-        Introduction::Tls { host: None } => {
+    let (host, profile) = match introduction {
+        Introduction::Tls(Hello {
+            host: Some(host),
+            profile,
+        }) => (host, profile),
+        Introduction::Tls(Hello { host: None, .. }) => {
             return splice(sessions, server, peeked, stream, SpliceReason::Unnamed).await;
         }
         Introduction::Plain => {
@@ -492,10 +384,15 @@ pub async fn serve_session(
         .connect(&target)
         .await
         .map_err(SessionError::Upstream)?;
-    let server_name = rustls::pki_types::ServerName::try_from(host.as_str().to_owned())
-        .map_err(|_| SessionError::Upstream(EgressError::Proxy(crate::ProxyError::Address)))?;
-    let upstream = match tokio_rustls::TlsConnector::from(sessions.upstream_config(wire))
-        .connect(server_name, upstream)
+    // **The hello Boreas sends is the one it just read.** `profile` came out of
+    // the client's own ClientHello, so this connection looks like the
+    // application that made it rather than like a proxy — or like a canonical
+    // Chrome, which on a WebView or Cronet device would be a fresh mismatch.
+    // The ALPN is the settled wire and nothing else, which is what keeps a
+    // crossed HTTP version unrepresentable.
+    let upstream = match sessions
+        .originator
+        .connect(host.as_str(), &profile, &alpn_for(wire), upstream)
         .await
     {
         Ok(upstream) => upstream,
@@ -675,6 +572,10 @@ mod tests {
 
     /// A real ClientHello, assembled field by field so the test states the
     /// layout rather than trusting an opaque blob.
+    const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+    const EXTENSION_SERVER_NAME: u16 = 0x0000;
+    const NAME_TYPE_HOST: u8 = 0x00;
+
     pub(super) fn client_hello(server_name: Option<&str>) -> Vec<u8> {
         let mut extensions = Vec::new();
         if let Some(name) = server_name {
@@ -717,9 +618,10 @@ mod tests {
         let hello = client_hello(Some("example.com"));
         assert_eq!(
             introduce(&hello),
-            Introduction::Tls {
+            Introduction::Tls(Hello {
                 host: Some(DomainName::new("example.com").unwrap()),
-            }
+                profile: crate::ClientProfile::default(),
+            })
         );
     }
 
@@ -745,7 +647,7 @@ mod tests {
     fn tls_without_a_server_name_is_tls_with_no_host() {
         assert_eq!(
             introduce(&client_hello(None)),
-            Introduction::Tls { host: None }
+            Introduction::Tls(Hello::default())
         );
     }
 
@@ -792,11 +694,11 @@ mod tests {
         let long = "a".repeat(300);
         assert_eq!(
             introduce(&client_hello(Some(&long))),
-            Introduction::Tls { host: None }
+            Introduction::Tls(Hello::default())
         );
         assert_eq!(
             introduce(&client_hello(Some("bad\0host"))),
-            Introduction::Tls { host: None }
+            Introduction::Tls(Hello::default())
         );
     }
 }
@@ -838,6 +740,15 @@ mod end_to_end {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        // A distinct subject, because rcgen gives every certificate the same
+        // default one — which would make the leaf's issuer equal to its own
+        // subject and so indistinguishable from a self-signed certificate. The
+        // old rustls upstream matched anchors by signature and did not care;
+        // BoringSSL reports it as `DEPTH_ZERO_SELF_SIGNED_CERT`, and is right
+        // to, so the fixture is what changes.
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "boreas test origin ca");
         let ca = ca_params.clone().self_signed(&ca_key).unwrap();
         let issuer = rcgen::Issuer::new(ca_params, ca_key);
 

@@ -45,6 +45,8 @@ use std::{
 
 use rustls::{AlertDescription, Error as TlsError};
 
+use crate::{HandshakeFailure, Refusal};
+
 /// How much of the interception stack a host tolerates.
 ///
 /// A three-point chain ordered by how much Boreas does, so `Splice < Inspect <
@@ -248,30 +250,59 @@ pub enum Leg {
 /// minute of network disable filtering for half a day.
 ///
 /// O(1): one downcast and one match. No allocation.
+/// **The two legs run different TLS implementations, so they carry different
+/// evidence.** Boreas terminates the client with rustls and originates upstream
+/// with BoringSSL — see [`mirror`](crate::Originator) for why the asymmetry is
+/// deliberate — so this dispatches on the leg first and reads each side's own
+/// error type. A single downcast would silently classify nothing on whichever
+/// leg it did not name, which is exactly how half a demotion lattice stops
+/// working without anything failing.
 #[must_use]
 pub fn classify(leg: Leg, error: &io::Error) -> Option<Demotion> {
-    // `tokio-rustls` reports a protocol failure as `InvalidData` wrapping the
-    // `rustls::Error`, which is the only place the alert survives; an error
-    // that is not one of those is transport trouble and not evidence.
-    let tls = error.get_ref()?.downcast_ref::<TlsError>()?;
-    match (leg, tls) {
-        // Either side may be the one that finds no shared protocol, and the
-        // remedy is the same from both.
-        (_, TlsError::NoApplicationProtocol)
-        | (_, TlsError::AlertReceived(AlertDescription::NoApplicationProtocol)) => {
+    let inner = error.get_ref()?;
+    match leg {
+        Leg::Client => terminating(inner.downcast_ref::<TlsError>()?),
+        Leg::Upstream => originating(inner.downcast_ref::<HandshakeFailure>()?.refusal?),
+    }
+}
+
+/// Evidence from rustls, terminating the client.
+///
+/// `tokio-rustls` reports a protocol failure as `InvalidData` wrapping the
+/// `rustls::Error`, which is the only place the alert survives; anything else
+/// is transport trouble and not evidence.
+fn terminating(tls: &TlsError) -> Option<Demotion> {
+    match tls {
+        TlsError::NoApplicationProtocol
+        | TlsError::AlertReceived(AlertDescription::NoApplicationProtocol) => {
             Some(Demotion::ProtocolRefused)
         }
-        (Leg::Client, TlsError::AlertReceived(alert)) => {
-            conclusive(*alert).then_some(Demotion::LeafRejected)
-        }
-        // Boreas rejected the server, rather than the server rejecting Boreas.
-        (Leg::Upstream, TlsError::InvalidCertificate(_)) => Some(Demotion::UpstreamUntrusted),
-        (Leg::Upstream, TlsError::AlertReceived(alert)) => {
-            conclusive(*alert).then_some(Demotion::UpstreamRefusedProxy)
-        }
+        TlsError::AlertReceived(alert) => conclusive(*alert).then_some(Demotion::LeafRejected),
         _ => None,
     }
 }
+
+/// Evidence from BoringSSL, originating to the server.
+///
+/// Total over [`Refusal`], which is the point of that sum: the three arms are
+/// the three distinguishable outcomes, and each maps to exactly one remedy.
+fn originating(refusal: Refusal) -> Option<Demotion> {
+    match refusal {
+        // Either side may be the one that finds no shared protocol, and the
+        // remedy is the same from both.
+        Refusal::NoProtocol | Refusal::Alert(ALERT_NO_APPLICATION_PROTOCOL) => {
+            Some(Demotion::ProtocolRefused)
+        }
+        // Boreas rejected the server, rather than the server rejecting Boreas.
+        Refusal::Untrusted => Some(Demotion::UpstreamUntrusted),
+        Refusal::Alert(alert) => conclusive_alert(alert).then_some(Demotion::UpstreamRefusedProxy),
+    }
+}
+
+/// RFC 8446's alert descriptions this module names.
+const ALERT_CLOSE_NOTIFY: u8 = 0;
+const ALERT_USER_CANCELED: u8 = 90;
+const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
 /// Whether an alert will recur on the next attempt.
 ///
@@ -284,6 +315,13 @@ fn conclusive(alert: AlertDescription) -> bool {
         alert,
         AlertDescription::CloseNotify | AlertDescription::UserCanceled
     )
+}
+
+/// The same question asked of BoringSSL's raw description byte, which is what
+/// [`Refusal::Alert`] carries. Kept beside [`conclusive`] so the two exceptions
+/// are stated once and cannot drift apart.
+fn conclusive_alert(alert: u8) -> bool {
+    !matches!(alert, ALERT_CLOSE_NOTIFY | ALERT_USER_CANCELED)
 }
 
 /// When each cause was last observed against one host, as the instant it stops
@@ -572,6 +610,11 @@ mod tests {
         io::Error::new(io::ErrorKind::InvalidData, error)
     }
 
+    /// The upstream leg's shape: BoringSSL's verdict, as `mirror` wraps it.
+    fn boring_error(refusal: Refusal) -> io::Error {
+        io::Error::other(HandshakeFailure::new(Some(refusal), "synthesized"))
+    }
+
     /// The classifier's whole job: name conclusive TLS refusals, and refuse to
     /// read anything into transport trouble.
     #[test]
@@ -583,27 +626,36 @@ mod tests {
             ),
             Some(Demotion::LeafRejected)
         );
+        // The upstream leg is BoringSSL, so its evidence is a `Refusal` and
+        // not a `rustls::Error`. Alert 116 is `certificate_required`.
         assert_eq!(
-            classify(
-                Leg::Upstream,
-                &tls_error(TlsError::AlertReceived(
-                    AlertDescription::CertificateRequired
-                ))
-            ),
+            classify(Leg::Upstream, &boring_error(Refusal::Alert(116))),
             Some(Demotion::UpstreamRefusedProxy)
         );
         assert_eq!(
-            classify(
-                Leg::Upstream,
-                &tls_error(TlsError::InvalidCertificate(
-                    rustls::CertificateError::UnknownIssuer
-                ))
-            ),
+            classify(Leg::Upstream, &boring_error(Refusal::Untrusted)),
             Some(Demotion::UpstreamUntrusted)
         );
         assert_eq!(
-            classify(Leg::Upstream, &tls_error(TlsError::NoApplicationProtocol)),
+            classify(Leg::Upstream, &boring_error(Refusal::NoProtocol)),
             Some(Demotion::ProtocolRefused)
+        );
+        assert_eq!(
+            classify(
+                Leg::Upstream,
+                &boring_error(Refusal::Alert(ALERT_NO_APPLICATION_PROTOCOL))
+            ),
+            Some(Demotion::ProtocolRefused)
+        );
+        // Each leg reads only its own implementation's errors: a rustls error
+        // arriving from the upstream leg is not evidence, and vice versa.
+        assert_eq!(
+            classify(Leg::Upstream, &tls_error(TlsError::NoApplicationProtocol)),
+            None
+        );
+        assert_eq!(
+            classify(Leg::Client, &boring_error(Refusal::Untrusted)),
+            None
         );
 
         // Transport trouble proves nothing, and this is the half that matters:
@@ -632,19 +684,31 @@ mod tests {
                 "{alert:?}"
             );
         }
+        for alert in [ALERT_CLOSE_NOTIFY, ALERT_USER_CANCELED] {
+            assert_eq!(
+                classify(Leg::Upstream, &boring_error(Refusal::Alert(alert))),
+                None,
+                "{alert}"
+            );
+        }
     }
 
     /// The legs read the same error differently, and must: only the server can
     /// refuse the proxy, and only the client can refuse the forged leaf.
     #[test]
     fn the_two_legs_read_the_same_alert_as_different_evidence() {
-        let refused = tls_error(TlsError::AlertReceived(AlertDescription::HandshakeFailure));
+        // `handshake_failure`, alert 40, seen from each side. The legs run
+        // different TLS implementations, so the same alert arrives in two
+        // shapes — and still has to mean two different things.
         assert_eq!(
-            classify(Leg::Client, &refused),
+            classify(
+                Leg::Client,
+                &tls_error(TlsError::AlertReceived(AlertDescription::HandshakeFailure))
+            ),
             Some(Demotion::LeafRejected)
         );
         assert_eq!(
-            classify(Leg::Upstream, &refused),
+            classify(Leg::Upstream, &boring_error(Refusal::Alert(40))),
             Some(Demotion::UpstreamRefusedProxy)
         );
     }

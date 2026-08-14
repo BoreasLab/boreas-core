@@ -9,6 +9,7 @@ mod exchange;
 mod filter;
 mod hysteria2;
 mod masque;
+mod mirror;
 mod mitm;
 mod origin;
 mod packet;
@@ -66,6 +67,10 @@ pub use hysteria2::{
 pub use masque::{
     CloseReason, MASQUE_OVERHEAD_BYTES, MasqueConfig, MasqueEgress, TunnelState,
     decode_ip_datagram, encode_ip_datagram,
+};
+pub use mirror::{
+    ClientProfile, HandshakeFailure, Hello, MirrorError, Opaque, Originator, Refusal, alpn_for,
+    alpn_list, read_hello,
 };
 pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
 pub use origin::{
