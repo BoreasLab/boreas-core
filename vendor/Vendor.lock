@@ -10,7 +10,7 @@ name = "h2"
 version = "0.4.15"
 crate-sha256 = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
 patch-sha256 = "cd3a3fcc0fed35e56d34447508b88f38a193e3a4eb5f3f8391076ab8d386ba4c"
-tree-sha256 = "849adf31f9a4cce5be67aacad0cb486f6fd5004532ba835a9c9be3c730e5aa87"
+tree-sha256 = "52796890be4efd830de289b7d066483d141996eb03de74f381482df5a0d4cf46"
 application = "clean"
 
 [[vendored]]

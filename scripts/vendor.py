@@ -588,6 +588,33 @@ def unpack(entry: Entry, release: Release, into: Path) -> Path:
     return unpacked
 
 
+def unversioned(tree: Path) -> list[str]:
+    """Paths present in `tree` that git is not tracking, sorted.
+
+    **The digest alone cannot catch this.** `tree_digest` walks the filesystem
+    and the lock records what it saw, so a file git declines to commit agrees
+    with the lock on the machine that wrote it and is simply absent everywhere
+    else -- drift that reproduces only in CI. `publish` removes the one cause
+    known to occur; this reports any other before it can travel.
+
+    O(files) in the tree, one `git ls-files` and one walk, no network.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "."],
+        cwd=tree,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if listed.returncode != 0:
+        return []
+    tracked = {name for name in listed.stdout.split("\0") if name}
+    walked = {
+        path.relative_to(tree).as_posix() for path in tree.rglob("*") if path.is_file()
+    }
+    return sorted(walked - tracked)
+
+
 def git(tree: Path, *arguments: str) -> int:
     return subprocess.run(
         ["git", *arguments], cwd=tree, capture_output=True, check=False
@@ -620,8 +647,21 @@ def apply_patch(tree: Path, patch: Path) -> Application:
 
 def publish(staged: Path, destination: Path) -> None:
     """Swap whole directories rather than writing into the live one, so a run
-    that dies midway leaves the previous tree intact and buildable."""
+    that dies midway leaves the previous tree intact and buildable.
+
+    **Every `.gitignore` the package ships is dropped, and that is a
+    correctness requirement rather than tidiness.** A nested `.gitignore`
+    outranks any rule further up, so a crate that ignores its own `Cargo.lock`
+    -- h2 does -- makes `git add` skip a file that is nonetheless part of the
+    tree. `--check` would then hash a working copy holding it against a commit
+    that never did, and report drift on every machine but the one that ran the
+    materialiser. The rules belong to that dependency's own development; this
+    tree is generated output of *this* repository, and what may be committed
+    here is not theirs to decide.
+    """
     shutil.rmtree(staged / ".git", ignore_errors=True)
+    for ignore in staged.rglob(".gitignore"):
+        ignore.unlink()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         shutil.rmtree(destination)
@@ -700,6 +740,12 @@ def check_one(entry: Entry, root: Path, row: LockRow | None) -> Outcome:
         )
     if (actual := tree_digest(tree)) != row.tree_sha256:
         return Drifted(entry.name, f"the tree was edited by hand ({actual[:12]})")
+    if untracked := unversioned(tree):
+        return Drifted(
+            entry.name,
+            f"{len(untracked)} file(s) are not committed, starting at "
+            f"{untracked[0]}; something is ignoring them",
+        )
     return Current(entry.name, row.version)
 
 
