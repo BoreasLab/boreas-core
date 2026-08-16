@@ -52,3 +52,11 @@ that owns the work, then follow its links only when a boundary is crossed.
 | `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |
 | `src/path.rs` | PTB validation against known flows, SYN MSS clamping | [Networking](networking.md) |
 | `src/udp.rs` | bounded datagrams and endpoint-independent mapping state | [Networking](networking.md) |
+| `src/mitm.rs` | the terminating TLS server, one acceptor per wire, and the interception allowlist | [Filtering](filtering.md) |
+| `src/mirror.rs` | the originating side: the ClientHello every dialling leg sends, and Chrome's HTTP/2 preface | [Decisions](decisions.md) |
+| `src/session.rs` | what happens to one terminated connection: introduce, decide, originate, terminate, serve | [Filtering](filtering.md) |
+| `src/exchange.rs` | the HTTP exchange, URL-tier filtering, hop-by-hop sweep, Alt-Svc steering | [Filtering](filtering.md) |
+| `src/rewrite.rs` | the HTML tier: content-coding decode, streaming rewrite under a budget | [Filtering](filtering.md) |
+| `src/demote.rs` | what a failed handshake proved, and the tier a host's history permits | [Filtering](filtering.md) |
+| `src/transport.rs` | proxy transports: TLS, WebSocket, HTTPUpgrade, gRPC, HTTP/2, QUIC | [Egress](egress.md) |
+| `vendor/` | crates patched in tree, generated from `vendor/patches/` by `scripts/vendor.py` | [vendor/README.md](../vendor/README.md) |
