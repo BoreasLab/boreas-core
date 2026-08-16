@@ -9,20 +9,23 @@
 //!
 //! **The host is not known when the connection arrives, and that is the whole
 //! problem this module solves.** A terminated flow carries an IP address and a
-//! port; the allowlist names *hosts*. The name lives in the TLS ClientHello's
-//! SNI extension, which arrives in the client's first bytes — before any
-//! handshake this process participates in. So the first thing here is a parser
-//! that reads those bytes without consuming them, and the rest follows from
-//! what it finds.
+//! port; the allowlist names *hosts*. The name arrives in the client's first
+//! bytes, before any handshake this process participates in — in a TLS
+//! ClientHello's SNI extension, or, on a site that never got a certificate, in
+//! a cleartext request's `Host` field. So the first thing here is a parser that
+//! reads those bytes without consuming them, and the rest follows from what it
+//! finds.
 //!
 //! **Fail open is a property of the type, not of the control flow.**
-//! [`Introduction`] has exactly three shapes and only one of them can lead to
-//! interception: a TLS record, carrying an SNI, naming a host the policy
-//! admits. Everything else — a name that is not allowlisted, a ClientHello with
-//! no SNI, bytes that are not TLS at all, a client that says nothing before the
-//! deadline — reaches [`Handling::Spliced`] with a reason attached. There is no
-//! path on which a parse failure intercepts, because the parser has no failure
-//! case: it can only fail to *recognise*, and non-recognition is splice.
+//! [`Introduction`] has exactly four shapes and only two of them can lead to
+//! interception: a TLS record carrying an SNI, or a complete request head
+//! carrying a `Host`, either one naming a host the policy admits. Everything
+//! else — a name that is not allowlisted, a ClientHello with no SNI, a request
+//! with no `Host`, bytes that are neither protocol, a client that says nothing
+//! before the deadline — reaches [`Handling::Spliced`] with a reason attached.
+//! There is no path on which a parse failure intercepts, because the parser has
+//! no failure case: it can only fail to *recognise*, and non-recognition is
+//! splice.
 //!
 //! **No version is crossed, and the origin is what settles it.** The upstream
 //! handshake runs first, offering the client's own ALPN list; the origin picks
@@ -45,7 +48,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Hello,
+    Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Either, Hello,
     InterceptDecision, InterceptPolicy, Interceptor, Leg, NoCosmetics, Originator, Prefixed,
     RequestFilter, RewriteFailures, Rewriting, Standing, StreamBudget, StreamEgress, Target, Tier,
     VersionCrossings, Wire, classify, run_exchange,
@@ -62,11 +65,18 @@ const RECORD_MAJOR: u8 = 0x03;
 /// wait for.
 const MAX_RECORD: usize = (1 << 14) + 5;
 
+/// How many header fields a cleartext request head may carry before this stops
+/// reading it. A browser sends fewer than twenty; the cap is here because the
+/// bytes are untrusted, and a head that exceeds it splices rather than being
+/// read further.
+const MAX_REQUEST_HEADERS: usize = 64;
+
 /// What the client's first bytes reveal.
 ///
-/// Three states, and the sum is the safety argument: only [`Self::Tls`] with a
-/// name can lead to interception, so every other outcome — including every
-/// malformed input — splices without a branch having to remember to.
+/// Four states, and the sum is the safety argument: only [`Self::Tls`] or
+/// [`Self::Http`] *with a name* can lead to interception, so every other
+/// outcome — including every malformed input — splices without a branch having
+/// to remember to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Introduction {
     /// Not enough bytes to tell yet. The caller reads more and asks again.
@@ -79,9 +89,31 @@ pub enum Introduction {
     /// the [`Offer`](crate::Offer) is what that hello proposes, both from these
     /// same bytes, so none of the three can disagree.
     Tls(Hello),
-    /// The first bytes are not a TLS handshake record: cleartext HTTP, or any
-    /// other protocol on a port the datapath routed here.
+    /// A complete cleartext HTTP/1.x request head, and the `Host` it named.
+    ///
+    /// **The blind spot this closes is a site with no HTTPS at all.** Port 80 is
+    /// inspected for the redirects that lead to 443, but a redirect is not the
+    /// only thing served there, and a host reached only over cleartext was
+    /// passing through unfiltered. `Host` is the cleartext analogue of SNI, and
+    /// `None` — absent, unparseable, or an address rather than a name — is the
+    /// same non-decision an absent SNI is.
+    Http { host: Option<DomainName> },
+    /// Neither a TLS record nor an HTTP request: any other protocol on a port
+    /// the datapath routed here.
     Plain,
+}
+
+/// How a session reaches the origin, once a host is known.
+///
+/// The two arms are the two things port 443 and port 80 are: a connection to
+/// re-originate under the client's own hello, and one that was never encrypted
+/// and needs no handshake at all.
+enum Approach {
+    Tls {
+        profile: crate::ClientProfile,
+        alpn: crate::Offer,
+    },
+    Cleartext,
 }
 
 /// Reads the client's first bytes without consuming them.
@@ -92,21 +124,55 @@ pub enum Introduction {
 /// force every caller to choose a fallback, and one of them would eventually
 /// choose to intercept.
 ///
-/// O(n) in the bytes examined, bounded by one TLS record, with one allocation
+/// O(n) in the bytes examined, bounded by [`MAX_RECORD`], with one allocation
 /// for the returned name and none otherwise.
 pub fn introduce(bytes: &[u8]) -> Introduction {
-    // TLS record header: type(1), legacy version(2), length(2).
+    // TLS record header: type(1), legacy version(2), length(2). Too few bytes
+    // to recognise one is also too few to hold a request line.
     let Some(header) = bytes.get(..5) else {
         return Introduction::Incomplete;
     };
     if header[0] != RECORD_HANDSHAKE || header[1] != RECORD_MAJOR {
-        return Introduction::Plain;
+        return request_head(bytes);
     }
     let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
     let Some(record) = bytes.get(5..5 + length) else {
         return Introduction::Incomplete;
     };
     Introduction::Tls(crate::read_hello(record))
+}
+
+/// Reads a cleartext HTTP/1.x request head for the `Host` it names.
+///
+/// `httparse` does the reading: it is already in the graph beneath `hyper`, it
+/// borrows rather than allocates, and it is tolerant in exactly the places a
+/// hand-rolled scan would be strict. Anything it refuses is [`Introduction::Plain`],
+/// which splices — so a protocol that merely resembles HTTP costs one parse.
+fn request_head(bytes: &[u8]) -> Introduction {
+    let mut fields = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
+    let mut request = httparse::Request::new(&mut fields);
+    match request.parse(bytes) {
+        Ok(httparse::Status::Complete(_)) => Introduction::Http {
+            host: host_field(request.headers),
+        },
+        Ok(httparse::Status::Partial) => Introduction::Incomplete,
+        Err(_) => Introduction::Plain,
+    }
+}
+
+/// The `Host` field's name, without its port.
+///
+/// Parsed as an authority rather than split on the last colon, because an IPv6
+/// literal is full of colons and `[::1]:80` would otherwise yield `[::1`. Both
+/// forms end at the same place: an address is not a name, so
+/// [`DomainName`] refuses it and the connection splices.
+fn host_field(fields: &[httparse::Header<'_>]) -> Option<DomainName> {
+    let value = fields
+        .iter()
+        .find(|field| field.name.eq_ignore_ascii_case("host"))?
+        .value;
+    let authority: http::uri::Authority = std::str::from_utf8(value).ok()?.parse().ok()?;
+    DomainName::new(authority.host()).ok()
 }
 
 /// Why a connection was spliced. Recorded rather than discarded: "spliced"
@@ -319,13 +385,14 @@ pub async fn serve_session(
     let port = server.port();
     let (introduction, peeked, stream) = peek(stream, sessions.limits.peek_timeout).await;
 
-    let (host, profile, alpn) = match introduction {
+    let (host, approach) = match introduction {
         Introduction::Tls(Hello {
             host: Some(host),
             profile,
             alpn,
-        }) => (host, profile, alpn),
-        Introduction::Tls(Hello { host: None, .. }) => {
+        }) => (host, Approach::Tls { profile, alpn }),
+        Introduction::Http { host: Some(host) } => (host, Approach::Cleartext),
+        Introduction::Tls(Hello { host: None, .. }) | Introduction::Http { host: None } => {
             return splice(sessions, server, peeked, stream, SpliceReason::Unnamed).await;
         }
         Introduction::Plain => {
@@ -363,16 +430,6 @@ pub async fn serve_session(
     }
     let tier = standing.tier();
 
-    // **The upstream handshake comes first, and that is what fixes the wire.**
-    // The origin picks from the client's own ALPN list, and the client is then
-    // offered exactly what the origin picked — so a crossed version stays
-    // unrepresentable *and* an origin that speaks only HTTP/1.1 is still
-    // served. Settling on the client's choice instead would offer `h2` alone to
-    // such an origin and be refused outright, losing a site Chrome loads.
-    //
-    // The order also buys back the failure case the client-first order could
-    // not have: no forged leaf has been sent yet, so an upstream handshake that
-    // fails still has a whole connection left to splice.
     let target = Target::Domain {
         host: host.clone(),
         port,
@@ -382,45 +439,73 @@ pub async fn serve_session(
         .connect(&target)
         .await
         .map_err(SessionError::Upstream)?;
-    // **The hello Boreas sends is the one it just read.** `profile` came out of
-    // the client's own ClientHello, so this connection looks like the
-    // application that made it rather than like a proxy — or like a canonical
-    // Chrome, which on a WebView or Cronet device would be a fresh mismatch.
-    let upstream = match sessions
-        .originator
-        .connect(host.as_str(), &profile, &alpn.encode(), transport)
-        .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            if let Some(cause) = classify(Leg::Upstream, &error) {
-                sessions
-                    .demotions
-                    .record(host.as_str(), cause, Instant::now());
-            }
-            return splice(
-                sessions,
-                server,
-                peeked,
-                stream,
-                SpliceReason::OriginHandshake,
-            )
-            .await;
-        }
-    };
-    let wire = Wire::from_alpn(upstream.ssl().selected_alpn_protocol());
 
-    let replayed = Prefixed::new(peeked, stream);
-    let client = match sessions.interceptor.terminate(replayed, wire).await {
-        Ok(client) => client,
-        Err(error) => {
-            // Here the leaf *has* been sent, so a client that rejects it leaves
-            // nothing to splice with. That cost is stated in
-            // [`crate::Demotions`] and is why demotion is measured on the retry.
-            return learn(&sessions, &host, Leg::Client, error, |error| {
-                SessionError::ClientHandshake(error)
-            });
+    // Both approaches end with the same pair of byte streams and a wire; what
+    // differs is how many handshakes stand between them.
+    let (client, upstream, wire) = match approach {
+        // **The upstream handshake comes first, and that is what fixes the
+        // wire.** The origin picks from the client's own ALPN list, and the
+        // client is then offered exactly what the origin picked — so a crossed
+        // version stays unrepresentable *and* an origin that speaks only
+        // HTTP/1.1 is still served. Settling on the client's choice instead
+        // would offer `h2` alone to such an origin and be refused outright,
+        // losing a site Chrome loads.
+        //
+        // The order also buys back the failure case the client-first order
+        // could not have: no forged leaf has been sent yet, so an upstream
+        // handshake that fails still has a whole connection left to splice.
+        Approach::Tls { profile, alpn } => {
+            // **The hello Boreas sends is the one it just read.** `profile` came
+            // out of the client's own ClientHello, so this connection looks like
+            // the application that made it rather than like a proxy — or like a
+            // canonical Chrome, which on a WebView or Cronet device would be a
+            // fresh mismatch.
+            let upstream = match sessions
+                .originator
+                .connect(host.as_str(), &profile, &alpn.encode(), transport)
+                .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    if let Some(cause) = classify(Leg::Upstream, &error) {
+                        sessions
+                            .demotions
+                            .record(host.as_str(), cause, Instant::now());
+                    }
+                    return splice(
+                        sessions,
+                        server,
+                        peeked,
+                        stream,
+                        SpliceReason::OriginHandshake,
+                    )
+                    .await;
+                }
+            };
+            let wire = Wire::from_alpn(upstream.ssl().selected_alpn_protocol());
+
+            let replayed = Prefixed::new(peeked, stream);
+            let client = match sessions.interceptor.terminate(replayed, wire).await {
+                Ok(client) => client,
+                Err(error) => {
+                    // Here the leaf *has* been sent, so a client that rejects it
+                    // leaves nothing to splice with. That cost is stated in
+                    // [`crate::Demotions`] and is why demotion is measured on
+                    // the retry.
+                    return learn(&sessions, &host, Leg::Client, error, |error| {
+                        SessionError::ClientHandshake(error)
+                    });
+                }
+            };
+            (Either::Left(client), Either::Left(upstream), wire)
         }
+        // No handshake on either leg, so there is nothing to fingerprint and
+        // nothing to demote — and only one wire cleartext HTTP/1.x has.
+        Approach::Cleartext => (
+            Either::Right(Prefixed::new(peeked, stream)),
+            Either::Right(transport),
+            Wire::Http1,
+        ),
     };
 
     // An error here is the exchange ending, which includes every ordinary way a
@@ -672,9 +757,51 @@ mod tests {
         );
     }
 
+    /// Cleartext HTTP is read for its `Host`, which is the cleartext analogue
+    /// of SNI. A head without one decides nothing, exactly as a hello without
+    /// an SNI decides nothing.
     #[test]
-    fn cleartext_is_recognised_as_not_tls() {
-        assert_eq!(introduce(b"GET / HTTP/1.1\r\n"), Introduction::Plain);
+    fn cleartext_http_is_read_for_its_host() {
+        assert_eq!(
+            introduce(b"GET / HTTP/1.1\r\nHost: example.com:80\r\n\r\n"),
+            Introduction::Http {
+                host: Some(DomainName::new("example.com").unwrap())
+            }
+        );
+        assert_eq!(
+            introduce(b"GET / HTTP/1.1\r\n\r\n"),
+            Introduction::Http { host: None }
+        );
+        // An address is carried like any other authority; an allowlist that
+        // does not name it splices on the ordinary path rather than here. The
+        // bracketed form is why the port is removed by parsing the authority
+        // rather than by splitting on the last colon, which would leave `[::1`.
+        for (head, expected) in [
+            ("Host: 203.0.113.4", "203.0.113.4"),
+            ("Host: [::1]:80", "[::1]"),
+        ] {
+            assert_eq!(
+                introduce(format!("GET / HTTP/1.1\r\n{head}\r\n\r\n").as_bytes()),
+                Introduction::Http {
+                    host: Some(DomainName::new(expected).unwrap())
+                }
+            );
+        }
+        // A head that has not ended yet must decide nothing, or the `Host`
+        // could still be in the bytes that have not arrived.
+        assert_eq!(
+            introduce(b"GET / HTTP/1.1\r\nHost: exa"),
+            Introduction::Incomplete
+        );
+    }
+
+    #[test]
+    fn what_is_neither_tls_nor_http_is_plain() {
+        assert_eq!(introduce(b"\x00\x01\x02\x03\x04\x05"), Introduction::Plain);
+        assert_eq!(
+            introduce(b"SSH-2.0-OpenSSH_9.6 Ubuntu\r\n"),
+            Introduction::Plain
+        );
         // A first byte that is a TLS record type but a version that is not
         // TLS 1.x: SSL 2.0's header, and anything else that happens to start
         // with 0x16.
@@ -825,6 +952,33 @@ mod end_to_end {
 
     /// An origin that records the first bytes it is sent and echoes them, for
     /// proving a splice is byte-exact.
+    /// An origin with no TLS at all, which is what a site that never got a
+    /// certificate looks like. Answers every request with its own path.
+    async fn start_cleartext_origin() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let path = request.uri().path().to_owned();
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(format!(
+                                    "cleartext:{path}"
+                                ))),
+                            ))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tcp), service)
+                        .await;
+                });
+            }
+        });
+        address
+    }
+
     async fn start_recording_origin() -> (SocketAddr, Arc<tokio::sync::Mutex<Vec<u8>>>) {
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1032,6 +1186,54 @@ mod end_to_end {
         );
     }
 
+    /// **A site with no HTTPS is still filtered.** Port 80 is inspected for the
+    /// redirects that lead to 443, but a host that never got a certificate
+    /// serves its content there, and it used to pass through untouched for want
+    /// of an SNI to read. `Host` is what names it, and neither leg handshakes.
+    #[tokio::test]
+    async fn a_cleartext_host_is_intercepted_through_its_host_header() {
+        let origin = start_cleartext_origin().await;
+        let authority = Arc::new(CertificateAuthority::generate().unwrap());
+        let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
+
+        let (client_side, terminated) = bridge::duplex();
+        let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
+
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_side))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                hyper::Request::builder()
+                    .uri("/page")
+                    .header(hyper::header::HOST, ALLOWED)
+                    .body(Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .expect("the exchange reaches the origin");
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"cleartext:/page", "the real origin answered");
+
+        drop(sender);
+        let handling = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the session finishes")
+            .unwrap()
+            .expect("the session succeeds");
+        assert_eq!(
+            handling,
+            Handling::Intercepted {
+                host: DomainName::new(ALLOWED).unwrap(),
+                wire: Wire::Http1,
+                tier: Tier::TOP,
+            }
+        );
+    }
+
     /// **The P15 through-line.** A client that does not trust the Boreas root —
     /// a pinned app, or any client the user did not install the root into —
     /// rejects the forged leaf. That connection is lost and cannot be
@@ -1174,10 +1376,11 @@ mod end_to_end {
         );
     }
 
-    /// Cleartext on an intercepted port is spliced, and says why. An allowlist
-    /// keyed on SNI has nothing to decide with when there is no TLS at all.
+    /// A cleartext request naming no host is spliced, and says why: `Host` is
+    /// what the allowlist reads on this path, and a head without one is the
+    /// same non-decision a hello without an SNI is.
     #[tokio::test]
-    async fn cleartext_is_spliced_with_its_reason() {
+    async fn cleartext_without_a_host_is_spliced_with_its_reason() {
         let (origin, seen) = start_recording_origin().await;
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
         let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
@@ -1209,7 +1412,7 @@ mod end_to_end {
         assert_eq!(
             handling,
             Handling::Spliced {
-                reason: SpliceReason::NotTls
+                reason: SpliceReason::Unnamed
             }
         );
     }
