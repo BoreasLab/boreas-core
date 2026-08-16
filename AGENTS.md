@@ -48,12 +48,18 @@ uv run scripts/vendor.py --check
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
-cargo check --manifest-path fuzz/Cargo.toml --all-targets
+RUSTFLAGS='--cfg fuzzing' cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
 `fuzz/` is its own workspace, so `--all-targets` above does not reach it: a
 renamed field compiles here and breaks there, and `[patch.crates-io]` has to be
 declared in both. Its check is last because it is the slow one.
+
+`--cfg fuzzing` is not optional. It is what `cargo fuzz` sets, it switches on
+`cfg(fuzzing)` code inside dependencies, and a vendored crate is a *path*
+dependency — which cargo does not cap lints for, so that crate's own `deny`
+attributes apply to us. Without the flag this command compiles a different
+graph than the campaign it stands in for.
 
 Update the owning document when a decision, constraint, acceptance criterion,
 dependency, risk, or verification status changes. Record unresolved claims in

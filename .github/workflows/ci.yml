@@ -40,6 +40,15 @@ jobs:
       - run: uvx ruff@0.16.1 check scripts/vendor.py
       - run: uvx ruff@0.16.1 format --check scripts/vendor.py
 
+      # One ignore file, at the root, because a nested one outranks it: that is
+      # how a vendored crate's own rules once hid a file from `git add` that
+      # `Vendor.lock` had already hashed. `git ls-files` does not descend into
+      # the `.claude/skills` symlink, so nothing there needs excepting.
+      - name: one authoritative .gitignore
+        run: |
+          stray=$(git ls-files '*.gitignore' ':!:.gitignore')
+          test -z "$stray" || { echo "nested .gitignore: $stray"; exit 1; }
+
       # The three commands AGENTS.md requires before any change lands.
       # clippy runs as a rustc wrapper, so -D warnings also fails plain
       # rustc lints such as unused imports across tests and benches.
@@ -73,7 +82,15 @@ jobs:
       # separate workspace — `cargo clippy --all-targets` in the check job
       # never compiles it — so a library change that breaks a fuzz target
       # surfaces here, in seconds, rather than after cargo-fuzz has built.
+      #
+      # `--cfg fuzzing` is what cargo-fuzz sets, and it is load-bearing rather
+      # than decorative: it switches on `cfg(fuzzing)` code inside dependencies,
+      # and a vendored crate is a *path* dependency, which cargo does not cap
+      # lints for. Without the flag this compiles a different graph than the
+      # campaign below and cannot stand in for it.
       - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+        env:
+          RUSTFLAGS: --cfg fuzzing
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

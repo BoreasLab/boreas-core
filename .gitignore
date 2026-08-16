@@ -1,11 +1,31 @@
-/target/
-/fuzz/target/
-/fuzz/artifacts/
-/fuzz/corpus/
+# The only ignore file this repo maintains. A nested one outranks it: git
+# resolves by depth, which is how a vendored crate's own rules once hid its
+# `Cargo.lock` from `git add` while `scripts/vendor.py` was still hashing it.
+# `publish` strips them from generated trees; CI rejects any other.
+# `.claude/skills` is a symlink, so nothing under it is ours to ignore.
 
-# scripts/vendor.py is imported by its own doctests, and CPython writes a cache
-# beside any module it imports. Derived, machine-specific, and version-tagged:
-# never wanted in the tree.
+# Rust. `**/` because cargo also runs in `fuzz/` and in a vendored crate
+# someone is debugging a patch against.
+**/target/
+**/*.rs.bk
+
+# `Cargo.lock` is deliberately absent: this crate is a binary's core, and every
+# vendored crate ships one. Ignoring it broke the vendor subsystem once.
+
+# cargo-fuzz. Reproducible from a run, none of it history.
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+
+# CPython writes a cache beside any module it imports, and `scripts/vendor.py`
+# imports itself for its doctests.
 __pycache__/
 *.py[cod]
 .ruff_cache/
+
+# Per-developer noise. Anything genuinely shared comes back by negation here.
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
