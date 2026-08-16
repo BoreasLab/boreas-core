@@ -33,11 +33,14 @@
 //! anyway), and ALPS. The TLS 1.3 cipher suites are fixed in BoringSSL and
 //! already match Chrome's, since Chrome is BoringSSL.
 //!
-//! **ALPN is deliberately not mirrored.** The client's offer settles the wire,
-//! and the upstream leg is then offered that one protocol and no other, which
-//! is what makes a crossed HTTP version unrepresentable rather than merely
-//! counted. [`Wire`](crate::Wire) owns that decision; a mirrored ALPN list would
-//! quietly take it back.
+//! **ALPN is mirrored, and the origin is what picks from it.** The upstream
+//! handshake offers the client's own list ([`Offer`]) and the client's handshake
+//! is then given exactly the one protocol the origin agreed to, so a crossed
+//! HTTP version stays unrepresentable while an origin that speaks only
+//! HTTP/1.1 is still served. Offering the client's *choice* upstream instead
+//! would send `h2` alone to such an origin and be refused outright — a site
+//! Chrome loads without complaint, lost to a one-entry ALPN list that is also
+//! nothing a browser sends.
 //!
 //! **The HTTP/2 half is here too, and it is not mirrored — it is Chrome's.**
 //! [`H2Profile`] carries the four fields the Akamai fingerprint reads. The
@@ -71,6 +74,7 @@ const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXTENSION_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXTENSION_COMPRESS_CERTIFICATE: u16 = 0x001b;
+const EXTENSION_ALPN: u16 = 0x0010;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const NAME_TYPE_HOST: u8 = 0x00;
@@ -170,6 +174,63 @@ impl ClientProfile {
 pub struct Hello {
     pub host: Option<crate::DomainName>,
     pub profile: ClientProfile,
+    pub alpn: Offer,
+}
+
+/// The application protocols a client offered, reduced to the ones Boreas can
+/// terminate and kept in the client's own order.
+///
+/// **This is what lets the origin settle the wire.** The upstream handshake
+/// offers this list verbatim, the origin picks one, and the client's handshake
+/// is then given that one and no other. An origin that speaks only HTTP/1.1 is
+/// therefore served over HTTP/1.1 on both legs, where offering the client's
+/// choice would have offered `h2` alone and been refused.
+///
+/// Empty is a real value meaning *negotiate nothing*: a client that sent no ALPN
+/// extension, or offered only protocols this cannot terminate. RFC 7301 makes
+/// that HTTP/1.1 on both sides, which is what a bare HTTP/1.1 client already
+/// expects.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Offer(Vec<crate::Wire>);
+
+impl Offer {
+    /// The protocols named in an `application_layer_protocol_negotiation`
+    /// extension body, keeping only what [`Wire`](crate::Wire) admits.
+    ///
+    /// Total on untrusted input: a body this cannot read is an empty offer.
+    /// O(bytes), and the result is bounded by [`Wire::ALL`](crate::Wire::ALL)
+    /// however long the client's list is.
+    fn read(body: &[u8]) -> Self {
+        let Some(list) = Reader::new(body).vector_u16() else {
+            return Self::default();
+        };
+        let mut wires = Vec::new();
+        let mut reader = Reader::new(list);
+        while let Some(name) = reader.vector_u8() {
+            // `h3` and anything else is dropped rather than carried: this leg
+            // is TCP, and a protocol the exchange cannot serve is one the
+            // origin must not be allowed to pick.
+            if let Some(wire) = crate::Wire::from_identifier(name)
+                && !wires.contains(&wire)
+            {
+                wires.push(wire);
+            }
+        }
+        Self(wires)
+    }
+
+    /// The wires offered, in the client's order.
+    #[must_use]
+    pub fn wires(&self) -> &[crate::Wire] {
+        &self.0
+    }
+
+    /// This offer in ALPN wire format, ready for a handshake.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let names: Vec<&[u8]> = self.0.iter().map(|wire| wire.identifier()).collect();
+        alpn_list(&names)
+    }
 }
 
 /// Reads one handshake record.
@@ -233,6 +294,7 @@ pub fn read_hello(record: &[u8]) -> Hello {
                 hello.profile.grease |= codepoints(body).any(is_grease);
                 hello.profile.sigalgs = codepoints(body).filter(|&id| !is_grease(id)).collect();
             }
+            EXTENSION_ALPN => hello.alpn = Offer::read(body),
             EXTENSION_COMPRESS_CERTIFICATE => {
                 // A one-byte length prefix here, unlike the two-byte vectors
                 // above, so it is read on its own terms.
@@ -698,18 +760,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Opaque<S> {
     }
 }
 
-/// The wire-format ALPN list offering exactly one protocol.
-///
-/// One, never two: offering the wire the client settled on and nothing else is
-/// what makes a crossed HTTP version unrepresentable instead of merely counted.
-#[must_use]
-pub fn alpn_for(wire: crate::Wire) -> Vec<u8> {
-    alpn_list(&[match wire {
-        crate::Wire::Http1 => b"http/1.1".as_slice(),
-        crate::Wire::Http2 => b"h2".as_slice(),
-    }])
-}
-
 /// The wire-format encoding of an ALPN protocol list: each name prefixed by its
 /// one-byte length. A name longer than 255 bytes cannot be encoded and is
 /// dropped, which is not reachable from any caller here.
@@ -939,12 +989,44 @@ mod tests {
         }
     }
 
-    /// One protocol, never two: this is what keeps a crossed HTTP version
-    /// unrepresentable rather than merely counted.
+    /// The client's list, in the client's order, so the origin makes the same
+    /// choice it would have made for the client itself.
     #[test]
-    fn alpn_offers_exactly_the_settled_wire() {
-        assert_eq!(alpn_for(crate::Wire::Http2), b"\x02h2");
-        assert_eq!(alpn_for(crate::Wire::Http1), b"\x08http/1.1");
+    fn an_offer_carries_the_clients_own_list_in_order() {
+        let hello = read_hello(&client_hello(&[extension(
+            EXTENSION_ALPN,
+            &names(&[b"h2", b"http/1.1"]),
+        )]));
+        assert_eq!(hello.alpn.wires(), [crate::Wire::Http2, crate::Wire::Http1]);
+        assert_eq!(hello.alpn.encode(), b"\x02h2\x08http/1.1");
+    }
+
+    /// `h3` rides QUIC, and this leg is TCP. Carrying it would let an origin
+    /// select a protocol the exchange cannot serve.
+    #[test]
+    fn a_protocol_this_cannot_terminate_is_dropped() {
+        let hello = read_hello(&client_hello(&[extension(
+            EXTENSION_ALPN,
+            &names(&[b"h3", b"http/1.1", b"h3"]),
+        )]));
+        assert_eq!(hello.alpn.wires(), [crate::Wire::Http1]);
+    }
+
+    /// No ALPN is an empty offer, which negotiates nothing on either leg —
+    /// RFC 7301's reading, and what a bare HTTP/1.1 client expects.
+    #[test]
+    fn a_hello_without_alpn_offers_nothing() {
+        let hello = read_hello(&client_hello(&[]));
+        assert!(hello.alpn.wires().is_empty());
+        assert!(hello.alpn.encode().is_empty());
+    }
+
+    /// A length-prefixed sequence of ALPN names, itself length-prefixed.
+    fn names(protocols: &[&[u8]]) -> Vec<u8> {
+        let body = alpn_list(protocols);
+        let mut out = u16::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+        out.extend(body);
+        out
     }
 
     fn profile_from(extensions: &[Vec<u8>]) -> ClientProfile {

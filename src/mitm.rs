@@ -11,10 +11,13 @@
 //!
 //! - **The application protocol is chosen by ALPN, never bridged.** Boreas
 //!   terminates h1 as h1 and h2 as h2; it never translates a live exchange from
-//!   one version to another. [`VersionCrossings`] counts any exchange whose
-//!   client and upstream protocols differ, and the P14 gate is that the count
-//!   stays zero. Modelling the protocol as a closed [`Wire`] sum keeps "which
-//!   versions exist" in one place the counter and the ALPN offer both read.
+//!   one version to another. The *origin* chooses, from the client's own offer,
+//!   and this server then advertises that one protocol — so an origin that
+//!   speaks only h1 is served rather than refused. [`VersionCrossings`] counts
+//!   any exchange whose client and upstream protocols differ, and the P14 gate
+//!   is that the count stays zero. Modelling the protocol as a closed [`Wire`]
+//!   sum keeps "which versions exist" in one place the counter, the acceptors,
+//!   and the offer all read.
 //! - **h3 is never terminated.** A locally added root cannot validate over
 //!   QUIC, so h3 is pass-through and the ALPN offer omits it. There is no h3
 //!   variant to bridge to, which is why [`Wire`] has two members and not three.
@@ -28,7 +31,7 @@ use std::{
     },
 };
 
-use rustls::{ServerConfig, crypto::ring::default_provider};
+use rustls::{ServerConfig, crypto::ring::default_provider, server::ResolvesServerCert};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
@@ -45,14 +48,34 @@ pub enum Wire {
 }
 
 impl Wire {
-    /// The wire the ALPN identifier names, or `Http1` as the RFC 7301 default
-    /// when a peer offers no ALPN at all — which is what a bare HTTP/1.1 client
-    /// does.
-    fn from_alpn(selected: Option<&[u8]>) -> Self {
-        match selected {
-            Some(b"h2") => Self::Http2,
-            _ => Self::Http1,
+    /// Both wires, in the order a server prefers them.
+    pub const ALL: [Self; 2] = [Self::Http2, Self::Http1];
+
+    /// The ALPN identifier this wire is negotiated under. One table, so the
+    /// three functions below cannot disagree about a spelling.
+    #[must_use]
+    pub const fn identifier(self) -> &'static [u8] {
+        match self {
+            Self::Http1 => b"http/1.1",
+            Self::Http2 => b"h2",
         }
+    }
+
+    /// The wire an ALPN identifier names, or `None` for one Boreas does not
+    /// terminate — `h3` above all, which rides QUIC where a user-added root
+    /// cannot validate.
+    #[must_use]
+    pub fn from_identifier(name: &[u8]) -> Option<Self> {
+        Self::ALL.into_iter().find(|wire| wire.identifier() == name)
+    }
+
+    /// The wire a *negotiated* ALPN names, or `Http1` as the RFC 7301 default
+    /// when nothing was negotiated — which is what a bare HTTP/1.1 client does.
+    #[must_use]
+    pub fn from_alpn(selected: Option<&[u8]>) -> Self {
+        selected
+            .and_then(Self::from_identifier)
+            .unwrap_or(Self::Http1)
     }
 }
 
@@ -149,11 +172,22 @@ impl VersionCrossings {
 }
 
 /// The terminating TLS server: a rustls `ServerConfig` that presents a forged
-/// leaf for whatever SNI a client offers, negotiating h2 by preference and
-/// falling back to http/1.1 — the two wires [`Wire`] admits, and no h3.
+/// leaf for whatever SNI a client offers.
+///
+/// **One acceptor per wire, and the caller says which.** The version a session
+/// serves is settled by the *origin*, not by the client — see
+/// [`Offer`](crate::Offer) — so this advertises exactly the one protocol the
+/// origin agreed to, and a crossed version is unrepresentable rather than
+/// merely counted. Both configurations are built once at construction, so
+/// choosing between them costs an array index instead of a handshake's worth of
+/// setup.
+///
+/// A client that offered no ALPN at all still negotiates none: RFC 7301 forbids
+/// a server from selecting a protocol the client did not offer, which rustls
+/// implements, so the fixed configuration is safe for that client too.
 #[derive(Clone)]
 pub struct Interceptor {
-    acceptor: TlsAcceptor,
+    acceptors: [TlsAcceptor; Wire::ALL.len()],
 }
 
 impl Interceptor {
@@ -163,28 +197,30 @@ impl Interceptor {
     /// and it is the one provider already in the graph for WireGuard and the
     /// DNS upstreams, so no second crypto stack ships.
     pub fn new(resolver: Arc<MitmResolver>) -> Result<Self, rustls::Error> {
-        let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
-        // Preference order: h2 first, http/1.1 second. h3 is absent by
-        // construction — the reason [`Wire`] has no third member.
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let resolver: Arc<dyn ResolvesServerCert> = resolver;
+        let build = |wire: Wire| -> Result<TlsAcceptor, rustls::Error> {
+            let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::clone(&resolver));
+            config.alpn_protocols = vec![wire.identifier().to_vec()];
+            Ok(TlsAcceptor::from(Arc::new(config)))
+        };
         Ok(Self {
-            acceptor: TlsAcceptor::from(Arc::new(config)),
+            acceptors: [build(Wire::ALL[0])?, build(Wire::ALL[1])?],
         })
     }
 
-    /// Terminates one client connection: completes the TLS handshake over
-    /// `stream` and reports the wire ALPN settled on, which the exchange must
-    /// mirror upstream so no version is crossed.
-    pub async fn terminate<S>(&self, stream: S) -> io::Result<(TlsStream<S>, Wire)>
+    /// Terminates one client connection, advertising `wire` and nothing else.
+    pub async fn terminate<S>(&self, stream: S, wire: Wire) -> io::Result<TlsStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let tls = self.acceptor.accept(stream).await?;
-        let wire = Wire::from_alpn(tls.get_ref().1.alpn_protocol());
-        Ok((tls, wire))
+        let index = Wire::ALL
+            .iter()
+            .position(|candidate| *candidate == wire)
+            .expect("Wire::ALL is every wire");
+        self.acceptors[index].accept(stream).await
     }
 }
 
@@ -253,11 +289,15 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
 
         let server = tokio::spawn(async move {
-            let (mut tls, wire) = interceptor
-                .terminate(server_io)
+            let mut tls = interceptor
+                .terminate(server_io, Wire::Http2)
                 .await
                 .expect("server handshake");
-            assert_eq!(wire, Wire::Http2, "h2 is the preferred wire");
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(b"h2".as_slice()),
+                "the advertised wire is the negotiated one"
+            );
             let mut buf = [0u8; 5];
             tls.read_exact(&mut buf)
                 .await

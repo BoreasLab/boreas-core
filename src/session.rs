@@ -24,12 +24,13 @@
 //! path on which a parse failure intercepts, because the parser has no failure
 //! case: it can only fail to *recognise*, and non-recognition is splice.
 //!
-//! **No version is crossed, by construction rather than by agreement.** The
-//! client's ALPN settles the wire; the upstream connection is then offered that
-//! one protocol and no other. A server that will not speak it fails the
-//! handshake, which is a visible error, rather than negotiating something else
-//! and leaving the exchange to bridge between versions.
-//!   [`VersionCrossings`] still counts, because a gate that can only be
+//! **No version is crossed, and the origin is what settles it.** The upstream
+//! handshake runs first, offering the client's own ALPN list; the origin picks
+//! from it, and the client's handshake is then offered that one protocol and no
+//! other — so both legs agree by construction. Letting the client's *preference*
+//! settle it instead would offer `h2` alone to an origin that speaks only
+//! HTTP/1.1 and be refused outright, losing a site a browser loads without
+//! complaint. [`VersionCrossings`] still counts, because a gate that can only be
 //! satisfied and never checked is not a gate.
 
 use std::{
@@ -47,7 +48,7 @@ use crate::{
     Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Hello,
     InterceptDecision, InterceptPolicy, Interceptor, Leg, NoCosmetics, Originator, Prefixed,
     RequestFilter, RewriteFailures, Rewriting, Standing, StreamBudget, StreamEgress, Target, Tier,
-    VersionCrossings, Wire, alpn_for, classify, run_exchange,
+    VersionCrossings, Wire, classify, run_exchange,
 };
 
 /// A TLS record carrying handshake messages.
@@ -74,8 +75,9 @@ pub enum Introduction {
     /// when one is present and well-formed, and `None` when the ClientHello
     /// carries no server name, spans more than one record, or is malformed
     /// inside a complete record — all indistinguishable to a policy that needs
-    /// a name. The [`ClientProfile`] alongside it shapes the upstream hello,
-    /// and comes from the same bytes, so the two cannot disagree.
+    /// a name. The [`ClientProfile`] alongside it shapes the upstream hello and
+    /// the [`Offer`](crate::Offer) is what that hello proposes, both from these
+    /// same bytes, so none of the three can disagree.
     Tls(Hello),
     /// The first bytes are not a TLS handshake record: cleartext HTTP, or any
     /// other protocol on a port the datapath routed here.
@@ -125,6 +127,11 @@ pub enum SpliceReason {
     /// machine-maintained half of the decision, and the one that lets the
     /// hand-maintained half grow.
     Demoted(Demotion),
+    /// The handshake *to the origin* failed, so there was nothing to intercept.
+    /// Distinct from [`Self::Demoted`] because it is what was just learned
+    /// rather than what was already known — and reachable at all only because
+    /// that handshake runs before any forged leaf is sent.
+    OriginHandshake,
 }
 
 /// What became of one connection.
@@ -312,11 +319,12 @@ pub async fn serve_session(
     let port = server.port();
     let (introduction, peeked, stream) = peek(stream, sessions.limits.peek_timeout).await;
 
-    let (host, profile) = match introduction {
+    let (host, profile, alpn) = match introduction {
         Introduction::Tls(Hello {
             host: Some(host),
             profile,
-        }) => (host, profile),
+            alpn,
+        }) => (host, profile, alpn),
         Introduction::Tls(Hello { host: None, .. }) => {
             return splice(sessions, server, peeked, stream, SpliceReason::Unnamed).await;
         }
@@ -355,31 +363,21 @@ pub async fn serve_session(
     }
     let tier = standing.tier();
 
-    // **The client's handshake comes first, and the order is forced.** The
-    // upstream leg must offer exactly one ALPN — that is what makes a crossed
-    // version unrepresentable rather than merely counted — and the protocol to
-    // offer is the one the client settles on, which is not known until its
-    // handshake completes.
+    // **The upstream handshake comes first, and that is what fixes the wire.**
+    // The origin picks from the client's own ALPN list, and the client is then
+    // offered exactly what the origin picked — so a crossed version stays
+    // unrepresentable *and* an origin that speaks only HTTP/1.1 is still
+    // served. Settling on the client's choice instead would offer `h2` alone to
+    // such an origin and be refused outright, losing a site Chrome loads.
     //
-    // It is also what makes the first failed connection unrecoverable: by the
-    // time the client rejects the forged leaf, the leaf has been sent, and no
-    // bytes remain to splice with. That cost is stated in [`crate::Demotions`]
-    // and is the reason demotion is measured on the *retry*.
-    let replayed = Prefixed::new(peeked, stream);
-    let (client, wire) = match sessions.interceptor.terminate(replayed).await {
-        Ok(terminated) => terminated,
-        Err(error) => {
-            return learn(&sessions, &host, Leg::Client, error, |error| {
-                SessionError::ClientHandshake(error)
-            });
-        }
-    };
-
+    // The order also buys back the failure case the client-first order could
+    // not have: no forged leaf has been sent yet, so an upstream handshake that
+    // fails still has a whole connection left to splice.
     let target = Target::Domain {
         host: host.clone(),
         port,
     };
-    let upstream = sessions
+    let transport = sessions
         .egress
         .connect(&target)
         .await
@@ -388,17 +386,39 @@ pub async fn serve_session(
     // the client's own ClientHello, so this connection looks like the
     // application that made it rather than like a proxy — or like a canonical
     // Chrome, which on a WebView or Cronet device would be a fresh mismatch.
-    // The ALPN is the settled wire and nothing else, which is what keeps a
-    // crossed HTTP version unrepresentable.
     let upstream = match sessions
         .originator
-        .connect(host.as_str(), &profile, &alpn_for(wire), upstream)
+        .connect(host.as_str(), &profile, &alpn.encode(), transport)
         .await
     {
         Ok(upstream) => upstream,
         Err(error) => {
-            return learn(&sessions, &host, Leg::Upstream, error, |error| {
-                SessionError::Upstream(EgressError::Io(error.kind()))
+            if let Some(cause) = classify(Leg::Upstream, &error) {
+                sessions
+                    .demotions
+                    .record(host.as_str(), cause, Instant::now());
+            }
+            return splice(
+                sessions,
+                server,
+                peeked,
+                stream,
+                SpliceReason::OriginHandshake,
+            )
+            .await;
+        }
+    };
+    let wire = Wire::from_alpn(upstream.ssl().selected_alpn_protocol());
+
+    let replayed = Prefixed::new(peeked, stream);
+    let client = match sessions.interceptor.terminate(replayed, wire).await {
+        Ok(client) => client,
+        Err(error) => {
+            // Here the leaf *has* been sent, so a client that rejects it leaves
+            // nothing to splice with. That cost is stated in
+            // [`crate::Demotions`] and is why demotion is measured on the retry.
+            return learn(&sessions, &host, Leg::Client, error, |error| {
+                SessionError::ClientHandshake(error)
             });
         }
     };
@@ -621,6 +641,7 @@ mod tests {
             Introduction::Tls(Hello {
                 host: Some(DomainName::new("example.com").unwrap()),
                 profile: crate::ClientProfile::default(),
+                alpn: crate::Offer::default(),
             })
         );
     }
@@ -907,7 +928,11 @@ mod end_to_end {
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // **Chrome's own list, against an origin that speaks only http/1.1.**
+        // The origin picks, so this is served over http/1.1 on both legs. Were
+        // the client's preference what settled it, the upstream leg would offer
+        // `h2` alone and the origin would refuse it outright.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(
@@ -916,6 +941,11 @@ mod end_to_end {
             )
             .await
             .expect("the forged leaf validates against the Boreas root");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(b"http/1.1".as_slice()),
+            "the origin's choice is what the client is offered"
+        );
 
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
             .await
@@ -1004,15 +1034,20 @@ mod end_to_end {
 
     /// **The P15 through-line.** A client that does not trust the Boreas root —
     /// a pinned app, or any client the user did not install the root into —
-    /// rejects the forged leaf. That first connection is lost and cannot be
-    /// otherwise: the leaf has been sent by the time the alert arrives. What
-    /// P15 buys is the *second* connection, which splices, and the assertion is
-    /// on the bytes that reach the origin rather than on the decision.
+    /// rejects the forged leaf. That connection is lost and cannot be
+    /// otherwise: the leaf has been sent by the time the alert arrives, which
+    /// is the one failure the upstream-first order does not recover. What P15
+    /// buys is the next connection, which
+    /// [`a_demoted_host_splices_the_next_connection_byte_for_byte`] covers.
+    ///
+    /// The origin here is a real TLS server because the upstream handshake now
+    /// runs first: reaching the client's leg at all means the origin's leg
+    /// already succeeded.
     #[tokio::test]
     async fn a_client_that_refuses_the_forged_leaf_demotes_the_host() {
-        let (origin, seen) = start_recording_origin().await;
+        let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
-        let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
+        let sessions = sessions_for(authority, &[ALLOWED], origin, &[origin_ca]);
 
         // A client trusting only an unrelated root, which is what a pinned
         // client looks like from here.
@@ -1058,10 +1093,22 @@ mod end_to_end {
             Tier::Splice,
             "the host must stop being intercepted"
         );
+    }
 
-        // **The retry, which is what the gate measures.** The same allowlisted
-        // host now passes through untouched, so the client speaks to the origin
-        // itself and the pin it was protecting is never challenged again.
+    /// **What the demotion buys, which is the gate P15 measures.** An
+    /// allowlisted host whose standing has fallen to splice passes through
+    /// untouched, so the client speaks to the origin itself and the pin it was
+    /// protecting is never challenged again. Asserted on the bytes that reach
+    /// the origin rather than on the decision.
+    #[tokio::test]
+    async fn a_demoted_host_splices_the_next_connection_byte_for_byte() {
+        let (origin, seen) = start_recording_origin().await;
+        let authority = Arc::new(CertificateAuthority::generate().unwrap());
+        let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
+        sessions
+            .demotions
+            .record(ALLOWED, Demotion::LeafRejected, Instant::now());
+
         let (mut client_side, terminated) = bridge::duplex();
         let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
         let hello = super::tests::client_hello(Some(ALLOWED));

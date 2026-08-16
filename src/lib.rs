@@ -69,8 +69,8 @@ pub use masque::{
     decode_ip_datagram, encode_ip_datagram,
 };
 pub use mirror::{
-    ClientProfile, H2Profile, HandshakeFailure, Hello, MirrorError, Opaque, Originator, Refusal,
-    alpn_for, alpn_list, read_hello,
+    ClientProfile, H2Profile, HandshakeFailure, Hello, MirrorError, Offer, Opaque, Originator,
+    Refusal, alpn_list, read_hello,
 };
 pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
 pub use origin::{

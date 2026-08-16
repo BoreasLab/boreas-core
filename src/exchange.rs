@@ -783,8 +783,11 @@ mod tests {
 
         let crossings_for_exchange = Arc::clone(&crossings);
         tokio::spawn(async move {
-            let (server_tls, wire) = interceptor.terminate(server_io).await.expect("terminate");
-            assert_eq!(wire, Wire::Http1);
+            let wire = Wire::Http1;
+            let server_tls = interceptor
+                .terminate(server_io, wire)
+                .await
+                .expect("terminate");
             run_exchange(
                 HOST_NAME,
                 wire,
@@ -1030,7 +1033,11 @@ mod tests {
         });
 
         tokio::spawn(async move {
-            let (server_tls, wire) = interceptor.terminate(server_io).await.expect("terminate");
+            let wire = Wire::Http1;
+            let server_tls = interceptor
+                .terminate(server_io, wire)
+                .await
+                .expect("terminate");
             let _ = run_exchange(
                 HOST_NAME,
                 wire,
@@ -1127,8 +1134,11 @@ mod tests {
 
         let crossings_for_exchange = Arc::clone(&crossings);
         tokio::spawn(async move {
-            let (server_tls, wire) = interceptor.terminate(server_io).await.expect("terminate");
-            assert_eq!(wire, Wire::Http2, "h2 was offered and preferred");
+            let wire = Wire::Http2;
+            let server_tls = interceptor
+                .terminate(server_io, wire)
+                .await
+                .expect("terminate");
             run_exchange(
                 HOST_NAME,
                 wire,
