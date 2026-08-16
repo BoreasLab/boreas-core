@@ -38,10 +38,10 @@
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::Upstream;
+use crate::{ClientProfile, Originator, Upstream};
 
 /// The largest upstream reply this crate will read. EDNS0 permits more; a
 /// resolver answering a stub does not need it, and the bound is what keeps an
@@ -185,10 +185,16 @@ impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
 /// Mozilla bundle, so it is built once per upstream and never per query — and
 /// because rustls keeps its session cache in the configuration, that is also
 /// what makes every query after the first a resumption.
+/// The stream a TLS upstream hands back. Named because two dialers and four
+/// transports return it and the type is a mouthful.
+type UpstreamTls = tokio_boring::SslStream<crate::Opaque<tokio::net::TcpStream>>;
+
 struct TlsDialer<B> {
     resolver: SocketAddr,
-    server_name: ServerName<'static>,
-    config: Arc<ClientConfig>,
+    server_name: String,
+    originator: Arc<Originator>,
+    /// The ALPN list in wire format, built once per configured upstream.
+    alpn: Vec<u8>,
     bypass: B,
     timeout: Duration,
 }
@@ -228,43 +234,42 @@ impl<B: TunnelBypass> TlsDialer<B> {
         alpn: &[&[u8]],
         bypass: B,
     ) -> Result<Self, UpstreamError> {
-        let server_name = ServerName::try_from(server_name)
-            .map_err(|_| UpstreamError::InvalidServerName)?
-            .to_owned();
+        // Parsed only to reject a name no handshake could verify. The value is
+        // discarded: BoringSSL takes the name as a string.
+        ServerName::try_from(server_name).map_err(|_| UpstreamError::InvalidServerName)?;
 
+        // **BoringSSL, wearing Chrome's hello.** An encrypted DNS query is the
+        // first thing a connection does and the most telling: a resolver
+        // reached with a `rustls` ClientHello names the software, not the
+        // browser it is resolving for. There is no client hello to mirror here,
+        // so the profile is a stated one.
+        //
         // The anchors are Mozilla's bundle and not the platform store; see the
         // module documentation for why that is a security property here rather
         // than a portability shortcut.
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        // The provider is named rather than taken from a process-wide default,
-        // because `ring` is already in this graph for WireGuard and a second
-        // one would be shipped weight on a target that counts it.
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|_| UpstreamError::UnsupportedTlsVersions)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
-
         Ok(Self {
             resolver,
-            server_name,
-            config: Arc::new(config),
+            server_name: server_name.to_owned(),
+            originator: Arc::new(Originator::new()),
+            alpn: crate::alpn_list(alpn),
             bypass,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         })
     }
 
-    async fn connect(&self) -> io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    async fn connect(&self) -> io::Result<UpstreamTls> {
         let stream = self.bypass.tcp(self.resolver).await?;
         // Nagle would hold a short query waiting for more bytes that are not
         // coming, which on a request/response protocol is pure added latency.
         stream.set_nodelay(true)?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.config));
-        connector.connect(self.server_name.clone(), stream).await
+        self.originator
+            .connect(
+                &self.server_name,
+                &ClientProfile::chrome(),
+                &self.alpn,
+                stream,
+            )
+            .await
     }
 }
 
@@ -798,10 +803,7 @@ mod tests {
         assert_eq!(upstream.authority, "dns.example:8443");
         assert_eq!(upstream.path, "/resolve");
         // The certificate carries the host, never the port.
-        assert_eq!(
-            upstream.dialer.server_name,
-            ServerName::try_from("dns.example").unwrap()
-        );
+        assert_eq!(upstream.dialer.server_name, "dns.example");
 
         // A URL with no path still addresses the origin's root.
         let bare = DohUpstream::new("https://dns.example", address(443), DirectSockets).unwrap();

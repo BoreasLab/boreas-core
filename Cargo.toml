@@ -149,13 +149,12 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 futures-core = "0.3"
 futures-sink = "0.3"
 tokio-util = { version = "0.7.19", features = ["rt"] }
-# Trust anchors for the originating side. `webpki-roots` ships SPKI-only
-# `TrustAnchor`s, which is what rustls verifies against and what BoringSSL
-# cannot load; this crate is the same Mozilla bundle as whole DER certificates.
-# Both are named because the terminating side's tests still build rustls client
-# configurations, and Cargo links the one copy of the underlying data.
+# Trust anchors, for the originating side, which is now every side that dials
+# out. `webpki-roots` ships SPKI-only `TrustAnchor`s — what rustls verifies
+# against and what BoringSSL cannot load — so this is the same Mozilla bundle as
+# whole DER certificates. rustls remains only as the terminating server, which
+# verifies nothing and needs no anchors.
 webpki-root-certs = "1"
-webpki-roots = "1"
 
 # The Windows adapter loads the WireGuard-authorized signed wintun.dll at
 # runtime; the bindings are Windows-only and never enter the Android graph.

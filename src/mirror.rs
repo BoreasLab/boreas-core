@@ -10,6 +10,12 @@
 //! `Acceptor` only lets a caller *read* a peer's. BoringSSL is what Chrome
 //! itself speaks, so matching it is configuration rather than reimplementation.
 //!
+//! **Every dialling leg comes through here**, not only interception: the
+//! VLESS-family transports, whose premise is looking like a browser reaching a
+//! website, and the encrypted DNS upstreams, whose query is the first thing a
+//! connection does. Those two have no client hello to copy, so they wear
+//! [`ClientProfile::chrome`] instead of a mirror.
+//!
 //! **The target is the client on this device, not a canonical Chrome.** Boreas
 //! already holds the real ClientHello — it terminated the connection to read the
 //! SNI — so the cipher list, groups, signature algorithms, GREASE, and
@@ -145,6 +151,34 @@ pub struct ClientProfile {
 }
 
 impl ClientProfile {
+    /// Chrome's own hello, for a leg that has no client to mirror.
+    ///
+    /// **The fallback is a stated profile, not the empty one.** An empty profile
+    /// leaves BoringSSL's defaults — `X25519`, `P-256`, `P-384` — which cannot
+    /// carry `X25519MLKEM768` and so name a TLS stack years older than the
+    /// browser this build otherwise reproduces. Every leg that dials out
+    /// without a ClientHello to copy uses this: the VLESS-family transports,
+    /// whose whole premise is looking like a browser reaching a website, and the
+    /// encrypted DNS upstreams.
+    ///
+    /// Mirroring is still preferred wherever a hello exists, for the reason this
+    /// module opens with: a fixed profile is right for one client and wrong for
+    /// every other, and needs maintaining against a four-week release train.
+    #[must_use]
+    pub fn chrome() -> Self {
+        Self {
+            groups: vec!["X25519MLKEM768", "X25519", "P-256", "P-384"],
+            // ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, rsa_pkcs1_sha256,
+            // ecdsa_secp384r1_sha384, rsa_pss_rsae_sha384, rsa_pkcs1_sha384,
+            // rsa_pss_rsae_sha512, rsa_pkcs1_sha512.
+            sigalgs: vec![
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            ],
+            compression: vec![BROTLI_ALGORITHM],
+            grease: true,
+        }
+    }
+
     /// Whether this profile overrides anything at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -987,6 +1021,18 @@ mod tests {
         for bytes in [b"".as_slice(), b"\x01", b"\x16\x03\x01", b"not tls at all"] {
             assert!(read_hello(bytes).profile.is_empty(), "{bytes:?}");
         }
+    }
+
+    /// The stated profile a leg with nothing to mirror wears. Asserted against
+    /// the group that actually distinguishes it: an empty profile leaves
+    /// BoringSSL's defaults, which cannot express `X25519MLKEM768` at all.
+    #[test]
+    fn the_chrome_profile_offers_the_group_the_default_one_cannot() {
+        let chrome = ClientProfile::chrome();
+        assert!(!chrome.is_empty());
+        assert_eq!(chrome.groups()[0], "X25519MLKEM768");
+        assert!(chrome.compresses_certificates());
+        assert!(chrome.grease);
     }
 
     /// The client's list, in the client's order, so the origin makes the same

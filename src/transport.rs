@@ -48,7 +48,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AsyncStream, BoxFuture, EgressError, Prefixed, ProxyError, TunnelBypass,
+    AsyncStream, BoxFuture, ClientProfile, EgressError, Originator, Prefixed, ProxyError,
+    TunnelBypass,
     quic::{Handshake, QuicConnection, client_config},
 };
 
@@ -125,68 +126,49 @@ pub struct TlsConfig {
 
 pub struct TlsTransport<B> {
     server: SocketAddr,
-    server_name: rustls::pki_types::ServerName<'static>,
-    config: Arc<rustls::ClientConfig>,
+    server_name: String,
+    originator: Arc<Originator>,
+    /// The ALPN list in wire format, built once because it never varies for a
+    /// configured transport.
+    alpn: Vec<u8>,
     bypass: B,
 }
 
 impl<B: TunnelBypass> TlsTransport<B> {
-    /// Trust anchors are Mozilla's bundle rather than the platform store, for
-    /// the reason the DNS upstreams give: the set this crate verifies
-    /// against should not be one a device owner or an MDM profile can widen.
+    /// **BoringSSL, wearing Chrome's hello.** A VLESS-family transport exists to
+    /// look like a browser reaching a website, so a `rustls` ClientHello on the
+    /// wire is the one thing it must not send. There is no client hello to
+    /// mirror on this leg — nothing local originated it — so the profile is
+    /// [`ClientProfile::chrome`] rather than the empty one, which would leave
+    /// BoringSSL's own defaults and no `X25519MLKEM768`.
     ///
-    /// The `ring` provider is named rather than taken from a process-wide
-    /// default, because it is already in this graph and a second one would be
-    /// shipped weight on a target that counts it.
+    /// Trust anchors are Mozilla's bundle rather than the platform store, for
+    /// the reason the DNS upstreams give: the set this crate verifies against
+    /// should not be one a device owner or an MDM profile can widen.
     pub fn new(config: TlsConfig, bypass: B) -> Result<Self, EgressError> {
-        let server_name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
-            .map_err(|_| ProxyError::Address)?
-            .to_owned();
-        let client = client_tls_config(&config.alpn, &config.extra_roots)?;
+        // Parsed only to reject a name no handshake could verify. The value is
+        // discarded: BoringSSL takes the name as a string.
+        rustls::pki_types::ServerName::try_from(config.server_name.as_str())
+            .map_err(|_| ProxyError::Address)?;
+        let alpn: Vec<&[u8]> = config.alpn.iter().map(Vec::as_slice).collect();
         Ok(Self {
             server: config.server,
-            server_name,
-            config: client,
+            server_name: config.server_name,
+            originator: Arc::new(Originator::new().with_extra_roots(&config.extra_roots)),
+            alpn: crate::alpn_list(&alpn),
             bypass,
         })
     }
-}
-
-/// A verifying `rustls` client configuration offering `alpn`.
-///
-/// Shared by [`TlsTransport`] and by the interception path's upstream leg,
-/// which needs the same anchors and the same provider but supplies its own
-/// already-connected stream. Building it is not free — the anchor set is parsed
-/// here — so a caller holds the `Arc` for the life of a configuration rather
-/// than rebuilding one per connection.
-pub fn client_tls_config(
-    alpn: &[Vec<u8>],
-    extra_roots: &[Vec<u8>],
-) -> Result<Arc<rustls::ClientConfig>, EgressError> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for anchor in extra_roots {
-        roots
-            .add(rustls::pki_types::CertificateDer::from(anchor.clone()))
-            .map_err(|_| EgressError::Proxy(ProxyError::Crypto))?;
-    }
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut client = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|_| EgressError::Quic)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    client.alpn_protocols = alpn.to_vec();
-    Ok(Arc::new(client))
 }
 
 impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let tcp = self.bypass.tcp(self.server).await?;
-            let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.config));
-            let stream = connector.connect(self.server_name.clone(), tcp).await?;
+            let stream = self
+                .originator
+                .connect(&self.server_name, &ClientProfile::chrome(), &self.alpn, tcp)
+                .await?;
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
         })
     }
