@@ -76,16 +76,32 @@ ECN preservation.
 unavailable. Shipping MASQUE systems use that fallback, which changes native
 UDP semantics without changing the selected egress label.
 
-## ADR-007: One Rust TLS Stack in v1
+## ADR-007: rustls Terminates, BoringSSL Originates
 
-**Decision:** Use rustls throughout v1. Do not mimic browser TLS or HTTP/2
-fingerprints.
+**Decision:** rustls serves the local client; every handshake Boreas *initiates*
+is BoringSSL, shaped by the client's own ClientHello. The upstream HTTP/2 preface
+is Chrome's.
 
-**Reason:** A MITM creates two TLS connections. The upstream connection exposes
-a different TLS and H2 fingerprint, which some CDNs use to challenge or block.
-Byte-level browser parity requires BoringSSL or equivalent browser behavior;
-no Rust-native client currently promises it. Instrument failures before paying
-the implementation and maintenance cost.
+**Supersedes** the original ADR-007, which chose rustls throughout and deferred
+fingerprint parity until CDN breakage was measured.
+
+**Reason:** A MITM creates two TLS connections, and the upstream one is
+fingerprinted by whoever answers. rustls exposes no supported way to shape a
+ClientHello — extension order, GREASE placement, and JA3/JA4-matching hellos are
+long-standing open requests — so the deferral was not a schedule choice but a
+dependency wall. `quiche` already linked BoringSSL, so adopting it directly added
+an edge rather than a library.
+
+**What made it worth doing before the measurement.** The gap was not a matter of
+degree. BoringSSL's default groups cannot express `X25519MLKEM768`, which every
+current Chrome offers; `hyper`'s HTTP/2 defaults matched Chrome on none of the
+four Akamai fields, and its pseudo-header order matched no browser at all. A
+client that differs in every field is not a near miss.
+
+**Cost, stated:** two patched dependencies (`vendor/README.md`), and a mirror
+that tracks BoringSSL's API rather than a fixed browser profile. The asymmetry is
+what bounds it — the terminating leg keeps rustls and its memory safety, because
+nothing fingerprints an application on the same device.
 
 ## ADR-008: Android User-Store CA Only
 
@@ -147,7 +163,6 @@ egress that declares none cannot be shown to clear the floor and is steered.
 
 ## Deferred and Rejected Directions
 
-- TLS fingerprint mimicry waits for measured CDN breakage.
 - WFP waits for proven per-app policy demand.
 - QUIC interception on Chromium is externally constrained and out of scope.
 - `mitmproxy_rs` is OS-integration glue around PyO3, not the desired TLS core.

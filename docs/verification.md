@@ -68,6 +68,9 @@ compatible release at that time.
 | `tokio-quiche` and quiche | MASQUE and later H3 | candidate | used by iCloud Private Relay Proxy B, Oxy, and WARP's MASQUE client |
 | ~~GotaTun~~ | WireGuard | integrated 2026-08-11 at 0.8.1 | Mullvad project; Windows readiness unexercised, no device in this environment |
 | `smoltcp` | locally terminated TCP | dev-only today | vendored in AOSP; host-scale feature limits require testing |
+| ~~`boring`~~ / `tokio-boring` | every TLS handshake Boreas initiates | integrated 2026-08-14 at 5.2 | Not a new C dependency: `quiche` already linked BoringSSL through this crate, so the artefact gained an edge rather than a library. 5.x vendors `BORINGSSL_API_VERSION 41`, which has `X25519MLKEM768`; 4.x predates it. Forced `quiche` into `vendor/` — `links = "boringssl"` admits one package per graph |
+| ~~`h2`~~ | HTTP/2 framing, and the pseudo-header order | patched in `vendor/` | Already in the graph beneath `hyper`. Vendored for one swap in `impl Iterator for Iter`: h2 emits `:method :scheme :authority :path`, every browser emits `:method :authority :scheme :path`, and neither h2 nor hyper exposes it. RFC 9113 §8.3 fixes no order among pseudo-headers |
+| ~~`ruzstd`~~ | zstd decode for the HTML tier | integrated 2026-08-14 at 0.9 | Decoder-only and pure Rust, matching `brotli-decompressor` and `flate2`'s `rust_backend`. Chrome has offered `zstd` since Chrome 123 and CDNs serve it, so without it the tier failed open on a growing share of documents |
 | `shadowsocks-rust` | Shadowsocks egress | candidate | mature and active |
 | `wintun-bindings` | Windows Wintun loading | verify binding release | exposes Adapter and Session APIs |
 | `wintun.dll` | signed Windows TUN driver | candidate | use WireGuard's authorized redistributable signed binary |
@@ -103,7 +106,11 @@ The design investigation reported the following as verified by 2026-08-08:
 - iOS packet-tunnel memory limits and Conscrypt APEX constraints were examined,
   but no longer constrain v1.
 - Certificate pinning, JA3/JA4, HTTP/2 fingerprinting, and ECH affect passive or
-  intercepted policy as described in the subsystem documents.
+  intercepted policy as described in the subsystem documents. Chrome's HTTP/2
+  preface — `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p` — was taken from
+  Chromium's `AddDefaultHttp2Settings` and cross-checked against curl-impersonate
+  and captures through Chrome 147; `src/mirror.rs` holds it as a value and
+  `src/exchange.rs` asserts it against the bytes an origin receives.
 - QUIC has a 1200-byte path floor and restricted sub-1200 behavior.
 
 Rechecked against primary sources on 2026-08-09:
@@ -141,7 +148,8 @@ Rechecked against primary sources on 2026-08-09:
 - Alt-Svc and HTTPS/SVCB records drive H3 discovery and retain cache state.
 - Cloudflare Radar protocol shares supported h2 and h3 prioritization.
 - Chromium's user-certificate path does not provide target H3 interception.
-- Browser fingerprint byte parity would require BoringSSL-class behavior.
+- Browser fingerprint byte parity requires BoringSSL-class behaviour, which is
+  why `boring` is now a direct dependency rather than only quiche's.
 - Privaxy's memory profile and functionality were reviewed.
 
 ## Not Yet Verified

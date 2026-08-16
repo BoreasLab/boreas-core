@@ -7,7 +7,7 @@
 | non-rooted Android CA trust | MITM is limited to eligible Chromium browsers and WebViews; native apps receive DNS and network filtering |
 | Chromium user roots and HTTP/3 | inspection-required hosts must be steered from h3 to h2 |
 | Certificate Transparency | Android user-store-only installation avoids the system-store CT path |
-| TLS and H2 fingerprint mismatch | CDN challenges may require automatic demotion; BoringSSL parity is deferred |
+| TLS and H2 fingerprint mismatch | closed: BoringSSL mirrors the client's own hello and the HTTP/2 preface is Chrome's; automatic demotion remains the fail-open response |
 | certificate pinning | reduced by browser scope but not absent; fail-open is mandatory |
 | ECH adoption | passive SNI policy is not durable; DNS is the no-decryption signal |
 | Windows driver signing | use the redistributable signed Wintun binary |
@@ -139,13 +139,16 @@ pinning census come from milestone instrumentation rather than separate work.
 
 | Risk | Severity | Mitigation and falsifier |
 |---|---|---|
-| CDN fingerprint breakage | High | narrow allowlist, challenge detection, automatic demotion; measure in M3 before considering BoringSSL |
+| CDN fingerprint breakage | Medium | BoringSSL originates and the Akamai fingerprint is asserted on the wire; narrow allowlist, challenge detection, automatic demotion; measure the residue in M3 |
 | smoltcp scaling | Medium-high | load test during M1; replace or specialize only on measured failure |
 | GotaTun immaturity | Medium | narrow boundary and NepTUN fallback; verify on both v1 platforms |
 | steering hysteresis | Medium | transient UDP/443 backstop and convergence telemetry |
 | VLESS-family maintenance | Medium | retain late-M4 priority and isolate private protocol code |
 | WebView vendor variation | Medium | early device and OS matrix before marketing claims |
 
-The top risk is now CDN fingerprint-induced breakage, not iOS memory or Android
-Conscrypt modification. That is an observable UX risk with a fail-open response,
-not an architectural wall.
+CDN fingerprint-induced breakage was the top risk while both fingerprints were
+`rustls`'s and `hyper`'s. Both are now the browser's, asserted by tests rather
+than assumed, so what remains is residue — an unmirrored TLS extension, a
+behavioural tell above the framing — measurable in M3 rather than architectural.
+It stays on the register because it is observable and fail-open, not because it
+is unaddressed.

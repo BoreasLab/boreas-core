@@ -71,12 +71,13 @@ boring = "5.2"
 tokio-boring = "5.2"
 # Content-coding decoders for the HTML tier, and **decoders only**.
 #
-# A compressed document is opaque to a rewriter, and `Accept-Encoding: identity`
-# only reaches origins that honour it — not a cache, not an intermediary, not a
-# server that ignores it — so the tier needs to be able to read what actually
-# arrives. gzip and Brotli are what browsers ask for and what CDNs serve; a
-# coding neither of these covers still forwards untouched, which is the same
-# fail-open path an unsupported charset already takes.
+# A compressed document is opaque to a rewriter, so the tier can read every
+# coding a browser asks for: gzip, deflate, Brotli, and Zstandard. That set is
+# not a convenience — it is what lets `Accept-Encoding` be **forwarded
+# verbatim**. Rewriting the field to `identity` would announce the proxy in the
+# one header a bot detector reads first, and would cost a document's worth of
+# bandwidth on a phone; a coding outside the set still forwards untouched, on
+# the same fail-open path an unsupported charset takes.
 #
 # **Nothing is recompressed on the way out, and that is a property of where the
 # bytes go rather than a shortcut.** The leg from Boreas to the browser is
@@ -86,12 +87,15 @@ tokio-boring = "5.2"
 # `identity` with streaming framing, which is exactly what
 # [Filtering](docs/filtering.md)'s step 6 asks for.
 #
-# `rust_backend` keeps flate2 on `miniz_oxide` rather than a C zlib, which is
-# what makes it cross-compile to Android with no toolchain of its own;
-# `brotli-decompressor` is the decoder half of the `brotli` crate, so the
-# encoder's tables never enter the artefact.
+# All three are pure Rust and decode-only, which is what makes them cross-compile
+# to Android with no toolchain of their own and keeps encoder tables out of the
+# artefact: `rust_backend` keeps flate2 on `miniz_oxide` rather than a C zlib,
+# `brotli-decompressor` is the decoder half of the `brotli` crate, and `ruzstd`
+# is a decoder with no libzstd behind it. `ruzstd` offers only a pull interface,
+# so `src/rewrite.rs` carries the push adapter and the bound that goes with it.
 brotli-decompressor = { version = "5.0.3", default-features = false, features = ["std"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+ruzstd = { version = "0.9.0", default-features = false, features = ["std"] }
 # The rule engine, as [Filtering](docs/filtering.md) specifies: `adblock`
 # decides and `lol_html` transforms. Brave's implementation is the one shipping
 # in a browser against the same lists Boreas targets, and it covers the two

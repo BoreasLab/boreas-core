@@ -61,7 +61,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderValue, Response, StatusCode,
-    header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+    header::{CONTENT_ENCODING, CONTENT_TYPE},
 };
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
@@ -98,9 +98,9 @@ pub enum NotRewritable {
     NoWholeBody,
     /// Not `text/html`.
     NotHtml,
-    /// The body is compressed with a coding this build cannot read — `zstd`, a
-    /// private coding, or two codings stacked. Fail-open, exactly as an
-    /// unsupported charset is.
+    /// The body is compressed with a coding this build cannot read — a private
+    /// coding, or two codings stacked. Fail-open, exactly as an unsupported
+    /// charset is.
     ContentCoded,
     /// A `charset` that a streaming, ASCII-compatible rewriter cannot read —
     /// UTF-16 in either order, ISO-2022-JP, `replacement` — or a label no
@@ -125,7 +125,7 @@ impl fmt::Display for NotRewritable {
 /// elimination rather than by a lookup that can miss.** A `Coding` value *is*
 /// the proof that a decoder exists for the body, so [`Rewritable`] carries one
 /// and the rewriter constructor cannot be reached without it. Everything the
-/// sum does not name — `zstd`, a private coding, two codings stacked — is not a
+/// sum does not name — a private coding, two codings stacked — is not a
 /// `Coding` at all and lands in [`NotRewritable::ContentCoded`], which forwards
 /// the body byte for byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +141,9 @@ pub enum Coding {
     Deflate,
     /// RFC 7932 Brotli, which is what CDNs serve HTML as.
     Brotli,
+    /// RFC 8878 Zstandard, which Chrome has offered since Chrome 123 and which
+    /// CDNs increasingly answer with.
+    Zstd,
 }
 
 impl Coding {
@@ -152,6 +155,7 @@ impl Coding {
             "gzip" | "x-gzip" => Some(Self::Gzip),
             "deflate" => Some(Self::Deflate),
             "br" => Some(Self::Brotli),
+            "zstd" => Some(Self::Zstd),
             _ => None,
         }
     }
@@ -539,6 +543,133 @@ impl RewriteFailures {
 /// decoder's own footprint the way [`StreamBudget`] bounds the rewriter's.
 const BROTLI_BUFFER_BYTES: usize = 64 * 1024;
 
+/// The most compressed input a zstd decoder may have to hold before it can make
+/// progress: RFC 8878 caps a block at 128 KiB, over a three-byte block header,
+/// under a frame header of at most eighteen. It is also the most that is handed
+/// over at once, which is what keeps the decoder's own buffer near one block
+/// however large a chunk arrives.
+const ZSTD_STAGING_BYTES: usize = 128 * 1024 + 3 + 18;
+
+/// The largest window a zstd frame may ask this build to keep. The format
+/// permits terabytes and a document needs none of them; the decoder compares
+/// this against the frame's declared window and refuses *before* allocating.
+const ZSTD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How much plaintext one chunk may decode to before the body is abandoned.
+///
+/// **A compression bomb is a body, not a bug.** Every coding here expands, and
+/// nothing in a `Content-Length` or a chunk boundary bounds by how much — so
+/// this is the ceiling that makes the tier's memory a function of the ceiling
+/// rather than of what an origin chose to send. Generous for a document and far
+/// under what a bomb reaches, so tripping it is a signal rather than a limit
+/// real content meets.
+const MAX_DECODED_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether a decoder error means *not enough bytes yet* rather than *these
+/// bytes are wrong*.
+///
+/// `ruzstd` reads a frame header with `read_exact`, so a header split across
+/// chunk boundaries surfaces as an error rather than as no progress made. The
+/// `UnexpectedEof` at the end of the chain is what separates the two; anything
+/// else is a body this cannot read.
+fn incomplete(error: &ruzstd::decoding::errors::FrameDecoderError) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = cause {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return io.kind() == std::io::ErrorKind::UnexpectedEof;
+        }
+        cause = error.source();
+    }
+    false
+}
+
+/// A push adapter over `ruzstd`, which offers only pull.
+///
+/// `FrameDecoder` reads whole blocks out of a slice and stages the result
+/// internally; this holds the partial block a chunk boundary split, and drains
+/// the staged plaintext through `collect_to_writer`, which appends into a `Vec`
+/// rather than allocating a fresh one per call.
+struct Zstd {
+    frame: ruzstd::decoding::FrameDecoder,
+    /// Compressed bytes that do not yet form a whole block. Bounded by
+    /// [`ZSTD_STAGING_BYTES`], which is what makes this path fixed-memory.
+    pending: Vec<u8>,
+    plain: Vec<u8>,
+    /// Whether a frame header has been read. Tracked here because
+    /// `FrameDecoder::is_finished` answers *true* before initialisation as well
+    /// as after the last block, and the two mean opposite things.
+    started: bool,
+}
+
+impl Zstd {
+    fn new() -> Self {
+        let mut frame = ruzstd::decoding::FrameDecoder::new();
+        frame.set_max_window_size(ZSTD_WINDOW_BYTES);
+        Self {
+            frame,
+            pending: Vec::new(),
+            plain: Vec::new(),
+            started: false,
+        }
+    }
+
+    /// Decodes what `source` holds, appending plaintext and returning how many
+    /// of its bytes were consumed.
+    fn drain(&mut self, source: &[u8]) -> Result<usize, Undecodable> {
+        let mut used = 0;
+        while used < source.len() {
+            // One staging window at a time: `decode_from_to` decodes *every*
+            // whole block its input contains, so an unbounded slice would stage
+            // an unbounded amount before anything could drain it.
+            let end = source.len().min(used + ZSTD_STAGING_BYTES);
+            let (read, _) = match self.frame.decode_from_to(&source[used..end], &mut []) {
+                Ok(progress) => progress,
+                // The bytes held back are a frame header the chunk boundary
+                // split; they decode once the rest of it arrives.
+                Err(error) if incomplete(&error) => break,
+                Err(_) => return Err(Undecodable),
+            };
+            self.started = true;
+            self.frame
+                .collect_to_writer(&mut self.plain)
+                .map_err(|_| Undecodable)?;
+            if self.plain.len() > MAX_DECODED_CHUNK_BYTES {
+                return Err(Undecodable);
+            }
+            // A frame's trailing four-byte checksum is reported as read whether
+            // or not all four arrived, so a claim larger than what was offered
+            // means the tail is still in flight rather than consumed.
+            if read == 0 || read > end - used {
+                break;
+            }
+            used += read;
+        }
+        // Bytes after a complete frame would be a second, concatenated one.
+        // Legal in the format, sent by no origin, and not decoded here — an
+        // error rather than a silent truncation of what follows.
+        if self.started && self.frame.is_finished() && used < source.len() {
+            return Err(Undecodable);
+        }
+        Ok(used)
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), Undecodable> {
+        if self.pending.is_empty() {
+            // The common case: a chunk holding whole blocks is decoded where it
+            // lies, and only its remainder is copied.
+            let used = self.drain(chunk)?;
+            self.pending.extend_from_slice(&chunk[used..]);
+        } else {
+            let mut held = std::mem::take(&mut self.pending);
+            held.extend_from_slice(chunk);
+            let used = self.drain(&held)?;
+            self.pending = held;
+            self.pending.drain(..used);
+        }
+        Ok(())
+    }
+}
+
 /// A push-driven decoder for one response body.
 ///
 /// **Push, not pull, because the body already is.** `hyper` hands over chunks
@@ -556,6 +687,7 @@ enum Decoder {
     Gzip(Box<flate2::write::GzDecoder<Vec<u8>>>),
     Deflate(Box<flate2::write::ZlibDecoder<Vec<u8>>>),
     Brotli(Box<brotli_decompressor::DecompressorWriter<Vec<u8>>>),
+    Zstd(Box<Zstd>),
 }
 
 /// The compressed stream was malformed or truncated.
@@ -584,6 +716,7 @@ impl Decoder {
                 Vec::new(),
                 BROTLI_BUFFER_BYTES,
             ))),
+            Coding::Zstd => Self::Zstd(Box::new(Zstd::new())),
         }
     }
 
@@ -594,21 +727,31 @@ impl Decoder {
     /// O(bytes) in the chunk, amortised no allocation.
     fn decode<'a>(&'a mut self, chunk: &'a [u8]) -> Result<&'a [u8], Undecodable> {
         use std::io::Write;
-        match self {
-            Self::Identity => Ok(chunk),
+        let plain: &[u8] = match self {
+            // The input slice *is* the output, and it is already bounded by
+            // whatever handed it over.
+            Self::Identity => return Ok(chunk),
             Self::Gzip(decoder) => {
                 decoder.write_all(chunk).map_err(|_| Undecodable)?;
-                Ok(decoder.get_ref())
+                decoder.get_ref()
             }
             Self::Deflate(decoder) => {
                 decoder.write_all(chunk).map_err(|_| Undecodable)?;
-                Ok(decoder.get_ref())
+                decoder.get_ref()
             }
             Self::Brotli(decoder) => {
                 decoder.write_all(chunk).map_err(|_| Undecodable)?;
-                Ok(decoder.get_ref())
+                decoder.get_ref()
             }
-        }
+            Self::Zstd(decoder) => {
+                decoder.push(chunk)?;
+                &decoder.plain
+            }
+        };
+        // One ceiling, whatever the coding: see [`MAX_DECODED_CHUNK_BYTES`].
+        (plain.len() <= MAX_DECODED_CHUNK_BYTES)
+            .then_some(plain)
+            .ok_or(Undecodable)
     }
 
     /// Closes the stream and borrows out the last bytes it was holding. A
@@ -628,6 +771,13 @@ impl Decoder {
                 decoder.close().map_err(|_| Undecodable)?;
                 Ok(decoder.get_ref())
             }
+            // A frame that never finished is a body truncated on the wire, and
+            // a block still pending is the same thing one boundary earlier.
+            Self::Zstd(decoder) => {
+                (decoder.started && decoder.frame.is_finished() && decoder.pending.is_empty())
+                    .then_some(decoder.plain.as_slice())
+                    .ok_or(Undecodable)
+            }
         }
     }
 
@@ -639,6 +789,7 @@ impl Decoder {
             Self::Gzip(decoder) => decoder.get_mut().clear(),
             Self::Deflate(decoder) => decoder.get_mut().clear(),
             Self::Brotli(decoder) => decoder.get_mut().clear(),
+            Self::Zstd(decoder) => decoder.plain.clear(),
         }
     }
 
@@ -942,36 +1093,6 @@ impl Rewriting {
             .map(|rules| (rules, *budget, Arc::clone(failures)))
     }
 
-    /// Asks upstream for a body this tier can read.
-    ///
-    /// **An optimisation now, not a requirement.** A document that arrives
-    /// uncompressed costs no decode at all, which on a phone is the difference
-    /// worth asking for; a document that arrives compressed anyway is still
-    /// read, because [`Coding`] carries a decoder for the codings that matter.
-    /// That is the point of asking rather than depending: an origin that
-    /// ignores the request, a cache that answers from a compressed entry, and
-    /// an intermediary that recompresses are all outside this proxy's control,
-    /// and before there were decoders each of them silently lost the tier.
-    ///
-    /// Only requests that say they want HTML are affected — a navigation, not
-    /// the scripts, images, and fonts that are the bulk of a page's bytes — and
-    /// only on hosts that actually have rules. `identity` is named explicitly
-    /// rather than the field being removed, because an absent `Accept-Encoding`
-    /// means *any* coding is acceptable, which is the opposite of what is
-    /// wanted.
-    pub fn prepare(&self, host: &str, headers: &mut HeaderMap) {
-        if self.rules(host).is_none() {
-            return;
-        }
-        let wants_html = headers
-            .get(ACCEPT)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|accept| accept.contains("text/html"));
-        if wants_html {
-            headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-        }
-    }
-
     /// Applies the tier to one response, adjusting its headers to match.
     ///
     /// Returns the response with a boxed body either way, because the caller
@@ -1184,6 +1305,7 @@ mod tests {
             ("gzip", Coding::Gzip),
             ("x-gzip", Coding::Gzip),
             ("BR", Coding::Brotli),
+            ("zstd", Coding::Zstd),
             ("deflate", Coding::Deflate),
             ("identity", Coding::Identity),
         ] {
@@ -1198,7 +1320,8 @@ mod tests {
             );
         }
         // One this build cannot, and two stacked, both forward untouched.
-        for value in ["zstd", "gzip, br", "compress"] {
+        // Stacked codings, and RFC 2616's LZW that nothing still sends.
+        for value in ["gzip, br", "compress", "br, gzip"] {
             assert_eq!(
                 rewritable(
                     StatusCode::OK,
@@ -1623,7 +1746,10 @@ mod streaming {
         let document = "<html><body><div class=\"ad\">present</div></body></html>";
         for fields in [
             // A coding no decoder here covers.
-            &[("content-type", "text/html"), ("content-encoding", "zstd")][..],
+            &[
+                ("content-type", "text/html"),
+                ("content-encoding", "compress"),
+            ][..],
             // Not a document.
             &[("content-type", "application/json")][..],
             // A character encoding a streaming rewriter cannot read.
@@ -1741,6 +1867,73 @@ mod streaming {
         );
     }
 
+    /// Compresses `plain` as zstd, so the test states the bytes rather than
+    /// trusting a fixture blob.
+    fn zstandard(plain: &str) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(
+            plain.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        )
+    }
+
+    /// **The coding this tier used to fail open on.** Chrome has offered `zstd`
+    /// since Chrome 123 and CDNs answer with it, so a document arriving this way
+    /// was forwarded unfiltered. One byte at a time, because that is the shape
+    /// that finds a decoder which cannot carry a block across a chunk boundary.
+    #[tokio::test]
+    async fn a_zstd_document_is_decoded_one_byte_at_a_time() {
+        let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
+        let document = "<html><body><p>keep</p><div class=\"ad\">gone</div></body></html>";
+        let compressed = zstandard(document);
+
+        let mut response = Response::new(Bytes2(
+            compressed
+                .iter()
+                .map(|byte| Bytes::copy_from_slice(&[*byte]))
+                .collect::<VecDeque<_>>(),
+        ));
+        *response.headers_mut() = headers(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-encoding", "zstd"),
+        ]);
+        let (parts, body) = rewriting.apply(HOST, response).into_parts();
+        let out = body.collect().await.expect("the document completes");
+        let out = String::from_utf8(out.to_bytes().to_vec()).unwrap();
+
+        assert!(!out.contains("gone"), "the rule did not apply: {out}");
+        assert!(out.contains("<p>keep</p>"));
+        assert!(parts.headers.get("content-encoding").is_none());
+    }
+
+    /// **A bomb is a body, not a bug.** Every coding here expands without a
+    /// bound the framing states, so the ceiling is what makes this tier's memory
+    /// a function of the ceiling rather than of what an origin chose to send.
+    #[test]
+    fn a_chunk_expanding_past_the_ceiling_is_refused() {
+        let bomb = vec![b'a'; 2 * MAX_DECODED_CHUNK_BYTES];
+        for (coding, compressed) in [
+            (Coding::Gzip, {
+                use std::io::Write;
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(&bomb).unwrap();
+                encoder.finish().unwrap()
+            }),
+            (Coding::Zstd, {
+                ruzstd::encoding::compress_to_vec(
+                    bomb.as_slice(),
+                    ruzstd::encoding::CompressionLevel::Fastest,
+                )
+            }),
+        ] {
+            let mut decoder = Decoder::new(coding);
+            assert!(
+                decoder.decode(&compressed).is_err(),
+                "{coding:?} decoded past the ceiling"
+            );
+        }
+    }
+
     /// A truncated compressed stream has no recoverable remainder, so the body
     /// ends visibly rather than silently short — the same answer ambiguous
     /// markup gets, and for the same reason.
@@ -1774,35 +1967,5 @@ mod streaming {
         let (_, body) = rewriting.apply(HOST, response).into_parts();
         assert!(body.collect().await.is_err());
         assert_eq!(failures.count(), 1);
-    }
-
-    /// The request side of the encoding problem: a document navigation on a
-    /// host with rules asks for an encoding this build can read, and nothing
-    /// else on the page is touched.
-    #[test]
-    fn only_document_requests_on_rule_bearing_hosts_lose_their_encodings() {
-        let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
-
-        let mut navigation = headers(&[
-            ("accept", "text/html,application/xhtml+xml,*/*;q=0.8"),
-            ("accept-encoding", "gzip, br, zstd"),
-        ]);
-        rewriting.prepare(HOST, &mut navigation);
-        assert_eq!(navigation.get("accept-encoding").unwrap(), "identity");
-
-        // A subresource keeps its compression, which is where the bytes are.
-        let mut subresource = headers(&[("accept", "image/webp,*/*"), ("accept-encoding", "br")]);
-        rewriting.prepare(HOST, &mut subresource);
-        assert_eq!(subresource.get("accept-encoding").unwrap(), "br");
-
-        // And a host with no rules pays nothing at all.
-        let mut elsewhere = headers(&[("accept", "text/html"), ("accept-encoding", "br")]);
-        rewriting.prepare("unlisted.example", &mut elsewhere);
-        assert_eq!(elsewhere.get("accept-encoding").unwrap(), "br");
-
-        // As does a connection the tier is off for.
-        let mut off = headers(&[("accept", "text/html"), ("accept-encoding", "br")]);
-        Rewriting::Off.prepare(HOST, &mut off);
-        assert_eq!(off.get("accept-encoding").unwrap(), "br");
     }
 }

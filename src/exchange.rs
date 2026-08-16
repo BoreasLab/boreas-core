@@ -485,9 +485,6 @@ impl Proxy {
         let client = (handling == Handling::Upgrade).then(|| hyper::upgrade::on(&mut request));
 
         strip_hop_by_hop(request.headers_mut(), handling);
-        // Asked *after* the hop-by-hop sweep, because the field it sets is one
-        // the sweep would otherwise be free to remove.
-        self.rewriting.prepare(&self.host, request.headers_mut());
 
         // The upstream wire equals the client wire by construction: the record
         // is the proof, and the P14 gate reads its count.
@@ -718,6 +715,28 @@ mod tests {
                 FilterVerdict::Allow
             }
         }
+    }
+
+    /// A fake origin that reports the request head it saw: every field name in
+    /// order, then the `Accept-Encoding` value. Both are things a proxy is
+    /// meant to relay untouched and easy to disturb by accident.
+    async fn fake_upstream_reflecting_head(io: DuplexStream) {
+        let service = service_fn(|request: Request<Incoming>| async move {
+            let names: Vec<&str> = request.headers().keys().map(HeaderName::as_str).collect();
+            let encoding = request
+                .headers()
+                .get("accept-encoding")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("<absent>")
+                .to_owned();
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!(
+                "{}|{encoding}",
+                names.join(",")
+            )))))
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(io), service)
+            .await;
     }
 
     /// A fake origin server: answers every request `200` with a body naming the
@@ -1176,6 +1195,89 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"origin:/resource");
         assert_eq!(crossings.count(), 0, "h2 to h2 crosses nothing");
+    }
+
+    /// **A relayed request head is the client's own.** Field order is a
+    /// fingerprint in its own right, and `Accept-Encoding` says which codings
+    /// the client can read — so a proxy that reorders one or narrows the other
+    /// is announcing itself in the one place it has no reason to.
+    ///
+    /// The `POST` matters: `Content-Length` is dropped here because the codec
+    /// re-frames the body, and `HeaderMap::remove` is a `swap_remove`, so this
+    /// is the shape that would silently permute.
+    #[tokio::test]
+    async fn a_relayed_request_keeps_its_field_order_and_encodings() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (upstream_client, upstream_server) = tokio::io::duplex(4096);
+        tokio::spawn(fake_upstream_reflecting_head(upstream_server));
+        tokio::spawn(run_exchange(
+            HOST_NAME,
+            Wire::Http1,
+            server_io,
+            upstream_client,
+            Arc::new(AllowAll),
+            Arc::new(VersionCrossings::new()),
+            Rewriting::Off,
+        ));
+
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        // Chrome's own order and its own encoding list, with the body that
+        // forces a `Content-Length` in the middle of it.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/submit")
+            .header(HOST, HOST_NAME)
+            .header("user-agent", "boreas-test")
+            .header("accept", "text/html")
+            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .header("accept-language", "en-GB,en;q=0.9")
+            .header("cookie", "a=1")
+            .body(Full::new(Bytes::from_static(b"body")))
+            .unwrap();
+        let response = sender.send_request(request).await.expect("forwarded");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+
+        // `content-length` trails because hyper re-frames the body it is
+        // sending, which is the codec's job and not a relayed field.
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "host,user-agent,accept,accept-encoding,accept-language,cookie,content-length\
+|gzip, deflate, br, zstd"
+        );
+    }
+
+    /// **Dropping a field must not move the others.** `HeaderMap::remove` is a
+    /// `swap_remove`, so removing `Content-Length` from the middle of a browser's
+    /// request would fling the last field into its place — and field order is a
+    /// fingerprint this proxy exists to preserve.
+    #[test]
+    fn dropping_a_field_leaves_the_order_of_the_rest() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("host", "example.test"),
+            ("user-agent", "boreas-test"),
+            ("content-length", "4"),
+            ("accept", "text/html"),
+            ("cookie", "a=1"),
+        ] {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        strip_hop_by_hop(&mut headers, Handling::Ordinary);
+        let names: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
+        assert_eq!(names, ["host", "user-agent", "accept", "cookie"]);
+
+        // And a head with nothing to drop is returned untouched, which is the
+        // path every ordinary h2 GET takes.
+        let mut untouched = headers.clone();
+        strip_hop_by_hop(&mut untouched, Handling::Ordinary);
+        assert_eq!(untouched, headers);
     }
 
     // ------------------------------------------------- the HTTP/2 fingerprint

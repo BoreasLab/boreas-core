@@ -54,7 +54,6 @@ native enforcement point on each platform. It also removes the 50 MB
 ## v1 Non-Goals
 
 - arbitrary native-app TLS interception on non-rooted Android
-- TLS or HTTP fingerprint mimicry
 - cross-version HTTP bridging
 - HTTP/3 interception for Chromium
 - iOS delivery

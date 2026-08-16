@@ -1058,7 +1058,7 @@ Boreas-attributable breakage.
 CSP relaxation, SRI preservation. Rewriters constructed only after `text/html`
 is confirmed. Memory settings and strict bail-out wired to fail open.
 
-**Status: complete in-process, less content-encoding decompression.**
+**Status: complete in-process.**
 Delivered in `src/rewrite.rs` and `src/rules.rs`:
 
 - **`adblock` decides and `lol_html` transforms**, which is the boundary
@@ -1095,11 +1095,10 @@ Delivered in `src/rewrite.rs` and `src/rules.rs`:
 
 **Deliberately not built, and recorded rather than hidden:**
 
-- **No decompressor.** `Rewriting::prepare` sets `Accept-Encoding: identity` on
-  document navigations for hosts that have rules, so the documents Boreas
-  intends to rewrite arrive readable. Subresources — the bulk of a page's bytes
-  — keep their compression, and a host with no rules pays nothing. Adding a
-  decoder is one arm of a closed sum.
+- ~~**No decompressor.**~~ Built. `Coding` carries gzip, deflate, Brotli, and
+  Zstandard — every coding a browser offers — which is what lets
+  `Accept-Encoding` be forwarded verbatim instead of rewritten to `identity`.
+  `Rewriting::prepare` is gone with it.
 - **No generic cosmetic rules, which is the engine's design rather than a
   shortcut.** `url_cosmetic_resources` deliberately returns only the
   host-specific set; the generic set is indexed by class and id token, to be

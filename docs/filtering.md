@@ -213,12 +213,25 @@ ISO-2022-JP, and `replacement` are unsupported and must splice unchanged.
 Wire `lol_html` memory settings and strict bail-out to a fail-open path.
 
 `Coding` is the closed sum of content codings a decoder exists for — identity,
-gzip, deflate, Brotli. Holding one *is* the proof that the body can be read, so
-the rewriter cannot be constructed without it; a coding the sum does not name,
-or two stacked, forwards untouched on the same fail-open path an unsupported
-charset takes. `Accept-Encoding: identity` remains a request, because a cache,
-an intermediary, or a non-compliant origin can all ignore it — which before the
-decoders existed lost the whole tier on that response, silently.
+gzip, deflate, Brotli, Zstandard. Holding one *is* the proof that the body can
+be read, so the rewriter cannot be constructed without it; a coding the sum does
+not name, or two stacked, forwards untouched on the same fail-open path an
+unsupported charset takes.
+
+**`Accept-Encoding` is forwarded verbatim, and covering all four codings is what
+buys that.** Boreas once rewrote the field to `identity` on document navigations
+so the tier would get something it could read. That is the loudest tell a proxy
+can leave — the field is what a bot detector reads first, and no browser sends
+`identity` — and it cost a document's worth of bandwidth on a metered phone to
+avoid a decode that runs at hundreds of megabytes a second. The request is now
+the client's own, unmodified.
+
+Every decoder is bounded by the same ceiling on plaintext produced per chunk. A
+compression bomb is a body rather than a bug: nothing in a `Content-Length` or a
+chunk boundary says how far a coding expands, so the ceiling is what makes this
+tier's memory a function of the ceiling rather than of what an origin chose to
+send. A chunk that exceeds it abandons the document, which is the same visible
+ending a truncated stream gets.
 
 **Preserving WebSocket upgrades is a property of the exchange's own sum.**
 `Connection` and `Upgrade` are hop-by-hop fields, and a proxy that swept them
