@@ -59,7 +59,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::{Rewriting, VersionCrossings, Wire};
+use crate::{H2Profile, Rewriting, VersionCrossings, Wire};
 
 /// The response body the proxy yields, uniform across forwarded and synthesized
 /// responses so one service can return either. Upstream bodies (`Incoming`) and
@@ -327,36 +327,61 @@ fn handling<B>(request: &Request<B>) -> Handling {
     }
 }
 
+/// Drops the fields a forwarding proxy must not relay, **keeping the order of
+/// the ones it does**.
+///
+/// The order matters because this proxy re-sends a browser's own requests, and
+/// the sequence a browser emits its headers in is as much a fingerprint as the
+/// SETTINGS frame carrying them ([`crate::H2Profile`]). `HeaderMap::remove` is a
+/// `swap_remove` — it moves the last entry into the hole — so removing
+/// `Content-Length` from a `POST` would permute everything a browser was careful
+/// about. Rebuilding is the only order-preserving deletion the map offers.
+///
+/// O(fields), one pass and one allocation, and only when something is actually
+/// dropped: an ordinary h2 `GET` carries none of these and returns after the
+/// scan.
 fn strip_hop_by_hop(headers: &mut HeaderMap, handling: Handling) {
-    // The `Connection` header may name further fields to drop; those named
-    // tokens are honoured before the header itself is removed. The collection
-    // is built only when the field is present at all, which on h2 is never —
-    // `Connection` is forbidden there — so the common wire pays nothing.
-    if headers.contains_key(CONNECTION) {
-        let named: Vec<HeaderName> = headers
-            .get_all(CONNECTION)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .map(str::trim)
-            // On the upgrade path `Connection: upgrade` names the very field
-            // that carries the offer, so honouring it would delete the message.
-            .filter(|token| {
-                handling == Handling::Ordinary || !token.eq_ignore_ascii_case("upgrade")
-            })
-            .filter_map(|token| HeaderName::from_bytes(token.as_bytes()).ok())
-            .collect();
-        for name in named {
-            headers.remove(name);
+    // `Connection` may name further fields to drop. Built only when the field
+    // is present at all, which on h2 is never — it is forbidden there — so the
+    // common wire pays one lookup.
+    let named: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        // On the upgrade path `Connection: upgrade` names the very field that
+        // carries the offer, so honouring it would delete the message.
+        .filter(|token| handling == Handling::Ordinary || !token.eq_ignore_ascii_case("upgrade"))
+        .filter_map(|token| HeaderName::from_bytes(token.as_bytes()).ok())
+        .collect();
+
+    let discard = |name: &HeaderName| {
+        HOP_BY_HOP.contains(&name.as_str())
+            || (handling == Handling::Ordinary && (*name == CONNECTION || *name == UPGRADE))
+            // Linear over a list that is empty on every h2 request and at most
+            // a few tokens on h1; a set would cost more to build than to miss.
+            || named.contains(name)
+    };
+
+    if !headers.keys().any(discard) {
+        return;
+    }
+
+    // `drain` yields `None` for a repeated name, so the last name seen is the
+    // one a `None` belongs to — and `None` while discarding means the value
+    // belongs to a field already dropped.
+    let mut kept = HeaderMap::with_capacity(headers.len());
+    let mut keeping: Option<HeaderName> = None;
+    for (name, value) in headers.drain() {
+        if let Some(name) = name {
+            keeping = (!discard(&name)).then_some(name);
+        }
+        if let Some(name) = &keeping {
+            kept.append(name, value);
         }
     }
-    for name in HOP_BY_HOP {
-        headers.remove(name);
-    }
-    if handling == Handling::Ordinary {
-        headers.remove(CONNECTION);
-        headers.remove(UPGRADE);
-    }
+    *headers = kept;
 }
 
 fn boxed_full(bytes: &'static [u8]) -> ProxyBody {
@@ -621,10 +646,15 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (sender, connection) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(upstream))
-            .await
-            .map_err(io::Error::other)?;
+    // The upstream preface is Chrome's, not hyper's: SETTINGS, the connection
+    // WINDOW_UPDATE, and pseudo-header order are all read as a fingerprint, and
+    // hyper's defaults match no browser.
+    let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+    let (sender, connection) = H2Profile::CHROME
+        .apply(&mut builder)
+        .handshake(TokioIo::new(upstream))
+        .await
+        .map_err(io::Error::other)?;
     let driver = tokio::spawn(connection);
     let proxy = Arc::new(Proxy {
         host,
@@ -648,7 +678,11 @@ where
         })
     };
 
+    // hyper's server accepts a 16 KiB header block, and this leg carries a
+    // browser's cookies. Chrome itself accepts 256 KiB, so a request Chrome was
+    // willing to send is one this proxy must be willing to relay.
     let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        .max_header_list_size(H2Profile::CHROME.max_header_list_size)
         .serve_connection(TokioIo::new(client), service)
         .await;
     driver.abort();
@@ -1132,5 +1166,199 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"origin:/resource");
         assert_eq!(crossings.count(), 0, "h2 to h2 crosses nothing");
+    }
+
+    // ------------------------------------------------- the HTTP/2 fingerprint
+
+    const FRAME_HEADERS: u8 = 0x1;
+    const FRAME_PRIORITY: u8 = 0x2;
+    const FRAME_SETTINGS: u8 = 0x4;
+    const FRAME_WINDOW_UPDATE: u8 = 0x8;
+
+    struct RawFrame {
+        kind: u8,
+        flags: u8,
+        stream: u32,
+        payload: Vec<u8>,
+    }
+
+    async fn read_frame<R: tokio::io::AsyncRead + Unpin>(io: &mut R) -> RawFrame {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0u8; 9];
+        io.read_exact(&mut head).await.expect("frame header");
+        let length = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let mut payload = vec![0u8; length];
+        io.read_exact(&mut payload).await.expect("frame payload");
+        RawFrame {
+            kind: head[3],
+            flags: head[4],
+            stream: u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]),
+            payload,
+        }
+    }
+
+    /// HPACK's prefixed integer (RFC 7541 §5.1): the low `bits` of `first`,
+    /// extended by continuation bytes when they are all ones.
+    fn varint(first: u8, mut rest: &[u8], bits: u32) -> (usize, &[u8]) {
+        let mask = (1usize << bits) - 1;
+        let mut value = usize::from(first) & mask;
+        if value == mask {
+            let mut shift = 0;
+            loop {
+                let (&byte, tail) = rest.split_first().expect("truncated integer");
+                rest = tail;
+                value += usize::from(byte & 0x7f) << shift;
+                shift += 7;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
+        (value, rest)
+    }
+
+    /// Steps over one HPACK string literal. Its length prefix is what this
+    /// needs; its Huffman coding is what it does not.
+    fn skip_string(rest: &[u8]) -> &[u8] {
+        let (&first, after) = rest.split_first().expect("truncated string");
+        let (length, after) = varint(first, after, 7);
+        &after[length..]
+    }
+
+    /// The static-table indices that name a pseudo-header, as the letter the
+    /// Akamai fingerprint spells it with. A request reaches index 7 at most.
+    fn pseudo_letter(index: usize) -> Option<char> {
+        match index {
+            1 => Some('a'),
+            2 | 3 => Some('m'),
+            4 | 5 => Some('p'),
+            6 | 7 => Some('s'),
+            _ => None,
+        }
+    }
+
+    /// The order of pseudo-header names in one HPACK block.
+    ///
+    /// Only the static table is consulted, which is sound for the first request
+    /// on a connection: the dynamic table is still empty, so no index can refer
+    /// to it. A pseudo-header sent with a *literal* name would go unseen, which
+    /// no encoder does and none of h2's paths can produce.
+    fn pseudo_order(block: &[u8]) -> String {
+        let mut letters: Vec<char> = Vec::new();
+        let mut rest = block;
+        while let Some((&first, after)) = rest.split_first() {
+            // Indexed field: name and value both come from a table, so the
+            // integer is the whole entry.
+            if first & 0x80 != 0 {
+                let (index, tail) = varint(first, after, 7);
+                letters.extend(pseudo_letter(index));
+                rest = tail;
+                continue;
+            }
+            // Dynamic table size update carries no field at all.
+            if first & 0xe0 == 0x20 {
+                (_, rest) = varint(first, after, 5);
+                continue;
+            }
+            // Literal: an indexed or literal name, then always a value string.
+            let prefix = if first & 0xc0 == 0x40 { 6 } else { 4 };
+            let (index, tail) = varint(first, after, prefix);
+            letters.extend(pseudo_letter(index));
+            rest = skip_string(if index == 0 { skip_string(tail) } else { tail });
+        }
+        letters
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The Akamai fingerprint, read off the bytes an origin actually receives.
+    ///
+    /// `mirror::tests` proves [`H2Profile::CHROME`] *renders* Chrome's published
+    /// string; this proves the wire agrees with the value, and the two together
+    /// are what make the fingerprint a checked fact rather than six constants
+    /// nobody reads. Pseudo-header order especially: no builder can set it, so
+    /// this is the only place that would notice `vendor/patches/h2.patch` going
+    /// missing.
+    #[tokio::test]
+    async fn the_upstream_preface_is_chromes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_near, client_far) = tokio::io::duplex(64 * 1024);
+        let (upstream_near, mut origin) = tokio::io::duplex(64 * 1024);
+
+        tokio::spawn(run_exchange(
+            HOST_NAME,
+            Wire::Http2,
+            client_far,
+            upstream_near,
+            Arc::new(AllowAll),
+            Arc::new(VersionCrossings::new()),
+            Rewriting::Off,
+        ));
+        // The origin's own empty SETTINGS, so the connection is well formed.
+        origin
+            .write_all(&[0, 0, 0, FRAME_SETTINGS, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_near))
+                .await
+                .expect("client conn");
+        tokio::spawn(connection);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("https://{HOST_NAME}/"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        tokio::spawn(async move { sender.send_request(request).await });
+
+        let mut preface = [0u8; 24];
+        origin.read_exact(&mut preface).await.expect("preface");
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
+        // Everything up to the request. The ACK of the origin's own SETTINGS is
+        // interleaved here and carries no fingerprint; a PRIORITY frame would
+        // be the fingerprint's third field, and Chrome sends none.
+        let mut settings = Vec::new();
+        let mut increment = 0;
+        let headers = loop {
+            let frame = read_frame(&mut origin).await;
+            match frame.kind {
+                FRAME_SETTINGS if frame.flags & 0x1 != 0 => {}
+                FRAME_SETTINGS => {
+                    settings = frame
+                        .payload
+                        .chunks_exact(6)
+                        .map(|pair| {
+                            let id = u16::from_be_bytes([pair[0], pair[1]]);
+                            let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
+                            format!("{id}:{value}")
+                        })
+                        .collect();
+                }
+                FRAME_WINDOW_UPDATE => {
+                    assert_eq!(frame.stream, 0, "the connection window, not a stream's");
+                    increment = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                }
+                FRAME_PRIORITY => panic!("Chrome sends no PRIORITY frame"),
+                FRAME_HEADERS => break frame,
+                _ => {}
+            }
+        };
+        // PRIORITY on the HEADERS frame is that same third field; PADDED would
+        // put a pad length in front of the block below.
+        assert_eq!(headers.flags & 0x28, 0);
+
+        assert_eq!(
+            format!(
+                "{}|{increment}|0|{}",
+                settings.join(";"),
+                pseudo_order(&headers.payload)
+            ),
+            H2Profile::CHROME.akamai(),
+        );
     }
 }

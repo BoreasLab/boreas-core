@@ -15,6 +15,7 @@ cargo-fuzz = true
 # fails on `links = "boringssl"`. The path is the same generated tree the root
 # points at; see ../vendor/README.md.
 [patch.crates-io]
+h2 = { path = "../vendor/h2" }
 quiche = { path = "../vendor/quiche" }
 
 [dependencies]

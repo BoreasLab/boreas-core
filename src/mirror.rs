@@ -39,10 +39,15 @@
 //! counted. [`Wire`](crate::Wire) owns that decision; a mirrored ALPN list would
 //! quietly take it back.
 //!
-//! This closes the TLS half of the fingerprint. The HTTP/2 half — the Akamai
-//! fingerprint, which is SETTINGS order, the connection WINDOW_UPDATE, and
-//! pseudo-header order — is hyper's, and is not addressed here; see
-//! [Delivery](../docs/delivery.md).
+//! **The HTTP/2 half is here too, and it is not mirrored — it is Chrome's.**
+//! [`H2Profile`] carries the four fields the Akamai fingerprint reads. The
+//! asymmetry with the ClientHello above is forced rather than chosen: a
+//! ClientHello arrives before anything is decrypted, so Boreas holds the
+//! client's own bytes, while an HTTP/2 preface arrives *inside* the connection
+//! this process terminates and is consumed by hyper's server before any of it
+//! could be copied. Reproducing the client's preface would mean reading frames
+//! hyper has already turned into a `Request`. So the upstream preface is a
+//! constant, and [`H2Profile::CHROME`] is what it is set to.
 
 use std::{
     collections::HashMap,
@@ -58,6 +63,7 @@ use boring::{
     },
     x509::{X509, store::X509StoreBuilder},
 };
+use hyper::client::conn::http2::Builder as H2Builder;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Handshake extensions this module reads out of a ClientHello.
@@ -720,9 +726,160 @@ pub fn alpn_list(protocols: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
+// ------------------------------------------------------- HTTP/2 preface
+
+/// HTTP/2's own initial connection window (RFC 9113 §6.9.2). Every endpoint
+/// starts here, so the WINDOW_UPDATE a fingerprint reads is the target less
+/// this.
+const SPEC_WINDOW_SIZE: u32 = 65_535;
+
+/// The pseudo-header order every browser sends, and the Akamai fingerprint's
+/// fourth field.
+///
+/// A constant rather than a setting because nothing in this process decides it:
+/// h2 hard-codes the order, and `vendor/patches/h2.patch` is what makes this
+/// string true. `exchange::tests` asserts it against the wire.
+const PSEUDO_HEADER_ORDER: &str = "m,a,s,p";
+
+/// `SETTINGS_ENABLE_PUSH`. hyper disables push unconditionally and so does
+/// Chrome, so there is no knob here and no disagreement to model.
+const ENABLE_PUSH: u32 = 0;
+
+/// The HTTP/2 connection preface a client is fingerprinted by.
+///
+/// **A value, so the fingerprint is a test rather than a habit.** The Akamai
+/// fingerprint reads four fields — SETTINGS, the connection WINDOW_UPDATE,
+/// PRIORITY, and pseudo-header order. The first two are this struct, the third
+/// is `0` for any client that sends no PRIORITY frame, and the fourth is
+/// [`PSEUDO_HEADER_ORDER`]. [`Self::akamai`] renders all four, which is what
+/// lets a test compare one string against Chrome's published one instead of
+/// trusting six loose constants to stay in agreement.
+///
+/// **An `Option` field models presence, not a default.** Chrome sends no
+/// `MAX_CONCURRENT_STREAMS` and no `MAX_FRAME_SIZE`, and *sending* either is as
+/// distinguishing as sending a wrong value — so `None` means the setting is
+/// absent from the frame. The two non-`Option` fields are the ones hyper always
+/// emits and offers no way to suppress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct H2Profile {
+    /// `SETTINGS_HEADER_TABLE_SIZE` (1): the HPACK dynamic table this endpoint
+    /// will maintain, which bounds what the *peer's* encoder may use. `None`
+    /// leaves HPACK's own 4096.
+    pub header_table_size: Option<u32>,
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` (3).
+    pub max_concurrent_streams: Option<u32>,
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` (4): the per-stream receive window.
+    pub initial_window_size: u32,
+    /// `SETTINGS_MAX_FRAME_SIZE` (5). `None` is what Chrome does, and costs
+    /// nothing: the value it would carry is the protocol default anyway.
+    pub max_frame_size: Option<u32>,
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` (6): the largest *uncompressed* header
+    /// block this endpoint accepts. Not a dictionary, despite living next to
+    /// one.
+    pub max_header_list_size: u32,
+    /// The connection-level receive window, which a client raises with a
+    /// WINDOW_UPDATE on stream 0 straight after its SETTINGS. Not a setting;
+    /// see [`Self::window_increment`].
+    pub connection_window_size: u32,
+}
+
+impl H2Profile {
+    /// Chrome's preface, unchanged from Chrome 124 through at least 147.
+    ///
+    /// The windows are Chromium's `kSpdyStreamMaxRecvWindowSize` and
+    /// `kSpdySessionMaxRecvWindowSize`; `1` and `6` are `kSpdyMaxHeaderTableSize`
+    /// and `kSpdyMaxHeaderListSize`. `3` and `5` are absent because
+    /// `AddDefaultHttp2Settings` never sets them.
+    pub const CHROME: Self = Self {
+        header_table_size: Some(64 * 1024),
+        max_concurrent_streams: None,
+        initial_window_size: 6 * 1024 * 1024,
+        max_frame_size: None,
+        max_header_list_size: 256 * 1024,
+        connection_window_size: 15 * 1024 * 1024,
+    };
+
+    /// The WINDOW_UPDATE increment this profile sends on stream 0.
+    #[must_use]
+    pub const fn window_increment(&self) -> u32 {
+        self.connection_window_size.saturating_sub(SPEC_WINDOW_SIZE)
+    }
+
+    /// The SETTINGS this profile puts on the wire, paired with their
+    /// identifiers and in ascending order — which is the order h2 encodes them
+    /// and therefore the order a fingerprint reads them.
+    const fn settings(&self) -> [(u16, Option<u32>); 6] {
+        [
+            (1, self.header_table_size),
+            (2, Some(ENABLE_PUSH)),
+            (3, self.max_concurrent_streams),
+            (4, Some(self.initial_window_size)),
+            (5, self.max_frame_size),
+            (6, Some(self.max_header_list_size)),
+        ]
+    }
+
+    /// This preface in the Akamai fingerprint's notation:
+    /// `SETTINGS|WINDOW_UPDATE|PRIORITY|PSEUDO_HEADER_ORDER`.
+    #[must_use]
+    pub fn akamai(&self) -> String {
+        let settings = self
+            .settings()
+            .into_iter()
+            .filter_map(|(id, value)| Some(format!("{id}:{}", value?)))
+            .collect::<Vec<_>>()
+            .join(";");
+        // PRIORITY is `0`: no client here sends a PRIORITY frame, and neither
+        // does Chrome since it moved to RFC 9218 priority signalling.
+        format!(
+            "{settings}|{}|0|{PSEUDO_HEADER_ORDER}",
+            self.window_increment()
+        )
+    }
+
+    /// Configures a hyper HTTP/2 client to open connections with this preface.
+    pub fn apply<'a, E: Clone>(&self, builder: &'a mut H2Builder<E>) -> &'a mut H2Builder<E> {
+        builder
+            .header_table_size(self.header_table_size)
+            .max_concurrent_streams(self.max_concurrent_streams)
+            .initial_stream_window_size(self.initial_window_size)
+            .initial_connection_window_size(self.connection_window_size)
+            .max_frame_size(self.max_frame_size)
+            .max_header_list_size(self.max_header_list_size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chrome's published fingerprint, verbatim. Six constants can each look
+    /// plausible alone; this is the one assertion that fails by naming which
+    /// field moved.
+    #[test]
+    fn the_chrome_profile_renders_chromes_published_fingerprint() {
+        assert_eq!(
+            H2Profile::CHROME.akamai(),
+            "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"
+        );
+    }
+
+    /// A `None` setting is absent from the frame rather than sent with a
+    /// default, because sending it at all is what a fingerprint sees.
+    #[test]
+    fn an_absent_setting_is_omitted_rather_than_defaulted() {
+        let profile = H2Profile {
+            header_table_size: None,
+            max_frame_size: Some(16_384),
+            max_concurrent_streams: Some(1000),
+            ..H2Profile::CHROME
+        };
+        assert!(
+            profile
+                .akamai()
+                .starts_with("2:0;3:1000;4:6291456;5:16384;6:262144|")
+        );
+    }
 
     /// GREASE is the sixteen values RFC 8701 reserves, and nothing else. A
     /// looser test would let an ordinary extension set the flag.

@@ -88,6 +88,28 @@ why the reverse check runs first.
 
 ## Current entries
 
+### `h2`
+
+Swaps two blocks in `impl Iterator for Iter` so a request emits `:authority`
+before `:scheme`, and nothing else.
+
+The Akamai HTTP/2 fingerprint is four fields — SETTINGS, the connection
+WINDOW_UPDATE, PRIORITY, and **pseudo-header order** — and the last one is the
+only one no builder can reach. h2 hard-codes `:method :scheme :authority :path`
+in `src/frame/headers.rs`; every current browser sends `:method :authority
+:scheme :path`. RFC 9113 §8.3 requires only that pseudo-headers precede regular
+fields and fixes no order among them, so both are valid HTTP/2 and only one of
+them is a browser.
+
+The other three fields are configuration, and `H2Profile::CHROME` in
+`src/mirror.rs` supplies them. That module mirrors the client's own ClientHello
+onto the upstream handshake; a request that then announces a pseudo-header order
+no browser uses gives the whole thing back one layer higher up, which is why
+this is worth a patched dependency rather than a documented gap.
+
+Decoding is unaffected: a receiver accepts pseudo-headers in any order, so the
+patch is invisible to every peer except a fingerprinter.
+
 ### `quiche`
 
 Raises `boring` from `^4.3` to `5.2`, and nothing else.

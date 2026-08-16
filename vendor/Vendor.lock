@@ -6,6 +6,14 @@
 # committed tree has not been edited by hand.
 
 [[vendored]]
+name = "h2"
+version = "0.4.15"
+crate-sha256 = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+patch-sha256 = "cd3a3fcc0fed35e56d34447508b88f38a193e3a4eb5f3f8391076ab8d386ba4c"
+tree-sha256 = "849adf31f9a4cce5be67aacad0cb486f6fd5004532ba835a9c9be3c730e5aa87"
+application = "clean"
+
+[[vendored]]
 name = "quiche"
 version = "0.29.3"
 crate-sha256 = "61166d27591eb7cb1310eec2b8fc6ae0e0686e9e4ed742a3ffc6317171175e7d"

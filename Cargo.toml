@@ -13,9 +13,12 @@ edition = "2024"
 # `quiche` is here because `boring-sys` declares `links = "boringssl"`, which
 # Cargo permits once per graph, so quiche's `boring = "^4.3"` would otherwise
 # bind Boreas's own originating-TLS seam to a BoringSSL from May 2023 that
-# predates `X25519MLKEM768`. `vendor/README.md` carries the argument and says
-# what retires the entry.
+# predates `X25519MLKEM768`. `h2` is here because pseudo-header order is the
+# fourth field of the Akamai HTTP/2 fingerprint and h2 hard-codes an order no
+# browser sends. `vendor/README.md` carries both arguments and says what
+# retires each entry.
 [patch.crates-io]
+h2 = { path = "vendor/h2" }
 quiche = { path = "vendor/quiche" }
 
 [dependencies]

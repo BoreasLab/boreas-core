@@ -19,6 +19,19 @@
 # reports an entry as retired when its patch *reverse-applies* to the pristine
 # package, which is a decidable fact meaning upstream has adopted the change.
 
+[patch.h2]
+reason = """
+The fourth field of the Akamai HTTP/2 fingerprint is the order a client emits \
+its pseudo-headers in, and h2 hard-codes `:method :scheme :authority :path` in \
+`impl Iterator for Iter`. Chrome emits `:method :authority :scheme :path`. \
+RFC 9113 s8.3 constrains only that pseudo-headers precede regular fields, so \
+the order is free and neither h2 nor hyper exposes it as configuration — a \
+builder knob cannot reach it. Boreas re-originates a browser's own requests, \
+so emitting a pseudo-header order no browser uses undoes the ClientHello \
+mirroring in `src/mirror.rs` one layer higher up.
+"""
+retires = "h2 exposes pseudo-header order as configuration, or adopts the browser order; then this entry, vendor/h2, and h2's [patch.crates-io] line should all be deleted."
+
 [patch.quiche]
 reason = """
 `boring-sys` declares `links = "boringssl"`, and Cargo admits exactly one such \
