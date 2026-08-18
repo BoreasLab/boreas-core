@@ -7,9 +7,8 @@
 use std::{net::Ipv4Addr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use boreas_core::{
-    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, Egress, EgressCapabilities,
-    EgressEmit, FilterPolicy, Harness, Limits, Mtu, NatBehavior, SimDevice, WireGuardConfig,
-    WireGuardEgress,
+    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, Egress, EgressEmit, FilterPolicy,
+    Harness, Limits, Mtu, NatBehavior, PathProperties, SimDevice, WireGuardConfig, WireGuardEgress,
 };
 
 /// Slices large enough for an encapsulated 1420-byte packet, and a budget
@@ -32,16 +31,16 @@ fn udp_frame(source: Ipv4Addr, source_port: u16) -> Vec<u8> {
 }
 
 fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
-    // The egress's real capabilities drive the plan, exactly as the shell
+    // The egress's real path properties drive the plan, exactly as the shell
     // would derive them from the `Egress` sum.
     let egress = Egress::Packet(Box::new(client_egress(Arc::clone(&pool))));
-    let capabilities = egress.capabilities();
+    let properties = egress.properties();
     assert_eq!(egress.accepts(), Accepts::IpPackets);
     Datapath::new(
         FilterPolicy::PassThrough,
         DnsPolicy::Forward,
         egress.accepts(),
-        capabilities,
+        properties,
         Mtu::new(1500).unwrap(),
         Limits {
             reassembly_timeout: Duration::from_secs(30),
@@ -57,7 +56,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
         },
         pool,
     )
-    .expect("a WireGuard capability set plans the packet fast path")
+    .expect("WireGuard path properties plan the packet fast path")
 }
 
 fn client_egress(pool: Arc<BufferPool>) -> WireGuardEgress {
@@ -191,12 +190,12 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
 }
 
 #[test]
-fn wireguard_capabilities_plan_the_packet_fast_path() {
+fn wireguard_properties_plan_the_packet_fast_path() {
     let plan = boreas_core::plan_flow(
         FilterPolicy::PassThrough,
         boreas_core::Inspection::Excluded,
         Accepts::IpPackets,
-        EgressCapabilities {
+        PathProperties {
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: boreas_core::WIREGUARD_OVERHEAD_BYTES,
             max_datagram_size: None,
@@ -205,7 +204,7 @@ fn wireguard_capabilities_plan_the_packet_fast_path() {
         },
         Mtu::new(1500).unwrap(),
     )
-    .expect("WireGuard capabilities plan");
+    .expect("WireGuard path properties plan");
 
     // 1500 - 80 leaves 1420, the conventional WireGuard MTU, and QUIC clears
     // the 1200-byte floor with headroom.

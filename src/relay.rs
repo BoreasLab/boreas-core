@@ -14,7 +14,7 @@
 //! association could not honour it: two clients talking to the same peer would
 //! receive each other's replies, because the only thing a returning datagram
 //! names is the peer it came from. Keying associations by client endpoint makes
-//! the mapping the association, so the capability claim
+//! the mapping the association, so the path properties
 //! ([`NatBehavior::EndpointIndependent`](crate::NatBehavior)) is a property of
 //! the structure rather than a hope.
 //!
@@ -221,7 +221,7 @@ async fn serve_association(
 ) -> RelayCounts {
     let mut counts = RelayCounts::default();
     let Ok(Association { sink, mut source }) = egress.associate().await else {
-        // The egress said so in its capability claim, or the proxy refused.
+        // The egress said so in its path properties, or the proxy refused.
         // Either way there is nothing to serve and the queued datagrams are
         // dropped with the receiver.
         counts.associations_failed += 1;
@@ -302,8 +302,8 @@ mod tests {
     };
 
     use crate::{
-        AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, EgressCapabilities,
-        NatBehavior,
+        AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, NatBehavior,
+        PathProperties,
     };
 
     fn pool() -> Arc<BufferPool> {
@@ -383,8 +383,8 @@ mod tests {
     struct EchoEgress(Arc<Echo>);
 
     impl StreamEgress for EchoEgress {
-        fn capabilities(&self) -> EgressCapabilities {
-            EgressCapabilities {
+        fn properties(&self) -> PathProperties {
+            PathProperties {
                 datagram_fidelity: DatagramFidelity::Native,
                 overhead_bytes: 0,
                 max_datagram_size: Some(1400),

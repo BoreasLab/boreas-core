@@ -9,8 +9,8 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy,
-    Mtu, NatBehavior,
+    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, FilterPolicy, Mtu, NatBehavior,
+    PathProperties,
 };
 
 fn udp_frame(flow: u32) -> Vec<u8> {
@@ -28,7 +28,7 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
         FilterPolicy::PassThrough,
         DnsPolicy::Forward,
         Accepts::Flows,
-        EgressCapabilities {
+        PathProperties {
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: 60,
             max_datagram_size: Some(1500),

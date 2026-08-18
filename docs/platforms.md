@@ -78,5 +78,5 @@ HTTP interception engine into the 50 MB `NEPacketTunnelProvider` budget.
 - Adapter shutdown cancels child work and releases OS resources deterministically.
 - Wintun distribution uses the authorized signed binary.
 - Android CA UX installs only to the user store.
-- Platform-specific behavior is represented as capability or events, not hidden
+- Platform-specific behavior is represented as path properties or events, not hidden
   branches in shared policy.

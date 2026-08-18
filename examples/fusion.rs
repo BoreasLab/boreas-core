@@ -75,7 +75,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
         FilterPolicy::PassThrough,
         DnsPolicy::Forward,
         egress.accepts(),
-        egress.capabilities(),
+        egress.properties(),
         Mtu::new(1500).unwrap(),
         Limits {
             reassembly_timeout: Duration::from_secs(30),
@@ -91,7 +91,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
         },
         pool,
     )
-    .expect("a WireGuard capability set plans")
+    .expect("WireGuard path properties plan")
 }
 
 /// Drives the exchange between the two tunnel ends until it settles,

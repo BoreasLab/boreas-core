@@ -25,11 +25,11 @@ use std::{
 };
 
 use crate::{
-    Accepts, Admission, Backstop, BufferPool, DatagramBuffer, DnsPolicy, EgressCapabilities,
-    FilterPolicy, FlowPlan, FlowTableError, Fragment, IngressAction, IngressPacket, Inspection,
-    InternalEndpoint, Mtu, OriginationPorts, PacketError, PlanError, Pooled, PushOutcome,
-    Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath, UdpFlowTable,
-    WriteError, admit, clamp_mss, plan_flow, replan, route_planned, udp_datagram_len, write_udp,
+    Accepts, Admission, Backstop, BufferPool, DatagramBuffer, DnsPolicy, FilterPolicy, FlowPlan,
+    FlowTableError, Fragment, IngressAction, IngressPacket, Inspection, InternalEndpoint, Mtu,
+    OriginationPorts, PacketError, PathProperties, PlanError, Pooled, PushOutcome, Reassembler,
+    Replan, SendOutcome, SteeringReason, Transport, TransportPath, UdpFlowTable, WriteError, admit,
+    clamp_mss, plan_flow, replan, route_planned, udp_datagram_len, write_udp,
 };
 
 /// One of the two sides the datapath sits between: the client's TUN and the
@@ -355,18 +355,18 @@ struct FlowState {
 pub struct Datapath {
     filter: FilterPolicy,
     dns: DnsPolicy,
-    /// The layer the configured egress accepts. Separate from the capability
-    /// claim because the layer is a property of the implementation variant,
+    /// The layer the configured egress accepts. Separate from the path
+    /// properties because the layer belongs to the implementation variant,
     /// established by the caller from [`crate::Egress`] and unable to drift
     /// from it there.
     accepts: Accepts,
-    egress: EgressCapabilities,
+    egress: PathProperties,
     path_mtu: Mtu,
     /// The planning decision for the current configuration, memoized — one per
     /// [`Inspection`] verdict, indexed by [`Inspection::index`].
     ///
     /// Every *other* input to `plan_flow` — filter policy, accepted layer,
-    /// capability claim, path MTU — is a session property, so the answer moves
+    /// path properties, path MTU — is a session property, so the answer moves
     /// only when the configuration does. The verdict is the one per-flow input,
     /// and it ranges over a two-element closed sum, so memoizing the whole
     /// function is a two-element array rather than a cache: there is no key to
@@ -416,7 +416,7 @@ impl Datapath {
         filter: FilterPolicy,
         dns: DnsPolicy,
         accepts: Accepts,
-        egress: EgressCapabilities,
+        egress: PathProperties,
         path_mtu: Mtu,
         limits: Limits,
         pool: Arc<BufferPool>,
@@ -555,7 +555,7 @@ impl Datapath {
             Side::Tunnel if self.inspected.live(&packet.destination, now) => Backstop::Active,
             Side::Tunnel | Side::Egress => Backstop::Lapsed,
         };
-        // `admit` settles everything no egress capability could change, which
+        // `admit` settles everything no path properties could change, which
         // is also everything that must keep working under a configuration that
         // cannot plan at all: reassembly, unsupported protocols, DNS, and the
         // steering backstop.
@@ -901,16 +901,16 @@ impl Datapath {
         Ok(!existed)
     }
 
-    /// Re-plans every live flow after the egress reports a capability change.
+    /// Re-plans every live flow after the egress reports a path change.
     ///
     /// O(live flows), one `replan` per flow and no intermediate event buffer:
     /// destructuring `self` borrows the flow table and the event queue as the
     /// disjoint fields they are, which matters at the 10,000-flow target.
-    pub fn on_capability_change(&mut self, accepts: Accepts, next: EgressCapabilities) {
+    pub fn on_path_change(&mut self, accepts: Accepts, next: PathProperties) {
         self.accepts = accepts;
         self.egress = next;
         // The memoized decisions move with the configuration they describe. An
-        // unplannable capability is kept as the `Err` it is: every subsequent
+        // unplannable path is kept as the `Err` it is: every subsequent
         // packet is refused and counted, which is what the caller already saw
         // when planning happened per packet.
         self.plans = Inspection::ALL
@@ -1026,8 +1026,8 @@ mod tests {
         }
     }
 
-    fn egress(fidelity: crate::DatagramFidelity) -> EgressCapabilities {
-        EgressCapabilities {
+    fn egress(fidelity: crate::DatagramFidelity) -> PathProperties {
+        PathProperties {
             datagram_fidelity: fidelity,
             overhead_bytes: 60,
             max_datagram_size: Some(1500),
@@ -1293,7 +1293,7 @@ mod tests {
         ));
 
         // MASQUE's QUIC-to-HTTP/2 fallback: fidelity drops, the flow lives.
-        path.on_capability_change(Accepts::Flows, egress(crate::DatagramFidelity::Emulated));
+        path.on_path_change(Accepts::Flows, egress(crate::DatagramFidelity::Emulated));
         assert_eq!(
             path.poll_event(),
             Some(FlowEvent::Resteered(SteeringReason::DatagramFidelity))
@@ -1316,7 +1316,7 @@ mod tests {
         let _ = path.poll_event();
 
         let packets_only = egress(crate::DatagramFidelity::Native);
-        path.on_capability_change(Accepts::IpPackets, packets_only);
+        path.on_path_change(Accepts::IpPackets, packets_only);
         assert!(matches!(
             path.poll_event(),
             Some(FlowEvent::FlowTornDown(_))
@@ -1457,7 +1457,7 @@ mod tests {
         // later `plan_flow` on the stored configuration a proof-carrying
         // repeat rather than a panic waiting to happen.
         let starved = egress(crate::DatagramFidelity::Native);
-        let starved = EgressCapabilities {
+        let starved = PathProperties {
             overhead_bytes: 400,
             ..starved
         };

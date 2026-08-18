@@ -39,8 +39,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, Decoded, EgressCapabilities, EgressError,
-    NatBehavior, Prefixed, ProxyError, StreamEgress, Target, TunnelBypass,
+    AsyncStream, BoxFuture, DatagramFidelity, Decoded, EgressError, NatBehavior, PathProperties,
+    Prefixed, ProxyError, StreamEgress, Target, TunnelBypass,
     quic::{Handshake, QuicConnection, client_config},
     varint,
 };
@@ -297,7 +297,7 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
     }
 
     /// Whether the server said it will carry datagrams. Recorded for when
-    /// Hysteria2's UDP lands; nothing reads it yet, and [`Self::capabilities`]
+    /// Hysteria2's UDP lands; nothing reads it yet, and [`Self::properties`]
     /// says so rather than claiming otherwise.
     pub fn udp_header() -> &'static str {
         HEADER_UDP
@@ -305,8 +305,8 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
 }
 
 impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             // Hysteria2 does carry datagrams, and this egress does not yet
             // implement them. The claim describes the code, not the protocol:
             // `associate` refuses, and those two must agree or the planner

@@ -26,8 +26,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, Decoded, DomainName, EgressCapabilities, EgressError,
-    NatBehavior, ProxyError, ProxyTransport, StreamEgress, Target,
+    AsyncStream, BoxFuture, DatagramFidelity, Decoded, DomainName, EgressError, NatBehavior,
+    PathProperties, ProxyError, ProxyTransport, StreamEgress, Target,
 };
 
 /// The only VLESS version, and the only one the reference implementations
@@ -36,7 +36,7 @@ const VERSION: u8 = 0;
 
 /// Commands, from the reference implementation. Only `Tcp` is issued here:
 /// VLESS UDP needs a length-prefixed packet framing this egress does not
-/// implement, and the capability claim says so rather than implying it.
+/// implement, and the path properties say so rather than implying it.
 const COMMAND_TCP: u8 = 1;
 
 /// VMess/VLESS address family bytes. Note `Domain` and `Ipv6` relative to
@@ -246,8 +246,8 @@ impl<T: ProxyTransport> VlessEgress<T> {
 }
 
 impl<T: ProxyTransport + 'static> StreamEgress for VlessEgress<T> {
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             // VLESS UDP needs a length-prefixed packet framing this egress
             // does not implement. Claiming otherwise would promise a relay
             // that is not here.

@@ -45,8 +45,8 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressCapabilities, EgressEmit,
-    FlowEvent, HostPolicy, Inbound, InternalEndpoint, Message, PacketEgress, Pooled, Provenance,
+    Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressEmit, FlowEvent, HostPolicy,
+    Inbound, InternalEndpoint, Message, PacketEgress, PathProperties, Pooled, Provenance,
     QueryPlan, Rcode, Relay, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses,
     plan_query, upstream::DnsUpstream, write_failure, write_refusal, write_response,
 };
@@ -90,7 +90,7 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 pub enum Control {
     /// The layer travels with the claim because both are derived from the
     /// same [`crate::Egress`] variant by the sender; apart they could drift.
-    CapabilityChange(Accepts, EgressCapabilities),
+    PathChange(Accepts, PathProperties),
     /// Ordered shutdown: control messages queued ahead of this one are applied
     /// first. [`Shell::shutdown`] uses the cancellation token instead, which
     /// needs no channel capacity and therefore cannot be refused.
@@ -184,7 +184,7 @@ pub struct Session<D, N, E, U> {
     /// An option for the same reason [`Termination`] is: a packet egress
     /// carries a datagram as the packet it already is, so it needs no
     /// association and no second task. A flow egress that carries no datagrams
-    /// at all also carries `None`, and its capability claim
+    /// at all also carries `None`, and its path properties
     /// (`datagram_fidelity: None`) is what already said so.
     pub relay: Option<Relay>,
 }
@@ -756,8 +756,8 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             _ = shutdown.cancelled() => break,
 
             message = control.recv() => match message {
-                Some(Control::CapabilityChange(accepts, next)) => {
-                    datapath.on_capability_change(accepts, next);
+                Some(Control::PathChange(accepts, next)) => {
+                    datapath.on_path_change(accepts, next);
                 }
                 // An explicit shutdown and a dropped owner are the same
                 // request: nobody is left to steer this reactor.
@@ -969,7 +969,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     //
     // A session with no relay is one whose egress carries datagrams as packets
     // — nothing is ever queued there — or one whose egress carries none at all,
-    // which its capability claim already stated. Both are counted rather than
+    // which its path properties already state. Both are counted rather than
     // silently discarded, because the second is a misconfiguration.
     while let Some(datagram) = datapath.poll_datagram() {
         match relay {

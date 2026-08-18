@@ -33,7 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource,
-    DomainName, EgressCapabilities, EgressError, NatBehavior, Prefixed, StreamEgress, Target,
+    DomainName, EgressError, NatBehavior, PathProperties, Prefixed, StreamEgress, Target,
     TunnelBypass,
 };
 
@@ -478,8 +478,8 @@ impl<B: TunnelBypass> Socks5Egress<B> {
 }
 
 impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             // The relay re-originates datagrams but preserves their boundaries
             // one for one, so a QUIC datagram crosses as itself.
             datagram_fidelity: DatagramFidelity::Native,

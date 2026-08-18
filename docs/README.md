@@ -11,7 +11,7 @@ that owns the work, then follow its links only when a boundary is crossed.
 | [Architecture](architecture.md) | layer boundaries, flow planning, effect isolation |
 | [Networking](networking.md) | IP, MTU, ICMP, TCP, UDP, NAT, reassembly |
 | [Filtering](filtering.md) | DNS, TLS trust, HTTP, steering, rewriting |
-| [Egress](egress.md) | capabilities, chaining, WireGuard, MASQUE, proxies |
+| [Egress](egress.md) | path properties, chaining, WireGuard, MASQUE, proxies |
 | [Platforms](platforms.md) | Android, Windows, iOS, JNI, Wintun |
 
 ## Governance and Delivery
@@ -38,8 +38,8 @@ that owns the work, then follow its links only when a boundary is crossed.
 
 | Path | Responsibility | Design owner |
 |---|---|---|
-| `src/lib.rs` | refined `Mtu`, error spine, capability composition, flow planning, total ingress classification | [Architecture](architecture.md) |
-| `src/datapath.rs` | sans-io datapath core: dispatch, flow lifecycle, capability replanning | [Architecture](architecture.md) |
+| `src/lib.rs` | refined `Mtu`, error spine, path composition, flow planning, total ingress classification | [Architecture](architecture.md) |
+| `src/datapath.rs` | sans-io datapath core: dispatch, flow lifecycle, path-change replanning | [Architecture](architecture.md) |
 | `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
 | `src/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
 | `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |

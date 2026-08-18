@@ -19,13 +19,13 @@ use std::{
 
 use boreas_core::{
     Accepts, AsyncDevice, AsyncNetwork, BufferPool, Control, DatagramFidelity, Datapath, DnsPolicy,
-    DnsUpstream, EgressCapabilities, EgressEmit, EgressError, FilterPolicy, FlowEvent, HostPolicy,
-    Inbound, InternalEndpoint, Mtu, NatBehavior, PacketEgress, Relay, Session, Shell, Telemetry,
-    Upstream,
+    DnsUpstream, EgressEmit, EgressError, FilterPolicy, FlowEvent, HostPolicy, Inbound,
+    InternalEndpoint, Mtu, NatBehavior, PacketEgress, PathProperties, Relay, Session, Shell,
+    Telemetry, Upstream,
 };
 
-fn capabilities() -> EgressCapabilities {
-    EgressCapabilities {
+fn properties() -> PathProperties {
+    PathProperties {
         datagram_fidelity: DatagramFidelity::Native,
         overhead_bytes: 60,
         max_datagram_size: Some(1500),
@@ -41,7 +41,7 @@ fn datapath_on(accepts: Accepts, queue_depth: usize, pool: Arc<BufferPool>) -> D
         FilterPolicy::PassThrough,
         DnsPolicy::Forward,
         accepts,
-        capabilities(),
+        properties(),
         Mtu::new(1500).unwrap(),
         boreas_core::Limits {
             reassembly_timeout: Duration::from_secs(30),
@@ -194,8 +194,8 @@ struct PassThroughEgress {
 }
 
 impl PacketEgress for PassThroughEgress {
-    fn capabilities(&self) -> EgressCapabilities {
-        capabilities()
+    fn properties(&self) -> PathProperties {
+        properties()
     }
 
     fn handle_tun_packet(
@@ -548,10 +548,7 @@ async fn control_messages_reach_the_core_in_order() {
 
     shell
         .control()
-        .send(Control::CapabilityChange(
-            Accepts::IpPackets,
-            capabilities(),
-        ))
+        .send(Control::PathChange(Accepts::IpPackets, properties()))
         .await
         .expect("control channel open");
 

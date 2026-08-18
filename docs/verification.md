@@ -51,7 +51,7 @@ MSVC. A windows-latest CI job now owns that check.
 `tokio` is taken with named features (`macros`, `rt`, `rt-multi-thread`,
 `sync`, `time`) rather than `full`. Boreas cross-compiles to Android, so the
 process, signal, and file drivers `full` would enable are shipped weight for
-capabilities the shell does not use.
+path properties the shell does not use.
 
 ### Planned and evaluated dependencies
 
@@ -141,7 +141,7 @@ Rechecked against primary sources on 2026-08-09:
 - RFC 4787 defines endpoint-independent UDP mapping, no port overloading, and a
   minimum two-minute mapping lifetime.
 - RFC 9297, RFC 9298, and RFC 9484 define HTTP datagrams, CONNECT-UDP, and
-  CONNECT-IP capability and fallback behavior.
+  CONNECT-IP support and fallback behavior.
 - RFC 9114 documents the non-trivial H2/H3 transition surface.
 - WebTransport is structurally H3-specific; WebSocket extended CONNECT differs
   across RFC 8441 and RFC 9220; CONNECT SETTINGS gate validity.

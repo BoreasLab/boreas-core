@@ -24,9 +24,9 @@ use std::{
 
 use boreas_core::{
     Accepts, AlpnOutcome, AsyncDevice, AsyncNetwork, BufferPool, DNS_PORT, DatagramFidelity,
-    Datapath, DnsPolicy, DnsUpstream, EchOutcome, EgressCapabilities, EgressEmit, EgressError,
-    FilterPolicy, HTTPS_PORT, HostPolicy, IngressPacket, InternalEndpoint, Message, Mtu,
-    NatBehavior, PacketEgress, Provenance, Rcode, RecordType, ResourceRecord, RuleCounts,
+    Datapath, DnsPolicy, DnsUpstream, EchOutcome, EgressEmit, EgressError, FilterPolicy,
+    HTTPS_PORT, HostPolicy, IngressPacket, InternalEndpoint, Message, Mtu, NatBehavior,
+    PacketEgress, PathProperties, Provenance, Rcode, RecordType, ResourceRecord, RuleCounts,
     SVCPARAM_ALPN, SVCPARAM_ECH, Session, Shell, Telemetry, Transport, Upstream, ech_param,
     h3_alpn_param, svc_params, write_udp,
 };
@@ -161,8 +161,8 @@ impl AsyncNetwork for SilentNetwork {
 struct NullEgress;
 
 impl PacketEgress for NullEgress {
-    fn capabilities(&self) -> EgressCapabilities {
-        capabilities()
+    fn properties(&self) -> PathProperties {
+        properties()
     }
 
     fn handle_tun_packet(
@@ -232,8 +232,8 @@ impl DnsUpstream for ScriptedUpstream {
 
 // ------------------------------------------------------------------ harness --
 
-fn capabilities() -> EgressCapabilities {
-    EgressCapabilities {
+fn properties() -> PathProperties {
+    PathProperties {
         datagram_fidelity: DatagramFidelity::Native,
         overhead_bytes: 80,
         max_datagram_size: Some(1400),
@@ -254,7 +254,7 @@ fn datapath(pool: Arc<BufferPool>) -> Datapath {
         FilterPolicy::PassThrough,
         DnsPolicy::Intercept,
         Accepts::IpPackets,
-        capabilities(),
+        properties(),
         Mtu::new(1500).unwrap(),
         boreas_core::Limits {
             reassembly_timeout: Duration::from_secs(30),
@@ -478,7 +478,7 @@ async fn a_forwarding_session_never_intercepts() {
         FilterPolicy::PassThrough,
         DnsPolicy::Forward,
         Accepts::IpPackets,
-        capabilities(),
+        properties(),
         Mtu::new(1500).unwrap(),
         boreas_core::Limits {
             reassembly_timeout: Duration::from_secs(30),

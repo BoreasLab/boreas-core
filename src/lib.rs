@@ -180,13 +180,13 @@ pub enum DatagramFidelity {
     Native,
 }
 
-/// The live capability claim of one egress. There is deliberately no
+/// The live path properties of one egress. There is deliberately no
 /// `accepts` field: the accepted layer is a property of the implementation
 /// variant (`Egress::Packet` vs `Egress::Stream`), so a claim can no longer
 /// disagree with the thing it describes. Callers receive the layer alongside
 /// this struct, derived from that variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EgressCapabilities {
+pub struct PathProperties {
     pub datagram_fidelity: DatagramFidelity,
     pub overhead_bytes: u16,
     pub max_datagram_size: Option<u16>,
@@ -206,22 +206,22 @@ pub enum NatBehavior {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapabilityError {
+pub enum ChainError {
     MixedLayers,
     OverheadOverflow,
 }
 
-impl EgressCapabilities {
+impl PathProperties {
     /// The weakest-link composition of two claims. Layer agreement is not
     /// checked here: it is a property of the implementations and is enforced
     /// by [`Egress::chain`], the only place two implementations meet.
-    pub fn chain(self, next: Self) -> Result<Self, CapabilityError> {
+    pub fn chain(self, next: Self) -> Result<Self, ChainError> {
         Ok(Self {
             datagram_fidelity: self.datagram_fidelity.min(next.datagram_fidelity),
             overhead_bytes: self
                 .overhead_bytes
                 .checked_add(next.overhead_bytes)
-                .ok_or(CapabilityError::OverheadOverflow)?,
+                .ok_or(ChainError::OverheadOverflow)?,
             max_datagram_size: match (self.max_datagram_size, next.max_datagram_size) {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (size, None) | (None, size) => size,
@@ -332,8 +332,8 @@ pub enum PlanError {
     InnerMtu(MtuError),
 }
 
-/// The result of re-planning a live flow after an egress reports a capability
-/// change. Established flows are never dropped silently: a downgrade yields
+/// The result of re-planning a live flow after an egress reports new path
+/// properties. Established flows are never dropped silently: a downgrade yields
 /// `Resteer`, and `Teardown` is reserved for a change no live flow can
 /// survive (the egress no longer accepts the layer the flow runs on, or its
 /// remaining MTU cannot carry IPv6 at all).
@@ -392,13 +392,13 @@ pub enum Backstop {
 /// What can be settled about a packet before its plan is consulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// Decided. No egress capability could have changed this answer.
+    /// Decided. No egress's path properties could have changed this.
     Settled(IngressAction),
     /// A whole packet of a carried protocol; [`route_planned`] finishes it.
     Planned,
 }
 
-/// The part of ingress classification that no egress capability can change.
+/// The part of ingress classification that no egress path properties can change.
 ///
 /// A fragment must be reassembled before L4 can observe it, a protocol this
 /// datapath does not carry must be dropped, and an intercepted DNS query must
@@ -461,7 +461,7 @@ pub fn plan_flow(
     filter: FilterPolicy,
     inspection: Inspection,
     accepts: Accepts,
-    egress: EgressCapabilities,
+    egress: PathProperties,
     path_mtu: Mtu,
 ) -> Result<FlowPlan, PlanError> {
     let inspected = filter == FilterPolicy::InspectHttp && inspection == Inspection::Candidate;
@@ -504,10 +504,10 @@ pub fn plan_flow(
     Ok(FlowPlan { transport, quic })
 }
 
-/// Re-plans a live flow after its egress reports a capability change (MASQUE's
+/// Re-plans a live flow after its egress reports a path change (MASQUE's
 /// QUIC-to-HTTP/2 fallback is the driving case). The filter policy and path
 /// MTU are session properties and pass through unchanged; only the egress
-/// moved. Errors only when the new capability cannot support the flow's layer
+/// moved. Errors only when the new path properties cannot support the flow's layer
 /// or leaves a packet path below the IPv6 floor, and the caller answers those
 /// with `Teardown`.
 pub fn replan(
@@ -515,7 +515,7 @@ pub fn replan(
     filter: FilterPolicy,
     inspection: Inspection,
     accepts: Accepts,
-    next: EgressCapabilities,
+    next: PathProperties,
     path_mtu: Mtu,
 ) -> Result<Replan, PlanError> {
     // A terminated flow does not prove the egress accepts only flows: under
@@ -555,7 +555,7 @@ pub fn replan(
 
 /// Classifies one whole packet: [`admit`], then [`route_planned`].
 ///
-/// The plan is a session property — filter policy, egress capability, and path
+/// The plan is a session property — filter policy, egress path properties, and path
 /// MTU — so deriving it once per configuration change instead of once per
 /// packet is both cheaper and the reason this function is total.
 ///
@@ -592,7 +592,7 @@ impl fmt::Display for PlanError {
     }
 }
 
-impl fmt::Display for CapabilityError {
+impl fmt::Display for ChainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MixedLayers => f.write_str("chained egresses accept different layers"),
@@ -612,14 +612,14 @@ impl Error for PlanError {
     }
 }
 
-impl Error for CapabilityError {}
+impl Error for ChainError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn egress(fidelity: DatagramFidelity, overhead_bytes: u16) -> EgressCapabilities {
-        EgressCapabilities {
+    fn egress(fidelity: DatagramFidelity, overhead_bytes: u16) -> PathProperties {
+        PathProperties {
             datagram_fidelity: fidelity,
             overhead_bytes,
             max_datagram_size: None,
@@ -654,11 +654,11 @@ mod tests {
             for right in FIDELITIES {
                 for left_nat in NAT_BEHAVIORS {
                     for right_nat in NAT_BEHAVIORS {
-                        let first = EgressCapabilities {
+                        let first = PathProperties {
                             nat_behavior: left_nat,
                             ..egress(left, 0)
                         };
-                        let second = EgressCapabilities {
+                        let second = PathProperties {
                             nat_behavior: right_nat,
                             ..egress(right, 0)
                         };
@@ -677,7 +677,7 @@ mod tests {
             for &overhead in &OVERHEADS {
                 for &path in &MTUS {
                     for max_datagram_size in [None, Some(1199), Some(1200), Some(1500)] {
-                        let capabilities = EgressCapabilities {
+                        let properties = PathProperties {
                             max_datagram_size,
                             ..egress(fidelity, overhead)
                         };
@@ -685,7 +685,7 @@ mod tests {
                             FilterPolicy::PassThrough,
                             Inspection::Excluded,
                             Accepts::IpPackets,
-                            capabilities,
+                            properties,
                             mtu(path),
                         ) else {
                             continue; // overhead exceeded the path; not admitted
@@ -721,14 +721,14 @@ mod tests {
                 FilterPolicy::PassThrough,
                 Inspection::Excluded,
                 Accepts::Flows,
-                EgressCapabilities {
+                PathProperties {
                     max_datagram_size: Some(1500),
                     ..egress(DatagramFidelity::Native, 0)
                 },
                 mtu(1500),
             )
             .unwrap();
-            let next = EgressCapabilities {
+            let next = PathProperties {
                 max_datagram_size: Some(1500),
                 ..egress(fidelity, 0)
             };
@@ -1041,7 +1041,7 @@ mod tests {
                 FilterPolicy::PassThrough,
                 Inspection::Excluded,
                 Accepts::Flows,
-                EgressCapabilities {
+                PathProperties {
                     max_datagram_size: Some(1000),
                     ..native_l4
                 },
@@ -1055,7 +1055,7 @@ mod tests {
                 FilterPolicy::PassThrough,
                 Inspection::Excluded,
                 Accepts::Flows,
-                EgressCapabilities {
+                PathProperties {
                     max_datagram_size: Some(1400),
                     ..native_l4
                 },
@@ -1100,7 +1100,7 @@ mod tests {
             "egress overhead exceeds the path MTU"
         );
         assert_eq!(
-            CapabilityError::MixedLayers.to_string(),
+            ChainError::MixedLayers.to_string(),
             "chained egresses accept different layers"
         );
         assert!(
@@ -1110,12 +1110,12 @@ mod tests {
     }
 
     #[test]
-    fn chaining_uses_the_weakest_capability() {
-        let first = EgressCapabilities {
+    fn chaining_uses_the_weakest_property() {
+        let first = PathProperties {
             max_datagram_size: Some(1400),
             ..egress(DatagramFidelity::Native, 40)
         };
-        let second = EgressCapabilities {
+        let second = PathProperties {
             max_datagram_size: Some(1300),
             preserves_ecn: false,
             ..egress(DatagramFidelity::Emulated, 20)
@@ -1123,7 +1123,7 @@ mod tests {
 
         assert_eq!(
             first.chain(second),
-            Ok(EgressCapabilities {
+            Ok(PathProperties {
                 datagram_fidelity: DatagramFidelity::Emulated,
                 overhead_bytes: 60,
                 max_datagram_size: Some(1300),

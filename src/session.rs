@@ -868,8 +868,8 @@ mod end_to_end {
     };
 
     use crate::{
-        AllowAll, AsyncStream, BoxFuture, CertificateAuthority, DatagramFidelity,
-        EgressCapabilities, Interceptor, MitmResolver, NatBehavior, bridge,
+        AllowAll, AsyncStream, BoxFuture, CertificateAuthority, DatagramFidelity, Interceptor,
+        MitmResolver, NatBehavior, PathProperties, bridge,
     };
 
     const ALLOWED: &str = "allowed.example";
@@ -1012,8 +1012,8 @@ mod end_to_end {
     struct ToOrigin(SocketAddr);
 
     impl StreamEgress for ToOrigin {
-        fn capabilities(&self) -> EgressCapabilities {
-            EgressCapabilities {
+        fn properties(&self) -> PathProperties {
+            PathProperties {
                 datagram_fidelity: DatagramFidelity::None,
                 overhead_bytes: 0,
                 max_datagram_size: None,

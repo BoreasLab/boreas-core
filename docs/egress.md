@@ -2,12 +2,12 @@
 
 ## Capability Before Protocol
 
-Egress is selected and composed by live capability, not by protocol name or
-static configuration. The same protocol can change capability during a session.
+Egress is selected and composed by live path properties, not by protocol name or
+static configuration. The same protocol can change its path properties during a session.
 MASQUE, for example, can fall back from QUIC to HTTP/2, losing native UDP
 semantics while remaining connected.
 
-The capability product includes:
+The path-properties product includes:
 
 - accepted input layer: IP packets or L4 flows
 - datagram fidelity: native, emulated, or none
@@ -33,7 +33,7 @@ clients already warn that UDP-relayed QUIC reliability depends on the outbound
 proxy and may fall back to TCP.
 
 Rule: any fidelity below native forces HTTP/2 steering. No QUIC datagram may be
-tunnelled over emulated or absent datagram capability.
+tunnelled over emulated or absent datagram fidelity.
 
 ## Tier 1: Packet Egress
 
@@ -123,4 +123,4 @@ verification item.
 - packet egress increments a fast-path counter and never enters smoltcp
 - a MASQUE QUIC-to-HTTP/2 transition re-steers policy without dropping flows
 - ECN and PMTU claims are validated against packet captures and path tests
-- each protocol reports live capability changes to the planner
+- each protocol reports live path changes to the planner

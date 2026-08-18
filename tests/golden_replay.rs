@@ -9,14 +9,14 @@ use std::{
 };
 
 use boreas_core::{
-    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy,
-    FlowEvent, InternalEndpoint, Mtu, NatBehavior, SteeringReason,
+    Accepts, BufferPool, DatagramFidelity, Datapath, DnsPolicy, FilterPolicy, FlowEvent,
+    InternalEndpoint, Mtu, NatBehavior, PathProperties, SteeringReason,
 };
 
 const NOW: Duration = Duration::from_secs(1_000);
 
-fn egress(fidelity: DatagramFidelity) -> EgressCapabilities {
-    EgressCapabilities {
+fn egress(fidelity: DatagramFidelity) -> PathProperties {
+    PathProperties {
         datagram_fidelity: fidelity,
         overhead_bytes: 60,
         max_datagram_size: Some(1500),
@@ -95,7 +95,7 @@ fn golden_replay_is_byte_exact() {
     );
 
     // 3. A fidelity downgrade re-steers; the flow and its buffered data live.
-    path.on_capability_change(Accepts::Flows, egress(DatagramFidelity::Emulated));
+    path.on_path_change(Accepts::Flows, egress(DatagramFidelity::Emulated));
     assert_eq!(
         path.poll_event(),
         Some(FlowEvent::Resteered(SteeringReason::DatagramFidelity)),

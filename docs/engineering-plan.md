@@ -103,13 +103,13 @@ precondition is not structural.
   that owns the invariant.
 - `TransportPath::PacketFastPath` carries the inner MTU; `LocalTermination` does
   not, because a re-originated byte stream has no client packet size. This also
-  put `EgressCapabilities::max_datagram_size` to work: it was declared, chained,
+  put `PathProperties::max_datagram_size` to work: it was declared, chained,
   and never consulted, so an egress with a 1000-byte datagram ceiling would
   previously have passed QUIC through below its floor.
 - `PlanError::InnerMtu` separates an unusable remainder from overhead that
   exceeds the path entirely. Both variants are reachable and tested.
 - `Display` and `std::error::Error` on `PlanError`, `PacketError`,
-  `FlowTableError`, `CapabilityError`, and `MtuError`, with `source()` chaining
+  `FlowTableError`, `ChainError`, and `MtuError`, with `source()` chaining
   where a cause exists. Hand-written: four enums cost about forty lines, which
   does not justify a proc-macro dependency in a core that cross-compiles to
   Android. No `anyhow`; the error type is part of the contract.
@@ -124,7 +124,7 @@ Two items from the original scope were dropped as speculative:
   port overloading in the *allocator*, which does not exist until P7, so that is
   where the invariant becomes real and where the newtype should land.
 
-Leave `EgressCapabilities::accepts` a runtime field. It becomes redundant with
+Leave `PathProperties::accepts` a runtime field. It becomes redundant with
 the implementation variant only once implementations exist, which is P10, and
 removing it earlier would be speculative.
 
@@ -183,11 +183,11 @@ CONNECT-IP stays in P17.
 
 **Status: complete.** Delivered:
 
-- `NatBehavior` on `EgressCapabilities`: ordered
+- `NatBehavior` on `PathProperties`: ordered
   `EndpointIndependent`/`AddressDependent`/`AddressAndPortDependent`, chained
   by `min` like fidelity. The egress document defers routing consequences to
   the first egress whose behavior affects routing; the field exists now so
-  capability reports carry it from day one.
+  path-properties reports carry it from day one.
 - `replan(current, filter, next, path_mtu) -> Result<Replan, PlanError>`.
   Filter policy and path MTU are session properties and pass through
   unchanged. `Teardown` answers a layer change or a transport-path crossing;
@@ -203,7 +203,7 @@ fidelity or below a 1200-byte budget across the MTU/overhead/ceiling grid;
 every Native-to-Emulated transition yields `Resteer`. 21 tests, fmt, clippy
 clean.
 
-**Unlocks:** P8 routes live capability changes through `replan`; P13 consumes
+**Unlocks:** P8 routes live path changes through `replan`; P13 consumes
 `SteeringReason`.
 
 ## Tier 1: Datapath and Simulation
@@ -212,13 +212,13 @@ clean.
 
 **Status: complete.** `Datapath` in `src/datapath.rs` composes P1–P3 and
 `UdpFlowTable` behind the poll API: `on_tun_packet`, `on_egress_packet`,
-`poll_transmit`, `poll_event`, `on_timeout`, and `on_capability_change`. It
+`poll_transmit`, `poll_event`, `on_timeout`, and `on_path_change`. It
 owns flow state and queues; it owns no socket, clock, or task. Invalid states
 are structural: fragments quarantine and re-enter dispatch only after
 reassembly re-parses a whole datagram, so a flow's plan always derives from a
 real header; `FlowState` exists only behind a successful `plan_flow`; egress-
 side fragments are pathological and drop. MSS clamping fires on the packet
-fast path before forwarding. `UdpFlowTable::retain` was added for capability-
+fast path before forwarding. `UdpFlowTable::retain` was added for path-
 driven teardown. `poll_timeout` was omitted at the time — neither the
 reassembler nor the flow table exposed its earliest deadline — and landed in
 P5 with the accessors the simulator needed.
@@ -349,7 +349,7 @@ does is P10, and until then the budget is what keeps an undrained queue bounded.
 runtime, and `recv` documents its cancel-safety obligation, because the reactor
 selects over it and drops the future routinely. Config reload via
 `watch::Receiver<Arc<Engine>>` waits for the filter engine to exist (P12); the
-capability-change path through `Control::CapabilityChange` already exercises the
+path-change route through `Control::PathChange` already exercises the
 same pointer-swap shape.
 
 **Gate met:** `tests/shell.rs` proves five properties, one per test — forward
@@ -406,10 +406,10 @@ and lint clean, and the simulator equivalence harness exists from P5.
 
 **Status: code complete; M1 device gate unexercised.** Delivered:
 
-- `src/egress.rs` replaces `EgressCapabilities::accepts` with the
+- `src/egress.rs` replaces `PathProperties::accepts` with the
   `Egress { Packet, Stream }` sum. The layer is the variant and the
-  capabilities come from the implementation behind it, so a claim can no
-  longer disagree with its implementation. `CapabilityError::MixedLayers` now
+  path properties come from the implementation behind it, so a claim can no
+  longer disagree with its implementation. `ChainError::MixedLayers` now
   reports from `Egress::chain`, where two implementations actually meet. The
   pure planner functions take the layer as an explicit parameter, and
   `Control::CapabilityChange` carries it alongside the claim.
@@ -417,7 +417,7 @@ and lint clean, and the simulator equivalence harness exists from P5.
   in, `EgressEmit::{ToNetwork, ToTunnel}` out, handshake retries and
   keepalives on an explicit `tick()` for the shell. Keepalives are suppressed
   at the boundary and WireGuard's 16-byte padding is stripped against the IP
-  length field, so the tunnel side sees exactly the packet. The capability
+  length field, so the tunnel side sees exactly the packet. The path-properties
   claim is Native fidelity, 80-byte worst-case (IPv6 underlay) overhead,
   endpoint-independent, and `preserves_ecn: false` until captures prove
   otherwise.
@@ -460,7 +460,7 @@ direction either.
 **The gap: the reactor had no egress.** `Shell::start` took a datapath and a
 device, which is not a product — it is a loopback. `PacketEgress` is now the
 whole sans-io interface (`handle_tun_packet`, `handle_network_packet`, `tick`,
-`tick_interval`) rather than a capability report, so `Box<dyn PacketEgress>`
+`tick_interval`) rather than a path-properties report, so `Box<dyn PacketEgress>`
 is a thing the reactor can run; `AsyncNetwork` is the datagram seam beside
 `AsyncDevice`, with a `tokio::net::UdpSocket` implementation and no new
 dependency. The reactor now closes the loop in one task: device → core →
@@ -506,7 +506,7 @@ next deadline needs GotaTun to expose one.
 **Gate:** the in-process part is met — `tests/egress.rs` drives the scripted
 harness into a real client-server WireGuard pair and asserts byte-exact
 return, zero flow state on the packet path, forwarding toward the egress
-rather than back down the device, and the reported capability set planning the
+rather than back down the device, and the reported path properties planning the
 fast path. The M1 product gate (single-interface client on Android and Windows
 hardware) needs the devices this environment does not have and is
 **unexercised**, same as P9's. A Windows CI job now compiles the Wintun
@@ -555,7 +555,7 @@ with a reason, below.** Delivered:
   invalidates every compression pointer targeting anything after the deletion.
   Uncompressed output costs tens of bytes on a response crossing a 1420-byte
   tunnel and cannot be wrong.
-- Interception in the core. `admit` now settles everything no egress capability
+- Interception in the core. `admit` now settles everything no egress path properties
   can change — reassembly, unsupported protocols, and DNS — so all three keep
   working under a configuration that cannot plan a flow, and `route_planned`
   handles the rest. Interception keys on the port rather than on a resolver
@@ -660,7 +660,7 @@ Delivered after P13, once P14's dependency question was decided.
 **DoQ is not delivered and the reason is not TLS.** DNS over QUIC needs a QUIC
 stack, which the plan admits at P17 with `tokio-quiche` for MASQUE. Adding one
 here for DNS alone would be the largest dependency in the graph serving the
-smallest capability in it.
+weakest path properties in it.
 
 **Gate met, and measured rather than asserted:** `examples/resolve.rs` resolves
 one name through all three transports against a live resolver. On the aarch64
@@ -1132,7 +1132,7 @@ subresource is modified; memory exhaustion demotes rather than fails.
 ### P17: Egress breadth
 
 MASQUE CONNECT-IP, SOCKS5 with UDP ASSOCIATE, Shadowsocks, then VLESS and
-Hysteria2. Each reports live capability through P3's `replan`.
+Hysteria2. Each reports live path properties through P3's `replan`.
 
 **Status: MASQUE CONNECT-IP, SOCKS5, Shadowsocks, VLESS, and Hysteria2 are
 complete for their stream paths and interop-verified. TUIC is dropped and
@@ -1140,7 +1140,7 @@ Reality is dropped; both findings are recorded below.** Delivered:
 
 - `src/masque.rs`, a CONNECT-IP tunnel as a `PacketEgress`. CONNECT-IP carries
   *whole IP packets*, so it joins WireGuard on the existing packet seam rather
-  than needing a new layer, and the planner reaches it through the capability
+  than needing a new layer, and the planner reaches it through the path-properties
   claim it already understands.
 - **`quiche` rather than `tokio-quiche`, and the reason is the seam.**
   [Verification](verification.md) pre-authorised both. Only plain `quiche` is
@@ -1416,7 +1416,7 @@ construction rather than by sequencing luck.
 
 | Loop | Why it looks circular | Break |
 |---|---|---|
-| MTU needs egress overhead; egress needs an MTU | `inner_mtu = path_mtu - overhead` | Overhead is static configuration known before connect. Discovery updates flow through P3 `replan`, so P3 depends on the `EgressCapabilities` type, not on P10's implementation |
+| MTU needs egress overhead; egress needs an MTU | `inner_mtu = path_mtu - overhead` | Overhead is static configuration known before connect. Discovery updates flow through P3 `replan`, so P3 depends on the `PathProperties` type, not on P10's implementation |
 | Verification needs a device; the device is a phase | every gate is a load measurement | P5 `SimDevice`. This is the root break; without it P9 must precede everything and M1 becomes one untestable block |
 | MITM needs steering; steering targets MITM hosts | both live in M3 | Strict order P13 before P14. Steering acts at discovery, before a connection exists |
 | MITM needs demotion; demotion needs MITM | fail-open is mandatory | Split into P14 narrow allowlist and P15 demotion, then broaden |

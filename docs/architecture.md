@@ -94,10 +94,10 @@ earned it. Replies re-enter the core as synthesized IP packets.
 
 ## Pure Planning Model
 
-Egress capability is a live runtime value:
+Egress path properties are a live runtime value:
 
 ```rust
-struct EgressCapabilities {
+struct PathProperties {
     datagram_fidelity: DatagramFidelity,
     overhead_bytes: u16,
     max_datagram_size: Option<u16>,
@@ -176,7 +176,7 @@ engineering plan's budget.
 
 ## Current Code
 
-- `src/lib.rs` implements capability composition, flow planning, and actions.
+- `src/lib.rs` implements path composition, flow planning, and actions.
 - `src/packet.rs` parses IPv4 and IPv6 without allocating and quarantines
   fragments before L4.
 - `src/udp.rs` implements endpoint-independent mapping state and bounded

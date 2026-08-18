@@ -1,12 +1,12 @@
-//! Egress implementations and the sum that binds capability to layer.
+//! Egress implementations and the sum that binds path properties to layer.
 //!
-//! An [`EgressCapabilities`] value is a claim; an [`Egress`] is the thing the
+//! An [`PathProperties`] value is a claim; an [`Egress`] is the thing the
 //! claim is about. Before this module existed, `accepts` was a runtime field
 //! that could disagree with the implementation it described. Now the layer is
-//! the enum variant and the capabilities come from the implementation behind
+//! the enum variant and the path properties come from the implementation behind
 //! it, so the two cannot drift apart.
 //!
-//! [`PacketEgress`] is the whole sans-io interface, not just a capability
+//! [`PacketEgress`] is the whole sans-io interface, not just a path-properties
 //! report: bytes in, [`EgressEmit`] values out, timers on an explicit `tick`.
 //! That is what lets the reactor drive any packet egress without naming
 //! WireGuard, and what makes `Box<dyn PacketEgress>` a thing you can run
@@ -35,8 +35,8 @@ use gotatun::{
 };
 
 use crate::{
-    Accepts, BufferPool, CapabilityError, DatagramFidelity, EgressCapabilities, Mtu, NatBehavior,
-    Pooled, ProxyError,
+    Accepts, BufferPool, ChainError, DatagramFidelity, Mtu, NatBehavior, PathProperties, Pooled,
+    ProxyError,
 };
 
 /// An egress that accepts whole IP packets, such as WireGuard or MASQUE
@@ -49,9 +49,9 @@ use crate::{
 /// network *and* a packet for the tunnel, and a caller batching several calls
 /// keeps their order.
 pub trait PacketEgress: Send {
-    /// The capability claim the planner sees. The accepted layer is not part
+    /// The path properties the planner sees. The accepted layer is not part
     /// of it: the [`Egress`] variant already says so.
-    fn capabilities(&self) -> EgressCapabilities;
+    fn properties(&self) -> PathProperties;
 
     /// Accepts one whole IP packet from the tunnel side, bound outward.
     fn handle_tun_packet(
@@ -400,9 +400,9 @@ pub struct Association {
 /// and "open a byte stream to this target" is the same question a proxy
 /// answers. A direct TCP dialer is the identity instance of it.
 pub trait StreamEgress: Send + Sync {
-    /// The capability claim the planner sees. The accepted layer is not part
+    /// The path properties the planner sees. The accepted layer is not part
     /// of it: the [`Egress`] variant already says so.
-    fn capabilities(&self) -> EgressCapabilities;
+    fn properties(&self) -> PathProperties;
 
     /// Opens a byte stream to `target`.
     fn connect<'a>(
@@ -413,7 +413,7 @@ pub trait StreamEgress: Send + Sync {
     /// Opens a datagram association.
     ///
     /// The default refuses, which is the honest answer for an egress whose
-    /// [`EgressCapabilities::datagram_fidelity`] is
+    /// [`PathProperties::datagram_fidelity`] is
     /// [`DatagramFidelity::None`](crate::DatagramFidelity::None): those two
     /// statements must agree, and an egress that does not implement this has
     /// already said so in its claim.
@@ -438,29 +438,29 @@ impl Egress {
         }
     }
 
-    /// The capability claim of the implementation behind the variant.
-    pub fn capabilities(&self) -> EgressCapabilities {
+    /// The path properties of the implementation behind the variant.
+    pub fn properties(&self) -> PathProperties {
         match self {
-            Self::Packet(egress) => egress.capabilities(),
-            Self::Stream(egress) => egress.capabilities(),
+            Self::Packet(egress) => egress.properties(),
+            Self::Stream(egress) => egress.properties(),
         }
     }
 
-    /// Chains two egresses' capabilities. Layer agreement is now a genuine
+    /// Chains two egresses' path properties. Layer agreement is now a genuine
     /// configuration conflict — a packet egress cannot carry a stream
     /// egress's flows — so `MixedLayers` is reported here, where the
     /// implementations are known, rather than between two bare claims.
-    pub fn chain(first: &Egress, next: &Egress) -> Result<EgressCapabilities, CapabilityError> {
+    pub fn chain(first: &Egress, next: &Egress) -> Result<PathProperties, ChainError> {
         if first.accepts() != next.accepts() {
-            return Err(CapabilityError::MixedLayers);
+            return Err(ChainError::MixedLayers);
         }
-        first.capabilities().chain(next.capabilities())
+        first.properties().chain(next.properties())
     }
 }
 
 /// Total WireGuard encapsulation overhead over an IPv6 underlay: 40 bytes of
 /// outer IPv6, 8 of UDP, and 32 of WireGuard header and authentication tag.
-/// IPv4 underlays cost 60; capabilities report the worst case so the inner
+/// IPv4 underlays cost 60; path properties report the worst case so the inner
 /// MTU never exceeds reality on either underlay.
 pub const WIREGUARD_OVERHEAD_BYTES: u16 = 80;
 
@@ -533,7 +533,7 @@ pub enum EgressError {
     /// the transport under a QUIC-based egress rather than that egress's own
     /// protocol, which is why it is distinct from [`Self::Proxy`].
     Quic,
-    /// This egress carries no datagrams, which its capability claim already
+    /// This egress carries no datagrams, which its path properties already
     /// says: `datagram_fidelity` is `None` and `associate` refuses.
     DatagramsUnsupported,
     /// A datagram arrived that will not fit the buffer offered for it. Explicit
@@ -692,8 +692,8 @@ impl WireGuardEgress {
 }
 
 impl PacketEgress for WireGuardEgress {
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: WIREGUARD_OVERHEAD_BYTES,
             max_datagram_size: None,
@@ -1015,14 +1015,14 @@ mod tests {
     }
 
     #[test]
-    fn the_reported_capabilities_match_the_implementation() {
+    fn the_reported_properties_match_the_implementation() {
         let pool = pool();
         let (client, _server) = pair(&pool);
         let egress = Egress::Packet(Box::new(client));
         assert_eq!(egress.accepts(), Accepts::IpPackets);
-        let capabilities = egress.capabilities();
-        assert_eq!(capabilities.datagram_fidelity, DatagramFidelity::Native);
-        assert_eq!(capabilities.overhead_bytes, WIREGUARD_OVERHEAD_BYTES);
+        let properties = egress.properties();
+        assert_eq!(properties.datagram_fidelity, DatagramFidelity::Native);
+        assert_eq!(properties.overhead_bytes, WIREGUARD_OVERHEAD_BYTES);
 
         // A stream egress chained behind a packet egress is a configuration
         // conflict reported where the implementations are known.
@@ -1037,8 +1037,8 @@ mod tests {
                 Box::pin(async { Err(EgressError::DatagramsUnsupported) })
             }
 
-            fn capabilities(&self) -> EgressCapabilities {
-                EgressCapabilities {
+            fn properties(&self) -> PathProperties {
+                PathProperties {
                     datagram_fidelity: DatagramFidelity::Native,
                     overhead_bytes: 0,
                     max_datagram_size: None,
@@ -1050,7 +1050,7 @@ mod tests {
         let stream = Egress::Stream(Box::new(NoStreams));
         assert_eq!(
             Egress::chain(&egress, &stream),
-            Err(CapabilityError::MixedLayers)
+            Err(ChainError::MixedLayers)
         );
     }
 }

@@ -68,7 +68,7 @@ Non-portable cases include:
 
 ## ADR-006: Live Egress Capabilities Govern Policy
 
-**Decision:** Route by current egress capability, not configured protocol name.
+**Decision:** Route by current egress path properties, not configured protocol name.
 Chaining takes minimum fidelity and datagram size, sums overhead, and intersects
 ECN preservation.
 

@@ -17,7 +17,7 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use boreas_core::{
-    Accepts, DatagramFidelity, Datapath, DnsPolicy, EgressCapabilities, FilterPolicy, Limits,
+    Accepts, DatagramFidelity, Datapath, DnsPolicy, PathProperties, FilterPolicy, Limits,
     Mtu, NatBehavior,
 };
 use libfuzzer_sys::fuzz_target;
@@ -27,7 +27,7 @@ fn datapath(accepts: Accepts, dns: DnsPolicy) -> Datapath {
         FilterPolicy::PassThrough,
         dns,
         accepts,
-        EgressCapabilities {
+        PathProperties {
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: 60,
             max_datagram_size: Some(1500),

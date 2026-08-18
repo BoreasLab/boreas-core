@@ -37,8 +37,8 @@ use std::{
 use quiche::h3::NameValue;
 
 use crate::{
-    BufferPool, DatagramFidelity, EgressCapabilities, EgressEmit, EgressError, NatBehavior,
-    PacketEgress, varint,
+    BufferPool, DatagramFidelity, EgressEmit, EgressError, NatBehavior, PacketEgress,
+    PathProperties, varint,
 };
 
 /// The CONNECT-IP context ID for a full IP packet, fixed by RFC 9484 §6.
@@ -46,7 +46,7 @@ const IP_PACKET_CONTEXT: u64 = 0;
 
 /// A conservative upper bound on everything wrapped around one tunnelled IP
 /// packet, used for inner-MTU arithmetic before a connection exists. Once one
-/// does, [`MasqueEgress::capabilities`] reports the *measured* ceiling from
+/// does, [`MasqueEgress::properties`] reports the *measured* ceiling from
 /// `quiche` instead, which is always the tighter and truer number.
 ///
 /// The terms, worst case: 40 bytes of outer IPv6 and 8 of UDP; a QUIC short
@@ -367,7 +367,7 @@ impl MasqueEgress {
 }
 
 impl PacketEgress for MasqueEgress {
-    fn capabilities(&self) -> EgressCapabilities {
+    fn properties(&self) -> PathProperties {
         // Once the connection is up, `quiche` knows the real datagram ceiling;
         // before that there is only the static estimate. Reporting the
         // measured number when it exists is what keeps the inner MTU honest.
@@ -375,7 +375,7 @@ impl PacketEgress for MasqueEgress {
             .conn
             .dgram_max_writable_len()
             .and_then(|len| u16::try_from(len.saturating_sub(usize::from(PREFIX_BYTES))).ok());
-        EgressCapabilities {
+        PathProperties {
             // CONNECT-IP carries whole IP packets, so a client's QUIC datagram
             // crosses as itself rather than being re-framed onto a stream.
             datagram_fidelity: DatagramFidelity::Native,
@@ -765,10 +765,10 @@ mod tests {
 
         // Once the tunnel is up the planner sees a real datagram ceiling
         // rather than only the static estimate.
-        let capabilities = egress.capabilities();
-        assert_eq!(capabilities.datagram_fidelity, DatagramFidelity::Native);
+        let properties = egress.properties();
+        assert_eq!(properties.datagram_fidelity, DatagramFidelity::Native);
         assert!(
-            capabilities.max_datagram_size.is_some_and(|size| size > 0),
+            properties.max_datagram_size.is_some_and(|size| size > 0),
             "an established tunnel reports its measured ceiling"
         );
 

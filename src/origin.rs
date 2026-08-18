@@ -36,7 +36,7 @@ use std::{
 };
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, Egress, EgressCapabilities, EgressError, NatBehavior,
+    AsyncStream, BoxFuture, DatagramFidelity, Egress, EgressError, NatBehavior, PathProperties,
     StreamEgress, Target,
 };
 
@@ -239,8 +239,8 @@ impl StreamEgress for TunnelledDialer {
     /// the packet egress charges is charged on the packets this connection
     /// produces, by the plan those packets are forwarded under — so counting it
     /// again here would count it twice.
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             datagram_fidelity: DatagramFidelity::None,
             overhead_bytes: 0,
             max_datagram_size: None,
@@ -321,8 +321,8 @@ async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> {
 pub struct NoPacketEgress;
 
 impl crate::PacketEgress for NoPacketEgress {
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             datagram_fidelity: DatagramFidelity::None,
             overhead_bytes: 0,
             max_datagram_size: None,
@@ -499,8 +499,8 @@ mod tests {
     fn every_egress_variant_assembles_into_both_effects() {
         struct NoStreams;
         impl StreamEgress for NoStreams {
-            fn capabilities(&self) -> EgressCapabilities {
-                EgressCapabilities {
+            fn properties(&self) -> PathProperties {
+                PathProperties {
                     datagram_fidelity: DatagramFidelity::Native,
                     overhead_bytes: 7,
                     max_datagram_size: Some(1400),
@@ -522,7 +522,7 @@ mod tests {
             DEFAULT_ORIGINATION_PORTS,
         );
         assert_eq!(
-            assembled.flows.capabilities().overhead_bytes,
+            assembled.flows.properties().overhead_bytes,
             7,
             "a stream egress is its own flow effect"
         );
@@ -531,7 +531,7 @@ mod tests {
             "and it re-originates nothing on this device"
         );
         assert_eq!(
-            assembled.packets.capabilities().datagram_fidelity,
+            assembled.packets.properties().datagram_fidelity,
             DatagramFidelity::None,
             "it carries no packets, and says so"
         );

@@ -43,8 +43,8 @@ use ring::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, EgressCapabilities, EgressError, NatBehavior,
-    ProxyError, StreamEgress, Target, TunnelBypass, encode_address,
+    AsyncStream, BoxFuture, DatagramFidelity, EgressError, NatBehavior, PathProperties, ProxyError,
+    StreamEgress, Target, TunnelBypass, encode_address,
 };
 
 /// The BLAKE3 derive-key context, fixed by SIP022. It is part of the wire
@@ -315,8 +315,8 @@ impl<B: TunnelBypass> ShadowsocksEgress<B> {
 }
 
 impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
-    fn capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
             // The UDP half (SIP022's separate packet format) is not
             // implemented, and the claim says so rather than implying a relay
             // that does not exist.
