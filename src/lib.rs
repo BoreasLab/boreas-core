@@ -37,7 +37,7 @@ mod vless;
 use std::{error::Error, fmt};
 
 pub use bridge::BridgedStream;
-pub use ca::{CaError, CertificateAuthority, MitmResolver};
+pub use ca::{CaError, CaKeys, CaMaterial, CertificateAuthority, MitmResolver};
 pub use datapath::{
     DEFAULT_INSPECTED_PORTS, Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Outbound, Side,
     Transmit,
