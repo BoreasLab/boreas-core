@@ -173,7 +173,40 @@ impl Mtu {
     /// QUIC pads initial packets to 1200 bytes and forbids IP fragmentation, so
     /// a path below that floor cannot complete a handshake.
     pub fn admits_quic(self) -> bool {
-        self.0 >= MIN_QUIC_MTU
+        self.quic_budget().is_some()
+    }
+
+    /// The QUIC budget this MTU affords. Total, because [`MIN_IPV6_MTU`]
+    /// exceeds [`MIN_QUIC_MTU`] and an `Mtu` cannot be below the first.
+    pub fn quic_budget(self) -> Option<QuicBudget> {
+        QuicBudget::new(self.0)
+    }
+}
+
+/// A datagram ceiling proven large enough to carry QUIC.
+///
+/// **Not an [`Mtu`], and the gap between them is eighty bytes of reachable
+/// configuration.** An `Mtu`'s floor is RFC 8200 section 5's 1280-octet IPv6
+/// minimum *link* MTU; a QUIC budget's floor is RFC 9000 section 14's 1200
+/// bytes, "the smallest allowed maximum datagram size". They are different
+/// quantities with different bounds, and an egress may legitimately declare a
+/// ceiling between them. Parsing such a ceiling as an `Mtu` rejected it for
+/// failing a floor it was never subject to, and every path in [1200, 1280) lost
+/// HTTP/3 for a reason that did not apply to it.
+///
+/// The type is the proof, so the question "does QUIC fit" is answered by
+/// whether one exists rather than by a comparison a caller has to remember.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuicBudget(u16);
+
+impl QuicBudget {
+    /// The one boundary a declared ceiling crosses to become a budget.
+    pub fn new(bytes: u16) -> Option<Self> {
+        (bytes >= MIN_QUIC_MTU).then_some(Self(bytes))
+    }
+
+    pub fn get(self) -> u16 {
+        self.0
     }
 }
 
@@ -492,10 +525,10 @@ pub fn plan_flow(
     // the egress's own datagram ceiling governs; an egress that does not declare
     // one cannot be shown to clear the floor, and steering beats a black hole.
     let datagram_budget = match transport {
-        TransportPath::PacketFastPath { inner_mtu } => Some(inner_mtu),
-        TransportPath::LocalTermination => egress
-            .max_datagram_size
-            .and_then(|bytes| Mtu::new(bytes).ok()),
+        TransportPath::PacketFastPath { inner_mtu } => inner_mtu.quic_budget(),
+        // A ceiling here is a datagram size, not a link MTU, so it is parsed
+        // against QUIC's floor rather than IPv6's. See [`QuicBudget`].
+        TransportPath::LocalTermination => egress.max_datagram_size.and_then(QuicBudget::new),
     };
 
     // Steering is per flow for the same reason termination is: an inspected
@@ -505,7 +538,7 @@ pub fn plan_flow(
         QuicPolicy::SteerToHttp2(SteeringReason::InspectionRequired)
     } else if egress.datagram_fidelity != DatagramFidelity::Native {
         QuicPolicy::SteerToHttp2(SteeringReason::DatagramFidelity)
-    } else if !datagram_budget.is_some_and(Mtu::admits_quic) {
+    } else if datagram_budget.is_none() {
         QuicPolicy::SteerToHttp2(SteeringReason::MtuBelowMinimum)
     } else {
         QuicPolicy::PassThrough
@@ -683,45 +716,82 @@ mod tests {
 
     #[test]
     fn plan_flow_never_passes_quic_below_native_or_below_floor() {
+        // **Both directions, and both transports.** The earlier form asserted
+        // only "must steer" and only under `Accepts::IpPackets`, which never
+        // reaches local termination -- so the arm that read an egress's
+        // datagram ceiling was never planned at all, and a ceiling it wrongly
+        // rejected could not be seen.
         for fidelity in FIDELITIES {
             for &overhead in &OVERHEADS {
                 for &path in &MTUS {
-                    for max_datagram_size in [None, Some(1199), Some(1200), Some(1500)] {
-                        let properties = PathProperties {
-                            max_datagram_size,
-                            ..egress(fidelity, overhead)
-                        };
-                        let Ok(plan) = plan_flow(
-                            FilterPolicy::PassThrough,
-                            Inspection::Excluded,
-                            Accepts::IpPackets,
-                            properties,
-                            mtu(path),
-                        ) else {
-                            continue; // overhead exceeded the path; not admitted
-                        };
-                        if fidelity != DatagramFidelity::Native {
-                            assert_ne!(
-                                plan.quic,
-                                QuicPolicy::PassThrough,
-                                "fidelity {fidelity:?} must steer"
-                            );
-                        }
-                        let budget = match plan.transport {
-                            TransportPath::PacketFastPath { inner_mtu } => Some(inner_mtu.get()),
-                            TransportPath::LocalTermination => max_datagram_size,
-                        };
-                        if budget.is_none_or(|bytes| bytes < MIN_QUIC_MTU) {
-                            assert_ne!(
-                                plan.quic,
-                                QuicPolicy::PassThrough,
-                                "budget {budget:?} must steer"
+                    for accepts in [Accepts::IpPackets, Accepts::Flows] {
+                        for max_datagram_size in
+                            [None, Some(1199), Some(1200), Some(1279), Some(1500)]
+                        {
+                            let properties = PathProperties {
+                                max_datagram_size,
+                                ..egress(fidelity, overhead)
+                            };
+                            let Ok(plan) = plan_flow(
+                                FilterPolicy::PassThrough,
+                                Inspection::Excluded,
+                                accepts,
+                                properties,
+                                mtu(path),
+                            ) else {
+                                continue; // overhead exceeded the path; not admitted
+                            };
+                            if fidelity != DatagramFidelity::Native {
+                                assert_ne!(
+                                    plan.quic,
+                                    QuicPolicy::PassThrough,
+                                    "fidelity {fidelity:?} must steer"
+                                );
+                                continue;
+                            }
+                            let budget = match plan.transport {
+                                TransportPath::PacketFastPath { inner_mtu } => {
+                                    Some(inner_mtu.get())
+                                }
+                                TransportPath::LocalTermination => max_datagram_size,
+                            };
+                            let fits = budget.is_some_and(|bytes| bytes >= MIN_QUIC_MTU);
+                            assert_eq!(
+                                plan.quic == QuicPolicy::PassThrough,
+                                fits,
+                                "budget {budget:?} over {accepts:?}: QUIC passes exactly when \
+                                 RFC 9000's floor is met"
                             );
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The eighty bytes between RFC 9000's floor and RFC 8200's. An egress
+    /// declaring a ceiling in this range can carry QUIC and used to be steered
+    /// off it, because its datagram size was parsed against the IPv6 minimum
+    /// link MTU rather than against QUIC's own floor.
+    #[test]
+    fn a_datagram_ceiling_between_the_two_floors_still_carries_quic() {
+        for bytes in [MIN_QUIC_MTU, 1234, MIN_IPV6_MTU - 1] {
+            assert!(QuicBudget::new(bytes).is_some(), "{bytes} clears RFC 9000");
+            assert!(Mtu::new(bytes).is_err(), "{bytes} is below RFC 8200");
+            let plan = plan_flow(
+                FilterPolicy::PassThrough,
+                Inspection::Excluded,
+                Accepts::Flows,
+                PathProperties {
+                    max_datagram_size: Some(bytes),
+                    ..egress(DatagramFidelity::Native, 0)
+                },
+                mtu(1500),
+            )
+            .unwrap();
+            assert_eq!(plan.quic, QuicPolicy::PassThrough, "{bytes} must pass");
+        }
+        assert!(QuicBudget::new(MIN_QUIC_MTU - 1).is_none());
     }
 
     #[test]

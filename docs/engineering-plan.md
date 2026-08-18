@@ -99,8 +99,10 @@ precondition is not structural.
 **Status: complete.** Delivered:
 
 - `Mtu`: private field, constructor rejects below `MIN_IPV6_MTU` of 1280 bytes
-  per ADR-011. `Mtu::admits_quic` names RFC 9000's 1200-byte floor on the type
-  that owns the invariant.
+  per ADR-011. RFC 9000's 1200-byte floor is a *different* bound on a different
+  quantity, and lives on `QuicBudget`: a link MTU and a datagram ceiling are not
+  the same refinement, and an egress may declare a ceiling between the two
+  floors. `Mtu::quic_budget` is the total map from one to the other.
 - `TransportPath::PacketFastPath` carries the inner MTU; `LocalTermination` does
   not, because a re-originated byte stream has no client packet size. This also
   put `PathProperties::max_datagram_size` to work: it was declared, chained,
