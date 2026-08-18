@@ -1380,8 +1380,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            second.authority().unwrap().root_certificate,
-            kept.root_certificate,
+            second.authority().unwrap().root_certificate(),
+            kept.root_certificate(),
             "the second tunnel mints under the root already in the device's store"
         );
         second.stop().await.unwrap();

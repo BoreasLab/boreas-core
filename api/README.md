@@ -52,8 +52,8 @@ let tunnel = Tunnel::start(
 ).await?;
 
 if let Some(material) = tunnel.authority() {
-    keystore.write(material.keys.as_bytes());       // secret
-    trust_store.offer(&material.root_certificate);  // public
+    keystore.write(material.keys().as_bytes());       // secret
+    trust_store.offer(material.root_certificate());   // public
 }
 ```
 

@@ -71,6 +71,12 @@ pub enum CaError {
     /// gets this generates a fresh authority and asks the user to trust it
     /// again, which is the only recovery there is.
     Material,
+    /// The stored certificate and the stored keys are not two halves of one
+    /// authority. Its own recovery, distinct from [`Self::Material`], because
+    /// both halves parsed: what failed is that they do not belong together,
+    /// which points at a host that wrote its two secure-storage slots at
+    /// different times rather than at a corrupted blob.
+    Mismatched,
 }
 
 impl fmt::Display for CaError {
@@ -80,6 +86,9 @@ impl fmt::Display for CaError {
             Self::Signing(error) => write!(f, "could not sign a certificate: {error}"),
             Self::KeyLoading(error) => write!(f, "could not load the leaf key: {error}"),
             Self::Material => f.write_str("stored key material is not intact"),
+            Self::Mismatched => {
+                f.write_str("the stored certificate was not issued to the stored key")
+            }
         }
     }
 }
@@ -89,7 +98,7 @@ impl std::error::Error for CaError {
         match self {
             Self::KeyGeneration(error) | Self::Signing(error) => Some(error),
             Self::KeyLoading(error) => Some(error),
-            Self::Material => None,
+            Self::Material | Self::Mismatched => None,
         }
     }
 }
@@ -150,9 +159,56 @@ fn root_params() -> Result<CertificateParams, CaError> {
 #[derive(Clone)]
 pub struct CaMaterial {
     /// DER. Public, and the artefact the user is asked to trust.
-    pub root_certificate: Vec<u8>,
+    root_certificate: Vec<u8>,
     /// Private key material. One value, one secure-storage slot.
-    pub keys: CaKeys,
+    keys: CaKeys,
+}
+
+impl CaMaterial {
+    /// The one boundary two secure-storage reads cross to become an authority.
+    ///
+    /// **Proves the halves are halves of the same thing, which nothing
+    /// downstream can.** The two live in different places by design — the
+    /// certificate in a trust store, the keys in a keystore — so a host can
+    /// write one and not the other: an interrupted rotation, a restored
+    /// backup, two slots under different keys. Neither half is corrupt in that
+    /// case, so every parse succeeds and the authority builds. What it then
+    /// mints are leaves signed by a key the installed root does not carry, and
+    /// the user sees every interception fail with nothing to read but a
+    /// certificate error. Refusing here turns that into one recoverable error
+    /// at startup.
+    ///
+    /// O(certificate bytes): one DER parse and one public-key comparison, once
+    /// per session.
+    pub fn from_parts(root_certificate: Vec<u8>, keys: CaKeys) -> Result<Self, CaError> {
+        let (root, _leaf) = keys.unpack()?;
+        let key =
+            boring::pkey::PKey::private_key_from_pkcs8(root).map_err(|_| CaError::Material)?;
+        let certificate =
+            boring::x509::X509::from_der(&root_certificate).map_err(|_| CaError::Material)?;
+        // **The signature, not just the public key.** The root is self-signed,
+        // so verifying it under the stored key proves the same thing a
+        // public-key comparison would and one thing more: that the certificate
+        // is the one this key actually issued, intact, rather than merely one
+        // carrying a matching public half.
+        if !certificate.verify(&key).unwrap_or(false) {
+            return Err(CaError::Mismatched);
+        }
+        Ok(Self {
+            root_certificate,
+            keys,
+        })
+    }
+
+    /// The certificate to hand a platform trust store.
+    pub fn root_certificate(&self) -> &[u8] {
+        &self.root_certificate
+    }
+
+    /// The secret half, to hand a platform keystore.
+    pub fn keys(&self) -> &CaKeys {
+        &self.keys
+    }
 }
 
 /// The private key material an authority signs with: the root's key, and the
@@ -232,12 +288,21 @@ impl CaKeys {
 ///
 /// ```no_run
 /// # use boreas_core::{CaKeys, CaMaterial, CertificateAuthority, Trust};
-/// # fn stored() -> Option<CaMaterial> { None }
-/// # fn keep(_: CaMaterial) {}
+/// # fn trust_store() -> Option<Vec<u8>> { None }
+/// # fn keystore() -> Option<Vec<u8>> { None }
+/// # fn keep(_: &CaMaterial) {}
 /// # fn offer_to_install(_: &[u8]) {}
 /// # fn main() -> Result<(), boreas_core::CaError> {
-/// let authority = CertificateAuthority::open(stored().map_or(Trust::Generate, Trust::Restore))?;
-/// keep(authority.material());
+/// // Two slots, so both must be there and both must belong together. A pair
+/// // that does not is `CaError::Mismatched`, and generating is the recovery.
+/// let stored = match (trust_store(), keystore()) {
+///     (Some(certificate), Some(keys)) => {
+///         CaMaterial::from_parts(certificate, CaKeys::from_bytes(keys)).ok()
+///     }
+///     _ => None,
+/// };
+/// let authority = CertificateAuthority::open(stored.map_or(Trust::Generate, Trust::Restore))?;
+/// keep(&authority.material());
 /// offer_to_install(authority.root_der());
 /// # Ok(()) }
 /// ```
@@ -347,6 +412,8 @@ impl CertificateAuthority {
     /// certificate — costs an X.509 parser in the dependency graph to learn
     /// three fields this crate wrote itself.
     pub fn restore(material: &CaMaterial) -> Result<Self, CaError> {
+        // The pair was proven to belong together by `CaMaterial::from_parts`,
+        // which is the only way to have one.
         let root_der = CertificateDer::from(material.root_certificate.clone()).into_owned();
         let (root, leaf) = material.keys.unpack()?;
         let root_key =
@@ -610,7 +677,7 @@ mod tests {
     #[test]
     fn material_a_host_could_not_store_intact_is_refused() {
         let good = CertificateAuthority::generate().unwrap().material();
-        let bytes = good.keys.as_bytes().to_vec();
+        let bytes = good.keys().as_bytes().to_vec();
 
         for (label, keys) in [
             ("empty", Vec::new()),
@@ -631,13 +698,12 @@ mod tests {
                 other
             }),
         ] {
-            let material = CaMaterial {
-                root_certificate: good.root_certificate.clone(),
-                keys: CaKeys::from_bytes(keys),
-            };
             assert!(
                 matches!(
-                    CertificateAuthority::restore(&material),
+                    CaMaterial::from_parts(
+                        good.root_certificate().to_vec(),
+                        CaKeys::from_bytes(keys)
+                    ),
                     Err(CaError::Material)
                 ),
                 "{label}"
@@ -645,18 +711,45 @@ mod tests {
         }
     }
 
+    /// **Two secure-storage slots can disagree, and every parse still
+    /// succeeds.** A host that wrote its keystore and not its trust store — an
+    /// interrupted rotation, a restored backup, two slots keyed differently —
+    /// hands over a certificate and keys that are each perfectly intact and are
+    /// not two halves of one authority. Without this the session builds, mints
+    /// leaves the installed root cannot vouch for, and the user sees a
+    /// certificate error on every site with nothing to act on.
+    #[test]
+    fn a_certificate_and_keys_from_different_authorities_are_refused() {
+        let mine = CertificateAuthority::generate().unwrap().material();
+        let theirs = CertificateAuthority::generate().unwrap().material();
+
+        assert!(
+            matches!(
+                CaMaterial::from_parts(theirs.root_certificate().to_vec(), mine.keys().clone()),
+                Err(CaError::Mismatched)
+            ),
+            "a root this key never issued"
+        );
+        // And the halves that do belong together still assemble, restore, and
+        // mint under the very same root.
+        let rejoined =
+            CaMaterial::from_parts(mine.root_certificate().to_vec(), mine.keys().clone()).unwrap();
+        let restored = CertificateAuthority::restore(&rejoined).unwrap();
+        assert_eq!(restored.root_der().as_ref(), mine.root_certificate());
+    }
+
     /// Keep public certificate separate from the secret: trust-store installers
     /// need the former in clear, while keystores must protect only the latter.
     #[test]
     fn the_public_artefact_is_not_inside_the_secret() {
         let material = CertificateAuthority::generate().unwrap().material();
-        assert!(!material.root_certificate.is_empty());
+        assert!(!material.root_certificate().is_empty());
         assert!(
             !material
-                .keys
+                .keys()
                 .as_bytes()
-                .windows(material.root_certificate.len())
-                .any(|window| window == material.root_certificate),
+                .windows(material.root_certificate().len())
+                .any(|window| window == material.root_certificate()),
             "the certificate is handed out separately, not buried in the secret"
         );
     }

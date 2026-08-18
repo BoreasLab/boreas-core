@@ -78,20 +78,32 @@ holds a JNI handle, clone the handle.
 
 Only if you intercept. `tunnel.authority()` returns:
 
-- `root_certificate` — **public**, DER. Hand it to the platform's trust
+- `root_certificate()` — **public**, DER. Hand it to the platform's trust
   installer. On Android, `KeyChain.createInstallIntent()` with
   `EXTRA_CERTIFICATE`; the user must approve it, and on Android 7+ apps that do
   not opt into user certificates will still refuse it. On Windows, the
   `ROOT` store for the current user.
-- `keys` — **private**. Store the bytes in the Android Keystore or under DPAPI.
-  Treat them as you would a password. They are opaque and self-describing;
-  you never need to look inside.
+- `keys()` — **private**. Store the bytes in the Android Keystore or under
+  DPAPI. Treat them as you would a password. They are opaque and
+  self-describing; you never need to look inside.
 
-Hand `keys` back as `Trust::Restore` next launch. If restoring fails you get
-`CaError::Material`, which means storage lost or corrupted the key: generate a
-fresh authority and ask the user to trust it again. Boreas will **not** silently
-generate a replacement, because a device whose store still trusts the old root
-would then intercept nothing while reporting itself healthy.
+Next launch, read both slots back and put them together with
+`CaMaterial::from_parts(certificate, CaKeys::from_bytes(keys))`, then hand the
+result to `Trust::Restore`. Two failures are possible and they mean different
+things:
+
+- `CaError::Material` — storage lost or corrupted the key blob.
+- `CaError::Mismatched` — both halves are intact and they are not two halves of
+  the same authority. The two live in different stores, so one can be written
+  without the other: an interrupted rotation, a restored backup, two slots keyed
+  differently. Nothing downstream can detect this — every parse succeeds, the
+  session starts, and it mints leaves the installed root cannot vouch for, so
+  the user sees a certificate error on every site and has nothing to act on.
+
+Both recover the same way: generate a fresh authority and ask the user to trust
+it again. Boreas will **not** silently generate a replacement, because a device
+whose store still trusts the old root would then intercept nothing while
+reporting itself healthy.
 
 ### Known limitation
 
