@@ -73,6 +73,12 @@ const HANDSHAKE_TIMEOUT: Duration = crate::Wait::ProxyDial.budget();
 /// queue is an unbounded number of half-open streams.
 const COMMAND_DEPTH: usize = 16;
 
+/// Inbound datagrams held for a claimant that is not reading fast enough.
+/// Bounded and lossy, for the reason every other datagram queue in this crate
+/// is: blocking a datagram producer turns loss into head-of-line delay, and the
+/// producer here is a connection carrying every other flow as well.
+const DATAGRAM_DEPTH: usize = 256;
+
 /// A `quiche::Config` with the transport limits a stream-carrying connection
 /// needs.
 ///
@@ -272,6 +278,7 @@ impl Handshake {
             next_stream_id: self.next_stream_id,
             streams: HashMap::new(),
             commands: receiver,
+            datagrams: None,
             wake: Arc::clone(&wake),
             shutdown,
         };
@@ -367,6 +374,15 @@ enum Command {
     OpenBidi {
         reply: oneshot::Sender<BridgedStream>,
     },
+    /// One QUIC DATAGRAM to send. Owned, because the driver sends it on its own
+    /// schedule and the caller is not waiting.
+    Send(Vec<u8>),
+    /// Claims the inbound datagram stream. Answered once; a second claimant
+    /// gets `None`, because two readers of one datagram stream would race for
+    /// each arriving packet and neither would see all of them.
+    Receive {
+        reply: oneshot::Sender<Option<mpsc::Receiver<Vec<u8>>>>,
+    },
 }
 
 impl QuicConnection {
@@ -382,6 +398,32 @@ impl QuicConnection {
             .await
             .map_err(|_| EgressError::Masque)?;
         response.await.map_err(|_| EgressError::Masque)
+    }
+
+    /// Queues one QUIC DATAGRAM.
+    ///
+    /// **Unreliable by construction, and the caller must want that.** A
+    /// datagram that does not fit the path, or that arrives when the send queue
+    /// is full, is dropped and never retransmitted — which is the correct
+    /// behaviour for the thing this carries, a client's own UDP packet, and
+    /// would be wrong for anything else.
+    pub async fn send_datagram(&self, payload: Vec<u8>) -> Result<(), EgressError> {
+        self.commands
+            .send(Command::Send(payload))
+            .await
+            .map_err(|_| EgressError::Quic)
+    }
+
+    /// Claims the inbound datagram stream, once.
+    ///
+    /// `None` if something already has it. One claimant is the shape a
+    /// multiplexing protocol needs anyway: every session on this connection
+    /// shares one datagram stream, so demultiplexing them is a job for the
+    /// protocol above rather than something several readers can race at.
+    pub async fn receive_datagrams(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        let (reply, response) = oneshot::channel();
+        self.commands.send(Command::Receive { reply }).await.ok()?;
+        response.await.ok().flatten()
     }
 
     /// Whether the driver is still running. Advisory only — a connection can
@@ -402,6 +444,10 @@ struct Driver {
     next_stream_id: u64,
     streams: HashMap<u64, Plumbing>,
     commands: mpsc::Receiver<Command>,
+    /// Where inbound datagrams go, once something has claimed them. `None`
+    /// until then, so a connection whose protocol carries no datagrams pays
+    /// nothing for the ones it will never see.
+    datagrams: Option<mpsc::Sender<Vec<u8>>>,
     wake: Arc<Notify>,
     shutdown: CancellationToken,
 }
@@ -462,6 +508,25 @@ impl Driver {
 
     fn dispatch(&mut self, command: Command) {
         match command {
+            Command::Send(payload) => {
+                // A datagram too large for the path, or one the send queue has
+                // no room for, is dropped here. That is the contract: the thing
+                // being carried is a UDP packet, and a UDP packet that does not
+                // arrive is a UDP packet that did not arrive.
+                let _ = self.conn.dgram_send(&payload);
+            }
+            Command::Receive { reply } => {
+                if self.datagrams.is_some() {
+                    let _ = reply.send(None);
+                    return;
+                }
+                let (sender, receiver) = mpsc::channel(DATAGRAM_DEPTH);
+                // The channel is kept only if the claimant is still there to
+                // read it; otherwise the driver would fill a queue nobody owns.
+                if reply.send(Some(receiver)).is_ok() {
+                    self.datagrams = Some(sender);
+                }
+            }
             Command::OpenBidi { reply } => {
                 // The peer's stream limit is a real refusal, not a wait: a
                 // caller that cannot have a stream now should learn it now and
@@ -488,6 +553,18 @@ impl Driver {
     /// is — at the stream counts one connection carries, probing a channel is
     /// cheaper than maintaining a ready list.
     fn service(&mut self, chunk: &mut [u8]) {
+        // Datagrams first, and drained fully: `quiche` holds them in a bounded
+        // queue that stops accepting once full, so leaving any behind would
+        // cost later ones. A claimant that is not keeping up loses packets
+        // rather than stalling the connection every stream on it shares.
+        if let Some(sink) = &self.datagrams {
+            while let Ok(len) = self.conn.dgram_recv(chunk) {
+                if sink.try_send(chunk[..len].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+
         // `readable()` yields an owned iterator, so the connection is free to
         // be mutated inside the loop.
         for id in self.conn.readable() {

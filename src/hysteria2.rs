@@ -29,18 +29,19 @@
 //! rather than invented ones, because a *different* padding distribution is
 //! itself a fingerprint.
 
-use std::{net::SocketAddr, ops::Range, time::Duration};
+use std::{net::SocketAddr, ops::Range, sync::Arc, time::Duration};
 
 use ring::rand::SecureRandom;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, Decoded, EgressError, NatBehavior, PathProperties,
-    Prefixed, ProxyError, StreamEgress, Target, TunnelBypass,
+    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
+    EgressError, NatBehavior, PathProperties, Prefixed, ProxyError, StreamEgress, Target,
+    TunnelBypass,
     quic::{Handshake, QuicConnection, client_config},
     varint,
 };
@@ -209,6 +210,181 @@ pub struct Hysteria2Config {
 /// nowhere else.
 pub type QuicConfigFactory = Box<dyn Fn() -> Result<quiche::Config, EgressError> + Send + Sync>;
 
+// ------------------------------------------------------- UDP over QUIC
+
+/// A `UDPMessage`, which is what one QUIC DATAGRAM carries.
+///
+/// ```text
+/// [uint32] Session ID
+/// [uint16] Packet ID
+/// [uint8]  Fragment ID
+/// [uint8]  Fragment count
+/// [varint] Address length
+/// [bytes]  Address string, "host:port"
+/// [bytes]  Payload
+/// ```
+///
+/// **The address is a string, not a structure.** Hysteria2 writes `host:port`
+/// as text and lets the server resolve it, which is why a name survives the
+/// crossing intact rather than being resolved on this side — the same property
+/// [`Target`] exists to protect everywhere else in this crate.
+///
+/// There is no frame-type varint and no authentication of its own: this rides
+/// inside QUIC, which provides both.
+struct UdpMessage<'a> {
+    session: u32,
+    packet: u16,
+    fragment: u8,
+    fragments: u8,
+    address: &'a str,
+    payload: &'a [u8],
+}
+
+/// Header bytes before the address: session, packet, fragment, count.
+const UDP_FIXED: usize = 4 + 2 + 1 + 1;
+
+/// The reference's `MaxDatagramFrameSize`. A message larger than this must be
+/// fragmented or dropped, never truncated.
+const MAX_DATAGRAM_FRAME: usize = 1200;
+
+impl UdpMessage<'_> {
+    /// Bytes this message's header costs, which is what fragmentation has to
+    /// subtract from the frame budget. The address is repeated in *every*
+    /// fragment, so this is per fragment rather than per message.
+    fn header_len(address: &str) -> usize {
+        UDP_FIXED + varint_len(address.len() as u64) + address.len()
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.session.to_be_bytes());
+        out.extend_from_slice(&self.packet.to_be_bytes());
+        out.push(self.fragment);
+        out.push(self.fragments);
+        varint::put(self.address.len() as u64, out);
+        out.extend_from_slice(self.address.as_bytes());
+        out.extend_from_slice(self.payload);
+    }
+
+    /// Total on untrusted input: every short buffer, over-long length, and
+    /// non-UTF-8 address is `None` rather than a panic or a partial read.
+    fn read(bytes: &[u8]) -> Option<UdpMessage<'_>> {
+        let fixed = bytes.get(..UDP_FIXED)?;
+        let (length, rest) = varint::get(&bytes[UDP_FIXED..])?;
+        if length == 0 || length > MAX_MESSAGE_LEN {
+            return None;
+        }
+        let (address, payload) = rest.split_at_checked(length as usize)?;
+        // The reference requires at least one payload byte, so a zero-length
+        // one is not representable and is refused rather than delivered empty.
+        if payload.is_empty() {
+            return None;
+        }
+        Some(UdpMessage {
+            session: u32::from_be_bytes(fixed[..4].try_into().expect("4 bytes")),
+            packet: u16::from_be_bytes(fixed[4..6].try_into().expect("2 bytes")),
+            fragment: fixed[6],
+            fragments: fixed[7],
+            address: std::str::from_utf8(address).ok()?,
+            payload,
+        })
+    }
+}
+
+/// How many bytes a QUIC varint of `value` occupies. `varint::put` picks the
+/// shortest form, so this has to agree with it exactly or a fragment's payload
+/// budget is wrong by a byte and the last fragment overflows the frame.
+fn varint_len(value: u64) -> usize {
+    match value {
+        0..=63 => 1,
+        64..=16_383 => 2,
+        16_384..=1_073_741_823 => 4,
+        _ => 8,
+    }
+}
+
+/// Splits one datagram into as many messages as the frame budget needs.
+///
+/// **Every fragment repeats the whole header, address included**, which is what
+/// makes the budget per fragment rather than amortised, and is what the
+/// reference does. `FragCount` is 1 for the ordinary case, where the spec says
+/// the packet and fragment identifiers are irrelevant.
+///
+/// O(payload length). Returns `None` for a payload that cannot be fragmented
+/// into at most 255 pieces, which is a datagram no path would carry anyway.
+fn fragment(session: u32, packet: u16, address: &str, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let budget = MAX_DATAGRAM_FRAME.checked_sub(UdpMessage::header_len(address))?;
+    if budget == 0 {
+        return None;
+    }
+    let count = payload.len().div_ceil(budget).max(1);
+    let fragments = u8::try_from(count).ok()?;
+    Some(
+        payload
+            .chunks(budget)
+            .chain(payload.is_empty().then_some(&[][..]))
+            .enumerate()
+            .map(|(index, chunk)| {
+                let mut out = Vec::with_capacity(MAX_DATAGRAM_FRAME);
+                UdpMessage {
+                    session,
+                    packet,
+                    fragment: index as u8,
+                    fragments,
+                    address,
+                    payload: chunk,
+                }
+                .write(&mut out);
+                out
+            })
+            .collect(),
+    )
+}
+
+/// Reassembles one session's fragmented messages.
+///
+/// **One packet at a time, deliberately.** The reference discards everything it
+/// holds the moment a different packet identifier arrives, and so does this: a
+/// datagram transport that buffered several partial packets would be a memory
+/// pool an attacker fills by sending first fragments, and the spec's own rule —
+/// lose one fragment, discard the packet — means nothing held is worth much.
+#[derive(Default)]
+struct Defragmenter {
+    packet: u16,
+    fragments: u8,
+    /// Fragments in index order, `None` where one has not arrived.
+    held: Vec<Option<Vec<u8>>>,
+}
+
+impl Defragmenter {
+    /// Returns the whole payload once every fragment of one packet is in hand.
+    ///
+    /// O(1) amortised per fragment, plus one copy of the payload when it
+    /// completes.
+    fn push(&mut self, message: &UdpMessage<'_>) -> Option<Vec<u8>> {
+        if message.fragments <= 1 {
+            return Some(message.payload.to_vec());
+        }
+        if message.fragment >= message.fragments {
+            return None;
+        }
+        if self.packet != message.packet || self.fragments != message.fragments {
+            self.packet = message.packet;
+            self.fragments = message.fragments;
+            self.held = vec![None; usize::from(message.fragments)];
+        }
+        self.held[usize::from(message.fragment)] = Some(message.payload.to_vec());
+        if self.held.iter().any(Option::is_none) {
+            return None;
+        }
+        let whole = self.held.iter().flatten().flatten().copied().collect();
+        self.held.clear();
+        // A completed packet leaves nothing behind, so the next first fragment
+        // starts from empty rather than from a stale count.
+        self.fragments = 0;
+        Some(whole)
+    }
+}
+
 /// A Hysteria2 server as a stream egress.
 pub struct Hysteria2Egress<B> {
     config: Hysteria2Config,
@@ -219,6 +395,10 @@ pub struct Hysteria2Egress<B> {
     /// produce *one* connection rather than two — the second waits and finds
     /// the first's.
     connection: Mutex<Option<QuicConnection>>,
+    /// The datagram hub for the live connection, or `None` when the server
+    /// answered `Hysteria-UDP: false`. Replaced whenever a connection is, since
+    /// a session identifier means nothing on a different connection.
+    datagrams: Mutex<Option<Arc<Sessions>>>,
     /// Cancels the driver task. Held here so the connection's lifetime is the
     /// egress's: dropping the egress ends the task rather than leaving it
     /// holding a socket nobody can reach.
@@ -238,6 +418,7 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
             bypass,
             quic,
             connection: Mutex::new(None),
+            datagrams: Mutex::new(None),
             shutdown: CancellationToken::new(),
         }
     }
@@ -291,27 +472,227 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
         if response.status != STATUS_AUTH_OK {
             return Err(ProxyError::AuthFailed.into());
         }
+        // **The server declares UDP support unilaterally and the client must
+        // obey it.** The request says nothing about datagrams; the response
+        // says whether any will be carried, and a server that said no "SHOULD
+        // silently discard" what a client sends anyway -- so sending would look
+        // exactly like a working relay that drops everything.
+        let carries_datagrams = response
+            .header(HEADER_UDP)
+            .is_some_and(|value| matches!(value, "true" | "1" | "t" | "T" | "TRUE" | "True"));
+
         let connection = handshake.drive(self.shutdown.clone());
+        // One hub per connection, started before any session can register, so
+        // a session opened immediately after this cannot miss its own replies.
+        let hub = if carries_datagrams {
+            let hub = Sessions::new();
+            hub.serve(&connection, self.shutdown.clone()).await;
+            Some(hub)
+        } else {
+            None
+        };
+        *self.datagrams.lock().await = hub;
         *held = Some(connection.clone());
         Ok(connection)
     }
 
-    /// Whether the server said it will carry datagrams. Recorded for when
-    /// Hysteria2's UDP lands; nothing reads it yet, and [`Self::properties`]
-    /// says so rather than claiming otherwise.
+    /// The response header a server declares datagram support in.
     pub fn udp_header() -> &'static str {
         HEADER_UDP
+    }
+}
+
+/// One session's inbound queue: a reassembled datagram and where it came from.
+type Route = mpsc::Sender<(Vec<u8>, Target)>;
+
+/// The datagram side of one authenticated connection.
+///
+/// **One QUIC connection carries every session, so someone has to
+/// demultiplex.** Hysteria2 gives each association a 32-bit session identifier
+/// and the server echoes it on every reply, so the routing key is in the
+/// message — but only one reader may take the connection's datagram stream, so
+/// that reader is here and it fans out.
+struct Sessions {
+    /// Where a session's reassembled datagrams go, by session identifier.
+    routes: std::sync::Mutex<std::collections::HashMap<u32, Route>>,
+    /// **The client picks these, and the reference starts at 1.** Zero is
+    /// avoided for the same reason the reference avoids it as a packet
+    /// identifier: it reads as "unset" in a capture.
+    next: std::sync::atomic::AtomicU32,
+}
+
+impl Sessions {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next: std::sync::atomic::AtomicU32::new(1),
+        })
+    }
+
+    /// Starts the one task that reads the connection's datagrams and routes
+    /// them. Returns `false` when something already claimed the stream, which
+    /// means a hub is already running for this connection.
+    async fn serve(self: &Arc<Self>, connection: &QuicConnection, shutdown: CancellationToken) {
+        let Some(mut inbound) = connection.receive_datagrams().await else {
+            return;
+        };
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            // Reassembly is per session, and the map is owned by this task
+            // alone -- so a session's partial packet cannot be observed or
+            // filled in by any other.
+            let mut partial: std::collections::HashMap<u32, Defragmenter> =
+                std::collections::HashMap::new();
+            loop {
+                let datagram = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    next = inbound.recv() => match next {
+                        Some(next) => next,
+                        None => break,
+                    },
+                };
+                // A malformed datagram is noise, not a failure: it rides an
+                // authenticated connection, but a server that speaks a dialect
+                // this client does not is not a reason to drop every session.
+                let Some(message) = UdpMessage::read(&datagram) else {
+                    continue;
+                };
+                let Some(route) = hub
+                    .routes
+                    .lock()
+                    .expect("no panic holds this")
+                    .get(&message.session)
+                    .cloned()
+                else {
+                    // A session that has gone away. Its reassembly state goes
+                    // with it, or a server that kept sending would keep a
+                    // buffer alive for a mapping nobody holds.
+                    partial.remove(&message.session);
+                    continue;
+                };
+                let Ok(from) = message.address.parse::<SocketAddr>().map(Target::Ip) else {
+                    // The reply names where it came from; a name here gives no
+                    // address to write into the synthesized packet's source,
+                    // and a client discards a reply from an address it did not
+                    // dial.
+                    continue;
+                };
+                let Some(whole) = partial.entry(message.session).or_default().push(&message) else {
+                    continue;
+                };
+                if route.try_send((whole, from)).is_err() {
+                    // The mapping is gone or is not keeping up. Either way this
+                    // is a dropped datagram, which is what a dropped datagram
+                    // is.
+                    continue;
+                }
+            }
+        });
+    }
+
+    /// Registers a session and returns its identifier and inbound queue.
+    fn open(&self) -> (u32, mpsc::Receiver<(Vec<u8>, Target)>) {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(SESSION_DEPTH);
+        self.routes
+            .lock()
+            .expect("no panic holds this")
+            .insert(id, sender);
+        (id, receiver)
+    }
+
+    fn close(&self, id: u32) {
+        self.routes.lock().expect("no panic holds this").remove(&id);
+    }
+}
+
+/// Datagrams held for one session that is not being drained. Bounded and lossy
+/// for the reason every datagram queue here is.
+const SESSION_DEPTH: usize = 64;
+
+/// The sending half of one Hysteria2 association.
+struct UdpSession {
+    connection: QuicConnection,
+    hub: Arc<Sessions>,
+    id: u32,
+    /// Identifies the fragments of one datagram. The reference draws a fresh
+    /// one per fragmented packet and leaves it at zero otherwise, which is
+    /// exactly what the spec means by "irrelevant" when the count is 1.
+    next_packet: std::sync::atomic::AtomicU32,
+}
+
+impl Drop for UdpSession {
+    /// **The protocol has no way to close a session, so this is the only
+    /// signal.** The server releases its port on its own idle timer; what this
+    /// releases is the routing entry, without which the hub would keep a
+    /// channel alive for a mapping nobody holds.
+    fn drop(&mut self) {
+        self.hub.close(self.id);
+    }
+}
+
+impl DatagramSink for UdpSession {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<(), EgressError>> {
+        Box::pin(async move {
+            let address = target.to_string();
+            let packet = self
+                .next_packet
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u16;
+            let Some(fragments) = fragment(self.id, packet, &address, payload) else {
+                return Err(EgressError::DatagramTooLarge {
+                    required: payload.len(),
+                });
+            };
+            for datagram in fragments {
+                self.connection.send_datagram(datagram).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The receiving half: one session's queue, filled by the hub.
+struct UdpReplies {
+    inbound: mpsc::Receiver<(Vec<u8>, Target)>,
+    /// Held so the routing entry outlives this half too. Without it a caller
+    /// that dropped the sink and kept the source would stop receiving.
+    _session: Arc<UdpSession>,
+}
+
+impl DatagramSource for UdpReplies {
+    fn recv_from<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<(usize, Target), EgressError>> {
+        Box::pin(async move {
+            let (payload, from) = self.inbound.recv().await.ok_or(EgressError::Quic)?;
+            let Some(into) = buf.get_mut(..payload.len()) else {
+                return Err(EgressError::DatagramTooLarge {
+                    required: payload.len(),
+                });
+            };
+            into.copy_from_slice(&payload);
+            Ok((payload.len(), from))
+        })
     }
 }
 
 impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // Hysteria2 does carry datagrams, and this egress does not yet
-            // implement them. The claim describes the code, not the protocol:
-            // `associate` refuses, and those two must agree or the planner
-            // steers a QUIC flow into an egress that will drop it.
-            datagram_fidelity: DatagramFidelity::None,
+            // **Native: a client datagram is one QUIC DATAGRAM, unreliable and
+            // unordered exactly as it was.** Fragmentation is the one caveat
+            // and it does not change the claim -- a packet that needs it is
+            // reassembled whole or discarded whole, never delivered in pieces.
+            //
+            // A server that answered `Hysteria-UDP: false` is a separate
+            // matter: `associate` refuses, and the flow fails rather than
+            // silently disappearing into a relay that discards it.
+            datagram_fidelity: DatagramFidelity::Native,
             // A terminated path re-originates the byte stream, so the client's
             // packet size stops existing and there is no per-packet header to
             // charge for.
@@ -320,6 +701,40 @@ impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
             preserves_ecn: false,
             nat_behavior: self.config.nat_behavior,
         }
+    }
+
+    /// Opens a datagram association: one session identifier on the connection
+    /// every other flow already shares.
+    ///
+    /// **No handshake and no control stream.** Hysteria2 has neither for UDP --
+    /// the first datagram establishes the session by carrying its identifier,
+    /// and there is no way to close one, so the server releases its port on its
+    /// own idle timer. What this allocates is a routing entry, and dropping the
+    /// association is what frees it.
+    fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
+        Box::pin(async move {
+            let connection = self.connection().await?;
+            let Some(hub) = self.datagrams.lock().await.clone() else {
+                // The server said it carries none. Refusing is the honest
+                // answer: sending anyway would look exactly like a relay that
+                // works and drops everything.
+                return Err(EgressError::DatagramsUnsupported);
+            };
+            let (id, inbound) = hub.open();
+            let session = Arc::new(UdpSession {
+                connection,
+                hub,
+                id,
+                next_packet: std::sync::atomic::AtomicU32::new(1),
+            });
+            Ok(Association {
+                source: Box::new(UdpReplies {
+                    inbound,
+                    _session: Arc::clone(&session),
+                }),
+                sink: session,
+            })
+        })
     }
 
     fn connect<'a>(
@@ -503,5 +918,171 @@ mod tests {
             );
             assert!(bytes.iter().all(|byte| PADDING_ALPHABET.contains(byte)));
         }
+    }
+
+    /// The field table from the protocol specification, read back by hand
+    /// rather than through this file's own decoder. Round-tripping a codec
+    /// against itself proves only self-consistency; the offsets are the thing
+    /// a peer agrees with.
+    #[test]
+    fn a_udp_message_lays_its_fields_out_where_the_specification_says() {
+        let mut out = Vec::new();
+        UdpMessage {
+            session: 0x0102_0304,
+            packet: 0x0506,
+            fragment: 2,
+            fragments: 5,
+            address: "example.com:443",
+            payload: b"body",
+        }
+        .write(&mut out);
+
+        assert_eq!(&out[..4], &[1, 2, 3, 4], "session, uint32 big endian");
+        assert_eq!(&out[4..6], &[5, 6], "packet, uint16 big endian");
+        assert_eq!(out[6], 2, "fragment index");
+        assert_eq!(out[7], 5, "fragment count");
+        // "example.com:443" is 15 bytes, which a one-byte QUIC varint holds.
+        assert_eq!(out[8], 15, "address length, QUIC varint");
+        assert_eq!(&out[9..24], b"example.com:443");
+        assert_eq!(&out[24..], b"body");
+
+        let read = UdpMessage::read(&out).expect("what was written reads back");
+        assert_eq!(read.session, 0x0102_0304);
+        assert_eq!(read.packet, 0x0506);
+        assert_eq!(read.fragment, 2);
+        assert_eq!(read.fragments, 5);
+        assert_eq!(read.address, "example.com:443");
+        assert_eq!(read.payload, b"body");
+    }
+
+    /// A message is bytes from a server, so every truncation and every
+    /// impossible length is `None` rather than a panic or a partial read.
+    #[test]
+    fn a_malformed_message_is_refused_rather_than_partially_believed() {
+        let mut whole = Vec::new();
+        UdpMessage {
+            session: 1,
+            packet: 0,
+            fragment: 0,
+            fragments: 1,
+            address: "198.51.100.7:53",
+            payload: b"x",
+        }
+        .write(&mut whole);
+        assert!(UdpMessage::read(&whole).is_some());
+
+        for length in 0..whole.len() {
+            assert!(
+                UdpMessage::read(&whole[..length]).is_none(),
+                "a message cut at {length} bytes is not a message"
+            );
+        }
+
+        let mut empty_address = whole.clone();
+        empty_address[8] = 0;
+        assert!(
+            UdpMessage::read(&empty_address).is_none(),
+            "an address of length zero names nothing"
+        );
+
+        let mut not_utf8 = whole.clone();
+        not_utf8[9] = 0xff;
+        assert!(UdpMessage::read(&not_utf8).is_none(), "the address is text");
+    }
+
+    /// **Every fragment repeats the whole header, address included**, so the
+    /// budget is per fragment. Getting that wrong by one varint byte makes the
+    /// last fragment exceed the frame and the server drop the packet.
+    #[test]
+    fn every_fragment_fits_the_frame_and_carries_the_address_again() {
+        let address = "a-rather-long-name.example.com:443";
+        let payload = vec![0xabu8; 4000];
+        let fragments = fragment(7, 9, address, &payload).expect("4000 bytes fragments");
+
+        assert!(fragments.len() > 1, "a 4000-byte payload does not fit one");
+        assert!(
+            fragments.iter().all(|one| one.len() <= MAX_DATAGRAM_FRAME),
+            "and none of the pieces exceeds the frame"
+        );
+
+        let mut rebuilt = Vec::new();
+        for (index, bytes) in fragments.iter().enumerate() {
+            let message = UdpMessage::read(bytes).expect("each fragment is a message");
+            assert_eq!(message.session, 7);
+            assert_eq!(message.packet, 9, "one identifier across the whole packet");
+            assert_eq!(message.fragment, index as u8);
+            assert_eq!(message.fragments, fragments.len() as u8);
+            assert_eq!(message.address, address, "repeated in every fragment");
+            rebuilt.extend_from_slice(message.payload);
+        }
+        assert_eq!(rebuilt, payload);
+    }
+
+    /// The ordinary case is one message with a count of 1, where the
+    /// specification says the packet and fragment identifiers are irrelevant.
+    #[test]
+    fn a_datagram_that_fits_is_not_fragmented() {
+        let fragments = fragment(1, 0, "198.51.100.7:53", b"query").expect("it fits");
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(UdpMessage::read(&fragments[0]).unwrap().fragments, 1);
+    }
+
+    /// Reassembly in order, out of order, and not at all. **Losing one fragment
+    /// discards the packet** — the specification requires it, and a transport
+    /// that delivered a hole would be worse than one that delivered nothing.
+    #[test]
+    fn reassembly_needs_every_fragment_and_tolerates_their_order() {
+        let address = "198.51.100.7:53";
+        let payload: Vec<u8> = (0..3000).map(|byte| byte as u8).collect();
+        let fragments = fragment(1, 4, address, &payload).unwrap();
+        let read = |bytes: &Vec<u8>| -> Vec<u8> { bytes.clone() };
+
+        // In order.
+        let mut forward = Defragmenter::default();
+        let mut whole = None;
+        for bytes in &fragments {
+            whole = forward.push(&UdpMessage::read(bytes).unwrap());
+        }
+        assert_eq!(whole.as_deref(), Some(payload.as_slice()));
+
+        // Reversed, which a lossy path produces routinely.
+        let mut backward = Defragmenter::default();
+        let mut whole = None;
+        for bytes in fragments.iter().rev().map(read).collect::<Vec<_>>() {
+            whole = backward.push(&UdpMessage::read(&bytes).unwrap());
+        }
+        assert_eq!(whole.as_deref(), Some(payload.as_slice()));
+
+        // One missing: nothing is ever produced.
+        let mut lossy = Defragmenter::default();
+        for bytes in fragments.iter().skip(1) {
+            assert!(
+                lossy.push(&UdpMessage::read(bytes).unwrap()).is_none(),
+                "a packet missing a fragment is a packet that did not arrive"
+            );
+        }
+    }
+
+    /// A new packet identifier discards whatever was held. Buffering several
+    /// partial packets would be a pool an attacker fills with first fragments,
+    /// and the specification's own rule means nothing held is worth much.
+    #[test]
+    fn a_new_packet_discards_the_partial_one_before_it() {
+        let address = "198.51.100.7:53";
+        let first = fragment(1, 10, address, &vec![1u8; 3000]).unwrap();
+        let second = fragment(1, 11, address, &vec![2u8; 3000]).unwrap();
+
+        let mut defrag = Defragmenter::default();
+        assert!(defrag.push(&UdpMessage::read(&first[0]).unwrap()).is_none());
+        // Everything from the second packet, which must complete on its own.
+        let mut whole = None;
+        for bytes in &second {
+            whole = defrag.push(&UdpMessage::read(bytes).unwrap());
+        }
+        assert_eq!(
+            whole.map(|payload| payload.len()),
+            Some(3000),
+            "the second packet completes without the first's fragment"
+        );
     }
 }
