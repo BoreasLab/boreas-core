@@ -1,17 +1,11 @@
 //! P14 certificate authority: the root Boreas installs in the user store, and
 //! the per-host leaves it mints on demand to terminate TLS.
 //!
-//! The design follows the one interception proxies have converged on. A single
-//! long-lived **leaf key** is generated once; every host gets its own
-//! *certificate* over that same key, signed by the root. Minting a host is then
-//! one signature, not a key generation — the expensive half of a certificate —
-//! so a browser opening a page of thirty origins pays thirty signatures against
-//! a warm cache rather than thirty P-256 keygens.
+//! One long-lived **leaf key** serves every host; each host gets a separately
+//! signed certificate. Minting costs one signature, not a P-256 keygen.
 //!
-//! **The root never leaves this process except as `root_der`.** That DER is
-//! what the platform layer installs into the Android or Windows user store, and
-//! it is deliberately the *only* way the private half is reachable: the signing
-//! key lives behind [`CertificateAuthority`] and mints leaves, nothing more.
+//! **The root leaves only as `root_der`.** The platform installs that DER in the
+//! user store; the private key remains behind [`CertificateAuthority`].
 //!
 //! **A missing certificate is a fail-open signal, not an error to surface.**
 //! [`MitmResolver::resolve`] returns `None` when it cannot forge a leaf — no
@@ -411,11 +405,8 @@ impl fmt::Debug for CertificateAuthority {
     }
 }
 
-/// A bounded, insertion-ordered leaf cache. Eviction is first-in-first-out
-/// rather than least-recently-used on purpose: a browsing session touches tens
-/// of origins, a miss costs one signature, and recency ordering over a set that
-/// small buys nothing a FIFO ring does not. The bound is what matters — state
-/// keyed by an attacker-suppliable SNI must not grow without limit.
+/// Bounded FIFO leaf cache. FIFO is sufficient for a browsing session's small
+/// origin set; the bound prevents attacker-controlled SNI from growing state.
 struct LeafCache {
     by_host: HashMap<String, Arc<CertifiedKey>>,
     order: VecDeque<String>,
@@ -489,9 +480,8 @@ impl fmt::Debug for MitmResolver {
 }
 
 impl ResolvesServerCert for MitmResolver {
-    /// A client that offers no SNI cannot be handed a forged certificate for a
-    /// name it did not ask for, so it gets `None` and the handshake fails —
-    /// which is the fail-open path, not a leak.
+    /// No SNI means no name for a forged certificate: fail the handshake and
+    /// let the caller splice.
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let host = client_hello.server_name()?;
         self.leaf(host)
@@ -510,16 +500,14 @@ mod tests {
     fn a_leaf_is_one_certificate_over_the_shared_key() {
         let ca = authority();
         let leaf = ca.leaf_for("example.com").expect("leaf mints");
-        // Exactly the leaf: the client already trusts the root, so the chain
-        // sends the end-entity certificate and nothing else.
+        // Client already trusts root; send only end-entity certificate.
         assert_eq!(leaf.cert.len(), 1);
         assert!(
             !ca.root_der().as_ref().is_empty(),
             "the installable root is real DER"
         );
 
-        // Two hosts share the one signer: the private-key half is identical, so
-        // the certified keys point at the same `SigningKey`.
+        // Hosts share one signer, so their certified keys share `SigningKey`.
         let other = ca.leaf_for("other.example").expect("leaf mints");
         assert!(
             Arc::ptr_eq(&leaf.key, &other.key),
@@ -617,10 +605,8 @@ mod tests {
         field(rest).0.to_vec()
     }
 
-    /// Stored material is bytes a host wrote to disk, so it comes back
-    /// truncated, corrupted, or from a build that wrote a format this one has
-    /// never seen. Every one of those is an error a host recovers from by
-    /// generating afresh — never a panic, and never a key half-read.
+    /// Host storage may truncate, corrupt, or contain an unknown format; reject
+    /// every such material without panicking or partially reading the key.
     #[test]
     fn material_a_host_could_not_store_intact_is_refused() {
         let good = CertificateAuthority::generate().unwrap().material();
@@ -659,10 +645,8 @@ mod tests {
         }
     }
 
-    /// The secret is one value with one home, and the certificate is not part
-    /// of it: a host that had to store them together would either put a public
-    /// artefact in the keystore or a private key beside the filter lists, and
-    /// the trust-store installer needs the certificate in the clear.
+    /// Keep public certificate separate from the secret: trust-store installers
+    /// need the former in clear, while keystores must protect only the latter.
     #[test]
     fn the_public_artefact_is_not_inside_the_secret() {
         let material = CertificateAuthority::generate().unwrap().material();
@@ -677,11 +661,8 @@ mod tests {
         );
     }
 
-    /// The host's single code path, and the property that lets it be single:
-    /// **whichever branch it took, it stores what came back and offers what
-    /// came back.** Storing a restoration is a no-op write and offering an
-    /// installed root shows no dialog, so a host never has to know which
-    /// happened.
+    /// Both generate and restore return material to store and a root to offer;
+    /// restore therefore needs no host-side special case.
     #[test]
     fn opening_with_or_without_stored_material_leaves_the_host_the_same_two_jobs() {
         let first = CertificateAuthority::open(Trust::Generate).unwrap();
@@ -700,9 +681,8 @@ mod tests {
         );
     }
 
-    /// Losing the key is a fact the host has to hear. Minting a fresh root
-    /// instead would leave a device whose store still trusts the old one with a
-    /// session that intercepts nothing, reports nothing, and looks healthy.
+    /// Do not replace an unreadable key: the device still trusts the old root,
+    /// so a fresh one would make interception silently ineffective.
     #[test]
     fn material_that_will_not_parse_is_reported_rather_than_replaced() {
         let good = CertificateAuthority::generate().unwrap().material();

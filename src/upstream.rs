@@ -43,9 +43,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{ClientProfile, Originator, Upstream};
 
-/// The largest upstream reply this crate will read. EDNS0 permits more; a
-/// resolver answering a stub does not need it, and the bound is what keeps an
-/// upstream from deciding how much memory a query costs.
+/// Stub-resolver ceiling; bounds memory an upstream can impose per query.
 pub(crate) const MAX_DNS_MESSAGE: usize = 4096;
 
 /// One DNS upstream transport.

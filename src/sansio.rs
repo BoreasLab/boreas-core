@@ -50,11 +50,8 @@ use crate::{EgressError, ProxyError};
 
 // ------------------------------------------------------- The pure half
 
-/// The result of decoding from a buffer that may not hold a whole message yet.
-///
-/// This is the type that makes a streaming parser total: the alternative is a
-/// decoder that returns an error for a short read, which a caller cannot
-/// distinguish from a real protocol violation and therefore cannot retry.
+/// Streaming decode result; `Incomplete` distinguishes short input from a
+/// protocol error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decoded<T> {
     /// More bytes are needed. The caller reads and calls again.
@@ -65,9 +62,7 @@ pub enum Decoded<T> {
 
 /// One protocol negotiation, as a pure state machine.
 ///
-/// Named for the act rather than for TLS's word: `Handshake` is already a live
-/// QUIC connection-in-progress elsewhere in this crate, and a trait and a value
-/// sharing a name is how a reader ends up at the wrong documentation.
+/// Named to distinguish this exchange from QUIC's `Handshake` connection type.
 ///
 /// **Total, and re-entrant on its input.** [`Self::advance`] is called with
 /// everything received so far — not with the delta — so a machine that answers
@@ -97,14 +92,8 @@ pub trait Negotiation {
     ) -> Result<Decoded<Self::Output>, ProxyError>;
 }
 
-/// What a codec did with the bytes it was offered.
-///
-/// The second variant is why this is a sum rather than a `usize`. A sans-IO
-/// framing layer copies: bytes land in the codec's buffer, then in the
-/// caller's. For a protocol whose framing *ends* — VLESS strips one response
-/// header and is a byte stream forever after — paying that copy on every
-/// subsequent byte would be a real regression against a hand-written adapter
-/// that just forwards the read. Saying so lets [`Framed`] stop copying.
+/// Decode result. `Transparent` ends framing, so VLESS avoids copying
+/// subsequent bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decode {
     /// Took `consumed` bytes; whatever they decoded to is in the sink.
@@ -161,10 +150,7 @@ pub trait Codec {
 
 /// How a codec treats what is written through it.
 ///
-/// A sum rather than a `bool` on [`Codec::encode`], because this is a static
-/// property of a protocol rather than a per-call outcome — a codec cannot start
-/// framing its writes half way through a connection, and a return value that
-/// suggested it could would be a state nothing can reach.
+/// Static write-framing property; it cannot change mid-connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Writes {
     /// Every payload goes through [`Codec::encode`].
@@ -178,9 +164,7 @@ pub enum Writes {
 
 /// How much is read at a time while a negotiation is in progress.
 ///
-/// Small on purpose. A handshake reply is tens of bytes, and the surplus past
-/// it is replayed rather than dropped, so a larger read would buy nothing and
-/// hold more of a hostile peer's bytes.
+/// Small to bound hostile-peer bytes; excess is replayed rather than dropped.
 const NEGOTIATION_CHUNK: usize = 512;
 
 /// The largest negotiation this will buffer before giving up.

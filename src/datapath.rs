@@ -33,19 +33,8 @@ use crate::{
     route_planned, udp_datagram_len, write_too_big, write_udp,
 };
 
-/// One of the two sides the datapath sits between: the client's TUN and the
-/// configured egress.
-///
-/// It names both the side a packet arrived on and the side a transmit is bound
-/// for, because every forwarding decision the core makes is exactly the
-/// crossing between them. [`Side::across`] is that crossing and is its own
-/// inverse.
-///
-/// Before this type existed, [`Transmit`] carried bytes and nothing else, so
-/// the shell had to guess the destination — and the only guess available, the
-/// device, sends a fast-path packet straight back at the client instead of
-/// encapsulating it. The destination is a fact the core knows and the shell
-/// cannot re-derive, so the core states it.
+/// Packet source or transmit destination: the shell cannot infer the egress
+/// from bytes. [`Side::across`] crosses the boundary and is self-inverse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     Tunnel,

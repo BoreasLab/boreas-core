@@ -54,10 +54,8 @@ pub struct Accepted {
 
 /// A terminated TCP connection, as an ordinary async byte stream.
 ///
-/// Reads yield the bytes the client sent; writes are delivered to the client as
-/// TCP segments. Closing the write half sends FIN, and an exhausted read half
-/// is the peer's FIN — so the type's `AsyncRead`/`AsyncWrite` contract carries
-/// the connection's half-close semantics rather than hiding them.
+/// Half-close is exposed: closing the write half sends FIN; an exhausted read
+/// half observes the peer's FIN.
 ///
 /// The name is the local one for [`crate::BridgedStream`]: the QUIC driver
 /// hands back the same type for the same reasons, and only the pump behind it

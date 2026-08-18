@@ -8,15 +8,9 @@
 //! datagrams and their targets ([`Outbound`]); this drives them through that
 //! association and synthesizes the replies back.
 //!
-//! **One association per client mapping, and that is the NAT model rather than
-//! a convenience.** RFC 4787's endpoint-independent mapping says one client
-//! source port gets one mapping that serves every peer it talks to. A shared
-//! association could not honour it: two clients talking to the same peer would
-//! receive each other's replies, because the only thing a returning datagram
-//! names is the peer it came from. Keying associations by client endpoint makes
-//! the mapping the association, so the path properties
-//! ([`NatBehavior::EndpointIndependent`](crate::NatBehavior)) is a property of
-//! the structure rather than a hope.
+//! **One association per client mapping is the NAT model.** A shared association
+//! cannot attribute replies when two clients contact the same peer; keying by
+//! client endpoint makes RFC 4787 endpoint independence structural.
 //!
 //! **The receive half is owned, the send half is shared, and the types say
 //! so.** [`DatagramSource`] takes `&mut self`, so exactly one task reads each
@@ -98,7 +92,7 @@ pub struct Relay {
 /// because under a flood each of these is per packet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RelayCounts {
-    /// Clients refused because the association ceiling was reached.
+    /// Clients refused at the association ceiling.
     pub associations_refused: u64,
     /// Datagrams a full association queue, an exhausted budget, or a failed
     /// send could not carry.
@@ -412,10 +406,7 @@ mod tests {
         }
     }
 
-    /// **The path that did not exist.** A client datagram reaches the egress
-    /// carrying the target the client addressed, and the reply comes back
-    /// attributed to the mapping that sent it. Before this, a datagram under a
-    /// flow egress was queued and never drained.
+    /// Client datagram reaches its target and the reply returns to its mapping.
     #[tokio::test]
     async fn a_client_datagram_crosses_the_association_and_its_reply_returns() {
         let echo = Arc::new(Echo::default());
@@ -465,9 +456,7 @@ mod tests {
             .unwrap();
     }
 
-    /// One association per client mapping, which is what makes an
-    /// endpoint-independent mapping expressible: two clients talking to the
-    /// same peer must not receive each other's replies.
+    /// One association per client mapping prevents replies crossing clients.
     #[tokio::test]
     async fn each_client_mapping_gets_its_own_association() {
         let echo = Arc::new(Echo::default());
@@ -522,9 +511,8 @@ mod tests {
             .unwrap();
     }
 
-    /// The association ceiling is a bound on state fed by network input, so a
-    /// client opening ports in a loop opens counted drops rather than proxy
-    /// sockets.
+    /// The association ceiling bounds network-fed state; excess ports become
+    /// counted drops, not proxy sockets.
     #[tokio::test]
     async fn the_association_ceiling_refuses_rather_than_grows() {
         let echo = Arc::new(Echo::default());
@@ -557,9 +545,8 @@ mod tests {
                 .unwrap();
         }
 
-        // Closing admission rather than cancelling, so the loop drains every
-        // queued datagram before it reports: a cancellation would race the
-        // decisions this test is about.
+        // Drain queued datagrams before reporting; cancellation would race the
+        // admission decisions under test.
         drop(out_tx);
         tokio::time::timeout(Duration::from_secs(5), relay)
             .await

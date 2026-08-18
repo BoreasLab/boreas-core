@@ -38,23 +38,17 @@ use tokio::{
 };
 use tokio_util::sync::PollSender;
 
-/// Bytes moved in one chunk between a driver and a stream task. A cap on the
-/// copy performed per probe, so one busy connection cannot monopolise a sweep;
-/// the channel depth times this is the per-stream buffer the bridge adds on top
-/// of the transport's own.
+/// Caps per-probe copying; channel depth times this is per-stream bridge
+/// buffering atop the transport's own.
 pub(crate) const CHUNK: usize = 16 * 1024;
 
-/// Chunks in flight per direction, per stream. Small on purpose: the
-/// transport's receive buffer is the real window, and this only smooths the
-/// hand-off.
+/// Chunks in flight per direction; smooths hand-off atop the transport window.
 pub(crate) const DEPTH: usize = 8;
 
 /// A transport stream, bridged to the reactor as an ordinary async byte stream.
 ///
-/// Reads yield what the peer sent; writes are delivered to the peer. Closing
-/// the write half sends FIN, and an exhausted read half is the peer's FIN — so
-/// the `AsyncRead`/`AsyncWrite` contract carries half-close semantics rather
-/// than hiding them.
+/// Half-close is exposed: closing the write half sends FIN; an exhausted read
+/// half observes the peer's FIN.
 ///
 /// **An abrupt failure arrives as end of stream, not as an error.** If the
 /// driver dies — a reset connection, a cancelled task — its senders drop, and a

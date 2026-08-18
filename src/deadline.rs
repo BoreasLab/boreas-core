@@ -27,14 +27,7 @@
 
 use std::{io, time::Duration};
 
-/// What a bounded wait is waiting for.
-///
-/// A sum rather than a struct of durations because the budget is a property of
-/// the *kind* of wait, not of a configuration: a caller names what it is doing
-/// and the number follows. That is what keeps a new dial path from inventing a
-/// fifth number, and what makes an expiry legible in a log — the error carries
-/// the name, so "which of the four handshakes stalled" is answered without a
-/// span.
+/// Wait kind selects its budget; the error carries the name for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
     /// One TCP connect. Covers a single SYN retransmission (Linux's first RTO

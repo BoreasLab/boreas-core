@@ -116,13 +116,8 @@ enum Approach {
     Cleartext,
 }
 
-/// Reads the client's first bytes without consuming them.
-///
-/// Total on untrusted input: there is no error case, because every byte
-/// sequence is *some* [`Introduction`], and the ones this cannot interpret are
-/// the ones that splice. That is deliberate — a parser with an error case would
-/// force every caller to choose a fallback, and one of them would eventually
-/// choose to intercept.
+/// Reads the client's first bytes without consuming them. Total on untrusted
+/// input; unknown input becomes a splice rather than an interception choice.
 ///
 /// O(n) in the bytes examined, bounded by [`MAX_RECORD`], with one allocation
 /// for the returned name and none otherwise.
@@ -162,10 +157,8 @@ fn request_head(bytes: &[u8]) -> Introduction {
 
 /// The `Host` field's name, without its port.
 ///
-/// Parsed as an authority rather than split on the last colon, because an IPv6
-/// literal is full of colons and `[::1]:80` would otherwise yield `[::1`. Both
-/// forms end at the same place: an address is not a name, so
-/// [`DomainName`] refuses it and the connection splices.
+/// Parses an authority to handle IPv6 literals; addresses are rejected by
+/// [`DomainName`] and splice.
 fn host_field(fields: &[httparse::Header<'_>]) -> Option<DomainName> {
     let value = fields
         .iter()

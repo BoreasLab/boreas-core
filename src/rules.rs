@@ -101,13 +101,8 @@ impl RuleEngine {
     }
 }
 
-/// The URL a rule is matched against.
-///
-/// HTTP/1.1 sends an origin-form target and HTTP/2 an absolute one, so the
-/// authority comes from the SNI-validated host rather than from anything the
-/// request claims — the same rule the exchange already applies to filtering.
-/// The scheme is `https` because it is not a guess: Boreas only ever terminates
-/// TLS, so an intercepted request is an `https` request by construction.
+/// Authority comes from the SNI-validated host, not the request; scheme is
+/// always `https` because Boreas terminates TLS only.
 fn absolute(host: &str, uri: &Uri) -> String {
     if uri.scheme().is_some() {
         return uri.to_string();
@@ -118,14 +113,8 @@ fn absolute(host: &str, uri: &Uri) -> String {
 
 /// The resource kind the fetch was made for, in the engine's vocabulary.
 ///
-/// `Sec-Fetch-Dest` is a browser-set request header that names exactly this and
-/// cannot be forged by page script, so it is read first. Its values are mapped
-/// to the closest content type the engine names; the empty destination is a
-/// `fetch()` or `XMLHttpRequest`, which is the one that needs translating.
-///
-/// Falling back to `Accept` recovers older clients: it is a preference list
-/// rather than a declaration, so it is consulted only for its leading type and
-/// only when the authoritative header is absent.
+/// Read unforgeable `Sec-Fetch-Dest` first; fall back to the leading `Accept`
+/// type for clients without it.
 fn destination<B>(request: &Request<B>) -> &'static str {
     if let Some(dest) = request
         .headers()

@@ -63,28 +63,24 @@ impl BufferPool {
     /// Copies `bytes` into a pooled buffer. `None` means the datagram exceeds
     /// the slice size, or the budget is spent; both are drops, never waits.
     ///
-    /// O(`bytes.len()`) for the copy and O(1) for the accounting. A recycled
-    /// buffer was allocated with `slice_size` capacity and is only ever
-    /// cleared, so no reallocation happens after a buffer's first use.
+    /// O(`bytes.len()`) copy, O(1) accounting; recycled buffers never
+    /// reallocate.
     pub fn take(self: &Arc<Self>, bytes: &[u8]) -> Option<Pooled> {
         let mut pooled = self.reserve(bytes.len())?;
         pooled.bytes.extend_from_slice(bytes);
         Some(pooled)
     }
 
-    /// A pooled buffer of `len` zeroed bytes, for a caller that *builds* its
-    /// content rather than copying an existing slice. The datapath synthesizes
-    /// whole IP datagrams this way, so a constructed packet costs the same
-    /// nothing an forwarded one does.
+    /// Builds a zeroed pooled buffer; the datapath uses it for synthesized IP
+    /// datagrams without an extra allocation.
     pub fn take_zeroed(self: &Arc<Self>, len: usize) -> Option<Pooled> {
         let mut pooled = self.reserve(len)?;
         pooled.bytes.resize(len, 0);
         Some(pooled)
     }
 
-    /// Spends one unit of budget and hands back an empty buffer with room for
-    /// `len` bytes. The single place the invariant `free.len() <= live <=
-    /// capacity` is touched.
+    /// Reserves one budget unit and returns an empty buffer. Sole mutation
+    /// point for `free.len() <= live <= capacity`.
     fn reserve(self: &Arc<Self>, len: usize) -> Option<Pooled> {
         if len > self.slice_size.get() {
             return None;
@@ -98,8 +94,7 @@ impl BufferPool {
                     state.exhausted = state.exhausted.saturating_add(1);
                     return None;
                 }
-                // Allocation happens outside the lock; the reservation is what
-                // the lock protects.
+                // Reserve under lock; allocate outside it.
                 None => {
                     state.live += 1;
                     None

@@ -53,20 +53,10 @@ use crate::{
     bridge::{BridgedStream, CHUNK, Plumbing, pair},
 };
 
-/// The largest UDP payload the driver will read or write. QUIC's own path MTU
-/// discovery keeps sent datagrams below the path's limit; this only has to be
-/// large enough not to truncate what arrives, and 1500 is the largest a peer
-/// can send over an ordinary Ethernet path without fragmenting.
+/// Read/write bound; QUIC handles path MTU, and 1500 covers ordinary Ethernet.
 const MAX_DATAGRAM: usize = 1500;
 
-/// How long [`Handshake::establish`] and [`Handshake::http3`] wait before
-/// giving up. QUIC retransmits inside this window; the deadline exists so a
-/// black-holed path fails a connection instead of hanging one.
-///
-/// It is a whole dial rather than a bare handshake — the QUIC handshake, the
-/// HTTP/3 settings under it, and the egress's own authentication all happen
-/// inside it — so it takes the same budget every other whole dial does rather
-/// than a number of its own.
+/// Whole-dial timeout, including QUIC handshake, HTTP/3 settings, and auth.
 const HANDSHAKE_TIMEOUT: Duration = crate::Wait::ProxyDial.budget();
 
 /// Commands in flight toward the driver. Bounded, because an unbounded command

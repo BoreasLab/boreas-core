@@ -43,7 +43,7 @@ pub struct Fragment<'a> {
     pub destination: IpAddr,
     pub protocol: u8,
     pub identification: u32,
-    /// Payload offset in bytes; the wire's 8-byte units are already decoded.
+    /// Payload offset in bytes; wire units already decoded.
     pub offset: u16,
     pub more_fragments: bool,
     pub payload: &'a [u8],
@@ -77,7 +77,7 @@ impl<'a> Fragment<'a> {
                 if !ipv6.is_payload_fragmented() {
                     return Ok(None);
                 }
-                // A fragmented packet carries exactly one Fragment header.
+                // A fragmented IPv6 packet has exactly one Fragment header.
                 let Some(Ipv6ExtensionSlice::Fragment(header)) = ipv6
                     .extensions()
                     .clone()
@@ -107,7 +107,7 @@ pub enum PushOutcome {
     Pending,
     /// Every block of the datagram arrived exactly once.
     Complete(Vec<u8>),
-    /// Malformed, overlapping, poisoned, or over capacity. `discarded` counts it.
+    /// Malformed, overlapping, poisoned, or over capacity.
     Discarded,
 }
 
@@ -120,16 +120,12 @@ struct Key {
 }
 
 struct Pending {
-    /// Sized to the largest extent seen; the real total arrives with the
-    /// final fragment, so no 64 KiB allocation happens up front.
+    /// Grows to the largest extent seen; the final fragment supplies total,
+    /// avoiding a 64 KiB upfront allocation.
     data: Vec<u8>,
     received: [u64; BITMAP_WORDS],
-    /// Population count of `received`. Maintained incrementally because
-    /// overlap is rejected before a block is ever marked, so every marked
-    /// block is new and the count is exact. This is what keeps completion an
-    /// O(1) test: re-scanning the bitmap per fragment would make a 64 KiB
-    /// datagram quadratic in its own fragment count, and the fragment count is
-    /// the attacker's choice.
+    /// Incremental block count makes completion O(1); overlap rejection keeps
+    /// the count exact.
     received_blocks: u32,
     total: Option<usize>,
     deadline: Instant,
@@ -162,9 +158,8 @@ impl Pending {
         self.received_blocks += (last_block - first_block + 1) as u32;
     }
 
-    /// O(1). Sound because `push` admits a block at most once and refuses any
-    /// byte beyond a known `total`, so `received_blocks` never exceeds the
-    /// block count and equality means every block arrived.
+    /// O(1); overlap and known-total checks make block-count equality
+    /// sufficient.
     fn is_complete(&self) -> bool {
         self.total
             .is_some_and(|total| usize::try_from(self.received_blocks) == Ok(total.div_ceil(8)))

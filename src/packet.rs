@@ -73,13 +73,8 @@ pub struct IngressPacket {
     pub destination: IpAddr,
     pub ecn: IpEcn,
     pub transport: Transport,
-    /// Where the transport payload begins in the parsed buffer, and how long
-    /// it is.
-    ///
-    /// An offset rather than a slice, because this is a `Copy` summary that
-    /// deliberately outlives the borrow it came from; a caller still holding
-    /// the bytes indexes with it, and one that does not cannot. Zero-length
-    /// for the transports that have no payload this parser names.
+    /// Offset and length, not a slice, so this `Copy` summary outlives the
+    /// input borrow. Zero for transports without payload.
     pub payload_at: u16,
     pub payload_len: u16,
 }
@@ -98,9 +93,8 @@ pub enum PacketError {
     Malformed(etherparse::err::packet::SliceError),
     MissingNetworkLayer,
     UnsupportedNetworkLayer,
-    /// A packet larger than an IP header can describe. Unreachable from the
-    /// wire — the length fields are 16 bits — and refused rather than
-    /// truncated so the offsets in `IngressPacket` are always exact.
+    /// Wire lengths are 16-bit; reject rather than truncate so `IngressPacket`
+    /// offsets stay exact.
     Oversized,
 }
 
