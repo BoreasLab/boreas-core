@@ -298,6 +298,18 @@ Numbered as above, with reserved slots for retired questions.
     is unimplemented and unmeasured, so `WireGuardEgress` claims
     `preserves_ecn: false`. Validate against packet captures before any claim.
 
+14. **DNS QDCOUNT = 0:** verified as an open interop question, 2026-08-18.
+    RFC 9619 section 4 (Standards Track, 2024) requires `QDCOUNT > 1` with
+    `OPCODE = 0` be treated as malformed, which `Message::parse` now does;
+    BIND (`lib/dns/message.c`), Unbound (`daemon/worker.c`), and Knot
+    (`src/libknot/packet/pkt.c`) all reject it independently. The same section
+    is equally explicit the other way — a middlebox "MUST NOT treat messages
+    with OPCODE = 0 and QDCOUNT = 0 as malformed", because DNS Cookies and AXFR
+    use it — and this parser has rejected `QDCOUNT = 0` since it was written,
+    which makes such a query a drop. Unmeasured whether any client this
+    resolver serves sends one over UDP/53; a cookie-probing stub would see a
+    silent drop and retry. Decide before claiming RFC 9619 conformance.
+
 ## Updating This Ledger
 
 For each new external claim, record the primary source, source date, observed

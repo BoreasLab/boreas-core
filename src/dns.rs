@@ -74,6 +74,14 @@ pub enum DnsError {
     /// The message declared no question. Every message Boreas handles is a
     /// query or its answer, and both carry one.
     NoQuestion,
+    /// More than one entry in the question section. RFC 9619 section 4 makes
+    /// this a malformed message for `OPCODE = 0`: "A DNS message with OPCODE =
+    /// 0 MUST NOT include a QDCOUNT parameter whose value is greater than 1",
+    /// and BIND, Unbound, and Knot all reject it. It matters here beyond
+    /// conformance: the parser reads exactly one question and treats what
+    /// follows as the answer section, so a second question used to be decoded
+    /// as a resource record and the filter ran against a name nobody asked.
+    MultipleQuestions(u16),
     /// The question's name used compression. Nothing precedes the question but
     /// the fixed header, so a pointer there targets the header and is
     /// nonsense; refusing it is what lets the question section be copied
@@ -98,6 +106,9 @@ impl fmt::Display for DnsError {
             Self::NameTooLong => "name exceeds 253 characters",
             Self::SeparatorInLabel => "label contains the presentation separator",
             Self::NoQuestion => "message carries no question",
+            Self::MultipleQuestions(count) => {
+                return write!(f, "message carries {count} questions, not one");
+            }
             Self::CompressedQuestion => "question name uses compression",
             Self::SvcParamsOutOfOrder => "SvcParam keys are not strictly increasing",
             Self::EmptyAlpnIdentifier => "ALPN list carries a zero-length identifier",
@@ -450,8 +461,15 @@ impl<'a> Message<'a> {
         let header = bytes.get(..HEADER_BYTES).ok_or(DnsError::Truncated)?;
         let word = |at: usize| u16::from_be_bytes([header[at], header[at + 1]]);
         let (id, flags, question_count, answer_count) = (word(0), word(2), word(4), word(6));
-        if question_count == 0 {
-            return Err(DnsError::NoQuestion);
+        // Exactly one, which is what the single `Question` below asserts and
+        // what everything after `answers_at` depends on. A drop rather than the
+        // FORMERR RFC 9619 section 4.3 asks middleboxes for: this shell has no
+        // path that answers an unparseable query, and a stub retries a dropped
+        // query exactly as it does a lost datagram.
+        match question_count {
+            0 => return Err(DnsError::NoQuestion),
+            1 => {}
+            count => return Err(DnsError::MultipleQuestions(count)),
         }
 
         let (name, name_len) = Name::read(bytes, HEADER_BYTES)?;
@@ -1352,6 +1370,34 @@ mod tests {
         out.extend_from_slice(&qtype.to_wire().to_be_bytes());
         out.extend_from_slice(&1u16.to_be_bytes()); // IN
         out
+    }
+
+    /// RFC 9619 section 4: "A DNS message with OPCODE = 0 MUST NOT include a
+    /// QDCOUNT parameter whose value is greater than 1." The parser reads one
+    /// question and calls everything after it the answer section, so a second
+    /// question used to be decoded as a resource record — the filter then ran
+    /// against whatever that misparse produced rather than against the name the
+    /// client asked for.
+    #[test]
+    fn a_query_carries_exactly_one_question_or_none_at_all() {
+        let one = query("example.com", RecordType::A, 0x1234);
+        assert!(Message::parse(&one).is_ok());
+
+        let mut none = one.clone();
+        none[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(Message::parse(&none).err(), Some(DnsError::NoQuestion));
+
+        // A second question appended, and QDCOUNT raised to match it: a
+        // well-formed-looking message that no conforming resolver accepts.
+        let mut two = one.clone();
+        two[4..6].copy_from_slice(&2u16.to_be_bytes());
+        two.extend_from_slice(&wire_name("tracker.example"));
+        two.extend_from_slice(&RecordType::A.to_wire().to_be_bytes());
+        two.extend_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            Message::parse(&two).err(),
+            Some(DnsError::MultipleQuestions(2))
+        );
     }
 
     fn response(name: &str, qtype: RecordType, answers: &[(&str, RecordType, Vec<u8>)]) -> Vec<u8> {
