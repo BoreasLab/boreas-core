@@ -24,15 +24,15 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
-    DomainName, EgressError, NatBehavior, PathProperties, ProxyError, ProxyTransport, StreamEgress,
-    Target,
+    Association, AsyncStream, BoxFuture, Codec, DatagramFidelity, DatagramSink, DatagramSource,
+    Decode, Decoded, DomainName, EgressError, Framed, NatBehavior, PathProperties, ProxyError,
+    ProxyTransport, StreamEgress, Target, Writes,
 };
 
 /// The only VLESS version, and the only one the reference implementations
@@ -536,119 +536,53 @@ impl<T: ProxyTransport + 'static> StreamEgress for VlessEgress<T> {
             encode_request(&self.config.user, target, &mut request);
             stream.write_all(&request).await?;
             stream.flush().await?;
-            // The response header is consumed lazily: a server sends it with
-            // its first payload, which may be long after the request, and
-            // waiting here would make `connect` block on the *target* rather
-            // than on the proxy.
-            Ok(Box::new(VlessStream {
-                inner: stream,
-                header: HeaderState::Pending(Vec::new()),
-            }) as Box<dyn AsyncStream>)
+            // The response header is consumed lazily by the codec, for the
+            // reason its own documentation gives.
+            Ok(Box::new(Framed::new(stream, ResponseHeader::default())) as Box<dyn AsyncStream>)
         })
     }
 }
 
-/// Whether the response header has been consumed yet.
+/// Strips the response header, then gets out of the way.
 ///
-/// A closed sum rather than a boolean and a buffer: once `Done`, there is no
-/// buffer to consult, and the compiler is what stops a later read from
-/// re-parsing a header that has already been stripped.
-enum HeaderState {
-    /// Still accumulating; holds what has arrived and what is left over after
-    /// the header ends.
-    Pending(Vec<u8>),
-    Done,
+/// **A codec rather than a negotiation, because the header does not arrive at
+/// dial.** A VLESS server writes it with its first payload, which may be long
+/// after the request; waiting for it in `connect` would block on the *target*
+/// rather than on the proxy, and a server-first protocol behind the proxy would
+/// never connect at all.
+///
+/// Once stripped, the stream is the payload and nothing else, which
+/// [`Decode::Transparent`] says — so the steady state costs no copy in either
+/// direction.
+#[derive(Default)]
+struct ResponseHeader {
+    stripped: bool,
 }
 
-/// A VLESS session as an ordinary byte stream: the request header is already
-/// written, and the response header is stripped from the first bytes read.
-struct VlessStream<S> {
-    inner: S,
-    header: HeaderState,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for VlessStream<S> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use std::task::Poll;
-        let this = self.get_mut();
-        loop {
-            match &mut this.header {
-                HeaderState::Done => {
-                    return std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
-                }
-                HeaderState::Pending(pending) => {
-                    match decode_response(pending) {
-                        Ok(Decoded::Complete { consumed, .. }) => {
-                            // Whatever followed the header is payload the
-                            // caller is owed before any further read.
-                            let leftover = pending.split_off(consumed);
-                            this.header = HeaderState::Done;
-                            if !leftover.is_empty() {
-                                let moved = buf.remaining().min(leftover.len());
-                                buf.put_slice(&leftover[..moved]);
-                                // The remainder beyond one buffer is bounded
-                                // by one read, so it cannot be large; pushing
-                                // it back would need a second buffer for a
-                                // case that a 4 KiB read cannot produce.
-                                debug_assert_eq!(moved, leftover.len());
-                                return Poll::Ready(Ok(()));
-                            }
-                            continue;
-                        }
-                        Ok(Decoded::Incomplete) => {}
-                        Err(error) => {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                error.to_string(),
-                            )));
-                        }
-                    }
-                    let mut chunk = [0u8; 512];
-                    let mut read_buf = ReadBuf::new(&mut chunk);
-                    match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
-                        Poll::Ready(Ok(())) => {
-                            let filled = read_buf.filled();
-                            if filled.is_empty() {
-                                // Closed before a whole header: end of stream
-                                // for the caller, which is what it can act on.
-                                return Poll::Ready(Ok(()));
-                            }
-                            pending.extend_from_slice(filled);
-                        }
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
+impl Codec for ResponseHeader {
+    /// O(1): the header is a version byte and a length-prefixed addon block.
+    fn decode(&mut self, input: &[u8], _out: &mut Vec<u8>) -> Result<Decode, ProxyError> {
+        if self.stripped {
+            return Ok(Decode::Transparent { consumed: 0 });
+        }
+        match decode_response(input)? {
+            Decoded::Complete { consumed, .. } => {
+                self.stripped = true;
+                Ok(Decode::Transparent { consumed })
             }
+            Decoded::Incomplete => Ok(Decode::Framed { consumed: 0 }),
         }
     }
-}
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for VlessStream<S> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
+        unreachable!("VLESS frames nothing it writes; see `writes`")
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    /// **VLESS writes raw bytes.** The request header went out once, in
+    /// `connect`; everything after it is the client's own stream, so it reaches
+    /// the transport untouched.
+    fn writes(&self) -> Writes {
+        Writes::Verbatim
     }
 }
 
@@ -929,5 +863,109 @@ mod tests {
             .await
             .expect("the reader observes cancellation rather than blocking on a read")
             .unwrap();
+    }
+
+    /// **The defect the port removed, pinned so it cannot come back.** A
+    /// response header and 300 bytes of payload arrive in one segment; the
+    /// caller reads 16 at a time. The hand-written adapter this replaced handed
+    /// out one bufferful and dropped the other 284 with no error anywhere —
+    /// a `debug_assert` in release is not a check.
+    #[tokio::test]
+    async fn a_small_reader_takes_every_byte_that_arrived_with_the_header() {
+        let (mut peer, ours) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            // Version byte, no addons, then payload.
+            let mut wire = vec![0u8, 0u8];
+            wire.extend(std::iter::repeat_n(b'x', 300));
+            peer.write_all(&wire).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let mut stream = Framed::new(ours, ResponseHeader::default());
+        let mut total = 0usize;
+        let mut small = [0u8; 16];
+        while total < 300 {
+            let read = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                stream.read(&mut small),
+            )
+            .await
+            .expect("the payload is still coming")
+            .unwrap();
+            if read == 0 {
+                break;
+            }
+            assert!(small[..read].iter().all(|byte| *byte == b'x'));
+            total += read;
+        }
+        assert_eq!(
+            total, 300,
+            "every byte the header arrived with reached the caller"
+        );
+    }
+
+    /// The header may arrive in pieces, and a server that sends it one byte at
+    /// a time is a server behind a middlebox that split the segment.
+    #[tokio::test]
+    async fn the_header_is_stripped_across_arbitrary_read_boundaries() {
+        for chunk in [1usize, 2, 3, 64] {
+            let (mut peer, ours) = tokio::io::duplex(4096);
+            // Two addon bytes, so a second parse would eat payload.
+            let mut wire = vec![0u8, 2u8, 0xaa, 0xbb];
+            wire.extend_from_slice(b"payload");
+            tokio::spawn(async move {
+                for piece in wire.chunks(chunk) {
+                    peer.write_all(piece).await.unwrap();
+                    peer.flush().await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            });
+
+            let mut stream = Framed::new(ours, ResponseHeader::default());
+            let mut seen = Vec::new();
+            while seen.len() < 7 {
+                let mut buf = [0u8; 32];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    stream.read(&mut buf),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("chunked by {chunk}: stalled"))
+                .unwrap();
+                if read == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..read]);
+            }
+            assert_eq!(seen, b"payload", "chunked by {chunk}");
+        }
+    }
+
+    /// The header is consumed once. Re-parsing it after the first payload would
+    /// read payload as a header and desynchronise a stream that has no
+    /// resynchronisation point.
+    #[test]
+    fn the_header_is_consumed_exactly_once() {
+        let mut codec = ResponseHeader::default();
+        let mut out = Vec::new();
+
+        assert_eq!(
+            codec.decode(&[0u8, 2, 0xaa, 0xbb], &mut out).unwrap(),
+            Decode::Transparent { consumed: 4 }
+        );
+        // Everything after is payload, and the codec claims none of it.
+        assert_eq!(
+            codec.decode(b"\x00\x02more", &mut out).unwrap(),
+            Decode::Transparent { consumed: 0 },
+            "bytes that merely look like a header are payload now"
+        );
+        assert!(out.is_empty(), "a strip produces nothing of its own");
+    }
+
+    /// A version this crate does not speak is refused rather than skipped over.
+    #[test]
+    fn a_response_from_a_protocol_this_is_not_is_refused() {
+        let mut codec = ResponseHeader::default();
+        assert!(codec.decode(&[9u8, 0], &mut Vec::new()).is_err());
     }
 }

@@ -102,7 +102,7 @@ pub use rewrite::{
     permit_inline_style, rewritable,
 };
 pub use rules::RuleEngine;
-pub use sansio::{Codec, Decode, Decoded, Framed, Negotiation, negotiate};
+pub use sansio::{Codec, Decode, Decoded, Framed, Negotiation, Writes, negotiate};
 pub use session::{
     Handling, Introduction, SessionError, SessionLimits, Sessions, SpliceReason, introduce,
     run_sessions, serve_session,

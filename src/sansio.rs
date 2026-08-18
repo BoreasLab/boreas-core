@@ -147,6 +147,31 @@ pub trait Codec {
     fn max_payload(&self) -> usize {
         usize::MAX
     }
+
+    /// Whether this codec frames what is written as well as what is read.
+    ///
+    /// Read by the adapter once, at construction. **The two directions are
+    /// genuinely independent**: VLESS strips one header off what arrives and
+    /// writes raw bytes forever, so routing its writes through [`Self::encode`]
+    /// would copy every outbound byte through a sink to hand it back unchanged.
+    fn writes(&self) -> Writes {
+        Writes::Framed
+    }
+}
+
+/// How a codec treats what is written through it.
+///
+/// A sum rather than a `bool` on [`Codec::encode`], because this is a static
+/// property of a protocol rather than a per-call outcome — a codec cannot start
+/// framing its writes half way through a connection, and a return value that
+/// suggested it could would be a state nothing can reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writes {
+    /// Every payload goes through [`Codec::encode`].
+    Framed,
+    /// Payloads reach the inner stream untouched, with no copy and no encode
+    /// call.
+    Verbatim,
 }
 
 // ------------------------------------------------------ The thin shell
@@ -247,13 +272,15 @@ pub struct Framed<S, C> {
     /// the framed size, and telling a caller its 100 bytes became 116 would
     /// have it advance past bytes it never wrote.
     taken: usize,
+    /// Asked of the codec once, at construction.
+    writes: Writes,
 }
 
-impl<S, C> Framed<S, C> {
+impl<S, C: Codec> Framed<S, C> {
     pub fn new(inner: S, codec: C) -> Self {
         Self {
+            writes: codec.writes(),
             inner,
-            codec,
             coded: Vec::new(),
             plain: Vec::new(),
             plain_at: 0,
@@ -261,6 +288,7 @@ impl<S, C> Framed<S, C> {
             pending: Vec::new(),
             pending_at: 0,
             taken: 0,
+            codec,
         }
     }
 
@@ -369,6 +397,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Codec + Unpin> AsyncWrite for Framed<
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        // The zero-copy write path: this protocol frames nothing outbound, so
+        // the caller's bytes reach the inner stream with no sink in between.
+        if this.writes == Writes::Verbatim {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        }
         // One payload in flight at a time. Encoding a second before the first
         // has left would interleave two frames on the wire, which no framing
         // here can express.
@@ -592,10 +625,28 @@ mod tests {
             Ok(Decode::Transparent { consumed: 2 })
         }
 
-        fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError> {
-            out.extend_from_slice(payload);
-            Ok(())
+        fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
+            unreachable!("this codec writes verbatim, so nothing is encoded")
         }
+
+        fn writes(&self) -> Writes {
+            Writes::Verbatim
+        }
+    }
+
+    /// A codec that frames only what it reads must not pay to write. The
+    /// `unreachable!` in `StripTwo::encode` is the assertion: reaching it means
+    /// the adapter routed a write through a codec that has no framing for it.
+    #[tokio::test]
+    async fn a_read_only_framing_writes_without_touching_the_codec() {
+        let (mut peer, ours) = tokio::io::duplex(4096);
+        let mut framed = Framed::new(ours, StripTwo::default());
+        framed.write_all(b"straight through").await.unwrap();
+        framed.flush().await.unwrap();
+
+        let mut back = [0u8; 16];
+        peer.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"straight through");
     }
 
     /// **The defect this adapter exists to make unrepresentable.** A header and
