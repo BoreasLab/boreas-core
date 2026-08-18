@@ -35,6 +35,19 @@ the product contract. Do not infer implemented status from visionary scope.
   question and no check in this repository gates it.
 - Keep abstractions at ownership boundaries with more than one real
   implementation. No speculative adapters or configuration.
+- Write a wire protocol in `sansio`'s vocabulary, not in an `async fn`. A
+  negotiation is a `Negotiation` and framing is a `Codec`: bytes in, bytes out,
+  no socket and no clock. `negotiate` and `Framed` are the only things that
+  await on a protocol's behalf, and adding a third read loop is how the four
+  they replaced each came to buffer slightly differently.
+- Do not add `poll_timeout`/`handle_timeout` to a protocol that owns no timers.
+  These are sequential exchanges over transports that already retransmit; the
+  deadline that bounds them is a session property and lives in `Wait`. A
+  `poll_timeout` that always answers `None` is a busy loop waiting to happen.
+- Sans-IO stops where backpressure is owned elsewhere. HTTP/2 flow control and
+  a QUIC connection's send window are I/O, not decisions about bytes; lift the
+  framing and leave them. `decode_grpc_header` is where that line was drawn and
+  says why.
 
 ## Change Process
 

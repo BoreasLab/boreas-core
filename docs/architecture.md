@@ -148,6 +148,44 @@ HTTP/3 and MITM are mutually exclusive for the Android target. Inspection
 policy therefore changes connection discovery before a connection starts; it
 never translates a live exchange between HTTP versions.
 
+## Protocol Model
+
+Every wire protocol is written without I/O. A negotiation is a `Negotiation` —
+bytes in, bytes out, synchronous — and framing is a `Codec`; `negotiate` and
+`Framed` are the only things in the crate that await on a protocol's behalf.
+
+```rust
+trait Negotiation {
+    type Output;
+    fn advance(&mut self, input: &[u8], out: &mut Vec<u8>)
+        -> Result<Decoded<Self::Output>, ProxyError>;
+}
+
+trait Codec {
+    fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decode, ProxyError>;
+    fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError>;
+    fn max_payload(&self) -> usize;
+    fn writes(&self) -> Writes;
+}
+```
+
+**This is deliberately not the ecosystem's canonical sans-IO quartet.**
+quinn-proto's `handle_input`/`poll_transmit`/`poll_timeout`/`handle_timeout`
+exists because QUIC owns timers; a proxy handshake owns none, so half of it
+would be vacuous here and a `poll_timeout` that always answers `None` invites
+the busy-loop driver bug its own advocates warn about. The deadline that does
+bound these exchanges is a session property and lives in `Wait`.
+
+Two escapes exist so the pattern's known cost — a copy at the boundary — is not
+paid where it buys nothing. `Decode::Transparent` ends read framing, so VLESS's
+post-header steady state reaches the inner stream with nothing in between;
+`Writes::Verbatim` does the same outbound for a protocol that frames only what
+it reads.
+
+The line stops at backpressure owned elsewhere. HTTP/2 flow control is I/O, not
+a decision about bytes, so `decode_grpc_header` lifts the framing and the window
+machinery stays in the adapter.
+
 ## Concurrency and Ownership
 
 - one owner coordinates each mutable flow state machine
