@@ -227,6 +227,40 @@ impl CaKeys {
     }
 }
 
+/// What a host has, and therefore what it is asking for.
+///
+/// **The intent is a value rather than a choice of constructor**, because the
+/// host that expresses it is on the other side of a serialized configuration
+/// and cannot call one of two functions. It reads its secure storage, wraps
+/// what it found or did not find, and hands over one thing.
+///
+/// That leaves the host with a single code path, which is the point:
+///
+/// ```no_run
+/// # use boreas_core::{CaKeys, CaMaterial, CertificateAuthority, Trust};
+/// # fn stored() -> Option<CaMaterial> { None }
+/// # fn keep(_: CaMaterial) {}
+/// # fn offer_to_install(_: &[u8]) {}
+/// # fn main() -> Result<(), boreas_core::CaError> {
+/// let authority = CertificateAuthority::open(stored().map_or(Trust::Generate, Trust::Restore))?;
+/// keep(authority.material());
+/// offer_to_install(authority.root_der());
+/// # Ok(()) }
+/// ```
+///
+/// Storing and offering happen unconditionally in both cases: storing what was
+/// just restored is a no-op write, and offering a root the user already trusts
+/// is a dialog the platform does not show. A host that branched here would have
+/// two paths to get wrong instead of none.
+pub enum Trust {
+    /// Nothing has been trusted yet. Mint a root; the host keeps what comes
+    /// back and asks the user to install it.
+    Generate,
+    /// The user already trusted this root. Use it, so every leaf minted this
+    /// session still chains to what is in the device's store.
+    Restore(CaMaterial),
+}
+
 /// The Boreas root and the shared leaf key it signs hosts with.
 ///
 /// Cheap to share behind an `Arc`: minting a leaf borrows `&self` and allocates
@@ -243,6 +277,22 @@ pub struct CertificateAuthority {
 }
 
 impl CertificateAuthority {
+    /// Opens the authority the host asked for.
+    ///
+    /// **Restoring never silently falls back to generating.** Stored material
+    /// that will not parse means the device's secure storage lost or corrupted
+    /// a key, and quietly minting a fresh root would leave a user whose store
+    /// still trusts the old one with a session that intercepts nothing and
+    /// reports nothing — the failure would surface months later as "filtering
+    /// stopped working". The host is told, and re-prompting is its decision to
+    /// make because it is the one that can show a dialog.
+    pub fn open(trust: Trust) -> Result<Self, CaError> {
+        match trust {
+            Trust::Generate => Self::generate(),
+            Trust::Restore(material) => Self::restore(&material),
+        }
+    }
+
     /// Generates a fresh root and leaf key. A defect if key generation or the
     /// self-signature fails; neither is a routine condition.
     pub fn generate() -> Result<Self, CaError> {
@@ -625,5 +675,44 @@ mod tests {
                 .any(|window| window == material.root_certificate),
             "the certificate is handed out separately, not buried in the secret"
         );
+    }
+
+    /// The host's single code path, and the property that lets it be single:
+    /// **whichever branch it took, it stores what came back and offers what
+    /// came back.** Storing a restoration is a no-op write and offering an
+    /// installed root shows no dialog, so a host never has to know which
+    /// happened.
+    #[test]
+    fn opening_with_or_without_stored_material_leaves_the_host_the_same_two_jobs() {
+        let first = CertificateAuthority::open(Trust::Generate).unwrap();
+        let kept = first.material();
+
+        let again = CertificateAuthority::open(Trust::Restore(kept.clone())).unwrap();
+        assert_eq!(
+            again.material().root_certificate,
+            kept.root_certificate,
+            "what a host stores after restoring is what it already had"
+        );
+        assert_eq!(
+            again.root_der().as_ref(),
+            kept.root_certificate.as_slice(),
+            "and what it offers is the root the user already trusts"
+        );
+    }
+
+    /// Losing the key is a fact the host has to hear. Minting a fresh root
+    /// instead would leave a device whose store still trusts the old one with a
+    /// session that intercepts nothing, reports nothing, and looks healthy.
+    #[test]
+    fn material_that_will_not_parse_is_reported_rather_than_replaced() {
+        let good = CertificateAuthority::generate().unwrap().material();
+        let broken = CaMaterial {
+            root_certificate: good.root_certificate,
+            keys: CaKeys::from_bytes(b"not this crate's".to_vec()),
+        };
+        assert!(matches!(
+            CertificateAuthority::open(Trust::Restore(broken)),
+            Err(CaError::Material)
+        ));
     }
 }
