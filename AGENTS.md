@@ -35,6 +35,13 @@ the product contract. Do not infer implemented status from visionary scope.
   question and no check in this repository gates it.
 - Keep abstractions at ownership boundaries with more than one real
   implementation. No speculative adapters or configuration.
+- **Refine what a client can set; do not refine what the composition root
+  derives.** A number a host writes through [api/](api/README.md) reaches a
+  place no error can describe, so a pair it can get wrong is parsed where it is
+  written — `StreamBudget::new`, `CaMaterial::from_parts`, `LocalStack::new`.
+  A number `api.rs` computes from another already has its proof in the
+  arithmetic, and wrapping it buys a type around a literal. The test is
+  reachability from outside the crate, not representability.
 - Write a wire protocol in `sansio`'s vocabulary, not in an `async fn`. A
   negotiation is a `Negotiation` and framing is a `Codec`: bytes in, bytes out,
   no socket and no clock. `negotiate` and `Framed` are the only things that

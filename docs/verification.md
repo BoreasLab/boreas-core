@@ -310,6 +310,16 @@ Numbered as above, with reserved slots for retired questions.
     resolver serves sends one over UDP/53; a cookie-probing stub would see a
     silent drop and retry. Decide before claiming RFC 9619 conformance.
 
+15. **Hysteria2 `FragCount == 0`:** verified 2026-08-18, spec silent and both
+    references agreeing. `v2.hysteria.network/docs/developers/Protocol/` states
+    "For packets that are not fragmented, the Fragment Count MUST be set to 1"
+    and says nothing about zero. `apernet/hysteria`
+    (`core/internal/frag/frag.go`, `Defragger.Feed`) and `SagerNet/sing-quic`
+    (`hysteria2/packet.go`, `udpDefragger.feed` — sing-box carries no FragCount
+    code of its own) both open with `FragCount <= 1` and return the message
+    whole. `Defragmenter::push` matches them. Revisit only if a server is
+    observed emitting zero, which neither reference's own fragmenter can.
+
 ## Updating This Ledger
 
 For each new external claim, record the primary source, source date, observed

@@ -407,6 +407,15 @@ impl Defragmenter {
     /// O(1) amortised per fragment, plus one copy of the payload when it
     /// completes.
     fn push(&mut self, message: &UdpMessage<'_>) -> Option<Vec<u8>> {
+        // **`<= 1`, not `== 1`, and that is a decision rather than an
+        // accident.** The specification says "For packets that are not
+        // fragmented, the Fragment Count MUST be set to 1" and is silent on
+        // zero, so a zero is a value no conforming sender emits. Both
+        // references fill the silence the same way — apernet/hysteria's
+        // `Defragger::Feed` and sing-quic's `udpDefragger::feed` each open with
+        // `FragCount <= 1`, returning the message whole — and this rides an
+        // authenticated connection, where refusing a datagram two reference
+        // implementations deliver buys nothing.
         if message.fragments <= 1 {
             return Some(message.payload.to_vec());
         }
