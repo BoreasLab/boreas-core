@@ -408,6 +408,9 @@ pub enum StartError {
     Datapath(DatapathError),
     /// A socket the tunnel needs could not be opened through the bypass.
     Io(std::io::ErrorKind),
+    /// The local terminator cannot serve every inspected port under the
+    /// [`Ceilings::terminated_connections`] it was given. Raise it.
+    Termination(crate::TerminationError),
 }
 
 impl std::fmt::Display for StartError {
@@ -418,6 +421,7 @@ impl std::fmt::Display for StartError {
             Self::Egress(error) => write!(f, "egress: {error}"),
             Self::Datapath(error) => write!(f, "datapath: {error}"),
             Self::Io(kind) => write!(f, "socket: {kind}"),
+            Self::Termination(error) => write!(f, "local termination: {error}"),
         }
     }
 }
@@ -1030,7 +1034,8 @@ fn start_termination(
         },
         pool,
         Instant::now(),
-    );
+    )
+    .map_err(StartError::Termination)?;
 
     let (packets_tx, packets_rx) = mpsc::channel(CHANNEL_DEPTH);
     let (replies_tx, replies_rx) = mpsc::channel(CHANNEL_DEPTH);

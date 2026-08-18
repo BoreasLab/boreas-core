@@ -104,6 +104,43 @@ pub struct TerminationLimits {
     pub socket_buffer: NonZeroUsize,
 }
 
+/// A ceiling that cannot serve the ports it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminationError {
+    /// `max_sockets` is smaller than one full backlog per inspected port.
+    ///
+    /// **Not merely tight — silently partial.** Listeners are replenished port
+    /// by port in order and stop at the ceiling, so the first ports get their
+    /// whole backlog and the last ones get *none*. A port with no listener
+    /// refuses every SYN with a RST, permanently, while its neighbours work
+    /// perfectly: with two inspected ports and a ceiling under one backlog,
+    /// plaintext HTTP is intercepted and HTTPS is dead, and nothing anywhere
+    /// says so.
+    SocketsBelowBacklog {
+        ports: usize,
+        backlog: usize,
+        ceiling: usize,
+    },
+}
+
+impl std::fmt::Display for TerminationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SocketsBelowBacklog {
+                ports,
+                backlog,
+                ceiling,
+            } => write!(
+                f,
+                "{ports} ports at a backlog of {backlog} need {} sockets, not {ceiling}",
+                ports * backlog
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TerminationError {}
+
 /// A `smoltcp` device backed by two byte-buffer queues rather than a NIC.
 /// `inbound` is what the client sent (consumed by `smoltcp` on receive);
 /// `outbound` is what `smoltcp` produced for the client (drained by the shell).
@@ -248,7 +285,18 @@ impl LocalStack {
         limits: TerminationLimits,
         pool: Arc<BufferPool>,
         base: Instant,
-    ) -> Self {
+    ) -> Result<Self, TerminationError> {
+        // Checked here rather than left to `replenish_listeners`, which has no
+        // way to report it: it fills ports in order and returns at the ceiling,
+        // so an insufficient ceiling is not a shortage spread thin but whole
+        // ports that never listen at all.
+        if ports.len() * limits.backlog.get() > limits.max_sockets.get() {
+            return Err(TerminationError::SocketsBelowBacklog {
+                ports: ports.len(),
+                backlog: limits.backlog.get(),
+                ceiling: limits.max_sockets.get(),
+            });
+        }
         let carried = usize::from(mtu.get()).min(pool.slice_size().get());
         let mut device = QueueDevice {
             inbound: VecDeque::new(),
@@ -294,7 +342,7 @@ impl LocalStack {
             base,
         };
         stack.replenish_listeners();
-        stack
+        Ok(stack)
     }
 
     /// Enqueues one client packet for the next [`poll`](Self::poll).
@@ -576,7 +624,36 @@ pub(crate) mod tests {
 
     /// Builds a terminator on its own budget.
     fn stack(ports: &[u16], limits: TerminationLimits, base: Instant) -> LocalStack {
-        LocalStack::new(mtu(), ports, limits, pool(), base)
+        LocalStack::new(mtu(), ports, limits, pool(), base).expect("the fixture fits")
+    }
+
+    /// **A ceiling under one backlog per port does not spread thin — it
+    /// starves the later ports outright.** `replenish_listeners` fills ports in
+    /// order and returns at the ceiling, so with two inspected ports and room
+    /// for one backlog, port 80 gets every listener and port 443 gets none:
+    /// plaintext HTTP intercepted, HTTPS answering RST to every SYN, forever,
+    /// and nothing anywhere reporting it. That is settable through the stable
+    /// interface by lowering `Ceilings::terminated_connections`.
+    #[test]
+    fn a_ceiling_that_cannot_hold_a_backlog_per_port_is_refused() {
+        assert_eq!(
+            LocalStack::new(mtu(), &[80, 443], limits(4, 4), pool(), Instant::now()).err(),
+            Some(TerminationError::SocketsBelowBacklog {
+                ports: 2,
+                backlog: 4,
+                ceiling: 4,
+            })
+        );
+        // Exactly enough is enough, and both ports get a full backlog.
+        let stack = LocalStack::new(mtu(), &[80, 443], limits(8, 4), pool(), Instant::now())
+            .expect("eight sockets hold two backlogs of four");
+        for port in [80, 443] {
+            assert_eq!(
+                stack.listeners.iter().filter(|l| l.port == port).count(),
+                4,
+                "port {port} must get its whole backlog"
+            );
+        }
     }
 
     fn limits(max_sockets: usize, backlog: usize) -> TerminationLimits {

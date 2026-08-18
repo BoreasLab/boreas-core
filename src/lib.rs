@@ -113,7 +113,9 @@ pub use socks5::{
     Credentials, CredentialsError, ProxyError, Reply, Socks5Config, Socks5Egress, decode_address,
     decode_datagram, encode_address, encode_datagram,
 };
-pub use stream::{LocalStack, StreamError, StreamId, Terminated, TerminationLimits};
+pub use stream::{
+    LocalStack, StreamError, StreamId, Terminated, TerminationError, TerminationLimits,
+};
 pub use terminate::{Accepted, TerminatedStream, run_terminator};
 pub use upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,

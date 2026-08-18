@@ -151,7 +151,7 @@ gets the process killed. Raise them on a desktop.
 | --- | --- | --- |
 | `buffer_slices` | 2048 | Payload buffers, shared by everything in flight: forwarded packets, queued datagrams, terminated segments, synthesized replies. `slices × (mtu + 128)` is the **whole** traffic memory budget. Exhaustion is a counted drop, never a wait or an allocation. |
 | `datagrams_per_flow` | 32 | Queued datagrams before one flow starts dropping. Per flow, so one noisy source cannot starve another. |
-| `terminated_connections` | 512 | Live locally-terminated connections. Also sizes the forged-certificate cache. |
+| `terminated_connections` | 512 | Live locally-terminated connections. Also sizes the forged-certificate cache. **Has a floor:** each inspected port holds a listening backlog of 64, and a ceiling below `ports × 64` leaves the later ports with no listener at all rather than a smaller share — so `start` refuses it with `StartError::Termination` instead of intercepting HTTP and answering RST on HTTPS. |
 | `associations` | 256 | Datagram associations through a proxy egress. |
 | `inspected_addresses` | 1024 | Addresses remembered as belonging to an intercepted host. |
 | `pending_reassemblies` | 64 | Fragmented packets held awaiting the rest of themselves. |

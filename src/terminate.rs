@@ -259,7 +259,8 @@ mod tests {
                 },
                 Arc::clone(&pool),
                 Instant::now(),
-            );
+            )
+            .expect("the fixture's ceiling holds a backlog per port");
             let (packets_tx, packets_rx) = mpsc::channel(64);
             let (replies_tx, replies_rx) = mpsc::channel(64);
             let (accepted_tx, accepted_rx) = mpsc::channel(4);
