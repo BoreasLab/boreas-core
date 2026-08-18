@@ -48,6 +48,10 @@ cosmetic filtering are still to come.
 
 ## Documentation
 
+**Embedding Boreas in an app: [api/](api/README.md).** That folder is
+self-contained and is the only thing a downstream client needs; everything
+below it is internal design material that changes without notice.
+
 - [Project documentation](docs/README.md)
 - [Architecture](docs/architecture.md)
 - [Delivery plan](docs/delivery.md)

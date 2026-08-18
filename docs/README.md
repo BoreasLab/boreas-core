@@ -3,6 +3,11 @@
 This index is the map for humans and agents. Start with the smallest document
 that owns the work, then follow its links only when a boundary is crossed.
 
+**These documents are internal.** They describe how Boreas is built today and
+are not a contract. An application embedding this crate reads [api/](../api/README.md)
+instead, which is self-contained and versioned — and a change here that would
+alter what that folder promises is a change that needs to be made there first.
+
 ## Product and System
 
 | Document | Read when working on |
