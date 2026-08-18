@@ -32,7 +32,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
-    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource,
+    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
     DomainName, EgressError, NatBehavior, PathProperties, Prefixed, StreamEgress, Target,
     TunnelBypass,
 };
@@ -147,19 +147,6 @@ impl Reply {
             other => Self::Other(other),
         }
     }
-}
-
-/// The result of decoding from a buffer that may not hold a whole message yet.
-///
-/// This is the type that makes a streaming parser total: the alternative is a
-/// decoder that returns an error for a short read, which a caller cannot
-/// distinguish from a real protocol violation and therefore cannot retry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decoded<T> {
-    /// More bytes are needed. The caller reads and calls again.
-    Incomplete,
-    /// A whole message, and how many bytes of the buffer it used.
-    Complete { value: T, consumed: usize },
 }
 
 /// Writes a target in RFC 1928 address form: `ATYP || ADDR || PORT`.

@@ -44,9 +44,9 @@ use ring::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource,
+    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
     EgressError, NatBehavior, PathProperties, ProxyError, StreamEgress, Target, TunnelBypass,
-    decode_address, encode_address, socks5::Decoded,
+    decode_address, encode_address,
 };
 
 /// The BLAKE3 derive-key context, fixed by SIP022. It is part of the wire

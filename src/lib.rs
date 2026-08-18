@@ -23,6 +23,7 @@ mod reassembly;
 mod relay;
 mod rewrite;
 mod rules;
+mod sansio;
 mod session;
 mod shadowsocks;
 mod shell;
@@ -101,6 +102,7 @@ pub use rewrite::{
     permit_inline_style, rewritable,
 };
 pub use rules::RuleEngine;
+pub use sansio::{Codec, Decode, Decoded, Framed, Negotiation, negotiate};
 pub use session::{
     Handling, Introduction, SessionError, SessionLimits, Sessions, SpliceReason, introduce,
     run_sessions, serve_session,
@@ -108,8 +110,8 @@ pub use session::{
 pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
 pub use shell::{AsyncDevice, AsyncNetwork, Control, Session, Shell, Telemetry, Termination};
 pub use socks5::{
-    Credentials, CredentialsError, Decoded, ProxyError, Reply, Socks5Config, Socks5Egress,
-    decode_address, decode_datagram, encode_address, encode_datagram,
+    Credentials, CredentialsError, ProxyError, Reply, Socks5Config, Socks5Egress, decode_address,
+    decode_datagram, encode_address, encode_datagram,
 };
 pub use stream::{LocalStack, StreamError, StreamId, Terminated, TerminationLimits};
 pub use terminate::{Accepted, TerminatedStream, run_terminator};
