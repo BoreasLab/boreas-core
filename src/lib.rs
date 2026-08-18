@@ -97,8 +97,8 @@ pub use quic::{H3Response, Handshake, QuicConnection, client_config};
 pub use reassembly::{Fragment, PushOutcome, ReassembledPacket, Reassembler};
 pub use relay::{Inbound, Relay, RelayCounts, RelayLimits, run_relay};
 pub use rewrite::{
-    Coding, CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable, Rewritable,
-    RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, Undecodable,
+    BudgetError, Coding, CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable,
+    Rewritable, RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, Undecodable,
     permit_inline_style, rewritable,
 };
 pub use rules::RuleEngine;

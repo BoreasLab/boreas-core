@@ -223,8 +223,14 @@ pub fn decode_address(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
     })
 }
 
-/// Credentials for RFC 1929 username/password authentication. Both halves are
-/// length-prefixed by one octet on the wire, so both are bounded here.
+/// Credentials for RFC 1929 username/password authentication.
+///
+/// Both halves are length-prefixed by one octet on the wire, and RFC 1929's own
+/// request diagram gives their widths as `1 to 255` — not `0 to 255`. An empty
+/// half is therefore not a short credential but an unencodable one, and the
+/// only place to find that out is a proxy that refuses the authentication with
+/// no explanation of which field it disliked. The range is the type's, so a
+/// configuration that cannot be put on the wire fails where it is written.
 #[derive(Clone, Debug)]
 pub struct Credentials {
     username: String,
@@ -233,8 +239,10 @@ pub struct Credentials {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialsError {
-    UsernameTooLong(usize),
-    PasswordTooLong(usize),
+    /// Outside RFC 1929's `1 to 255`, in either direction. The length is
+    /// carried so a host can say which end of the range it missed.
+    Username(usize),
+    Password(usize),
 }
 
 impl Credentials {
@@ -244,8 +252,8 @@ impl Credentials {
     ) -> Result<Self, CredentialsError> {
         let (username, password) = (username.into(), password.into());
         match (username.len(), password.len()) {
-            (length, _) if length > 255 => Err(CredentialsError::UsernameTooLong(length)),
-            (_, length) if length > 255 => Err(CredentialsError::PasswordTooLong(length)),
+            (length, _) if !(1..=255).contains(&length) => Err(CredentialsError::Username(length)),
+            (_, length) if !(1..=255).contains(&length) => Err(CredentialsError::Password(length)),
             _ => Ok(Self { username, password }),
         }
     }
@@ -810,15 +818,32 @@ mod tests {
             vec![VERSION, 2, METHOD_NONE, METHOD_USERPASS]
         );
 
-        // Both halves are length-prefixed by one octet, so both are bounded.
-        assert_eq!(
-            Credentials::new("u".repeat(256), "p").map(|_| ()),
-            Err(CredentialsError::UsernameTooLong(256))
-        );
-        assert_eq!(
-            Credentials::new("u", "p".repeat(256)).map(|_| ()),
-            Err(CredentialsError::PasswordTooLong(256))
-        );
+        // RFC 1929's request diagram gives both halves as `1 to 255`, so both
+        // ends of the range are refused. Empty is the one that mattered: it
+        // encodes a zero length byte, which no conforming server reads back as
+        // a credential, and the only report is an authentication that failed.
+        for (username, password, expected) in [
+            (
+                "u".repeat(256),
+                "p".to_owned(),
+                CredentialsError::Username(256),
+            ),
+            (String::new(), "p".to_owned(), CredentialsError::Username(0)),
+            (
+                "u".to_owned(),
+                "p".repeat(256),
+                CredentialsError::Password(256),
+            ),
+            ("u".to_owned(), String::new(), CredentialsError::Password(0)),
+        ] {
+            assert_eq!(
+                Credentials::new(username.clone(), password.clone()).map(|_| ()),
+                Err(expected),
+                "{}/{}",
+                username.len(),
+                password.len()
+            );
+        }
     }
 
     /// **The exchange, with no socket anywhere.** Before the port this needed a

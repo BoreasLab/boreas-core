@@ -484,10 +484,68 @@ pub struct StreamBudget {
     /// The ceiling on what the rewriter *holds*: buffered unparsed input and
     /// selector-matching state. Exceeding it is a graceful bail-out, not a
     /// failure of the response.
-    pub max_memory_bytes: usize,
+    max_memory_bytes: usize,
     /// The parsing buffer reserved up front, so an ordinary document does not
     /// grow it. Charged against the ceiling above.
-    pub parsing_buffer_bytes: usize,
+    parsing_buffer_bytes: usize,
+}
+
+/// A budget that cannot rewrite anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetError {
+    /// A ceiling of zero. Every document exceeds it before its first byte, so
+    /// rewriting is off — but off by way of a per-response bail-out that looks
+    /// like a stream of failures rather than like a setting.
+    NoCeiling,
+    /// A parsing buffer larger than the ceiling that has to contain it. The
+    /// buffer is charged against the ceiling, so this is the same silence
+    /// arriving one step later.
+    BufferExceedsCeiling { parsing: usize, ceiling: usize },
+}
+
+impl fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCeiling => f.write_str("a rewriting ceiling of zero rewrites nothing"),
+            Self::BufferExceedsCeiling { parsing, ceiling } => write!(
+                f,
+                "a {parsing}-byte parsing buffer cannot fit under a {ceiling}-byte ceiling"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BudgetError {}
+
+impl StreamBudget {
+    /// The one boundary a host's two numbers cross to become a budget.
+    ///
+    /// **Both failures are silent without it.** The numbers reach `lol_html`
+    /// as a memory ceiling and a preallocation charged against it, and a pair
+    /// that cannot hold a document produces a bail-out per response — the same
+    /// observable as a site that simply does not get rewritten, with a counter
+    /// climbing where nobody is looking. A configuration that cannot work now
+    /// fails where it is written.
+    pub fn new(max_memory_bytes: usize, parsing_buffer_bytes: usize) -> Result<Self, BudgetError> {
+        match (max_memory_bytes, parsing_buffer_bytes) {
+            (0, _) => Err(BudgetError::NoCeiling),
+            (ceiling, parsing) if parsing > ceiling => {
+                Err(BudgetError::BufferExceedsCeiling { parsing, ceiling })
+            }
+            _ => Ok(Self {
+                max_memory_bytes,
+                parsing_buffer_bytes,
+            }),
+        }
+    }
+
+    pub fn max_memory_bytes(self) -> usize {
+        self.max_memory_bytes
+    }
+
+    pub fn parsing_buffer_bytes(self) -> usize {
+        self.parsing_buffer_bytes
+    }
 }
 
 impl Default for StreamBudget {
@@ -500,6 +558,38 @@ impl Default for StreamBudget {
             // The bridge's chunk size, so a typical write lands in one buffer.
             parsing_buffer_bytes: 16 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// **Both halves of an unusable budget are silent.** They reach `lol_html`
+    /// as a ceiling and a preallocation charged against it, so a pair that
+    /// cannot hold a document bails out once per response — indistinguishable,
+    /// from outside, from a site that simply is not rewritten. This is set
+    /// through the stable interface, so the host getting it wrong is a
+    /// downstream developer with no way to see it.
+    #[test]
+    fn a_budget_that_could_never_rewrite_is_refused_where_it_is_written() {
+        assert_eq!(StreamBudget::new(0, 0).err(), Some(BudgetError::NoCeiling));
+        assert_eq!(
+            StreamBudget::new(1024, 4096).err(),
+            Some(BudgetError::BufferExceedsCeiling {
+                parsing: 4096,
+                ceiling: 1024
+            })
+        );
+        // A buffer exactly filling the ceiling is the boundary and is allowed:
+        // it leaves nothing spare, but nothing about it is contradictory.
+        assert!(StreamBudget::new(1024, 1024).is_ok());
+
+        let default = StreamBudget::default();
+        assert!(
+            StreamBudget::new(default.max_memory_bytes(), default.parsing_buffer_bytes()).is_ok(),
+            "the default must be a budget its own constructor accepts"
+        );
     }
 }
 
@@ -1219,8 +1309,8 @@ fn build(
         .with_graceful_bail_out_on_content_handler_error(true)
         .with_memory_settings(
             MemorySettings::new()
-                .with_max_allowed_memory_usage(budget.max_memory_bytes)
-                .with_preallocated_parsing_buffer_size(budget.parsing_buffer_bytes)
+                .with_max_allowed_memory_usage(budget.max_memory_bytes())
+                .with_preallocated_parsing_buffer_size(budget.parsing_buffer_bytes())
                 // The fail-open path, and the reason a bail-out keeps the
                 // response whole: every byte the rewriter was holding is
                 // flushed raw before it gives up.
@@ -1778,13 +1868,8 @@ mod streaming {
     /// a far stronger statement than "roughly the same length".
     #[tokio::test]
     async fn an_exhausted_budget_costs_no_bytes_and_counts_the_failure() {
-        let (rewriting, _, failures) = tier(
-            &[".matches-nothing"],
-            StreamBudget {
-                max_memory_bytes: 1024,
-                parsing_buffer_bytes: 64,
-            },
-        );
+        let (rewriting, _, failures) =
+            tier(&[".matches-nothing"], StreamBudget::new(1024, 64).unwrap());
         // One tag far longer than the budget, split so the rewriter has to hold
         // the first half across a poll.
         let opening = format!("<div data-x=\"{}", "y".repeat(4096));

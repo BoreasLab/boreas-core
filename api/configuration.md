@@ -123,7 +123,7 @@ without an authority — those are not representable, so nothing has to check.
 | `lists` | Filter-list text, in the syntax [AdGuard and uBlock use](https://adguard.com/kb/general/ad-filtering/create-own-filters/). You fetch and store these; Boreas compiles them and keeps none. Malformed lines are counted and skipped — one bad line in fifty thousand must not cost a user their rule set. |
 | `hosts` | The hosts to intercept. **An allowlist, never a pattern.** Interception forges a certificate, and the set of hosts that happens to should be one a user can read. |
 | `trust` | `Trust::Generate` on first run, `Trust::Restore(material)` after. See [platform.md](platform.md#3-installing-the-root-certificate). |
-| `documents.budget` | Memory one response may occupy while being rewritten. A document is transformed as it arrives rather than buffered whole; this is what makes that a bound rather than an intention. Default 2 MiB. |
+| `documents.budget` | Memory one response may occupy while being rewritten. A document is transformed as it arrives rather than buffered whole; this is what makes that a bound rather than an intention. Default 2 MiB. Build a non-default one with `StreamBudget::new(ceiling, parsing_buffer)`, which refuses a zero ceiling and a parsing buffer larger than the ceiling charged against it — both of those rewrite nothing, once per response, with no error a user could see. |
 
 Refusals: empty `hosts` with interception on is `NoHostsToIntercept` — forging
 certificates for the empty set is the name tier with extra machinery. A host
