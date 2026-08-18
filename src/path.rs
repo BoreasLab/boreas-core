@@ -23,7 +23,7 @@ pub fn validate_ptb<V>(
 
     let source_port = match quoted.transport {
         Transport::Udp { source_port, .. } | Transport::Tcp { source_port, .. } => source_port,
-        Transport::Icmp | Transport::Other | Transport::Fragment => return None,
+        Transport::Icmp(_) | Transport::Other | Transport::Fragment => return None,
     };
 
     flows
@@ -335,7 +335,7 @@ mod tests {
 
         // Non-TCP/UDP quoted transports are not flows at all.
         let icmp = IngressPacket {
-            transport: Transport::Icmp,
+            transport: Transport::Icmp(crate::IcmpClass::Informational),
             ..quoted
         };
         assert_eq!(validate_ptb(&icmp, 1400, &flows), None);

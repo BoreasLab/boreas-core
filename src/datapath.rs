@@ -26,10 +26,11 @@ use std::{
 
 use crate::{
     Accepts, Admission, Backstop, BufferPool, DatagramBuffer, DnsPolicy, FilterPolicy, FlowPlan,
-    FlowTableError, Fragment, IngressAction, IngressPacket, Inspection, InternalEndpoint, Mtu,
-    OriginationPorts, PacketError, PathProperties, PlanError, Pooled, PushOutcome, Reassembler,
-    Replan, SendOutcome, SteeringReason, Transport, TransportPath, UdpFlowTable, WriteError, admit,
-    clamp_mss, plan_flow, replan, route_planned, udp_datagram_len, write_udp,
+    FlowTableError, Fragment, IcmpClass, IngressAction, IngressPacket, Inspection,
+    InternalEndpoint, Mtu, OriginationPorts, PacketError, PathProperties, PlanError, Pooled,
+    PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
+    UdpFlowTable, WriteError, admit, clamp_mss, forbids_fragmentation, plan_flow, replan,
+    route_planned, udp_datagram_len, write_too_big, write_udp,
 };
 
 /// One of the two sides the datapath sits between: the client's TUN and the
@@ -90,6 +91,11 @@ pub enum FlowEvent {
     /// browser retries, so folded into a counter; the count is the
     /// convergence signal [Filtering](../docs/filtering.md) asks for.
     QuicSteered,
+    /// An over-sized packet was answered with an ICMP Packet Too Big naming
+    /// this MTU. Per over-sized packet until the sender's path discovery
+    /// converges, so the shell folds it into a counter — a count that stays
+    /// high is a client whose link MTU was configured wider than the tunnel.
+    PathReported(Mtu),
 }
 
 /// The addresses an inspected host was seen to resolve to, and until when.
@@ -580,7 +586,31 @@ impl Datapath {
                 let clamp = match plan.transport {
                     // The clamp is the only mechanism that reaches a terminated
                     // path's segment size; on non-SYN packets it is a no-op.
-                    TransportPath::PacketFastPath { inner_mtu } => Some(inner_mtu),
+                    TransportPath::PacketFastPath { inner_mtu } => {
+                        // **The client's link is wider than the tunnel, and
+                        // something has to say so.** The TUN is `path_mtu`
+                        // wide; the tunnel is narrower by the egress's
+                        // overhead. TCP never reaches this — its MSS was
+                        // clamped on the SYN — so what does is QUIC, which
+                        // sets DF and learns its path from exactly this
+                        // message. Forwarding it to be fragmented or dropped
+                        // downstream is a black hole the sender cannot see.
+                        //
+                        // An ICMP *error* is the one thing never answered: RFC
+                        // 1122 §3.2.2 and RFC 4443 §2.4 (e) both forbid it,
+                        // because two hosts each reporting the other's report
+                        // is a loop. An echo is fair game — `ping -M do` is how
+                        // a person discovers a path MTU by hand.
+                        if from == Side::Tunnel
+                            && packet.transport != Transport::Icmp(IcmpClass::Error)
+                            && buf.len() > usize::from(inner_mtu.get())
+                            && forbids_fragmentation(buf)
+                        {
+                            self.report_too_big(buf, inner_mtu);
+                            return Ok(());
+                        }
+                        Some(inner_mtu)
+                    }
                     TransportPath::LocalTermination => None,
                 };
                 self.forward(buf, from.across(), clamp);
@@ -862,6 +892,37 @@ impl Datapath {
         self.transmits.push_back(Transmit { to, bytes });
     }
 
+    /// Answers an over-sized packet with the ICMP Packet Too Big its sender
+    /// needs, on the same budget every other payload draws from.
+    ///
+    /// The reply goes back to the tunnel, which is where the sender is; it is
+    /// never forwarded on, because the packet it reports on was not.
+    ///
+    /// O(quoted length), bounded by the family's ICMP ceiling.
+    fn report_too_big(&mut self, buf: &[u8], inner_mtu: Mtu) {
+        let Some(mut reply) = self.pool.take_zeroed(self.pool.slice_size().get()) else {
+            self.events.push_back(FlowEvent::TransmitDropped);
+            return;
+        };
+        match write_too_big(&mut reply, buf, inner_mtu.get()) {
+            Ok(len) => {
+                // The buffer came from this pool at its full slice size and
+                // the message is shorter, so the shrink cannot be refused.
+                let shrunk = reply.resize(len);
+                debug_assert!(shrunk, "an ICMP error is shorter than a slice");
+                self.transmits.push_back(Transmit {
+                    to: Side::Tunnel,
+                    bytes: reply,
+                });
+                self.events.push_back(FlowEvent::PathReported(inner_mtu));
+            }
+            // Unreachable for a packet that parsed once already, and a counted
+            // drop rather than an error: the sender retries, which is what it
+            // would do for the packet this could not answer.
+            Err(_) => self.events.push_back(FlowEvent::TransmitDropped),
+        }
+    }
+
     fn on_fragment(&mut self, buf: &[u8], from: Side, now: Instant) -> Result<(), DatapathError> {
         let Some(fragment) = Fragment::parse(buf)? else {
             return Ok(());
@@ -987,7 +1048,7 @@ fn endpoint_of(packet: IngressPacket) -> InternalEndpoint {
         address: packet.source,
         port: match packet.transport {
             Transport::Tcp { source_port, .. } | Transport::Udp { source_port, .. } => source_port,
-            Transport::Icmp | Transport::Other | Transport::Fragment => 0,
+            Transport::Icmp(_) | Transport::Other | Transport::Fragment => 0,
         },
     }
 }
@@ -997,7 +1058,7 @@ mod tests {
     use super::*;
     use crate::{BufferPool, Limits};
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
         sync::Arc,
         time::Duration,
     };
@@ -1609,5 +1670,311 @@ mod tests {
             vec![1234, 5678, 1234, 5678],
             "one datagram per flow per turn"
         );
+    }
+
+    /// A wire-valid IPv4 ICMP packet between two hosts, carrying `kind`/`code`
+    /// and `body`. One builder for both directions, so a test states only the
+    /// direction it is about.
+    fn icmpv4(source: [u8; 4], destination: [u8; 4], kind: u8, body: &[u8]) -> Vec<u8> {
+        let total = 28 + body.len();
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 1; // ICMP
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet[20] = kind;
+        packet[24..26].copy_from_slice(&1u16.to_be_bytes()); // identifier
+        packet[28..].copy_from_slice(body);
+        packet
+    }
+
+    /// A UDP datagram of exactly `total` bytes, with the Don't Fragment bit set
+    /// or clear. QUIC is the sender this stands in for: it sets DF and expects
+    /// to be told when a packet does not fit.
+    fn sized_udp(total: usize, dont_fragment: bool) -> Vec<u8> {
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        if dont_fragment {
+            packet[6] = 0x40;
+        }
+        packet[8] = 64;
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&49152u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&((total - 20) as u16).to_be_bytes());
+        packet
+    }
+
+    /// A session over an egress that carries whole IP packets. The fast path is
+    /// the case ICMP has to work on, because it is the only one where the
+    /// client's own stack is the other end of the conversation.
+    fn fast_path() -> Datapath {
+        Datapath::new(
+            FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
+            Accepts::IpPackets,
+            egress(crate::DatagramFidelity::Native),
+            Mtu::new(1500).unwrap(),
+            limits(64),
+            pool(),
+        )
+        .unwrap()
+    }
+
+    /// **ICMP is not a special case for a packet egress; it is one more
+    /// protocol that crosses.** Ping and traceroute work through the tunnel for
+    /// exactly this reason, and nothing but a test says so — the forwarding arm
+    /// names no transport, so a future refinement of the classifier could
+    /// silently stop reaching it.
+    #[test]
+    fn icmp_crosses_a_packet_egress_in_both_directions() {
+        let mut path = fast_path();
+        let now = Instant::now();
+
+        let request = icmpv4([192, 0, 2, 1], [198, 51, 100, 2], 8, b"ping payload");
+        path.on_tun_packet(&request, now).unwrap();
+        let out = path.poll_transmit().expect("the echo request is forwarded");
+        assert_eq!(out.to, Side::Egress);
+        assert_eq!(&out.bytes[..], &request[..], "whole, byte for byte");
+
+        let reply = icmpv4([198, 51, 100, 2], [192, 0, 2, 1], 0, b"ping payload");
+        path.on_egress_packet(&reply, now).unwrap();
+        let back = path.poll_transmit().expect("the echo reply is forwarded");
+        assert_eq!(back.to, Side::Tunnel);
+        assert_eq!(&back.bytes[..], &reply[..]);
+    }
+
+    /// **The one error this crate originates.** The client's TUN is 1500 and
+    /// the tunnel is 1440, so a 1500-byte QUIC datagram is one the client may
+    /// legitimately send and this session cannot carry. Forwarding it to be
+    /// fragmented or dropped downstream is a black hole; the sender is told
+    /// instead, and learns its path from the answer.
+    #[test]
+    fn an_oversized_packet_that_forbids_fragmentation_is_answered_not_dropped() {
+        let mut path = fast_path();
+        let oversized = sized_udp(1500, true);
+        path.on_tun_packet(&oversized, Instant::now()).unwrap();
+
+        let reply = path.poll_transmit().expect("the sender is answered");
+        assert_eq!(reply.to, Side::Tunnel, "back to the sender, not onward");
+
+        let parsed = IngressPacket::parse(&reply.bytes).unwrap();
+        assert_eq!(parsed.source, oversized_destination());
+        assert_eq!(parsed.destination, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(reply.bytes[20], 3, "Destination Unreachable");
+        assert_eq!(reply.bytes[21], 4, "Fragmentation Needed");
+        assert_eq!(
+            u16::from_be_bytes([reply.bytes[26], reply.bytes[27]]),
+            1440,
+            "and it offers the tunnel's real budget"
+        );
+        assert_eq!(
+            &reply.bytes[28..48],
+            &oversized[..20],
+            "quoting the packet, which is what makes the report credible"
+        );
+        assert!(
+            path.poll_transmit().is_none(),
+            "the packet itself does not also go on"
+        );
+        assert_eq!(
+            path.poll_event(),
+            Some(FlowEvent::PathReported(Mtu::new(1440).unwrap()))
+        );
+    }
+
+    fn oversized_destination() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))
+    }
+
+    /// The report is for senders who said they cannot fragment. A packet that
+    /// permits fragmentation gets the ordinary path, and a packet that fits
+    /// was never anyone's problem.
+    #[test]
+    fn a_packet_that_fits_or_permits_fragmenting_is_forwarded_as_before() {
+        let now = Instant::now();
+        for (label, packet) in [
+            ("fits the tunnel", sized_udp(1400, true)),
+            ("permits fragmenting", sized_udp(1500, false)),
+        ] {
+            let mut path = fast_path();
+            path.on_tun_packet(&packet, now).unwrap();
+            let out = path.poll_transmit().unwrap_or_else(|| panic!("{label}"));
+            assert_eq!(out.to, Side::Egress, "{label} must still cross");
+            assert!(
+                !matches!(path.poll_event(), Some(FlowEvent::PathReported(_))),
+                "{label} is not something to report"
+            );
+        }
+    }
+
+    /// A report is generated for the client's own packets and never for what
+    /// arrives from the egress: an over-sized packet coming inward is the
+    /// far side's path problem, and answering it would send an ICMP error to a
+    /// host that is not this session's sender.
+    #[test]
+    fn nothing_arriving_from_the_egress_is_reported_on() {
+        let mut path = fast_path();
+        path.on_egress_packet(&sized_udp(1500, true), Instant::now())
+            .unwrap();
+        assert_eq!(
+            path.poll_transmit().map(|out| out.to),
+            Some(Side::Tunnel),
+            "forwarded, as every inbound packet is"
+        );
+        assert!(!matches!(
+            path.poll_event(),
+            Some(FlowEvent::PathReported(_))
+        ));
+    }
+
+    /// A UDP datagram over IPv6 of exactly `total` bytes. There is no DF bit to
+    /// set: RFC 8200 §4.5 removed in-network fragmentation, so every IPv6
+    /// packet is one its sender forbade fragmenting.
+    fn sized_udp_v6(total: usize) -> Vec<u8> {
+        let mut packet = vec![0u8; total];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&((total - 40) as u16).to_be_bytes());
+        packet[6] = 17; // UDP
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        packet[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
+        packet[40..42].copy_from_slice(&49152u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&443u16.to_be_bytes());
+        packet[44..46].copy_from_slice(&((total - 40) as u16).to_be_bytes());
+        packet
+    }
+
+    /// **IPv6 reports the same fact with a different message, and getting the
+    /// two confused is silent.** A v4 report is Destination Unreachable /
+    /// Fragmentation Needed with a `u16` MTU in the second header word; a v6
+    /// report is Packet Too Big, its own type, with a `u32` MTU one word
+    /// earlier. A v4-shaped message on a v6 packet parses as something else
+    /// entirely and no stack complains — it just never learns its path.
+    #[test]
+    fn an_ipv6_report_is_packet_too_big_not_fragmentation_needed() {
+        let mut path = fast_path();
+        let oversized = sized_udp_v6(1500);
+        path.on_tun_packet(&oversized, Instant::now()).unwrap();
+
+        let reply = path.poll_transmit().expect("the sender is answered");
+        assert_eq!(reply.to, Side::Tunnel);
+        assert_eq!(reply.bytes[6], 58, "next header is ICMPv6, not ICMPv4's 1");
+        assert_eq!(reply.bytes[40], 2, "Packet Too Big (RFC 4443 §3.2)");
+        assert_eq!(reply.bytes[41], 0, "which has exactly one code");
+        assert_eq!(
+            u32::from_be_bytes(reply.bytes[44..48].try_into().unwrap()),
+            1440,
+            "a 32-bit MTU one word earlier than IPv4 puts its 16-bit one"
+        );
+        assert_eq!(
+            &reply.bytes[48..88],
+            &oversized[..40],
+            "quoting the packet that did not fit"
+        );
+        assert!(
+            reply.bytes.len() <= 1280,
+            "RFC 4443 §2.4 (c): an ICMPv6 error never exceeds the IPv6 minimum \
+             MTU, or the report itself needs a report"
+        );
+    }
+
+    /// The ICMPv6 checksum covers a pseudo-header of the IPv6 addresses, the
+    /// payload length, and the next-header value; ICMPv4's covers the ICMP
+    /// message alone. A v6 message checksummed the v4 way is discarded by every
+    /// receiver, and a test that only ever built v4 would never notice.
+    #[test]
+    fn both_families_checksum_the_way_their_own_rfc_says() {
+        let now = Instant::now();
+        for (label, oversized) in [
+            ("ipv4", sized_udp(1500, true)),
+            ("ipv6", sized_udp_v6(1500)),
+        ] {
+            let mut path = fast_path();
+            path.on_tun_packet(&oversized, now).unwrap();
+            let reply = path.poll_transmit().unwrap_or_else(|| panic!("{label}"));
+            // `from_ip` verifies nothing, so the checksum is recomputed over
+            // what was written and compared with what was written.
+            let sliced = etherparse::SlicedPacket::from_ip(&reply.bytes)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            let ok = match sliced.transport {
+                Some(etherparse::TransportSlice::Icmpv4(icmp)) => {
+                    icmp.header().icmp_type.calc_checksum(icmp.payload()) == icmp.header().checksum
+                }
+                Some(etherparse::TransportSlice::Icmpv6(icmp)) => {
+                    let source = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets();
+                    let destination = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+                    icmp.header()
+                        .icmp_type
+                        .calc_checksum(source, destination, icmp.payload())
+                        == Ok(icmp.header().checksum)
+                }
+                other => panic!("{label}: not an ICMP reply: {other:?}"),
+            };
+            assert!(ok, "{label}: the checksum does not verify");
+        }
+    }
+
+    /// RFC 1122 §3.2.2 and RFC 4443 §2.4 (e): an error is never answered with
+    /// an error, or two hosts each reporting the other's report never stop.
+    /// **The classification differs by family and that is the whole hazard** —
+    /// IPv6 says "type below 128", IPv4 says "one of these five", and IPv6's
+    /// rule applied to IPv4 would read Echo Request (type 8) as an error and
+    /// stop answering the one probe a person can run by hand.
+    #[test]
+    fn an_oversized_icmp_error_is_not_answered_but_an_oversized_echo_is() {
+        let now = Instant::now();
+        let mut body = vec![0u8; 1472];
+        body[0] = 0x45; // whatever an error would be quoting
+
+        for (label, kind, answered) in [
+            ("v4 destination unreachable", 3, false),
+            ("v4 time exceeded", 11, false),
+            ("v4 redirect", 5, false),
+            // **Type 8 is the whole point.** IPv4 calls it Echo Request and
+            // answers it; IPv6 has nothing there and, being below 128, calls
+            // it an error and stays quiet. One number, two verdicts.
+            ("v4 echo request", 8, true),
+        ] {
+            let mut path = fast_path();
+            let packet = {
+                let mut packet = icmpv4([192, 0, 2, 1], [198, 51, 100, 2], kind, &body);
+                packet[6] = 0x40; // Don't Fragment
+                packet
+            };
+            assert_eq!(packet.len(), 1500, "{label}");
+            path.on_tun_packet(&packet, now).unwrap();
+            let out = path.poll_transmit().unwrap_or_else(|| panic!("{label}"));
+            assert_eq!(
+                out.to,
+                if answered { Side::Tunnel } else { Side::Egress },
+                "{label}"
+            );
+        }
+
+        for (label, kind, answered) in [
+            ("v6 packet too big", 2, false),
+            ("v6 type 8, which IPv4 would have answered", 8, false),
+            ("v6 echo request", 128, true),
+            ("v6 neighbor solicitation", 135, true),
+        ] {
+            let mut path = fast_path();
+            let mut packet = sized_udp_v6(1500);
+            packet[6] = 58; // ICMPv6
+            packet[40] = kind;
+            packet[41] = 0;
+            path.on_tun_packet(&packet, now).unwrap();
+            let out = path.poll_transmit().unwrap_or_else(|| panic!("{label}"));
+            assert_eq!(
+                out.to,
+                if answered { Side::Tunnel } else { Side::Egress },
+                "{label}"
+            );
+        }
     }
 }

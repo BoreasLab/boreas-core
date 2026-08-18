@@ -77,7 +77,10 @@ pub use origin::{
     Assembly, DEFAULT_ORIGINATION_PORTS, NoPacketEgress, OriginationPorts, PortRangeError,
     TunnelledDialer, assemble,
 };
-pub use packet::{IngressPacket, PacketError, Transport, WriteError, udp_datagram_len, write_udp};
+pub use packet::{
+    IcmpClass, IngressPacket, PacketError, Transport, WriteError, forbids_fragmentation,
+    udp_datagram_len, write_too_big, write_udp,
+};
 pub use path::{PathUpdate, clamp_mss, validate_ptb};
 #[cfg(unix)]
 pub use platform::AndroidTun;
@@ -420,7 +423,7 @@ pub fn admit(transport: Transport, dns: DnsPolicy, backstop: Backstop) -> Admiss
             destination_port: HTTPS_PORT,
             ..
         } if backstop == Backstop::Active => Admission::Settled(IngressAction::DropSteered),
-        Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp => Admission::Planned,
+        Transport::Tcp { .. } | Transport::Udp { .. } | Transport::Icmp(_) => Admission::Planned,
     }
 }
 
@@ -439,7 +442,7 @@ pub fn route_planned(transport: Transport, plan: FlowPlan) -> IngressAction {
     match transport {
         Transport::Tcp { .. } => IngressAction::OpenStream(plan),
         Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
-        Transport::Icmp => IngressAction::HandleIcmp(plan),
+        Transport::Icmp(_) => IngressAction::HandleIcmp(plan),
         // Both were settled by `admit`; reaching them here means a caller
         // bypassed it, and dropping is the answer that cannot be wrong.
         Transport::Other | Transport::Fragment => IngressAction::DropUnsupported,

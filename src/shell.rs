@@ -125,6 +125,11 @@ pub enum Telemetry {
     /// QUIC attempts the steering backstop refused. Convergence is this
     /// falling back to zero once the browser has re-raced to TCP.
     QuicSteered(u64),
+    /// Over-sized packets answered with an ICMP Packet Too Big. A count that
+    /// stays high past a client's path discovery is a link MTU configured
+    /// wider than the tunnel can carry, which is a configuration fault this
+    /// number is the only visible symptom of.
+    PathsReported(u64),
     /// One resolved query, with everything needed to explain its verdict.
     ///
     /// Passed through whole rather than folded: a query is a flow-scale event,
@@ -636,6 +641,7 @@ struct Counters {
     egress_rejected: u64,
     queries_dropped: u64,
     quic_steered: u64,
+    paths_reported: u64,
     termination_dropped: u64,
 }
 
@@ -660,6 +666,7 @@ impl Counters {
         report(&mut self.egress_rejected, Telemetry::EgressRejected);
         report(&mut self.queries_dropped, Telemetry::QueriesDropped);
         report(&mut self.quic_steered, Telemetry::QuicSteered);
+        report(&mut self.paths_reported, Telemetry::PathsReported);
         report(&mut self.termination_dropped, Telemetry::TerminationDropped);
     }
 }
@@ -1014,6 +1021,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             FlowEvent::DatagramDropped(_) => counters.datagrams_dropped += 1,
             FlowEvent::TransmitDropped => counters.transmits_dropped += 1,
             FlowEvent::QuicSteered => counters.quic_steered += 1,
+            FlowEvent::PathReported(_) => counters.paths_reported += 1,
             // Flow lifecycle events are bounded by the flow count, so they
             // pass through one for one.
             event @ (FlowEvent::StreamOpened(_)
