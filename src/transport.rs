@@ -42,7 +42,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use futures_core::Stream;
 use futures_sink::Sink;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
@@ -61,6 +61,20 @@ use crate::{
 /// transport, it would be half of one.
 pub trait ProxyTransport: Send + Sync {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>>;
+
+    /// The name the layer below is addressed by, for an HTTP-shaped transport
+    /// above it to put in `Host` when the deployment has not overridden it.
+    ///
+    /// **sing-box's rule, and it matters on the wire**: configured host, then
+    /// the TLS server name, then the server's address. A transport that made
+    /// something up instead — `localhost`, say — announces itself to any server
+    /// that logs the field and to any CDN that routes on it.
+    ///
+    /// `None` only for a transport that genuinely cannot know. Every chain
+    /// bottoms out at [`PlainTransport`] or [`TlsTransport`], both of which can.
+    fn authority(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A boxed chain is itself a transport.
@@ -74,6 +88,10 @@ impl ProxyTransport for Box<dyn ProxyTransport> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         (**self).dial()
     }
+
+    fn authority(&self) -> Option<&str> {
+        (**self).authority()
+    }
 }
 
 /// A plain TCP transport through the tunnel bypass.
@@ -83,12 +101,19 @@ impl ProxyTransport for Box<dyn ProxyTransport> {
 /// `Plain` rather than something that could be mistaken for secure.
 pub struct PlainTransport<B> {
     server: SocketAddr,
+    /// Rendered once, because `authority` hands out a borrow and a
+    /// `SocketAddr` has no `&str` view of its own.
+    authority: String,
     bypass: B,
 }
 
 impl<B: TunnelBypass> PlainTransport<B> {
     pub fn new(server: SocketAddr, bypass: B) -> Self {
-        Self { server, bypass }
+        Self {
+            authority: server.to_string(),
+            server,
+            bypass,
+        }
     }
 }
 
@@ -99,6 +124,10 @@ impl<B: TunnelBypass + 'static> ProxyTransport for PlainTransport<B> {
                 crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.server)).await?;
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
         })
+    }
+
+    fn authority(&self) -> Option<&str> {
+        Some(&self.authority)
     }
 }
 
@@ -172,6 +201,12 @@ impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {
                 .await?;
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
         })
+    }
+
+    /// The name in SNI, which is what a server expects to see echoed in `Host`
+    /// and what a fronted deployment's CDN routes on.
+    fn authority(&self) -> Option<&str> {
+        Some(&self.server_name)
     }
 }
 
@@ -248,7 +283,7 @@ impl<T: ProxyTransport + 'static> ProxyTransport for WebSocketTransport<T> {
             // The authority is only ever a name here: the socket is already
             // connected, so this URI is read for its `Host` header and its path
             // and never resolved.
-            let host = self.headers.host_or("localhost");
+            let host = self.headers.host_or(self.inner.authority().unwrap_or(""));
             let uri = format!("ws://{host}{}", self.path);
             let mut request = http::Request::builder()
                 .uri(&uri)
@@ -274,6 +309,12 @@ impl<T: ProxyTransport + 'static> ProxyTransport for WebSocketTransport<T> {
                 .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
             Ok(Box::new(WebSocketStream::new(socket)) as Box<dyn AsyncStream>)
         })
+    }
+
+    /// Delegated: what a chain is addressed by belongs to whatever is
+    /// underneath it, not to the framing on top.
+    fn authority(&self) -> Option<&str> {
+        self.inner.authority()
     }
 }
 
@@ -403,6 +444,16 @@ pub struct HttpUpgradeConfig {
 /// throughput while the thing that actually gets a connection through a CDN is
 /// the *handshake* looking like a WebSocket's. So this sends exactly that
 /// handshake, takes the `101`, and then speaks raw bytes.
+///
+/// **The reference is sing-box's `v2rayhttpupgrade`, and this matches it byte
+/// for byte** — including the two details a from-scratch implementation gets
+/// wrong. sing-box builds a Go `http.Request` and calls `Write`, so the wire
+/// order is Go's: request line, `Host`, `User-Agent`, then every remaining
+/// header **sorted by canonical name**. And it sends Go's default
+/// `User-Agent`, because it never sets one. Neither is negotiable: a request
+/// whose header order differs from every other client of this protocol is a
+/// request that stands out in exactly the logs this transport exists to blend
+/// into.
 pub struct HttpUpgradeTransport<T> {
     path: String,
     headers: HttpHeaders,
@@ -423,95 +474,170 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpUpgradeTransport<T> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let mut stream = self.inner.dial().await?;
-            let host = self.headers.host_or("localhost");
-            let mut request = format!(
-                "GET {} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n",
-                self.path
-            );
-            for (name, value) in &self.headers.extra {
-                request.push_str(&format!("{name}: {value}\r\n"));
-            }
-            request.push_str("\r\n");
-            stream.write_all(request.as_bytes()).await?;
-            stream.flush().await?;
-
-            let surplus = read_upgrade_response(&mut stream).await?;
-            // Whatever followed the response head is already tunnel payload;
-            // `Prefixed` replays it. sing-box does the same with a cached conn,
-            // and omitting it truncates the first read of every connection
-            // where the server answers and sends in one segment.
+            let host = self.headers.host_or(self.inner.authority().unwrap_or(""));
+            let mut upgrade = Upgrade::new(&self.path, &host, &self.headers);
+            // Whatever followed the `101` is already tunnel payload; the
+            // negotiation reports it and `Prefixed` replays it. Omitting that
+            // truncates the first read of every connection where the server
+            // answers and sends in one segment, which is what sing-box's
+            // `bufio.NewCachedConn` exists to prevent on its side.
             //
-            // **The mirror image of this is a race in sing-box's server, and it
-            // is not ours to fix.** Go's `http.Server` buffers whatever it has
-            // read when a handler hijacks the connection and returns it in a
-            // `bufrw`; sing-box discards that value, so payload arriving in the
-            // window between its `101` and its `Hijack` is lost and the flow is
-            // reset. Sending nothing for a moment after the response would
-            // narrow that window without closing it, at the cost of a delay on
-            // every connection, so this client does what the reference client
-            // does and writes immediately. `tests/interop.rs` retries a flow
-            // for this reason and says so.
+            // **The mirror image of this is a race in the reference servers,
+            // and it is not ours to fix.** Go's `http.Server` buffers whatever
+            // it read when a handler hijacks the connection and hands it back
+            // in a `bufrw`; both sing-box and Xray-core discard that value, so
+            // payload arriving in the window between their `101` and their
+            // `Hijack` is lost and the flow is reset. Waiting before writing
+            // would narrow that window without closing it, at the cost of a
+            // delay on every connection, so this client does what the reference
+            // clients do and writes immediately. `tests/interop.rs` retries a
+            // flow for this reason and says so.
+            let ((), surplus) = crate::negotiate(&mut stream, &mut upgrade).await?;
             Ok(Box::new(Prefixed::new(surplus, stream)) as Box<dyn AsyncStream>)
+        })
+    }
+
+    fn authority(&self) -> Option<&str> {
+        self.inner.authority()
+    }
+}
+
+/// Go's default, which is what sing-box sends because it never sets one. A
+/// deployment that wants a browser's puts it in `headers`.
+const GO_USER_AGENT: &str = "Go-http-client/1.1";
+
+/// The HTTP/1.1 Upgrade exchange, as a pure state machine.
+///
+/// No socket, no clock: the request is built once at construction and handed
+/// over on the first advance, and every subsequent one re-reads the same
+/// growing response buffer. That is what lets the whole exchange — including a
+/// server that dribbles its status line one byte at a time — be tested without
+/// a network.
+struct Upgrade {
+    /// Taken on the first advance, which is how "write once per phase" is
+    /// enforced by the type rather than by a flag.
+    request: Option<Vec<u8>>,
+}
+
+impl Upgrade {
+    fn new(path: &str, host: &str, headers: &HttpHeaders) -> Self {
+        Self {
+            request: Some(encode_upgrade_request(path, host, headers)),
+        }
+    }
+}
+
+impl crate::Negotiation for Upgrade {
+    type Output = ();
+
+    /// O(response head), re-parsed from the start on each offer. The head is
+    /// bounded by the driver, and re-parsing a few hundred bytes a handful of
+    /// times is cheaper than the incremental parser it would take to avoid it.
+    fn advance(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<crate::Decoded<()>, ProxyError> {
+        if let Some(request) = self.request.take() {
+            out.extend_from_slice(&request);
+        }
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut response = httparse::Response::new(&mut headers);
+        let head = match response.parse(input).map_err(|_| ProxyError::Header)? {
+            httparse::Status::Complete(head) => head,
+            httparse::Status::Partial => return Ok(crate::Decoded::Incomplete),
+        };
+
+        // The numeric code, as sing-box checks it. Xray-core compares the whole
+        // status line to `"101 Switching Protocols"`, which breaks against a
+        // server that writes a different reason phrase; matching the stricter
+        // reader would refuse connections the other reference client accepts.
+        if response.code != Some(101) {
+            return Err(ProxyError::Denied(format!(
+                "expected 101, got {}",
+                response.code.unwrap_or(0)
+            )));
+        }
+        // A `101` without the upgrade headers is a proxy that answered without
+        // switching protocols, and writing tunnel bytes into it would be
+        // writing into an HTTP response body. Both reference clients check
+        // both, case-insensitively on the value.
+        let named = |name: &str, want: &str| {
+            response.headers.iter().any(|header| {
+                header.name.eq_ignore_ascii_case(name)
+                    && std::str::from_utf8(header.value)
+                        .is_ok_and(|value| value.trim().eq_ignore_ascii_case(want))
+            })
+        };
+        if !named("Connection", "upgrade") || !named("Upgrade", "websocket") {
+            return Err(ProxyError::Denied(
+                "101 without the upgrade headers".to_owned(),
+            ));
+        }
+        Ok(crate::Decoded::Complete {
+            value: (),
+            consumed: head,
         })
     }
 }
 
-/// The largest response head this will buffer before giving up. A server that
-/// has not finished its headers by here is not one this transport can use, and
-/// the cap is what stops a hostile peer growing the buffer without bound.
-const MAX_HEAD: usize = 16 * 1024;
-
-/// Reads the `101` response and returns whatever was read past its head.
+/// Builds the request exactly as Go's `(*http.Request).Write` would.
 ///
-/// `httparse` does the parsing rather than a hand-rolled scan for `\r\n\r\n`:
-/// it is already in the graph beneath `hyper`, and it reports exactly the
-/// "incomplete, read more" state this needs instead of leaving the caller to
-/// distinguish a truncated head from a malformed one.
-async fn read_upgrade_response(stream: &mut Box<dyn AsyncStream>) -> Result<Vec<u8>, EgressError> {
-    let mut buf = Vec::with_capacity(512);
-    let mut chunk = [0u8; 512];
-    loop {
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut response = httparse::Response::new(&mut headers);
-        match response.parse(&buf) {
-            Ok(httparse::Status::Complete(head)) => {
-                if response.code != Some(101) {
-                    return Err(ProxyError::Denied(format!(
-                        "expected 101, got {}",
-                        response.code.unwrap_or(0)
-                    ))
-                    .into());
-                }
-                // sing-box checks both, and so does this: a `101` without the
-                // upgrade headers is a proxy that answered without switching
-                // protocols, and writing tunnel bytes into it would be writing
-                // into an HTTP response body.
-                let named = |name: &str, want: &str| {
-                    response.headers.iter().any(|header| {
-                        header.name.eq_ignore_ascii_case(name)
-                            && std::str::from_utf8(header.value)
-                                .is_ok_and(|value| value.eq_ignore_ascii_case(want))
-                    })
-                };
-                if !named("Connection", "upgrade") || !named("Upgrade", "websocket") {
-                    return Err(
-                        ProxyError::Denied("101 without the upgrade headers".to_owned()).into(),
-                    );
-                }
-                return Ok(buf.split_off(head));
-            }
-            Ok(httparse::Status::Partial) => {}
-            Err(_) => return Err(ProxyError::Header.into()),
-        }
-        if buf.len() >= MAX_HEAD {
-            return Err(ProxyError::Header.into());
-        }
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(EgressError::Io(std::io::ErrorKind::UnexpectedEof));
-        }
-        buf.extend_from_slice(&chunk[..read]);
+/// The ordering is the whole point and it is not this crate's choice: request
+/// line, `Host`, `User-Agent`, then everything else **sorted by canonical
+/// header name**, because that is what `Header.writeSubset` does and therefore
+/// what every server that has ever seen this protocol expects. `Connection` and
+/// `Upgrade` are in that sorted run rather than ahead of it, so a configured
+/// header beginning with `S` lands between them.
+///
+/// O(headers log headers) for the sort, once per dial.
+fn encode_upgrade_request(path: &str, host: &str, headers: &HttpHeaders) -> Vec<u8> {
+    let mut sorted: Vec<(String, &str)> = headers
+        .extra
+        .iter()
+        .map(|(name, value)| (canonical(name), value.as_str()))
+        .filter(|(name, _)| name != "Host" && name != "User-Agent")
+        .collect();
+    sorted.push(("Connection".to_owned(), "Upgrade"));
+    sorted.push(("Upgrade".to_owned(), "websocket"));
+    sorted.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let agent = headers
+        .extra
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
+        .map_or(GO_USER_AGENT, |(_, value)| value.as_str());
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n");
+    for (name, value) in sorted {
+        request.push_str(&format!("{name}: {value}\r\n"));
     }
+    request.push_str("\r\n");
+    request.into_bytes()
+}
+
+/// A header name in MIME canonical form: `content-type` becomes `Content-Type`.
+///
+/// Go canonicalises before sorting, so sorting the raw configured spelling
+/// would order `x-foo` after `Upgrade` where Go orders `X-Foo` before it.
+///
+/// O(name length), one allocation.
+fn canonical(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut starting = true;
+    for byte in name.chars() {
+        if starting {
+            out.extend(
+                byte.to_ascii_uppercase()
+                    .to_lowercase()
+                    .flat_map(char::to_uppercase),
+            );
+        } else {
+            out.push(byte.to_ascii_lowercase());
+        }
+        starting = byte == '-';
+    }
+    out
 }
 
 // --------------------------------------------------- HTTP/2 and gRPC
@@ -672,7 +798,10 @@ impl<T: ProxyTransport + 'static> ProxyTransport for GrpcTransport<T> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let sender = h2_sender(&self.connection, &self.inner).await?;
-            let host = self.config.headers.host_or("localhost");
+            let host = self
+                .config
+                .headers
+                .host_or(self.inner.authority().unwrap_or(""));
             let mut request = http::Request::builder()
                 .method(http::Method::POST)
                 .uri(format!(
@@ -694,13 +823,22 @@ impl<T: ProxyTransport + 'static> ProxyTransport for GrpcTransport<T> {
             h2_dial(sender, request, Framing::Grpc)
         })
     }
+
+    /// Delegated: what a chain is addressed by belongs to whatever is
+    /// underneath it, not to the framing on top.
+    fn authority(&self) -> Option<&str> {
+        self.inner.authority()
+    }
 }
 
 impl<T: ProxyTransport + 'static> ProxyTransport for HttpTransport<T> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let sender = h2_sender(&self.connection, &self.inner).await?;
-            let host = self.config.headers.host_or("localhost");
+            let host = self
+                .config
+                .headers
+                .host_or(self.inner.authority().unwrap_or(""));
             let method = http::Method::from_bytes(self.config.method.as_bytes())
                 .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
             let mut request = http::Request::builder()
@@ -714,6 +852,12 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpTransport<T> {
                 .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
             h2_dial(sender, request, Framing::Raw)
         })
+    }
+
+    /// Delegated: what a chain is addressed by belongs to whatever is
+    /// underneath it, not to the framing on top.
+    fn authority(&self) -> Option<&str> {
+        self.inner.authority()
     }
 }
 
@@ -1018,6 +1162,7 @@ impl<B: TunnelBypass + 'static> ProxyTransport for QuicTransport<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// **The trap this module exists to avoid.** Protobuf and QUIC varints
     /// agree on every value below 64 and disagree immediately above it, so a
@@ -1112,5 +1257,169 @@ mod tests {
             HttpHeaders::default().host_or("origin.example"),
             "origin.example"
         );
+    }
+
+    /// **The wire order is Go's, not ours, and that is the point.** sing-box
+    /// builds an `http.Request` and calls `Write`, which emits the request
+    /// line, `Host`, `User-Agent`, then every remaining header sorted by
+    /// canonical name. A request in any other order is a request that stands
+    /// out in the one log this transport exists to look ordinary in.
+    #[test]
+    fn an_upgrade_request_is_byte_identical_to_the_reference_clients() {
+        let request = encode_upgrade_request("/tunnel", "cdn.example", &HttpHeaders::default());
+        assert_eq!(
+            String::from_utf8(request).unwrap(),
+            "GET /tunnel HTTP/1.1\r\n\
+             Host: cdn.example\r\n\
+             User-Agent: Go-http-client/1.1\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             \r\n"
+        );
+    }
+
+    /// Configured headers join the sorted run rather than sitting after it, so
+    /// one beginning with `S` lands *between* `Connection` and `Upgrade` —
+    /// which is exactly where Go puts it and nowhere a hand-rolled builder
+    /// would.
+    #[test]
+    fn configured_headers_are_sorted_in_among_the_upgrade_pair() {
+        let headers = HttpHeaders {
+            host: None,
+            extra: vec![
+                ("x-late".to_owned(), "z".to_owned()),
+                ("sec-early".to_owned(), "a".to_owned()),
+                ("accept".to_owned(), "*/*".to_owned()),
+            ],
+        };
+        let request = String::from_utf8(encode_upgrade_request("/", "h", &headers)).unwrap();
+        let names: Vec<&str> = request
+            .lines()
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Host",
+                "User-Agent",
+                "Accept",
+                "Connection",
+                "Sec-Early",
+                "Upgrade",
+                "X-Late",
+            ],
+            "canonicalised, then sorted, exactly as Go's writeSubset does"
+        );
+    }
+
+    /// A deployment that wants a browser's user agent gets it, and does not get
+    /// two.
+    #[test]
+    fn a_configured_user_agent_replaces_gos_default_rather_than_joining_it() {
+        let headers = HttpHeaders {
+            host: None,
+            extra: vec![("User-Agent".to_owned(), "Mozilla/5.0".to_owned())],
+        };
+        let request = String::from_utf8(encode_upgrade_request("/", "h", &headers)).unwrap();
+        assert_eq!(request.matches("User-Agent:").count(), 1);
+        assert!(request.contains("User-Agent: Mozilla/5.0\r\n"));
+        assert!(!request.contains(GO_USER_AGENT));
+    }
+
+    /// The `Host` a server sees is the fronted name when one is configured, and
+    /// otherwise whatever the layer below is addressed by. **Never a made-up
+    /// constant**: a request announcing `localhost` to a CDN is a request that
+    /// does not route and a log line that does not blend in.
+    #[test]
+    fn the_host_falls_back_to_what_the_layer_below_is_addressed_by() {
+        let fronted = HttpHeaders {
+            host: Some("fronted.example".to_owned()),
+            extra: Vec::new(),
+        };
+        assert_eq!(fronted.host_or("origin.example"), "fronted.example");
+        assert_eq!(
+            HttpHeaders::default().host_or("origin.example"),
+            "origin.example"
+        );
+    }
+
+    /// The exchange, driven a byte at a time. A client that only works when the
+    /// whole response head lands in one read is one that works against a
+    /// loopback test and fails behind a middlebox that splits the segment.
+    #[tokio::test]
+    async fn the_upgrade_completes_however_the_response_is_split() {
+        for chunk in [1usize, 7, 4096] {
+            let (mut peer, ours) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 256];
+                while !seen.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let read = peer.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    seen.extend_from_slice(&buf[..read]);
+                }
+                let response = b"HTTP/1.1 101 Switching Protocols\r\n\
+                                 Connection: upgrade\r\n\
+                                 Upgrade: websocket\r\n\r\npayload";
+                for piece in response.chunks(chunk) {
+                    peer.write_all(piece).await.unwrap();
+                    peer.flush().await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            });
+
+            let mut stream = ours;
+            let mut upgrade = Upgrade::new("/", "h", &HttpHeaders::default());
+            let ((), surplus) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::negotiate(&mut stream, &mut upgrade),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("chunked by {chunk}: stalled"))
+            .unwrap_or_else(|error| panic!("chunked by {chunk}: {error}"));
+            assert_eq!(surplus, b"payload", "chunked by {chunk}");
+        }
+    }
+
+    /// A `101` is not enough on its own. Both reference clients check the
+    /// upgrade headers too, because a proxy that answered without switching
+    /// protocols would take tunnel bytes as an HTTP response body.
+    #[test]
+    fn a_response_that_did_not_switch_protocols_is_refused() {
+        use crate::Negotiation;
+        let refusals: [&[u8]; 4] = [
+            b"HTTP/1.1 200 OK\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: close\r\nUpgrade: websocket\r\n\r\n",
+        ];
+        for response in refusals {
+            let mut upgrade = Upgrade::new("/", "h", &HttpHeaders::default());
+            let mut out = Vec::new();
+            assert!(
+                upgrade.advance(response, &mut out).is_err(),
+                "{}",
+                String::from_utf8_lossy(response)
+            );
+        }
+    }
+
+    /// Header values arrive with the space after the colon still attached in
+    /// some servers' spelling; comparing without trimming rejects a perfectly
+    /// ordinary `101`.
+    #[test]
+    fn header_values_are_compared_case_insensitively_and_untrimmed() {
+        use crate::Negotiation;
+        let mut upgrade = Upgrade::new("/", "h", &HttpHeaders::default());
+        let mut out = Vec::new();
+        let response = b"HTTP/1.1 101 Switching Protocols\r\n\
+                         Connection: Upgrade\r\n\
+                         Upgrade: WebSocket\r\n\r\n";
+        assert!(matches!(
+            upgrade.advance(response, &mut out).unwrap(),
+            crate::Decoded::Complete { .. }
+        ));
     }
 }

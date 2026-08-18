@@ -164,6 +164,22 @@ pub enum VlessTransport {
         tls: crate::TlsConfig,
         settings: crate::GrpcConfig,
     },
+    /// An HTTP/1.1 Upgrade over TLS, and **raw bytes after it**.
+    ///
+    /// The same handshake a WebSocket performs — which is the part a CDN
+    /// inspects — without the per-message header and masking a WebSocket pays
+    /// for every frame afterwards. Choose it over [`Self::WebSocket`] wherever
+    /// the infrastructure in the way proxies an upgrade transparently, which is
+    /// what it was invented for.
+    HttpUpgrade {
+        tls: crate::TlsConfig,
+        settings: crate::HttpUpgradeConfig,
+    },
+    /// An ordinary HTTP/2 request whose body is the byte stream.
+    Http {
+        tls: crate::TlsConfig,
+        settings: crate::HttpConfig,
+    },
 }
 
 /// How names are answered.
@@ -1191,6 +1207,14 @@ impl VlessTransport {
                 crate::TlsTransport::new(tls, bypass)?,
             )),
             Self::Grpc { tls, settings } => Box::new(crate::GrpcTransport::new(
+                settings,
+                crate::TlsTransport::new(tls, bypass)?,
+            )),
+            Self::HttpUpgrade { tls, settings } => Box::new(crate::HttpUpgradeTransport::new(
+                settings,
+                crate::TlsTransport::new(tls, bypass)?,
+            )),
+            Self::Http { tls, settings } => Box::new(crate::HttpTransport::new(
                 settings,
                 crate::TlsTransport::new(tls, bypass)?,
             )),

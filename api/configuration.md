@@ -56,7 +56,15 @@ survive a hostile network lives underneath. Pick one:
 | `Plain { server }` | TCP in the clear. Only correct under something that already provides confidentiality. |
 | `Tls(TlsConfig)` | TLS over TCP, wearing Chrome's hello. |
 | `WebSocket { tls, settings }` | A WebSocket over TLS. What a CDN-fronted deployment looks like to middleboxes. |
+| `HttpUpgrade { tls, settings }` | The same upgrade handshake a WebSocket performs, then **raw bytes**. Prefer it over `WebSocket` wherever the infrastructure in the way proxies an upgrade transparently: identical to inspect, without the per-frame header and masking. |
 | `Grpc { tls, settings }` | gRPC over HTTP/2 over TLS. |
+| `Http { tls, settings }` | An ordinary HTTP/2 request whose body is the byte stream. |
+
+`WebSocketConfig`, `HttpUpgradeConfig`, and `HttpConfig` each carry a `path` and
+an `HttpHeaders`. `HttpHeaders::host` overrides the `Host` header — set it to
+the fronted name when the address you dial and the name the CDN routes on
+differ. Left unset, `Host` is the TLS server name, then the server address; it
+is never a placeholder.
 
 `TlsConfig::extra_roots` accepts DER trust anchors **in addition to** the
 bundled Mozilla set, for a self-hosted server behind a private CA. There is
