@@ -219,7 +219,10 @@ impl std::fmt::Display for DomainName {
 /// with a nearby edge instead of one near the client; and a name resolved
 /// locally would leak the destination to the local resolver the tunnel exists
 /// to bypass.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Hash`, because a proxy whose datagram framing binds a stream to one
+/// destination has to key its streams by it — VLESS is that proxy, and the
+/// alternative is a linear scan per datagram.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     Ip(std::net::SocketAddr),
     Domain { host: DomainName, port: u16 },

@@ -21,13 +21,18 @@
 //! destination for every name and every IPv6 address. They are separate
 //! functions for that reason, and the tests pin both.
 
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::{Mutex, mpsc},
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, Decoded, DomainName, EgressError, NatBehavior,
-    PathProperties, ProxyError, ProxyTransport, StreamEgress, Target,
+    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
+    DomainName, EgressError, NatBehavior, PathProperties, ProxyError, ProxyTransport, StreamEgress,
+    Target,
 };
 
 /// The only VLESS version, and the only one the reference implementations
@@ -38,6 +43,13 @@ const VERSION: u8 = 0;
 /// VLESS UDP needs a length-prefixed packet framing this egress does not
 /// implement, and the path properties say so rather than implying it.
 const COMMAND_TCP: u8 = 1;
+/// UDP. **The address in the request header is the only one there is** — a
+/// datagram frame on a UDP stream carries a length and a payload and nothing
+/// else — so one stream serves exactly one destination. That is what shapes
+/// [`VlessDatagrams`] and it is not a shortcut: Xray's own non-mux path works
+/// the same way, which is why it reserves that path for DNS and reaches for
+/// XUDP everywhere else.
+const COMMAND_UDP: u8 = 2;
 
 /// VMess/VLESS address family bytes. Note `Domain` and `Ipv6` relative to
 /// SOCKS5: the values are swapped, which is why this table is written out.
@@ -194,10 +206,21 @@ pub fn decode_addr_port(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
 /// that XTLS Vision uses, which belongs with Reality rather than with plain
 /// VLESS, and an empty block is the explicit "no flow" the reference expects.
 pub fn encode_request(user: &UserId, target: &Target, out: &mut Vec<u8>) {
+    request(user, target, COMMAND_TCP, out);
+}
+
+/// The same header with the UDP command. Separate rather than a boolean
+/// parameter, because the two produce streams that behave differently enough
+/// that a caller should have had to name which it wanted.
+pub fn encode_datagram_request(user: &UserId, target: &Target, out: &mut Vec<u8>) {
+    request(user, target, COMMAND_UDP, out);
+}
+
+fn request(user: &UserId, target: &Target, command: u8, out: &mut Vec<u8>) {
     out.push(VERSION);
     out.extend_from_slice(user.as_bytes());
     out.push(0); // addons length: no flow
-    out.push(COMMAND_TCP);
+    out.push(command);
     encode_addr_port(target, out);
 }
 
@@ -233,30 +256,274 @@ pub struct VlessConfig {
     pub nat_behavior: NatBehavior,
 }
 
+// ---------------------------------------------------------- UDP
+
+/// One datagram on a UDP stream: a big-endian length and that many bytes.
+///
+/// The whole per-packet framing. No address, no session identifier, no sequence
+/// number — everything that would identify a packet is instead a property of
+/// the stream it arrived on.
+const LENGTH_PREFIX: usize = 2;
+
+/// The largest frame the reference writer will emit, which is its 8 KiB buffer
+/// less the prefix. Read side accepts up to 65535, but writing more than a peer
+/// will write is how a client discovers that a server silently drops it.
+const MAX_FRAME: usize = 8192 - LENGTH_PREFIX;
+
+/// Datagrams held for a mapping that is not draining them. Bounded and lossy,
+/// as every datagram queue in this crate is.
+const INBOUND_DEPTH: usize = 64;
+
+/// The sending half of one destination's stream. Shared, because `send_to`
+/// takes `&self` and every flow in the mapping writes through the same one.
+type Writer = Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
+
+/// One VLESS datagram association: a stream per destination, and one queue for
+/// what comes back.
+///
+/// **A stream per destination is what the protocol leaves us.** The target
+/// lives in the request header and a frame carries only a length, so a stream
+/// is bound to one peer for its life. Every reply on it is therefore *from*
+/// that peer, which is how [`DatagramSource`] can name a source at all without
+/// a per-packet address to read.
+///
+/// The visible consequence is the NAT behaviour: a server opens its own socket
+/// per stream, so two destinations see two source ports. That is what
+/// `nat_behavior` on [`VlessConfig`] is for, and configuring it as anything
+/// more generous than address-and-port-dependent would be a claim this shape
+/// cannot support.
+struct VlessDatagrams<T> {
+    transport: Arc<T>,
+    user: UserId,
+    /// The write half of the stream serving each destination, opened on first
+    /// use. An async mutex because opening one awaits, and because two flows to
+    /// the same peer arriving together must produce *one* stream rather than
+    /// two — the second waits and finds the first's.
+    streams: Mutex<HashMap<Target, Writer>>,
+    inbound: mpsc::Sender<(Vec<u8>, Target)>,
+    /// Ends every reader task this association started. Its lifetime is the
+    /// association's, so a dropped association leaves no task holding a socket.
+    shutdown: CancellationToken,
+}
+
+impl<T> Drop for VlessDatagrams<T> {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+impl<T: ProxyTransport + 'static> VlessDatagrams<T> {
+    /// The stream serving `target`, opening and registering one if there is
+    /// none.
+    ///
+    /// O(1) amortised. The lock is held across the dial deliberately: it is
+    /// what makes concurrent first datagrams to one peer share a stream instead
+    /// of racing to build two, and a second stream would mean a second source
+    /// port the peer sees.
+    async fn stream(&self, target: &Target) -> Result<Writer, EgressError> {
+        let mut held = self.streams.lock().await;
+        if let Some(stream) = held.get(target) {
+            return Ok(Arc::clone(stream));
+        }
+
+        let stream = self.transport.dial().await?;
+        let mut request = Vec::with_capacity(64);
+        encode_datagram_request(&self.user, target, &mut request);
+        let (reader, mut writer) = tokio::io::split(stream);
+        writer.write_all(&request).await?;
+        writer.flush().await?;
+
+        tokio::spawn(read_datagrams(
+            reader,
+            target.clone(),
+            self.inbound.clone(),
+            self.shutdown.clone(),
+        ));
+
+        let writer: Writer = Arc::new(Mutex::new(Box::new(writer)));
+        held.insert(target.clone(), Arc::clone(&writer));
+        Ok(writer)
+    }
+}
+
+/// Reads one stream's frames until it ends, attributing each to the peer the
+/// stream was opened for.
+///
+/// The response header is consumed here rather than at dial, for the reason the
+/// TCP side gives: a server sends it with its first payload, which may be long
+/// after the request, and waiting at dial would block on the *target* rather
+/// than on the proxy.
+async fn read_datagrams<R: AsyncRead + Unpin + Send + 'static>(
+    mut reader: R,
+    target: Target,
+    inbound: mpsc::Sender<(Vec<u8>, Target)>,
+    shutdown: CancellationToken,
+) {
+    let mut held: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; MAX_FRAME];
+    let mut header = false;
+
+    loop {
+        let read = tokio::select! {
+            () = shutdown.cancelled() => break,
+            read = reader.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            },
+        };
+        held.extend_from_slice(&chunk[..read]);
+
+        if !header {
+            match decode_response(&held) {
+                Ok(Decoded::Complete { consumed, .. }) => {
+                    held.drain(..consumed);
+                    header = true;
+                }
+                Ok(Decoded::Incomplete) => continue,
+                Err(_) => break,
+            }
+        }
+
+        // Every whole frame currently held. A partial one stays for the next
+        // read rather than being delivered short: half a datagram is not a
+        // smaller datagram.
+        while held.len() >= LENGTH_PREFIX {
+            let length = usize::from(u16::from_be_bytes([held[0], held[1]]));
+            if held.len() < LENGTH_PREFIX + length {
+                break;
+            }
+            let payload = held[LENGTH_PREFIX..LENGTH_PREFIX + length].to_vec();
+            held.drain(..LENGTH_PREFIX + length);
+            // A zero-length frame is what the reference writer refuses to
+            // emit, so one arriving is noise rather than an empty datagram.
+            if length > 0 && inbound.try_send((payload, target.clone())).is_err() {
+                // The mapping is gone, or is not keeping up.
+                continue;
+            }
+        }
+    }
+}
+
+impl<T: ProxyTransport + 'static> DatagramSink for VlessDatagrams<T> {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<(), EgressError>> {
+        Box::pin(async move {
+            if payload.len() > MAX_FRAME {
+                return Err(EgressError::DatagramTooLarge {
+                    required: payload.len(),
+                });
+            }
+            let stream = self.stream(target).await?;
+            let mut frame = Vec::with_capacity(LENGTH_PREFIX + payload.len());
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.extend_from_slice(payload);
+            // One write for the whole frame: a length that reached the server
+            // without its payload behind it would desynchronise the stream for
+            // good, and there is no resynchronisation point in this framing.
+            let mut writer = stream.lock().await;
+            writer.write_all(&frame).await?;
+            writer.flush().await?;
+            Ok(())
+        })
+    }
+}
+
+/// The receiving half: every stream's reader feeds this one queue.
+struct VlessReplies {
+    inbound: mpsc::Receiver<(Vec<u8>, Target)>,
+    /// Held so the streams and their reader tasks outlive this half. Without
+    /// it, a caller that dropped the sink and kept the source would stop
+    /// receiving the moment the last stream closed.
+    _sink: Arc<dyn DatagramSink>,
+}
+
+impl DatagramSource for VlessReplies {
+    fn recv_from<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<(usize, Target), EgressError>> {
+        Box::pin(async move {
+            let (payload, from) = self
+                .inbound
+                .recv()
+                .await
+                .ok_or(EgressError::Io(std::io::ErrorKind::BrokenPipe))?;
+            let Some(into) = buf.get_mut(..payload.len()) else {
+                return Err(EgressError::DatagramTooLarge {
+                    required: payload.len(),
+                });
+            };
+            into.copy_from_slice(&payload);
+            Ok((payload.len(), from))
+        })
+    }
+}
+
 /// A VLESS server as a stream egress, over any [`ProxyTransport`].
 pub struct VlessEgress<T> {
     config: VlessConfig,
-    transport: T,
+    /// Shared rather than owned, because a datagram association holds one
+    /// stream per destination and each is dialled through this. `new` still
+    /// takes the transport by value: whether it is shared is this type's
+    /// business, not its caller's.
+    transport: Arc<T>,
 }
 
 impl<T: ProxyTransport> VlessEgress<T> {
     pub fn new(config: VlessConfig, transport: T) -> Self {
-        Self { config, transport }
+        Self {
+            config,
+            transport: Arc::new(transport),
+        }
     }
 }
 
 impl<T: ProxyTransport + 'static> StreamEgress for VlessEgress<T> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // VLESS UDP needs a length-prefixed packet framing this egress
-            // does not implement. Claiming otherwise would promise a relay
-            // that is not here.
-            datagram_fidelity: DatagramFidelity::None,
+            // **Emulated, not native, and the distinction is the whole point.**
+            // Datagram *boundaries* survive exactly -- the framing is a length
+            // and a payload -- but they cross a reliable, ordered stream, so a
+            // lost packet is retransmitted and everything behind it waits.
+            // That is fine for DNS and wrong for QUIC, which is precisely what
+            // `Emulated` tells the planner: carry the datagram flow, steer the
+            // QUIC one to HTTP/2 rather than running a loss-tolerant protocol
+            // over a loss-hiding transport.
+            datagram_fidelity: DatagramFidelity::Emulated,
             overhead_bytes: 0,
-            max_datagram_size: None,
+            max_datagram_size: Some(MAX_FRAME as u16),
             preserves_ecn: false,
             nat_behavior: self.config.nat_behavior,
         }
+    }
+
+    /// Opens a datagram association.
+    ///
+    /// **Nothing is dialled here.** A stream is bound to one destination for
+    /// its life, so there is no stream to open until a datagram names where it
+    /// is going; the association is a routing table and a queue, and it costs
+    /// one channel until the first packet.
+    fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
+        Box::pin(async move {
+            let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_DEPTH);
+            let sink = Arc::new(VlessDatagrams {
+                transport: Arc::clone(&self.transport),
+                user: self.config.user,
+                streams: Mutex::new(HashMap::new()),
+                inbound: inbound_tx,
+                shutdown: CancellationToken::new(),
+            });
+            Ok(Association {
+                source: Box::new(VlessReplies {
+                    inbound: inbound_rx,
+                    _sink: Arc::clone(&sink) as Arc<dyn DatagramSink>,
+                }),
+                sink,
+            })
+        })
     }
 
     fn connect<'a>(
@@ -531,5 +798,136 @@ mod tests {
         );
         // A version this client does not speak is named.
         assert_eq!(decode_response(&[9, 0]), Err(ProxyError::Version(9)));
+    }
+
+    /// The UDP command differs from TCP in exactly one byte, and the address
+    /// still rides in the request header — which is the fact the whole
+    /// stream-per-destination shape follows from.
+    #[test]
+    fn a_datagram_request_differs_from_a_stream_one_by_its_command() {
+        let user = UserId::parse("11111111-2222-3333-4444-555555555555").unwrap();
+        let target = Target::Domain {
+            host: DomainName::new("example.com").unwrap(),
+            port: 443,
+        };
+
+        let (mut tcp, mut udp) = (Vec::new(), Vec::new());
+        encode_request(&user, &target, &mut tcp);
+        encode_datagram_request(&user, &target, &mut udp);
+
+        assert_eq!(tcp.len(), udp.len());
+        assert_eq!(tcp[18], COMMAND_TCP);
+        assert_eq!(udp[18], COMMAND_UDP);
+        assert_eq!(&tcp[..18], &udp[..18], "version, user, and addons agree");
+        assert_eq!(
+            &tcp[19..],
+            &udp[19..],
+            "and the destination is in the header either way"
+        );
+    }
+
+    /// A reader that only ever sees whole frames would pass on a stream that
+    /// delivers one byte at a time, which is what a real one does. **A partial
+    /// frame is held, never delivered short** — half a datagram is not a
+    /// smaller datagram.
+    #[tokio::test]
+    async fn frames_reassemble_across_arbitrary_read_boundaries() {
+        let target = Target::Ip("198.51.100.7:53".parse().unwrap());
+        let payloads: [&[u8]; 3] = [b"first", b"second one", b"3"];
+
+        // A response header, then three framed datagrams.
+        let mut wire = vec![0u8, 0u8];
+        for payload in payloads {
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(payload);
+        }
+
+        for chunk in [1usize, 2, 7, wire.len()] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+            let shutdown = CancellationToken::new();
+            tokio::spawn(read_datagrams(
+                reader,
+                target.clone(),
+                inbound_tx,
+                shutdown.clone(),
+            ));
+
+            let wire = wire.clone();
+            tokio::spawn(async move {
+                for piece in wire.chunks(chunk) {
+                    writer.write_all(piece).await.unwrap();
+                    writer.flush().await.unwrap();
+                }
+                // Held open: closing would end the reader before the last
+                // frame had been taken off the channel.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+
+            for expected in payloads {
+                let (payload, from) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), inbound_rx.recv())
+                        .await
+                        .unwrap_or_else(|_| panic!("chunked by {chunk}: a frame never arrived"))
+                        .expect("the channel is open");
+                assert_eq!(payload, expected, "chunked by {chunk}");
+                assert_eq!(
+                    from, target,
+                    "attributed to the peer its stream was opened for"
+                );
+            }
+        }
+    }
+
+    /// The response header is stripped once and never re-read. A stream that
+    /// re-parsed it after the first frame would read payload as a header and
+    /// desynchronise for good.
+    #[tokio::test]
+    async fn the_response_header_is_consumed_exactly_once() {
+        let target = Target::Ip("198.51.100.7:53".parse().unwrap());
+        // A header with a two-byte addon block, so a second parse would eat
+        // four bytes of the frame behind it and produce nonsense.
+        let mut wire = vec![0u8, 2u8, 0xaa, 0xbb];
+        wire.extend_from_slice(&5u16.to_be_bytes());
+        wire.extend_from_slice(b"hello");
+        wire.extend_from_slice(&5u16.to_be_bytes());
+        wire.extend_from_slice(b"world");
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+        tokio::spawn(read_datagrams(
+            reader,
+            target.clone(),
+            inbound_tx,
+            CancellationToken::new(),
+        ));
+        tokio::spawn(async move {
+            writer.write_all(&wire).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        assert_eq!(inbound_rx.recv().await.unwrap().0, b"hello");
+        assert_eq!(inbound_rx.recv().await.unwrap().0, b"world");
+    }
+
+    /// Cancelling the association ends every reader it started, so a dropped
+    /// association leaves no task holding a socket.
+    #[tokio::test]
+    async fn cancelling_ends_a_reader_that_is_still_waiting() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let reading = tokio::spawn(read_datagrams(
+            reader,
+            Target::Ip("198.51.100.7:53".parse().unwrap()),
+            inbound_tx,
+            shutdown.clone(),
+        ));
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reading)
+            .await
+            .expect("the reader observes cancellation rather than blocking on a read")
+            .unwrap();
     }
 }
