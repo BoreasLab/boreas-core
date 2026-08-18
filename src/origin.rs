@@ -300,7 +300,7 @@ fn local_for(address: SocketAddr, port: u16) -> SocketAddr {
 /// session's DNS policy answers it. So the name is resolved in the same view
 /// the client saw, which is the property [`Target`] exists to protect on a
 /// proxy egress and which a packet tunnel gets for free.
-async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> {
+pub(crate) async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> {
     match target {
         Target::Ip(address) => Ok(*address),
         Target::Domain { host, port } => tokio::net::lookup_host((host.as_str(), *port))

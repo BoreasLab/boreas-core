@@ -83,6 +83,17 @@ pub trait TunnelBypass: Send + Sync {
         &self,
         peer: SocketAddr,
     ) -> impl Future<Output = io::Result<tokio::net::TcpStream>> + Send;
+
+    /// A UDP socket with **no peer**, for a datagram relay that names a
+    /// different destination per datagram.
+    ///
+    /// Required rather than defaulted, and deliberately so: a default would be
+    /// an ordinary wildcard bind, which is correct on a desktop and silently
+    /// wrong on Android — the socket would travel through the very tunnel it is
+    /// relaying for. A platform that had to override [`Self::udp`] has to
+    /// override this too, and a required method is what makes the compiler say
+    /// so instead of a comment.
+    fn unbound(&self) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send;
 }
 
 /// The bypass for a host where nothing is in the way: ordinary sockets on the
@@ -91,6 +102,12 @@ pub trait TunnelBypass: Send + Sync {
 /// Correct on a desktop whose default route is not the tunnel, and the
 /// deliberate wrong answer on Android, where the socket must be protected
 /// before it is connected. Named for what it does not do.
+///
+/// `Clone` because a tunnel needs one bypass per thing that dials -- the
+/// egress, the resolver, a relay -- and this one carries no state to share.
+/// An implementation that holds a JNI handle clones the handle, which is what
+/// `Clone` on such a type means everywhere else.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DirectSockets;
 
 impl TunnelBypass for DirectSockets {
@@ -119,6 +136,13 @@ impl TunnelBypass for DirectSockets {
         peer: SocketAddr,
     ) -> impl Future<Output = io::Result<tokio::net::TcpStream>> + Send {
         async move { tokio::net::TcpStream::connect(peer).await }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn unbound(&self) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send {
+        // Dual-stack v6, so one socket reaches peers of both families and a
+        // relay does not have to know which it will be asked for next.
+        async move { tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).await }
     }
 }
 

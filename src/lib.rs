@@ -1,3 +1,4 @@
+pub mod api;
 mod bridge;
 mod ca;
 mod datapath;
@@ -54,9 +55,9 @@ pub use dns::{
     write_failure, write_refusal, write_response,
 };
 pub use egress::{
-    Association, AsyncStream, BoxFuture, DatagramSink, DatagramSource, DomainName, DomainNameError,
-    Egress, EgressEmit, EgressError, Either, PacketEgress, Prefixed, StreamEgress, Target,
-    WIREGUARD_OVERHEAD_BYTES, WireGuardConfig, WireGuardEgress,
+    Association, AsyncStream, BoxFuture, DatagramSink, DatagramSource, DirectEgress, DomainName,
+    DomainNameError, Egress, EgressEmit, EgressError, Either, PacketEgress, Prefixed, StreamEgress,
+    Target, WIREGUARD_OVERHEAD_BYTES, WireGuardConfig, WireGuardEgress,
 };
 pub use exchange::{
     AllowAll, AltSvc, FilterVerdict, ProxyBody, RequestFilter, run_exchange, steer_alt_svc,

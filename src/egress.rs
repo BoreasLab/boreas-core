@@ -36,7 +36,7 @@ use gotatun::{
 
 use crate::{
     Accepts, BufferPool, ChainError, DatagramFidelity, Mtu, NatBehavior, PathProperties, Pooled,
-    ProxyError,
+    ProxyError, TunnelBypass,
 };
 
 /// An egress that accepts whole IP packets, such as WireGuard or MASQUE
@@ -100,6 +100,51 @@ pub trait PacketEgress: Send {
     /// rather than of each protocol.
     fn next_deadline(&self) -> Option<std::time::Instant> {
         None
+    }
+}
+
+/// A boxed packet egress is itself one.
+///
+/// The shape of an egress is a deployment's choice and therefore not known
+/// until runtime, so the reactor is handed a `Box<dyn PacketEgress>` — and the
+/// reactor is generic over `E: PacketEgress`, not over a box. This impl is what
+/// joins the two, exactly as [`crate::ProxyTransport`]'s does for a transport
+/// chain.
+impl PacketEgress for Box<dyn PacketEgress> {
+    fn properties(&self) -> PathProperties {
+        (**self).properties()
+    }
+
+    fn handle_tun_packet(
+        &mut self,
+        packet: &[u8],
+        out: &mut Vec<EgressEmit>,
+    ) -> Result<(), EgressError> {
+        (**self).handle_tun_packet(packet, out)
+    }
+
+    fn handle_network_packet(
+        &mut self,
+        datagram: &[u8],
+        out: &mut Vec<EgressEmit>,
+    ) -> Result<(), EgressError> {
+        (**self).handle_network_packet(datagram, out)
+    }
+
+    fn max_network_datagram(&self) -> usize {
+        (**self).max_network_datagram()
+    }
+
+    fn tick(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
+        (**self).tick(out)
+    }
+
+    fn tick_interval(&self) -> Duration {
+        (**self).tick_interval()
+    }
+
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        (**self).next_deadline()
     }
 }
 
@@ -419,6 +464,122 @@ pub trait StreamEgress: Send + Sync {
     /// already said so in its claim.
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async { Err(EgressError::DatagramsUnsupported) })
+    }
+}
+
+/// The identity [`StreamEgress`]: it opens the connection the client asked for,
+/// to the address the client asked for, and adds nothing.
+///
+/// **The most common configuration in the product this serves.** A content
+/// blocker filters what crosses without moving where it goes, so its egress is
+/// the one that does nothing — and without this type that configuration was the
+/// one thing the crate could not express, since every other egress is a proxy.
+///
+/// It dials through [`TunnelBypass`](crate::TunnelBypass) rather than through
+/// `TcpStream::connect`, which is the whole reason it is not trivial: a
+/// re-originated connection that went out over the default route would re-enter
+/// Boreas's own TUN and be terminated again, forever. The bypass is what the
+/// platform uses to exclude it, and naming the obligation here is what stops it
+/// being forgotten.
+pub struct DirectEgress<B> {
+    bypass: B,
+    /// Mapping behaviour reported to the planner. Configuration rather than a
+    /// constant because it is the *host's* NAT that governs here, not a
+    /// proxy's: a phone behind a carrier-grade NAT and a desktop with a public
+    /// address are the same code and different answers.
+    nat_behavior: NatBehavior,
+}
+
+impl<B: TunnelBypass> DirectEgress<B> {
+    pub fn new(bypass: B, nat_behavior: NatBehavior) -> Self {
+        Self {
+            bypass,
+            nat_behavior,
+        }
+    }
+}
+
+impl<B: TunnelBypass + 'static> StreamEgress for DirectEgress<B> {
+    fn properties(&self) -> PathProperties {
+        PathProperties {
+            // **Native, because there is nothing in the way.** A datagram sent
+            // here is the datagram the host stack sends, so QUIC survives, and
+            // the association below is one ordinary connected socket.
+            datagram_fidelity: DatagramFidelity::Native,
+            // Nothing is encapsulated, so nothing is charged. The client's own
+            // path MTU governs and this adds no header to it.
+            overhead_bytes: 0,
+            max_datagram_size: None,
+            preserves_ecn: false,
+            nat_behavior: self.nat_behavior,
+        }
+    }
+
+    fn connect<'a>(
+        &'a self,
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
+        Box::pin(async move {
+            let address = crate::origin::resolve(target).await?;
+            let stream = crate::within(crate::Wait::TcpConnect, self.bypass.tcp(address)).await?;
+            // Nagle would hold a short request waiting for bytes that are not
+            // coming, which on a re-originated exchange is pure added latency.
+            stream.set_nodelay(true)?;
+            Ok(Box::new(stream) as Box<dyn AsyncStream>)
+        })
+    }
+
+    /// **One socket per client mapping, not per target**, which is what makes
+    /// the endpoint-independent claim above true: the same socket carries
+    /// datagrams to every peer the mapping talks to, so a peer sees one source
+    /// port for the life of the association exactly as it would without Boreas.
+    fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
+        Box::pin(async move {
+            // Unconnected: `send_to` names a different peer per datagram, which
+            // a connected socket forbids. Bound through the bypass so the
+            // socket leaves by a route that is not the tunnel.
+            let relay = Arc::new(DirectRelay(self.bypass.unbound().await?));
+            Ok(Association {
+                source: Box::new(DirectSource {
+                    relay: Arc::clone(&relay),
+                }),
+                sink: relay,
+            })
+        })
+    }
+}
+
+/// One unbound socket, shared by the association's two halves. A newtype rather
+/// than an impl on tokio's socket, so this crate's trait stays this crate's.
+struct DirectRelay(tokio::net::UdpSocket);
+
+impl DatagramSink for DirectRelay {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<(), EgressError>> {
+        Box::pin(async move {
+            let address = crate::origin::resolve(target).await?;
+            self.0.send_to(payload, address).await?;
+            Ok(())
+        })
+    }
+}
+
+struct DirectSource {
+    relay: Arc<DirectRelay>,
+}
+
+impl DatagramSource for DirectSource {
+    fn recv_from<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<(usize, Target), EgressError>> {
+        Box::pin(async move {
+            let (len, from) = self.relay.0.recv_from(buf).await?;
+            Ok((len, Target::Ip(from)))
+        })
     }
 }
 
