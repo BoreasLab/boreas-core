@@ -1,6 +1,9 @@
-//! Feeds arbitrary bytes through the reassembler. Invariants under test:
-//! no panic, no out-of-bounds access, and a completed datagram is always the
-//! exact concatenation of non-overlapping fragment payloads that fit 64 KiB.
+//! Feeds arbitrary bytes through the reassembler. Invariants under test: no
+//! panic, no out-of-bounds access, and a completed datagram is a re-parseable
+//! IP packet whose payload is the concatenation of non-overlapping fragment
+//! payloads within the 64 KiB ceiling. The re-parse is the point: the datapath
+//! feeds every completion straight back into `IngressPacket::parse`, so a
+//! completion that is not a packet is a defect the fuzzer should surface.
 
 #![no_main]
 
@@ -37,6 +40,8 @@ fuzz_target!(|data: &[u8]| {
                     datagram.len() <= u16::MAX as usize,
                     "reassembled datagram exceeds the 64 KiB IPv4 ceiling"
                 );
+                boreas_core::IngressPacket::parse(&datagram)
+                    .expect("a completed reassembly must re-parse as an IP packet");
             }
             PushOutcome::Pending | PushOutcome::Discarded => {}
         }

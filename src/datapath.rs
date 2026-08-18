@@ -1309,6 +1309,58 @@ mod tests {
         );
     }
 
+    /// **The defect a completed reassembly used to be.** Fragments were
+    /// reassembled into their *payload* and then handed to `IngressPacket::parse`,
+    /// which reads an IP header — so every fragmented datagram this session was
+    /// asked to carry failed with `UnsupportedIpVersion`, indistinguishable
+    /// from a malformed packet. Nothing caught it because no test completed a
+    /// reassembly through the datapath.
+    #[test]
+    fn a_reassembled_datagram_re_enters_dispatch_as_a_packet() {
+        let mut path = datapath(crate::DatagramFidelity::Native);
+        let now = Instant::now();
+
+        // One UDP datagram split across two IPv4 fragments at the 8-byte
+        // boundary the wire's offset units impose.
+        let mut head = [0u8; 28];
+        head[0] = 0x45;
+        head[2..4].copy_from_slice(&28u16.to_be_bytes());
+        head[4..6].copy_from_slice(&0xbeefu16.to_be_bytes());
+        head[6..8].copy_from_slice(&0x2000u16.to_be_bytes()); // more fragments
+        head[8] = 64;
+        head[9] = 17;
+        head[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        head[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        head[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        head[22..24].copy_from_slice(&53u16.to_be_bytes());
+        head[24..26].copy_from_slice(&16u16.to_be_bytes()); // UDP length
+
+        let mut tail = head;
+        tail[6..8].copy_from_slice(&1u16.to_be_bytes()); // last fragment, at 8
+        tail[20..28].copy_from_slice(b"payload!");
+
+        path.on_tun_packet(&head, now).unwrap();
+        assert_eq!(path.poll_event(), None, "one fragment opens nothing");
+
+        path.on_tun_packet(&tail, now)
+            .expect("a reassembled datagram is a packet, not a parse failure");
+        assert_eq!(
+            path.poll_event(),
+            Some(FlowEvent::DatagramOpened(InternalEndpoint {
+                address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                port: 1234,
+            })),
+            "the flow is planned from the datagram's own header"
+        );
+        // And the bytes that reach the egress are the whole datagram, not the
+        // fragment that completed it.
+        let datagram = path.poll_datagram().expect("the payload was forwarded");
+        assert!(
+            datagram.payload.ends_with(b"payload!"),
+            "the reassembled payload reached the egress"
+        );
+    }
+
     #[test]
     fn fragment_quarantine_then_reassembled_admission() {
         let mut path = datapath(crate::DatagramFidelity::Native);

@@ -94,7 +94,7 @@ pub use platform::AndroidTun;
 pub use platform::WintunDevice;
 pub use pool::{BufferPool, Pooled};
 pub use quic::{H3Response, Handshake, QuicConnection, client_config};
-pub use reassembly::{Fragment, PushOutcome, Reassembler};
+pub use reassembly::{Fragment, PushOutcome, ReassembledPacket, Reassembler};
 pub use relay::{Inbound, Relay, RelayCounts, RelayLimits, run_relay};
 pub use rewrite::{
     Coding, CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable, Rewritable,

@@ -12,6 +12,13 @@
 //! - capacity and timeouts bound memory; a poisoned or evicted key admits
 //!   nothing until it expires.
 //!
+//! **What completes is a packet, not a payload.** The fragments carry
+//! transport bytes, but a consumer re-parses an IP datagram — so the headers of
+//! the fragment at offset zero are kept and the datagram is rebuilt behind
+//! them, per RFC 791 section 3.2 for IPv4 and RFC 8200 section 4.5 for IPv6.
+//! [`ReassembledPacket`] is what says which of the two came out; when it was
+//! `Vec<u8>` the two were the same type and the datapath parsed the wrong one.
+//!
 //! Time enters only through `now`, and the expiry index follows the same
 //! discipline as `UdpFlowTable`'s timer wheel: **one slot per pending
 //! datagram, inserted once**. A later fragment refreshes the datagram's
@@ -37,16 +44,46 @@ const MAX_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const BLOCK_BITS: usize = MAX_DATAGRAM_BYTES / 8 + 1;
 const BITMAP_WORDS: usize = BLOCK_BITS.div_ceil(64);
 
+/// The IPv6 Fragment header's Next Header value and fixed length (RFC 8200
+/// section 4.5: "The Fragment header is identified by a Next Header value of 44",
+/// and its format is two 32-bit words).
+const IPV6_FRAGMENT: u8 = 44;
+const IPV6_FRAGMENT_BYTES: usize = 8;
+const IPV6_HEADER_BYTES: usize = 40;
+
+/// One fragment of one datagram, and the headers the whole datagram will
+/// inherit from it.
+///
+/// **Fields are private because two of them are refinements the wire
+/// establishes and nothing else can.** `offset` is a multiple of eight, because
+/// it is decoded from a field counted in 8-byte units; `headers` is the exact
+/// prefix `payload` was carved out of. Reassembly's block accounting depends on
+/// the first and its output depends on the second, so [`Self::parse`] is the
+/// only way to make one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fragment<'a> {
-    pub source: IpAddr,
-    pub destination: IpAddr,
-    pub protocol: u8,
-    pub identification: u32,
-    /// Payload offset in bytes; wire units already decoded.
-    pub offset: u16,
-    pub more_fragments: bool,
-    pub payload: &'a [u8],
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: u8,
+    identification: u32,
+    /// Payload offset in bytes; wire units already decoded, hence a multiple
+    /// of eight.
+    offset: u16,
+    more_fragments: bool,
+    payload: &'a [u8],
+    /// What the reassembled datagram is rebuilt behind, taken from this
+    /// fragment when its offset is zero and ignored otherwise. RFC 791
+    /// section 3.2 files the first fragment's internet header in the header
+    /// buffer; RFC 8200 section 4.5 says the reassembled packet's Per-Fragment
+    /// headers are "all headers up to, but not including, the Fragment header
+    /// of the first fragment packet".
+    headers: &'a [u8],
+    /// For IPv6, where in `headers` the Next Header byte sits that reassembly
+    /// must overwrite: RFC 8200 section 4.5 requires that "the Next Header
+    /// field of the last header of the Per-Fragment headers is obtained from
+    /// the Next Header field of the first fragment's Fragment header". `None`
+    /// for IPv4, which has no such splice.
+    next_header_at: Option<usize>,
 }
 
 impl<'a> Fragment<'a> {
@@ -63,6 +100,9 @@ impl<'a> Fragment<'a> {
                     return Ok(None);
                 }
                 let header = ipv4.header();
+                // etherparse has already proven the header is well formed and
+                // wholly present, so its declared length is a valid index.
+                let header_bytes = usize::from(header.ihl()) * 4;
                 Ok(Some(Self {
                     source: IpAddr::V4(header.source_addr()),
                     destination: IpAddr::V4(header.destination_addr()),
@@ -71,6 +111,8 @@ impl<'a> Fragment<'a> {
                     offset: header.fragments_offset().value() * 8,
                     more_fragments: header.more_fragments(),
                     payload: ipv4.payload().payload,
+                    headers: packet.get(..header_bytes).unwrap_or_default(),
+                    next_header_at: None,
                 }))
             }
             NetSlice::Ipv6(ipv6) => {
@@ -86,6 +128,16 @@ impl<'a> Fragment<'a> {
                 else {
                     return Ok(None);
                 };
+                // **The chain is walked again here, and etherparse cannot do
+                // it for us.** `Ipv6Slice::payload` skips every extension
+                // header, but RFC 8200 section 4.5 puts the headers after the
+                // Fragment header in the *Fragmentable* Part — "These headers
+                // must be in the first fragment" — so they are payload to be
+                // reassembled, not headers to be re-emitted. Taking
+                // etherparse's payload would drop them from the datagram.
+                let Some((next_header_at, fragment_at)) = ipv6_fragment_header(packet) else {
+                    return Ok(None);
+                };
                 Ok(Some(Self {
                     source: IpAddr::V6(ipv6.header().source_addr()),
                     destination: IpAddr::V6(ipv6.header().destination_addr()),
@@ -93,12 +145,191 @@ impl<'a> Fragment<'a> {
                     identification: header.identification(),
                     offset: header.fragment_offset().value() * 8,
                     more_fragments: header.more_fragments(),
-                    payload: ipv6.payload().payload,
+                    payload: packet
+                        .get(fragment_at + IPV6_FRAGMENT_BYTES..)
+                        .unwrap_or_default(),
+                    headers: packet.get(..fragment_at).unwrap_or_default(),
+                    next_header_at: Some(next_header_at),
                 }))
             }
             NetSlice::Arp(_) => Ok(None),
         }
     }
+
+    pub fn source(&self) -> IpAddr {
+        self.source
+    }
+
+    pub fn destination(&self) -> IpAddr {
+        self.destination
+    }
+
+    /// The transport this datagram carries: IPv4's Protocol field, or the
+    /// Fragment header's Next Header for IPv6.
+    pub fn protocol(&self) -> u8 {
+        self.protocol
+    }
+
+    /// Always a multiple of eight.
+    pub fn offset(&self) -> u16 {
+        self.offset
+    }
+
+    pub fn more_fragments(&self) -> bool {
+        self.more_fragments
+    }
+
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+/// Walks an IPv6 header chain to its Fragment header, returning the index of
+/// the Next Header byte that precedes it and the index of the header itself.
+///
+/// RFC 8200 section 4.5 defines the Per-Fragment headers as "the IPv6 header
+/// plus any extension headers that must be processed by nodes en route to the
+/// destination, that is, all headers up to and including the Routing header if
+/// present, else the Hop-by-Hop Options header if present" — so the walk stops
+/// at the first Fragment header and treats everything before it as inherited.
+///
+/// O(extension headers), which RFC 8200 section 4.1 bounds at one Hop-by-Hop,
+/// one Routing, and two Destination Options in a conforming packet; a
+/// non-conforming chain terminates all the same because every step advances
+/// `at` by at least eight bytes.
+fn ipv6_fragment_header(packet: &[u8]) -> Option<(usize, usize)> {
+    // Byte 6 of the fixed header is its Next Header field.
+    let mut next_header_at = 6;
+    let mut at = IPV6_HEADER_BYTES;
+
+    loop {
+        let next = *packet.get(next_header_at)?;
+        if next == IPV6_FRAGMENT {
+            // The Fragment header must be wholly present for its Next Header
+            // to be spliceable.
+            packet.get(at..at + IPV6_FRAGMENT_BYTES)?;
+            return Some((next_header_at, at));
+        }
+        let length = match next {
+            // Hop-by-Hop Options, Routing, Destination Options: "Length ... in
+            // 8-octet units, not including the first 8 octets" (RFC 8200
+            // sections 4.3, 4.4, 4.6).
+            0 | 43 | 60 => (usize::from(*packet.get(at + 1)?) + 1) * 8,
+            // The Authentication Header is the exception RFC 4302 section 2.2
+            // names: its length is "in 32-bit words (4-byte units), minus 2",
+            // explicitly not the 8-byte convention the others use.
+            51 => (usize::from(*packet.get(at + 1)?) + 2) * 4,
+            // Anything else is an upper-layer header, so there is no Fragment
+            // header in this chain.
+            _ => return None,
+        };
+        next_header_at = at;
+        at = at.checked_add(length)?;
+    }
+}
+
+/// A datagram every fragment of which arrived, rebuilt into the packet its
+/// sender wrote.
+///
+/// **The type exists because `Vec<u8>` did not distinguish the two things
+/// reassembly could plausibly return.** What the fragments carry is transport
+/// payload; what a consumer re-parses is an IP packet; both are bytes, so the
+/// compiler had nothing to say when reassembly handed out the first and the
+/// datapath parsed the second. Every completed datagram failed with
+/// `UnsupportedIpVersion` and the error was indistinguishable from a malformed
+/// packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReassembledPacket(Vec<u8>);
+
+impl ReassembledPacket {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ReassembledPacket {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Rebuilds the datagram from the headers of its first fragment and the
+/// reassembled data.
+///
+/// Returns `None` when the result cannot be a packet — a header that is not
+/// the family it claimed, or a datagram whose length no longer fits the field
+/// that has to state it. O(headers + data), one allocation sized exactly once.
+fn rebuild(
+    headers: &[u8],
+    next_header_at: Option<usize>,
+    protocol: u8,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let mut packet = Vec::with_capacity(headers.len() + data.len());
+    packet.extend_from_slice(headers);
+    packet.extend_from_slice(data);
+
+    match next_header_at {
+        None => {
+            // IPv4. RFC 791 section 3.2 files the first fragment's header and
+            // sets `TL <- TDL+(IHL*4)`; the fragment fields go with the
+            // fragmentation they described.
+            if packet.len() < 20 || packet[0] >> 4 != 4 {
+                return None;
+            }
+            let total = u16::try_from(packet.len()).ok()?;
+            packet[2..4].copy_from_slice(&total.to_be_bytes());
+            // Clear More Fragments and the offset, keeping the two high flag
+            // bits: Don't Fragment on a reassembled datagram is not something
+            // RFC 791, RFC 815, or RFC 1122 section 3.3.2 speaks to, so it is
+            // left exactly as the sender set it rather than invented here.
+            packet[6] &= 0b1100_0000;
+            packet[7] = 0;
+            // **Recomputed, though no reassembly text demands it.** RFC 791
+            // lists the header checksum among the "fields which may be
+            // affected by fragmentation" but its reassembly procedure never
+            // says to recompute one; only the fragmentation procedure does.
+            // Total Length just changed, so the inherited checksum is stale
+            // and every downstream parser that verifies it would reject the
+            // datagram.
+            packet[10..12].copy_from_slice(&[0, 0]);
+            let checksum = ones_complement(&packet[..(usize::from(packet[0] & 0x0f) * 4)]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
+        Some(next_header_at) => {
+            // IPv6. The Fragment header "is not present in the final,
+            // reassembled packet" (RFC 8200 section 4.5), which `headers`
+            // already reflects, and the Next Header it carried is spliced into
+            // the last Per-Fragment header.
+            if packet.len() < IPV6_HEADER_BYTES || packet[0] >> 4 != 6 {
+                return None;
+            }
+            *packet.get_mut(next_header_at)? = protocol;
+            // Equivalent to RFC 8200's `PL.orig = PL.first - FL.first - 8 +
+            // (8 * FO.last) + FL.last`: both name the bytes after the fixed
+            // header, and this side has the reassembled length directly.
+            let payload = u16::try_from(packet.len() - IPV6_HEADER_BYTES).ok()?;
+            packet[4..6].copy_from_slice(&payload.to_be_bytes());
+        }
+    }
+    Some(packet)
+}
+
+/// The internet checksum of `header`: the one's complement of the one's
+/// complement sum of its 16-bit words (RFC 1071). O(header bytes).
+fn ones_complement(header: &[u8]) -> u16 {
+    let sum = header
+        .chunks(2)
+        .map(|word| u32::from(u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)])))
+        .sum::<u32>();
+    let folded = (sum & 0xffff) + (sum >> 16);
+    !u16::try_from((folded & 0xffff) + (folded >> 16)).unwrap_or(u16::MAX)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -106,7 +337,7 @@ pub enum PushOutcome {
     /// Buffered.
     Pending,
     /// Every block of the datagram arrived exactly once.
-    Complete(Vec<u8>),
+    Complete(ReassembledPacket),
     /// Malformed, overlapping, poisoned, or over capacity.
     Discarded,
 }
@@ -128,19 +359,63 @@ struct Pending {
     /// the count exact.
     received_blocks: u32,
     total: Option<usize>,
-    deadline: Instant,
+    expiry: Expiry,
     poisoned: bool,
+    /// The headers of the fragment at offset zero, and where IPv6's Next
+    /// Header splice lands in them. Empty until that fragment arrives, which
+    /// is why completion cannot be reached without it: the datagram is not
+    /// complete while block zero is missing.
+    headers: Vec<u8>,
+    next_header_at: Option<usize>,
+}
+
+/// When a pending datagram expires, and which bucket its key currently sits in.
+///
+/// **The two diverge, and conflating them leaks the index.** Every fragment
+/// refreshes `at`, but re-filing the key on each one would cost a bucket scan
+/// per fragment — so the slot stays where it was written and `expire`
+/// re-validates it. That is sound only while removal names the *slot*: unfiling
+/// a completed datagram under its refreshed `at` looks in a bucket the key was
+/// never in, and leaves a slot behind for an entry that is gone. `max_pending`
+/// bounds the entries, not the index, so those slots accumulate for a whole
+/// timeout at whatever rate datagrams complete.
+#[derive(Clone, Copy, Debug)]
+struct Expiry {
+    /// Authoritative. What `expire` compares against `now`.
+    at: Instant,
+    /// Where the key is filed. Always a valid key into `expirations`.
+    slot: Instant,
+}
+
+impl Expiry {
+    fn filed(at: Instant) -> Self {
+        Self { at, slot: at }
+    }
+
+    /// Moves the deadline without moving the slot, which is what makes a
+    /// refresh O(1).
+    fn refresh(&mut self, at: Instant) {
+        self.at = at;
+    }
+
+    /// Records that the key has been re-filed under its current deadline,
+    /// returning the slot it left. `None` when the two already agreed.
+    fn refiled(&mut self) -> Option<Instant> {
+        (self.slot != self.at).then(|| std::mem::replace(&mut self.slot, self.at))
+    }
 }
 
 impl Pending {
-    fn new(deadline: Instant) -> Self {
+    fn new(expiry: Expiry) -> Self {
         Self {
             data: Vec::new(),
             received: [0; BITMAP_WORDS],
             received_blocks: 0,
             total: None,
-            deadline,
+            expiry,
             poisoned: false,
+            headers: Vec::new(),
+            next_header_at: None,
         }
     }
 
@@ -251,10 +526,10 @@ impl Reassembler {
                 // A later fragment only refreshes `deadline` below, so a
                 // fragment flood adds no expiry-index memory at all.
                 self.expirations.entry(deadline).or_default().push(key);
-                vacant.insert(Pending::new(deadline))
+                vacant.insert(Pending::new(Expiry::filed(deadline)))
             }
         };
-        pending.deadline = deadline;
+        pending.expiry.refresh(deadline);
 
         if pending.poisoned {
             self.discarded = self.discarded.saturating_add(1);
@@ -281,6 +556,14 @@ impl Reassembler {
             return PushOutcome::Discarded;
         }
 
+        if offset == 0 {
+            // RFC 791 section 3.2 and RFC 8200 section 4.5 both name the
+            // fragment at offset zero as the one whose headers the reassembled
+            // datagram inherits, so only this one is kept.
+            pending.headers.clear();
+            pending.headers.extend_from_slice(fragment.headers);
+            pending.next_header_at = fragment.next_header_at;
+        }
         if extent > pending.data.len() {
             pending.data.resize(extent, 0);
         }
@@ -308,13 +591,25 @@ impl Reassembler {
 
         // A completed datagram leaves `pending`, so its slot leaves the index
         // with it; the index never outlives its entries.
-        let deadline = pending.deadline;
+        let slot = pending.expiry.slot;
         let Some(mut pending) = self.pending.remove(&key) else {
             return PushOutcome::Discarded;
         };
-        self.forget_slot(deadline, &key);
+        // The *slot*, not the deadline: they diverge on every refresh, and
+        // unfiling under the wrong one leaves the index holding a key whose
+        // entry is gone. See [`Expiry`].
+        self.forget_slot(slot, &key);
         pending.data.truncate(pending.total.unwrap_or(0));
-        PushOutcome::Complete(pending.data)
+        let Some(packet) = rebuild(
+            &pending.headers,
+            pending.next_header_at,
+            key.protocol,
+            &pending.data,
+        ) else {
+            self.discarded = self.discarded.saturating_add(1);
+            return PushOutcome::Discarded;
+        };
+        PushOutcome::Complete(ReassembledPacket(packet))
     }
 
     /// Removes one key from its expiry bucket. O(keys sharing the bucket),
@@ -355,11 +650,16 @@ impl Reassembler {
                 // The slot is a hint; the entry's real deadline governs, so a
                 // refreshed datagram is re-bucketed rather than evicted early.
                 match self.pending.entry(key) {
-                    Entry::Occupied(occupied) if occupied.get().deadline <= now => {
+                    Entry::Occupied(occupied) if occupied.get().expiry.at <= now => {
                         occupied.remove();
                         evicted += 1;
                     }
-                    Entry::Occupied(occupied) => rebucket.push((occupied.get().deadline, key)),
+                    Entry::Occupied(mut occupied) => {
+                        // The slot moves with the key, so the entry and the
+                        // index agree again from here.
+                        occupied.get_mut().expiry.refiled();
+                        rebucket.push((occupied.get().expiry.at, key));
+                    }
                     Entry::Vacant(_) => {}
                 }
             }
@@ -379,6 +679,12 @@ mod tests {
 
     const NOW: fn() -> Instant = Instant::now;
 
+    /// The IPv4 header every synthetic fragment below carries, with More
+    /// Fragments set and a length that reassembly must correct.
+    const HEADER: [u8; 20] = [
+        0x45, 0x00, 0x00, 0x1c, 0xbe, 0xef, 0x20, 0x00, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2,
+    ];
+
     fn fragment(offset: u16, more_fragments: bool, payload: &'static [u8]) -> Fragment<'static> {
         Fragment {
             source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
@@ -388,7 +694,25 @@ mod tests {
             offset,
             more_fragments,
             payload,
+            headers: &HEADER,
+            next_header_at: None,
         }
+    }
+
+    /// The datagram [`HEADER`]'s fragments must reassemble into: the same
+    /// header with Total Length corrected, the fragment fields cleared, and the
+    /// checksum recomputed over the result.
+    fn datagram(payload: &[u8]) -> ReassembledPacket {
+        let mut packet = HEADER.to_vec();
+        packet.extend_from_slice(payload);
+        let total = u16::try_from(packet.len()).unwrap();
+        packet[2..4].copy_from_slice(&total.to_be_bytes());
+        packet[6] = 0;
+        packet[7] = 0;
+        packet[10..12].copy_from_slice(&[0, 0]);
+        let checksum = ones_complement(&packet[..20]);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        ReassembledPacket(packet)
     }
 
     fn fresh_reassembler() -> Reassembler {
@@ -411,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             reassembler.push(fragment(8, true, &message[8..16]), now),
-            PushOutcome::Complete(message.to_vec())
+            PushOutcome::Complete(datagram(message))
         );
         assert!(reassembler.is_empty());
     }
@@ -523,11 +847,68 @@ mod tests {
         assert_eq!(index_slots(&reassembler), 1);
         assert_eq!(
             reassembler.push(fragment(8, false, b"bb"), now),
-            PushOutcome::Complete(b"aaaaaaaabb".to_vec())
+            PushOutcome::Complete(datagram(b"aaaaaaaabb"))
         );
         assert!(reassembler.is_empty());
         assert_eq!(index_slots(&reassembler), 0, "the slot left with the entry");
         assert_eq!(reassembler.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_refreshed_datagram_that_completes_leaves_no_slot_behind() {
+        // **The divergence the same-instant tests could not see.** Every
+        // fragment refreshes the deadline but not the slot, so a datagram
+        // completed after a refresh was unfiled under a bucket it had never
+        // been in — leaving one orphan slot per completion, for a whole
+        // timeout, in an index `max_pending` does not bound.
+        let start = NOW();
+        let mut reassembler = fresh_reassembler();
+        assert_eq!(
+            reassembler.push(fragment(0, true, b"aaaaaaaa"), start),
+            PushOutcome::Pending
+        );
+        assert_eq!(
+            reassembler.push(fragment(8, false, b"bb"), start + Duration::from_secs(5)),
+            PushOutcome::Complete(datagram(b"aaaaaaaabb"))
+        );
+        assert!(reassembler.is_empty());
+        assert_eq!(index_slots(&reassembler), 0, "the slot left with the entry");
+        assert_eq!(reassembler.next_deadline(), None);
+    }
+
+    #[test]
+    fn an_ipv6_datagram_is_rebuilt_without_its_fragment_header() {
+        // RFC 8200 section 4.5: the Fragment header "is not present in the
+        // final, reassembled packet", the last Per-Fragment header's Next
+        // Header comes from it, and Payload Length counts what follows the
+        // fixed header.
+        let mut first = vec![
+            0x60, 0, 0, 0, 0, 16, 44, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 17, 0, 0, 1, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        first.extend_from_slice(b"aaaaaaaa");
+        let mut second = first[..48].to_vec();
+        second[5] = 10; // payload length: the Fragment header plus two bytes
+        second[42] = 0; // fragment offset 8 bytes, more fragments clear
+        second[43] = 8;
+        second.extend_from_slice(b"bb");
+
+        let mut reassembler = fresh_reassembler();
+        let first = Fragment::parse(&first).unwrap().unwrap();
+        assert_eq!(reassembler.push(first, NOW()), PushOutcome::Pending);
+        let second = Fragment::parse(&second).unwrap().unwrap();
+        let PushOutcome::Complete(packet) = reassembler.push(second, NOW()) else {
+            panic!("every fragment arrived");
+        };
+
+        assert_eq!(packet.len(), 50, "40-byte header plus ten bytes of payload");
+        assert_eq!(&packet[40..], b"aaaaaaaabb");
+        assert_eq!(packet[6], 17, "the Fragment header's Next Header, spliced");
+        assert_eq!(
+            u16::from_be_bytes([packet[4], packet[5]]),
+            10,
+            "Payload Length counts the reassembled data, not the fragment"
+        );
     }
 
     #[test]
@@ -614,6 +995,8 @@ mod tests {
                 offset: 8,
                 more_fragments: true,
                 payload: &[1, 2, 3, 4, 5, 6, 7, 8],
+                headers: &ipv4[..20],
+                next_header_at: None,
             }))
         );
 
@@ -632,6 +1015,10 @@ mod tests {
                 offset: 8,
                 more_fragments: true,
                 payload: &[1, 2, 3, 4, 5, 6, 7, 8],
+                // The Per-Fragment headers stop before the Fragment header,
+                // which sits at byte 40 and does not survive reassembly.
+                headers: &ipv6[..40],
+                next_header_at: Some(6),
             }))
         );
 
