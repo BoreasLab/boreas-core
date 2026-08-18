@@ -1,6 +1,7 @@
 mod bridge;
 mod ca;
 mod datapath;
+mod deadline;
 mod demote;
 mod device;
 mod dns;
@@ -41,6 +42,7 @@ pub use datapath::{
     DEFAULT_INSPECTED_PORTS, Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Outbound, Side,
     Transmit,
 };
+pub use deadline::{Wait, within};
 pub use demote::{Demotion, Demotions, Leg, Standing, Tier, classify};
 pub use device::{Device, Harness, SimDevice};
 pub use dns::{

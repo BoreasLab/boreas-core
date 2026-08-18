@@ -432,7 +432,8 @@ impl<B: TunnelBypass> Socks5Egress<B> {
     /// The buffer comes back with the negotiation's surplus still in it, so the
     /// caller keeps reading where this stopped rather than from an empty one.
     async fn negotiate(&self) -> Result<(tokio::net::TcpStream, Vec<u8>), EgressError> {
-        let mut stream = self.bypass.tcp(self.config.proxy).await?;
+        let mut stream =
+            crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.config.proxy)).await?;
         let mut out = Vec::with_capacity(4);
         encode_greeting(self.config.credentials.as_ref(), &mut out);
         stream.write_all(&out).await?;

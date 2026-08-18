@@ -334,7 +334,8 @@ impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let method = self.config.key.method;
-            let mut stream = self.bypass.tcp(self.config.server).await?;
+            let mut stream =
+                crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.config.server)).await?;
 
             // A fresh random salt per session: it is the only input that makes
             // two sessions under one pre-shared key different, so it comes from

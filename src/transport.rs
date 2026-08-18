@@ -95,7 +95,8 @@ impl<B: TunnelBypass> PlainTransport<B> {
 impl<B: TunnelBypass + 'static> ProxyTransport for PlainTransport<B> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            let stream = self.bypass.tcp(self.server).await?;
+            let stream =
+                crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.server)).await?;
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
         })
     }
@@ -164,7 +165,7 @@ impl<B: TunnelBypass> TlsTransport<B> {
 impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            let tcp = self.bypass.tcp(self.server).await?;
+            let tcp = crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.server)).await?;
             let stream = self
                 .originator
                 .connect(&self.server_name, &ClientProfile::chrome(), &self.alpn, tcp)

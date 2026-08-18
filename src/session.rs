@@ -434,9 +434,12 @@ pub async fn serve_session(
         host: host.clone(),
         port,
     };
-    let transport = sessions
-        .egress
-        .connect(&target)
+    // **The backstop over every egress at once.** Each leg beneath this is
+    // bounded on its own -- the connect, the TLS, the transport's upgrade --
+    // but a proxy that accepts the connection and then never speaks is bounded
+    // by none of them, and that is the shape a handover leaves behind: the SYN
+    // crossed before the path moved and nothing after it did.
+    let transport = crate::within(crate::Wait::ProxyDial, sessions.egress.connect(&target))
         .await
         .map_err(SessionError::Upstream)?;
 

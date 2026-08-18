@@ -272,7 +272,7 @@ impl StreamEgress for TunnelledDialer {
             // would exhaust it under ordinary browsing.
             socket.set_reuseaddr(true)?;
             socket.bind(local_for(address, lease.port))?;
-            let stream = socket.connect(address).await?;
+            let stream = crate::within(crate::Wait::TcpConnect, socket.connect(address)).await?;
             // Nagle would hold a short request waiting for bytes that are not
             // coming, which on a proxied exchange is pure added latency.
             stream.set_nodelay(true)?;

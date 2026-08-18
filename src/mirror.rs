@@ -622,9 +622,16 @@ impl Originator {
         let configuration = connector
             .configure()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        tokio_boring::connect(configuration, host, Opaque(stream))
-            .await
-            .map_err(handshake_error)
+        // **Every TLS handshake this crate originates passes here**, so the
+        // bound is stated once: the upstream leg of an intercepted session, the
+        // TLS under a V2Ray transport, and DoT and DoH alike. A handshake is a
+        // wait on a peer that a vanished mobile path never ends.
+        crate::within(crate::Wait::TlsHandshake, async {
+            tokio_boring::connect(configuration, host, Opaque(stream))
+                .await
+                .map_err(handshake_error)
+        })
+        .await
     }
 }
 

@@ -258,7 +258,7 @@ impl<B: TunnelBypass> TlsDialer<B> {
     }
 
     async fn connect(&self) -> io::Result<UpstreamTls> {
-        let stream = self.bypass.tcp(self.resolver).await?;
+        let stream = crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.resolver)).await?;
         // Nagle would hold a short query waiting for more bytes that are not
         // coming, which on a request/response protocol is pure added latency.
         stream.set_nodelay(true)?;

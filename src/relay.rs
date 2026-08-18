@@ -220,7 +220,9 @@ async fn serve_association(
     shutdown: CancellationToken,
 ) -> RelayCounts {
     let mut counts = RelayCounts::default();
-    let Ok(Association { sink, mut source }) = egress.associate().await else {
+    let Ok(Association { sink, mut source }) =
+        crate::within(crate::Wait::ProxyDial, egress.associate()).await
+    else {
         // The egress said so in its path properties, or the proxy refused.
         // Either way there is nothing to serve and the queued datagrams are
         // dropped with the receiver.
@@ -572,5 +574,84 @@ mod tests {
             total.associations_refused, 3,
             "one mapping was admitted and three were refused: {total:?}"
         );
+    }
+
+    /// An egress that accepts the connection and then says nothing — the shape
+    /// a path takes when the handset walked out of Wi-Fi range mid-dial. No RST
+    /// arrives, no ICMP, no FIN; the association simply never opens.
+    struct NeverAnswers;
+
+    impl StreamEgress for NeverAnswers {
+        fn properties(&self) -> PathProperties {
+            PathProperties {
+                datagram_fidelity: DatagramFidelity::Native,
+                overhead_bytes: 0,
+                max_datagram_size: Some(1400),
+                preserves_ecn: false,
+                nat_behavior: NatBehavior::EndpointIndependent,
+            }
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Target,
+        ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// **Nothing but a deadline ends a connection whose path stopped
+    /// existing.** Without one, this association holds a task, a queue, and
+    /// every pooled payload queued behind it for as long as the process runs —
+    /// and a client that roams does this several times an hour, so the leak is
+    /// ordinary rather than adversarial.
+    #[tokio::test(start_paused = true)]
+    async fn an_egress_that_never_answers_gives_the_association_up() {
+        let pool = pool();
+        let (out_tx, out_rx) = mpsc::channel(8);
+        let (in_tx, _in_rx) = mpsc::channel(8);
+        let (count_tx, mut count_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+
+        let relay = tokio::spawn(run_relay(
+            Arc::new(NeverAnswers),
+            Arc::clone(&pool),
+            out_rx,
+            in_tx,
+            RelayLimits::default(),
+            count_tx,
+            shutdown.clone(),
+        ));
+
+        out_tx
+            .send(Outbound {
+                client: client(49152),
+                target: target(),
+                payload: pool.take(b"query").unwrap(),
+            })
+            .await
+            .unwrap();
+
+        // Well past the dial budget and far short of forever, which is what the
+        // absence of a bound would have cost.
+        let counts = tokio::time::timeout(crate::Wait::ProxyDial.budget() * 2, count_rx.recv())
+            .await
+            .expect("the association gives up on its own")
+            .expect("the channel is open");
+        assert_eq!(counts.associations_failed, 1);
+        assert_eq!(
+            counts.datagrams_dropped, 1,
+            "and the queued payload with it"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("no association outlives the relay")
+            .unwrap();
     }
 }

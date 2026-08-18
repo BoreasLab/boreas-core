@@ -62,7 +62,12 @@ const MAX_DATAGRAM: usize = 1500;
 /// How long [`Handshake::establish`] and [`Handshake::http3`] wait before
 /// giving up. QUIC retransmits inside this window; the deadline exists so a
 /// black-holed path fails a connection instead of hanging one.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// It is a whole dial rather than a bare handshake — the QUIC handshake, the
+/// HTTP/3 settings under it, and the egress's own authentication all happen
+/// inside it — so it takes the same budget every other whole dial does rather
+/// than a number of its own.
+const HANDSHAKE_TIMEOUT: Duration = crate::Wait::ProxyDial.budget();
 
 /// Commands in flight toward the driver. Bounded, because an unbounded command
 /// queue is an unbounded number of half-open streams.

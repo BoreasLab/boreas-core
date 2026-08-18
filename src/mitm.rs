@@ -220,7 +220,15 @@ impl Interceptor {
             .iter()
             .position(|candidate| *candidate == wire)
             .expect("Wire::ALL is every wire");
-        self.acceptors[index].accept(stream).await
+        // A client that opens a connection and then handshakes slowly, or not
+        // at all, otherwise holds a task and a forged leaf for as long as it
+        // likes. The peek before this bounded the client's *first* bytes; this
+        // bounds the rest of what it says.
+        crate::within(
+            crate::Wait::ClientHandshake,
+            self.acceptors[index].accept(stream),
+        )
+        .await
     }
 }
 
