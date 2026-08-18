@@ -32,6 +32,7 @@
 
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,8 +44,9 @@ use ring::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    AsyncStream, BoxFuture, DatagramFidelity, EgressError, NatBehavior, PathProperties, ProxyError,
-    StreamEgress, Target, TunnelBypass, encode_address,
+    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource,
+    EgressError, NatBehavior, PathProperties, ProxyError, StreamEgress, Target, TunnelBypass,
+    decode_address, encode_address, socks5::Decoded,
 };
 
 /// The BLAKE3 derive-key context, fixed by SIP022. It is part of the wire
@@ -143,6 +145,13 @@ impl PreSharedKey {
     /// salt)`, truncated to the method's key length.
     ///
     /// O(key + salt) — a single BLAKE3 compression over 32 to 64 bytes.
+    /// The key material itself. Crate-private: the one legitimate reader is
+    /// the packet cipher, whose AES methods key their separate-header block on
+    /// the pre-shared key directly rather than on anything derived.
+    fn raw(&self) -> &[u8] {
+        &self.bytes
+    }
+
     fn subkey(&self, salt: &[u8]) -> Vec<u8> {
         let mut material = Vec::with_capacity(self.bytes.len() + salt.len());
         material.extend_from_slice(&self.bytes);
@@ -302,6 +311,493 @@ pub struct ShadowsocksConfig {
     pub nat_behavior: NatBehavior,
 }
 
+// -------------------------------------------------------- SIP022 UDP
+
+/// **SIP022's packet format is a second construction, not a variation of the
+/// stream one.** A stream is salt-then-chunks under one derived key with a
+/// counter nonce; a packet stands alone, so it carries its own key material and
+/// its own nonce, and the two AES methods and the ChaCha method do that
+/// *differently*. Modelling them as one format with flags is how a client ends
+/// up deriving a subkey for a method that has none.
+///
+/// The AES methods put an 8-byte session ID and an 8-byte packet ID in a
+/// 16-byte *separate header*, encrypt it as a single AES-ECB block under the
+/// pre-shared key itself, and derive the body's subkey from the session ID. The
+/// ChaCha method has no separate header at all: a random 24-byte XChaCha20
+/// nonce goes in front, the body is keyed by the pre-shared key directly, and
+/// the session and packet IDs move *inside* the encrypted body.
+///
+/// Both come from BoringSSL, which is already linked for every hello this crate
+/// sends: `ring` exposes neither a raw AES block nor XChaCha20-Poly1305, and
+/// neither is a thing to hand-roll.
+enum PacketCipher {
+    /// The AES methods. `header` is keyed by the pre-shared key and used one
+    /// block at a time with padding off, which is the only correct way to use
+    /// ECB and is why it appears nowhere else.
+    Separate {
+        key: PreSharedKey,
+        header: boring::symm::Cipher,
+    },
+    /// `2022-blake3-chacha20-poly1305`. One context for the association's life,
+    /// because the key never changes: it is the pre-shared key.
+    Merged { key: boring::aead::AeadCtx },
+}
+
+/// Bytes of the AES methods' separate header.
+const SEPARATE_HEADER: usize = 16;
+
+/// The AEAD nonce is a window over the plaintext separate header rather than a
+/// field of its own: the last four bytes of the session ID followed by the
+/// whole packet ID. Uniqueness therefore comes from the packet counter, which
+/// is what makes the counter's discipline load-bearing.
+const NONCE_WINDOW: std::ops::Range<usize> = 4..SEPARATE_HEADER;
+
+/// XChaCha20-Poly1305's nonce, written in the clear ahead of the body.
+const MERGED_NONCE: usize = 24;
+
+/// Packet types, the packet-format counterparts of [`TYPE_REQUEST`] and
+/// [`TYPE_RESPONSE`]. Separate constants because they are a separate namespace
+/// in the specification, even though they happen to agree.
+const PACKET_TO_SERVER: u8 = 0;
+const PACKET_TO_CLIENT: u8 = 1;
+
+/// The largest UDP payload a datagram can carry, which sizes the receive buffer
+/// exactly: nothing larger can arrive, so a payload this cannot hold does not
+/// exist.
+const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
+
+/// The largest client datagram this egress will carry, and therefore what the
+/// planner budgets QUIC against.
+///
+/// It is the IPv6 minimum path less the worst case this format adds: the
+/// separate header or nonce, the tag, the fixed message header, and the largest
+/// address SIP022 can express. Deliberately the *worst* case rather than the
+/// one a given target happens to cost, because the number is a promise made
+/// once per session and a flow must not discover mid-transfer that its
+/// destination's name was long.
+const MAX_PROXIED_DATAGRAM: u16 = {
+    // nonce or separate header, tag, type, timestamp, padding length
+    let framing = MERGED_NONCE + TAG + 1 + 8 + 2;
+    // domain form: type byte, length octet, 255 bytes of name, port
+    let address = 1 + 1 + 255 + 2;
+    (crate::MIN_IPV6_MTU as usize - 48 - framing - address) as u16
+};
+
+/// One packet's plaintext, after whichever framing its method used has been
+/// removed. Both constructions produce exactly this, which is what lets
+/// everything above them be written once.
+struct Opened {
+    session: [u8; 8],
+    packet_id: u64,
+    /// The message proper, starting at its type byte.
+    message: Vec<u8>,
+}
+
+impl PacketCipher {
+    fn new(key: &PreSharedKey) -> Result<Self, EgressError> {
+        Ok(match key.method {
+            Method::Aes128Gcm => Self::Separate {
+                key: key.clone(),
+                header: boring::symm::Cipher::aes_128_ecb(),
+            },
+            Method::Aes256Gcm => Self::Separate {
+                key: key.clone(),
+                header: boring::symm::Cipher::aes_256_ecb(),
+            },
+            Method::ChaCha20Poly1305 => Self::Merged {
+                key: boring::aead::AeadCtx::new_default_tag(
+                    &boring::aead::Algorithm::xchacha20_poly1305(),
+                    key.raw(),
+                )
+                .map_err(|_| ProxyError::Crypto)?,
+            },
+        })
+    }
+
+    /// Seals one packet for the server.
+    ///
+    /// O(message length), with one allocation for the datagram the caller is
+    /// about to hand to the socket.
+    fn seal(
+        &self,
+        session: [u8; 8],
+        packet_id: u64,
+        message: &[u8],
+    ) -> Result<Vec<u8>, EgressError> {
+        let mut identity = [0u8; SEPARATE_HEADER];
+        identity[..8].copy_from_slice(&session);
+        identity[8..].copy_from_slice(&packet_id.to_be_bytes());
+
+        match self {
+            Self::Separate { .. } => {
+                let sealed = self.aead(&session)?;
+                let mut out = self.block(boring::symm::Mode::Encrypt, &identity)?;
+                out.extend_from_slice(message);
+                let tag =
+                    Self::finish(&sealed, &identity[NONCE_WINDOW], &mut out, SEPARATE_HEADER)?;
+                out.extend_from_slice(&tag);
+                Ok(out)
+            }
+            Self::Merged { key } => {
+                let mut out = vec![0u8; MERGED_NONCE];
+                random(&mut out)?;
+                let nonce: [u8; MERGED_NONCE] = out[..].try_into().expect("just sized");
+                // The identity is inside the body here, not ahead of it.
+                out.extend_from_slice(&identity);
+                out.extend_from_slice(message);
+                let tag = Self::finish(key, &nonce, &mut out, MERGED_NONCE)?;
+                out.extend_from_slice(&tag);
+                Ok(out)
+            }
+        }
+    }
+
+    /// Opens one packet from the server.
+    ///
+    /// Nothing here trusts anything: the identity is read, the body is
+    /// authenticated under a key derived from it, and only then does a caller
+    /// see a byte of it. A forged identity yields a key that opens nothing.
+    fn open(&self, datagram: &[u8]) -> Result<Opened, EgressError> {
+        let (identity, key, nonce, body) = match self {
+            Self::Separate { .. } => {
+                let (header, body) = datagram
+                    .split_at_checked(SEPARATE_HEADER)
+                    .ok_or(ProxyError::Header)?;
+                let identity = self.block(boring::symm::Mode::Decrypt, header)?;
+                let nonce = identity[NONCE_WINDOW].to_vec();
+                let key = self.aead(&identity[..8])?;
+                (identity, key, nonce, body.to_vec())
+            }
+            Self::Merged { key } => {
+                let (nonce, body) = datagram
+                    .split_at_checked(MERGED_NONCE)
+                    .ok_or(ProxyError::Header)?;
+                let mut plain = Self::reveal(key, nonce, body.to_vec())?;
+                if plain.len() < SEPARATE_HEADER {
+                    return Err(ProxyError::Header.into());
+                }
+                let identity = plain[..SEPARATE_HEADER].to_vec();
+                plain.drain(..SEPARATE_HEADER);
+                return Ok(Self::identify(&identity, plain));
+            }
+        };
+        let message = Self::reveal(&key, &nonce, body)?;
+        Ok(Self::identify(&identity, message))
+    }
+
+    fn identify(identity: &[u8], message: Vec<u8>) -> Opened {
+        let mut session = [0u8; 8];
+        session.copy_from_slice(&identity[..8]);
+        Opened {
+            session,
+            packet_id: u64::from_be_bytes(
+                identity[8..SEPARATE_HEADER].try_into().expect("16 bytes"),
+            ),
+            message,
+        }
+    }
+
+    /// Seals `out[at..]` in place and returns the tag to append. Split out
+    /// because both constructions seal the same way once they have agreed on a
+    /// key and a nonce, and only the framing around it differs.
+    fn finish(
+        key: &boring::aead::AeadCtx,
+        nonce: &[u8],
+        out: &mut [u8],
+        at: usize,
+    ) -> Result<Vec<u8>, EgressError> {
+        let mut tag = vec![0u8; TAG];
+        key.seal_in_place(nonce, &mut out[at..], &mut tag, &[])
+            .map_err(|_| ProxyError::Crypto)?;
+        Ok(tag)
+    }
+
+    fn reveal(
+        key: &boring::aead::AeadCtx,
+        nonce: &[u8],
+        mut body: Vec<u8>,
+    ) -> Result<Vec<u8>, EgressError> {
+        let at = body.len().checked_sub(TAG).ok_or(ProxyError::Header)?;
+        let tag = body.split_off(at);
+        key.open_in_place(nonce, &mut body, &tag, &[])
+            .map_err(|_| ProxyError::Crypto)?;
+        Ok(body)
+    }
+
+    /// The AEAD context for one AES-method session. The subkey is derived from
+    /// the session ID exactly as the stream side derives its own from the salt,
+    /// which is why one `subkey` serves both.
+    fn aead(&self, session: &[u8]) -> Result<boring::aead::AeadCtx, EgressError> {
+        let Self::Separate { key, .. } = self else {
+            return Err(ProxyError::Crypto.into());
+        };
+        let algorithm = match key.method {
+            Method::Aes128Gcm => boring::aead::Algorithm::aes_128_gcm(),
+            _ => boring::aead::Algorithm::aes_256_gcm(),
+        };
+        boring::aead::AeadCtx::new_default_tag(&algorithm, &key.subkey(session))
+            .map_err(|_| ProxyError::Crypto.into())
+    }
+
+    /// One ECB block, padding off. `Crypter` rather than `symm::encrypt`
+    /// because the latter pads to a second block, and a 32-byte separate header
+    /// is not a separate header.
+    fn block(&self, mode: boring::symm::Mode, input: &[u8]) -> Result<Vec<u8>, EgressError> {
+        let Self::Separate { key, header } = self else {
+            return Err(ProxyError::Crypto.into());
+        };
+        let mut crypter = boring::symm::Crypter::new(*header, mode, key.raw(), None)
+            .map_err(|_| ProxyError::Crypto)?;
+        crypter.pad(false);
+        let mut out = vec![0u8; input.len() + header.block_size()];
+        let written = crypter
+            .update(input, &mut out)
+            .map_err(|_| ProxyError::Crypto)?;
+        let extra = crypter
+            .finalize(&mut out[written..])
+            .map_err(|_| ProxyError::Crypto)?;
+        out.truncate(written + extra);
+        Ok(out)
+    }
+}
+
+/// Fills `bytes` from the system CSPRNG and nowhere else.
+fn random(bytes: &mut [u8]) -> Result<(), EgressError> {
+    ring::rand::SystemRandom::new()
+        .fill(bytes)
+        .map_err(|_| ProxyError::Crypto)?;
+    Ok(())
+}
+
+/// Builds one client-to-server message: type, timestamp, padding, target
+/// address, payload.
+///
+/// **Padding is a policy, and this one is the reference implementations'.**
+/// Both `shadowsocks-go` and `sing-shadowsocks` pad only queries to port 53,
+/// where a datagram's length otherwise leaks which name was asked for; padding
+/// everything would cost bandwidth on a phone for no distinguishability that
+/// TLS has not already provided. The length is `1 + rand % 900`, matching their
+/// `MaxPaddingLength`.
+///
+/// O(payload length), one allocation.
+fn encode_packet_request(
+    target: &Target,
+    now: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, EgressError> {
+    let pad = padding_for(target)?;
+    let mut out = Vec::with_capacity(11 + pad.len() + 22 + payload.len());
+    out.push(PACKET_TO_SERVER);
+    out.extend_from_slice(&now.to_be_bytes());
+    out.extend_from_slice(&(pad.len() as u16).to_be_bytes());
+    out.extend_from_slice(&pad);
+    encode_address(target, &mut out);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn padding_for(target: &Target) -> Result<Vec<u8>, EgressError> {
+    if target.port() != crate::DNS_PORT {
+        return Ok(Vec::new());
+    }
+    let mut pick = [0u8; 2];
+    random(&mut pick)?;
+    let mut pad = vec![0u8; 1 + usize::from(u16::from_be_bytes(pick)) % MAX_PADDING];
+    random(&mut pad)?;
+    Ok(pad)
+}
+
+/// Reads one server-to-client message, returning where the reply came from and
+/// where its payload starts.
+///
+/// Three checks, all of them MUST-level in SIP022 and each closing a different
+/// hole: the type byte stops a reflected request from being read as a response,
+/// the clock bounds the replay window to 30 seconds, and the echoed client
+/// session ID stops another client's reply being delivered to this one.
+///
+/// O(address length). Total on untrusted input.
+fn decode_packet_response(
+    message: &[u8],
+    client_session: &[u8; 8],
+    now: u64,
+) -> Result<(Target, usize), EgressError> {
+    // type(1) + timestamp(8) + client session(8) + padding length(2)
+    let fixed = message.get(..19).ok_or(ProxyError::Header)?;
+    if fixed[0] != PACKET_TO_CLIENT {
+        return Err(ProxyError::Header.into());
+    }
+    check_timestamp(
+        u64::from_be_bytes(fixed[1..9].try_into().expect("8 bytes")),
+        now,
+    )?;
+    if &fixed[9..17] != client_session {
+        return Err(ProxyError::SaltMismatch.into());
+    }
+    let pad = usize::from(u16::from_be_bytes(
+        fixed[17..19].try_into().expect("2 bytes"),
+    ));
+    let at = 19usize.checked_add(pad).ok_or(ProxyError::Header)?;
+    let rest = message.get(at..).ok_or(ProxyError::Header)?;
+    match decode_address(rest)? {
+        Decoded::Complete { value, consumed } => Ok((value, at + consumed)),
+        Decoded::Incomplete => Err(ProxyError::Header.into()),
+    }
+}
+
+/// A sliding window over one server session's packet IDs, in WireGuard's shape:
+/// the highest identifier seen and a bitmap of the 64 below it.
+///
+/// SIP022 requires one — a relay whose replies can be replayed is a relay whose
+/// client can be made to re-process an old answer — and points at WireGuard's
+/// as a usable implementation. Sixty-four is ample for a UDP association: a
+/// reply reordered by more than that many packets is one the transport above
+/// has already given up on.
+///
+/// O(1) per packet, and no allocation ever.
+#[derive(Default)]
+struct Window {
+    /// `None` until the first packet, because **SIP022 starts a packet counter
+    /// at zero**: a bare `u64` high-water mark would make the very first
+    /// legitimate packet indistinguishable from a replay of itself.
+    highest: Option<u64>,
+    below: u64,
+}
+
+impl Window {
+    /// Whether `id` is fresh, recording it when it is.
+    ///
+    /// **Called only after the packet has authenticated**, which is SIP022's
+    /// own rule: advancing on an unauthenticated identifier would let anyone
+    /// who can guess a session ID push the window past every real packet.
+    fn admit(&mut self, id: u64) -> bool {
+        let Some(highest) = self.highest else {
+            self.highest = Some(id);
+            return true;
+        };
+        let Some(behind) = highest.checked_sub(id) else {
+            // Ahead of everything seen: shift the bitmap by the gap, then mark
+            // the old high-water mark as seen. A gap of 64 or more leaves
+            // nothing of the old window inside the new one, so it starts empty.
+            let gap = id - highest;
+            self.below = if gap < 64 {
+                (self.below << gap) | (1 << (gap - 1))
+            } else {
+                0
+            };
+            self.highest = Some(id);
+            return true;
+        };
+        if behind == 0 || behind > 64 {
+            return false;
+        }
+        let bit = 1u64 << (behind - 1);
+        if self.below & bit != 0 {
+            return false;
+        }
+        self.below |= bit;
+        true
+    }
+}
+
+/// One SIP022 datagram association: a socket to the server, the session this
+/// client speaks under, and the counter that must never repeat against it.
+///
+/// The counter and the key live together for the reason the stream side's do:
+/// the AEAD nonce is a window over the packet identifier, so a repeated
+/// identifier is a repeated nonce, which is total loss of confidentiality.
+struct PacketRelay {
+    socket: tokio::net::UdpSocket,
+    cipher: PacketCipher,
+    session: [u8; 8],
+    /// SIP022 starts at zero and adds one per packet sent. Atomic because the
+    /// sink is shared by every flow in the mapping and `send_to` takes `&self`.
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl DatagramSink for PacketRelay {
+    fn send_to<'a>(
+        &'a self,
+        payload: &'a [u8],
+        target: &'a Target,
+    ) -> BoxFuture<'a, Result<(), EgressError>> {
+        Box::pin(async move {
+            let message = encode_packet_request(target, now_seconds(), payload)?;
+            let packet_id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let datagram = self.cipher.seal(self.session, packet_id, &message)?;
+            self.socket.send(&datagram).await?;
+            Ok(())
+        })
+    }
+}
+
+/// The receiving half, and the state that makes a reply believable.
+struct PacketSource {
+    relay: Arc<PacketRelay>,
+    /// **Two server sessions, not one.** SIP022 requires a client to survive a
+    /// server restart, which changes the server's session ID mid-association;
+    /// it permits keeping exactly the current one and one predecessor, which is
+    /// what this is. A third would be a cache with an eviction policy for a set
+    /// that never exceeds two.
+    sessions: [Option<([u8; 8], Window)>; 2],
+    /// One receive buffer for the association's life, sized so that nothing a
+    /// UDP datagram can carry is ever truncated.
+    framed: Vec<u8>,
+}
+
+impl PacketSource {
+    /// The window for `session`, admitting it as the current one if it is new
+    /// and retiring whatever was oldest.
+    fn window(&mut self, session: [u8; 8]) -> &mut Window {
+        if let Some(at) = self
+            .sessions
+            .iter()
+            .position(|held| held.as_ref().is_some_and(|(id, _)| *id == session))
+        {
+            return &mut self.sessions[at].as_mut().expect("just found").1;
+        }
+        self.sessions.swap(0, 1);
+        self.sessions[0] = Some((session, Window::default()));
+        &mut self.sessions[0].as_mut().expect("just written").1
+    }
+}
+
+impl DatagramSource for PacketSource {
+    fn recv_from<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<(usize, Target), EgressError>> {
+        Box::pin(async move {
+            loop {
+                let read = self.relay.socket.recv(&mut self.framed).await?;
+                // **A bad packet is skipped, never fatal.** Anything can send to
+                // a UDP socket, so a datagram that will not open is noise on a
+                // public port rather than a failure of this association.
+                let Ok(opened) = self.relay.cipher.open(&self.framed[..read]) else {
+                    continue;
+                };
+                let Ok((from, at)) =
+                    decode_packet_response(&opened.message, &self.relay.session, now_seconds())
+                else {
+                    continue;
+                };
+                // Only now, with the packet authenticated and its header
+                // validated, may the window move.
+                if !self.window(opened.session).admit(opened.packet_id) {
+                    continue;
+                }
+                let payload = &opened.message[at..];
+                let Some(into) = buf.get_mut(..payload.len()) else {
+                    return Err(EgressError::DatagramTooLarge {
+                        required: payload.len(),
+                    });
+                };
+                into.copy_from_slice(payload);
+                return Ok((payload.len(), from));
+            }
+        })
+    }
+}
+
 /// A Shadowsocks 2022 server as a stream egress.
 pub struct ShadowsocksEgress<B> {
     config: ShadowsocksConfig,
@@ -317,15 +813,55 @@ impl<B: TunnelBypass> ShadowsocksEgress<B> {
 impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // The UDP half (SIP022's separate packet format) is not
-            // implemented, and the claim says so rather than implying a relay
-            // that does not exist.
-            datagram_fidelity: DatagramFidelity::None,
+            // **Native, and the packet format is why.** SIP022 carries one
+            // client datagram as one server datagram with its own address
+            // inside, so a boundary crosses intact and one association serves
+            // every peer -- which is what makes QUIC survive this egress rather
+            // than be steered off it.
+            datagram_fidelity: DatagramFidelity::Native,
+            // A datagram is re-originated by the server, so the client's own
+            // packet size stops existing at the proxy and there is no
+            // per-packet header for the *client's* path to charge for. What the
+            // framing costs is charged in `max_datagram_size` instead, which is
+            // the budget that actually binds.
             overhead_bytes: 0,
-            max_datagram_size: None,
+            max_datagram_size: Some(MAX_PROXIED_DATAGRAM),
             preserves_ecn: false,
             nat_behavior: self.config.nat_behavior,
         }
+    }
+
+    /// Opens the datagram half: one socket to the server, one client session,
+    /// and the counter that must never repeat against it.
+    ///
+    /// **No handshake, which is the point of the format.** Unlike SOCKS5's UDP
+    /// ASSOCIATE there is no control connection whose lifetime bounds this one
+    /// and no relay address to be told; the first packet establishes the
+    /// session by carrying its identifier, so an association costs one socket
+    /// and one round of randomness.
+    fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
+        Box::pin(async move {
+            let socket = self.bypass.udp(self.config.server).await?;
+            let mut session = [0u8; 8];
+            // SIP022: "the server session ID MUST be randomly generated", and
+            // the client's likewise -- it is the salt every packet key on this
+            // association is derived from.
+            random(&mut session)?;
+            let relay = Arc::new(PacketRelay {
+                socket,
+                cipher: PacketCipher::new(&self.config.key)?,
+                session,
+                next: std::sync::atomic::AtomicU64::new(0),
+            });
+            Ok(Association {
+                source: Box::new(PacketSource {
+                    relay: Arc::clone(&relay),
+                    sessions: [None, None],
+                    framed: vec![0u8; MAX_UDP_PAYLOAD],
+                }),
+                sink: relay,
+            })
+        })
     }
 
     fn connect<'a>(
@@ -711,6 +1247,293 @@ mod tests {
         assert_eq!(
             u16::from_be_bytes(fixed[9..11].try_into().unwrap()),
             body.len() as u16
+        );
+    }
+
+    /// **A server written from the specification, not from the encoder above.**
+    /// Round-tripping a codec against itself proves only that it is
+    /// self-consistent; the thing that matters is agreeing with a peer, so this
+    /// reads the bytes the way SIP022's field tables say to and answers the
+    /// same way.
+    fn spec_server_reply(
+        key: &PreSharedKey,
+        datagram: &[u8],
+        from: &Target,
+        payload: &[u8],
+        server_session: [u8; 8],
+        packet_id: u64,
+    ) -> (Vec<u8>, Target, Vec<u8>) {
+        use boring::{
+            aead::{AeadCtx, Algorithm},
+            symm::{Cipher, Crypter, Mode},
+        };
+
+        let aes = matches!(key.method, Method::Aes128Gcm | Method::Aes256Gcm);
+        let algorithm = match key.method {
+            Method::Aes128Gcm => Algorithm::aes_128_gcm(),
+            Method::Aes256Gcm => Algorithm::aes_256_gcm(),
+            Method::ChaCha20Poly1305 => Algorithm::xchacha20_poly1305(),
+        };
+
+        // --- read what the client sent
+        let (identity, body, nonce) = if aes {
+            let block = match key.method {
+                Method::Aes128Gcm => Cipher::aes_128_ecb(),
+                _ => Cipher::aes_256_ecb(),
+            };
+            let mut crypter = Crypter::new(block, Mode::Decrypt, key.raw(), None).unwrap();
+            crypter.pad(false);
+            let mut plain = vec![0u8; 32];
+            let n = crypter.update(&datagram[..16], &mut plain).unwrap();
+            plain.truncate(n);
+            let nonce = plain[4..16].to_vec();
+            (plain, datagram[16..].to_vec(), nonce)
+        } else {
+            (Vec::new(), datagram[24..].to_vec(), datagram[..24].to_vec())
+        };
+        let ctx = if aes {
+            AeadCtx::new_default_tag(&algorithm, &key.subkey(&identity[..8])).unwrap()
+        } else {
+            AeadCtx::new_default_tag(&algorithm, key.raw()).unwrap()
+        };
+        let mut opened = body.clone();
+        let tag = opened.split_off(opened.len() - 16);
+        ctx.open_in_place(&nonce, &mut opened, &tag, &[]).unwrap();
+        // For the merged form the identity is the first 16 bytes of the body.
+        let (client_session, message) = if aes {
+            (identity[..8].to_vec(), opened.as_slice())
+        } else {
+            (opened[..8].to_vec(), &opened[16..])
+        };
+
+        assert_eq!(message[0], 0, "type: client to server");
+        let pad = u16::from_be_bytes(message[9..11].try_into().unwrap()) as usize;
+        let Decoded::Complete {
+            value: target,
+            consumed,
+        } = decode_address(&message[11 + pad..]).unwrap()
+        else {
+            panic!("the client wrote a whole address");
+        };
+        let sent = message[11 + pad + consumed..].to_vec();
+
+        // --- answer the way the field table says to
+        let mut reply = Vec::new();
+        reply.push(1u8); // type: server to client
+        reply.extend_from_slice(&now_seconds().to_be_bytes());
+        reply.extend_from_slice(&client_session);
+        reply.extend_from_slice(&0u16.to_be_bytes()); // no padding
+        encode_address(from, &mut reply);
+        reply.extend_from_slice(payload);
+
+        let mut identity = [0u8; 16];
+        identity[..8].copy_from_slice(&server_session);
+        identity[8..].copy_from_slice(&packet_id.to_be_bytes());
+        let out = if aes {
+            let block = match key.method {
+                Method::Aes128Gcm => Cipher::aes_128_ecb(),
+                _ => Cipher::aes_256_ecb(),
+            };
+            let mut crypter = Crypter::new(block, Mode::Encrypt, key.raw(), None).unwrap();
+            crypter.pad(false);
+            let mut header = vec![0u8; 32];
+            let n = crypter.update(&identity, &mut header).unwrap();
+            header.truncate(n);
+            let ctx = AeadCtx::new_default_tag(&algorithm, &key.subkey(&server_session)).unwrap();
+            let mut tag = vec![0u8; 16];
+            ctx.seal_in_place(&identity[4..16], &mut reply, &mut tag, &[])
+                .unwrap();
+            [header, reply, tag].concat()
+        } else {
+            let ctx = AeadCtx::new_default_tag(&algorithm, key.raw()).unwrap();
+            let nonce = [7u8; 24];
+            let mut body = [identity.to_vec(), reply].concat();
+            let mut tag = vec![0u8; 16];
+            ctx.seal_in_place(&nonce, &mut body, &mut tag, &[]).unwrap();
+            [nonce.to_vec(), body, tag].concat()
+        };
+        (out, target, sent)
+    }
+
+    /// Every method's packet format, against a server that reads the
+    /// specification rather than this file. **The two AES methods and the
+    /// ChaCha one are different constructions**, so a test that only covered
+    /// one would leave the other's framing entirely unexercised.
+    #[test]
+    fn a_packet_round_trips_against_a_server_built_from_the_field_tables() {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Aes256Gcm,
+            Method::ChaCha20Poly1305,
+        ] {
+            let psk = key(method);
+            let cipher = PacketCipher::new(&psk).unwrap();
+            let session = [9u8; 8];
+            let target = Target::Domain {
+                host: crate::DomainName::new("example.com").unwrap(),
+                port: 443,
+            };
+
+            let message = encode_packet_request(&target, now_seconds(), b"hello").unwrap();
+            let datagram = cipher.seal(session, 0, &message).unwrap();
+
+            let (reply, seen, sent) = spec_server_reply(
+                &psk,
+                &datagram,
+                &Target::Ip("198.51.100.7:443".parse().unwrap()),
+                b"world",
+                [4u8; 8],
+                0,
+            );
+            assert_eq!(seen, target, "{}: the target crossed", method.name());
+            assert_eq!(sent, b"hello", "{}: the payload crossed", method.name());
+
+            let opened = cipher.open(&reply).unwrap();
+            assert_eq!(opened.session, [4u8; 8], "{}", method.name());
+            let (from, at) =
+                decode_packet_response(&opened.message, &session, now_seconds()).unwrap();
+            assert_eq!(from, Target::Ip("198.51.100.7:443".parse().unwrap()));
+            assert_eq!(&opened.message[at..], b"world", "{}", method.name());
+        }
+    }
+
+    /// The three MUST-level checks, each closing a different hole. A reflected
+    /// request read as a response would deliver a client its own bytes; a stale
+    /// timestamp is the replay window SIP022 bounds at 30 seconds; and a reply
+    /// echoing another client's session is another client's traffic.
+    #[test]
+    fn a_reply_must_be_a_reply_recent_and_addressed_to_this_client() {
+        let session = [9u8; 8];
+        let ours = |kind: u8, when: u64, echo: [u8; 8]| {
+            let mut message = vec![kind];
+            message.extend_from_slice(&when.to_be_bytes());
+            message.extend_from_slice(&echo);
+            message.extend_from_slice(&0u16.to_be_bytes());
+            encode_address(
+                &Target::Ip("198.51.100.7:443".parse().unwrap()),
+                &mut message,
+            );
+            message.extend_from_slice(b"payload");
+            message
+        };
+        let now = now_seconds();
+
+        assert!(
+            decode_packet_response(&ours(PACKET_TO_CLIENT, now, session), &session, now).is_ok()
+        );
+        assert!(
+            decode_packet_response(&ours(PACKET_TO_SERVER, now, session), &session, now).is_err(),
+            "a reflected request is not a response"
+        );
+        assert!(
+            decode_packet_response(
+                &ours(PACKET_TO_CLIENT, now - CLOCK_SKEW_SECONDS - 1, session),
+                &session,
+                now
+            )
+            .is_err(),
+            "and neither is a replay from a minute ago"
+        );
+        assert!(
+            decode_packet_response(&ours(PACKET_TO_CLIENT, now, [1u8; 8]), &session, now).is_err(),
+            "nor another client's reply"
+        );
+    }
+
+    /// SIP022 requires a sliding window because a relay whose replies can be
+    /// replayed is a relay whose client can be made to re-process an old
+    /// answer. Reordering inside the window is ordinary on any path and must
+    /// still be accepted.
+    #[test]
+    fn the_replay_window_admits_reordering_and_refuses_repetition() {
+        let mut window = Window::default();
+        assert!(window.admit(0));
+        assert!(!window.admit(0), "the same packet twice is a replay");
+        assert!(window.admit(5));
+        assert!(window.admit(3), "reordering inside the window is not");
+        assert!(!window.admit(3));
+        assert!(window.admit(4));
+        assert!(!window.admit(5));
+
+        // Far ahead resets the bitmap; everything under the new floor is gone
+        // rather than admitted, which is the conservative half of the trade.
+        assert!(window.admit(1_000));
+        assert!(
+            !window.admit(4),
+            "below the window is refused, not admitted"
+        );
+        assert!(window.admit(999), "and just inside it is still accepted");
+    }
+
+    /// The nonce is a window over the packet identifier, so a repeated
+    /// identifier is a repeated nonce — which against one key is total loss of
+    /// confidentiality, not a degraded mode.
+    #[test]
+    fn the_packet_counter_never_repeats_a_nonce() {
+        let psk = key(Method::Aes256Gcm);
+        let cipher = PacketCipher::new(&psk).unwrap();
+        let session = [3u8; 8];
+        let message = encode_packet_request(
+            &Target::Ip("198.51.100.7:443".parse().unwrap()),
+            now_seconds(),
+            b"x",
+        )
+        .unwrap();
+
+        let mut headers = std::collections::HashSet::new();
+        for packet_id in 0..64 {
+            let datagram = cipher.seal(session, packet_id, &message).unwrap();
+            assert!(
+                headers.insert(datagram[..SEPARATE_HEADER].to_vec()),
+                "two packets sealed under one nonce"
+            );
+        }
+    }
+
+    /// A datagram that will not open is noise, not a failure: anything on the
+    /// internet can send to a UDP socket, so an association that died on the
+    /// first stray packet would not survive a public port for a minute.
+    #[test]
+    fn a_packet_that_will_not_open_is_refused_rather_than_believed() {
+        let psk = key(Method::Aes128Gcm);
+        let cipher = PacketCipher::new(&psk).unwrap();
+        let message = encode_packet_request(
+            &Target::Ip("198.51.100.7:443".parse().unwrap()),
+            now_seconds(),
+            b"x",
+        )
+        .unwrap();
+        let mut datagram = cipher.seal([1u8; 8], 0, &message).unwrap();
+
+        assert!(cipher.open(&datagram).is_ok());
+        let last = datagram.len() - 1;
+        datagram[last] ^= 0x01;
+        assert!(cipher.open(&datagram).is_err(), "a flipped tag bit");
+        datagram[last] ^= 0x01;
+        datagram[0] ^= 0x01;
+        assert!(cipher.open(&datagram).is_err(), "a forged session identity");
+        assert!(cipher.open(&[]).is_err(), "and nothing at all");
+    }
+
+    /// Padding exists to stop a datagram's length naming which host was looked
+    /// up, so it applies where that leak is — plain DNS — and nowhere else.
+    #[test]
+    fn only_a_query_to_the_resolver_is_padded() {
+        let dns = Target::Ip("198.51.100.7:53".parse().unwrap());
+        let web = Target::Ip("198.51.100.7:443".parse().unwrap());
+        let now = now_seconds();
+
+        let padded = encode_packet_request(&dns, now, b"query").unwrap();
+        let bare = encode_packet_request(&web, now, b"query").unwrap();
+        assert_eq!(
+            u16::from_be_bytes(bare[9..11].try_into().unwrap()),
+            0,
+            "everything else pays nothing"
+        );
+        let length = u16::from_be_bytes(padded[9..11].try_into().unwrap());
+        assert!(
+            (1..=MAX_PADDING as u16).contains(&length),
+            "1 + rand % 900, as both reference implementations do: {length}"
         );
     }
 }
