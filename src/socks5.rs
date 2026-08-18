@@ -29,8 +29,6 @@ use std::{
     sync::Arc,
 };
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 use crate::{
     Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
     DomainName, EgressError, NatBehavior, PathProperties, Prefixed, StreamEgress, Target,
@@ -343,46 +341,6 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<(Target, &[u8]), ProxyError> {
     }
 }
 
-/// Reads until `decode` yields a whole message, growing `buf` as needed.
-///
-/// The loop is what makes the codec's `Incomplete` useful: it is the one place
-/// that turns "not yet" into another read, so no decoder has to know about I/O
-/// and no caller has to re-implement framing. A peer that closes mid-message
-/// is `UnexpectedEof` rather than a silent partial parse.
-/// **`buf` carries the surplus out, and it must not be discarded.** A reply's
-/// length lives inside the reply, so this reads *at least* one message and may
-/// read past it — TCP does not preserve the sender's boundaries. What follows
-/// the message is the connection's first payload bytes: a server-first protocol
-/// sends its banner as soon as the proxy connects, and it arrives coalesced
-/// into the same segment as the reply. So the message is drained from the front
-/// and whatever remains stays in `buf` for the caller to replay through
-/// [`Prefixed`], which is also what makes calling this twice on one connection
-/// correct.
-async fn read_message<S, T>(
-    stream: &mut S,
-    buf: &mut Vec<u8>,
-    decode: impl Fn(&[u8]) -> Result<Decoded<T>, ProxyError>,
-) -> Result<T, EgressError>
-where
-    S: AsyncStream,
-{
-    let mut chunk = [0u8; 512];
-    loop {
-        match decode(buf)? {
-            Decoded::Complete { value, consumed } => {
-                buf.drain(..consumed);
-                return Ok(value);
-            }
-            Decoded::Incomplete => {}
-        }
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(EgressError::Io(std::io::ErrorKind::UnexpectedEof));
-        }
-        buf.extend_from_slice(&chunk[..read]);
-    }
-}
-
 /// Static configuration for one SOCKS5 proxy.
 pub struct Socks5Config {
     /// The proxy's TCP endpoint.
@@ -395,6 +353,131 @@ pub struct Socks5Config {
     /// proxy's, unobservable from here, and the planner is entitled to a
     /// measured claim rather than an optimistic constant.
     pub nat_behavior: NatBehavior,
+}
+
+/// RFC 1928's exchange, as a pure state machine.
+///
+/// Three phases, one of them conditional: greet and learn the selected method;
+/// if it is username/password, authenticate; then send the command and read the
+/// reply. Both commands share every step up to the request byte, which is why
+/// this is one machine parameterised by the command rather than two that drift.
+///
+/// **The offset is the machine's own, not the driver's.** [`crate::negotiate`]
+/// hands over everything received so far and drains only when the whole
+/// exchange completes, so a machine spanning several messages has to remember
+/// how far into that buffer its earlier phases reached. Keeping it here rather
+/// than widening [`Decoded`] to carry partial progress leaves the sum the same
+/// one sixty other decoders return.
+struct Negotiate<'a> {
+    credentials: Option<&'a Credentials>,
+    command: u8,
+    target: &'a Target,
+    phase: Phase,
+    /// How much of the offered input earlier phases have consumed.
+    at: usize,
+}
+
+/// Where the exchange has reached. A closed sum, so a phase that forgot to
+/// advance is a match arm that does not compile rather than a flag that
+/// silently re-sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Greeting written; awaiting the method the proxy selected.
+    Selecting,
+    /// Credentials written; awaiting the status byte.
+    Authenticating,
+    /// Command written; awaiting the reply.
+    Requesting,
+}
+
+impl<'a> Negotiate<'a> {
+    fn new(credentials: Option<&'a Credentials>, command: u8, target: &'a Target) -> Self {
+        Self {
+            credentials,
+            command,
+            target,
+            phase: Phase::Selecting,
+            at: 0,
+        }
+    }
+}
+
+impl crate::Negotiation for Negotiate<'_> {
+    /// The address the proxy reports it bound. A `CONNECT` caller discards it;
+    /// a `UDP ASSOCIATE` caller sends its datagrams there, which is the only
+    /// reason it is carried at all.
+    type Output = Target;
+
+    /// O(bytes offered) per call, over an exchange bounded to a few tens of
+    /// bytes plus one address.
+    fn advance(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decoded<Target>, ProxyError> {
+        loop {
+            // Everything earlier phases have not already taken.
+            let rest = input.get(self.at..).unwrap_or_default();
+            match self.phase {
+                Phase::Selecting if self.at == 0 && input.is_empty() && out.is_empty() => {
+                    encode_greeting(self.credentials, out);
+                    return Ok(Decoded::Incomplete);
+                }
+                Phase::Selecting => {
+                    let Decoded::Complete { value, consumed } = decode_method_selection(rest)?
+                    else {
+                        return Ok(Decoded::Incomplete);
+                    };
+                    self.at += consumed;
+                    match value {
+                        METHOD_USERPASS => {
+                            // The greeting offers `USERPASS` only when
+                            // credentials exist, so a proxy selecting it
+                            // without them is choosing an unoffered method.
+                            let credentials = self
+                                .credentials
+                                .ok_or(ProxyError::UnexpectedMethod(METHOD_USERPASS))?;
+                            encode_credentials(credentials, out);
+                            self.phase = Phase::Authenticating;
+                        }
+                        _ => {
+                            encode_request(self.command, self.target, out);
+                            self.phase = Phase::Requesting;
+                        }
+                    }
+                }
+                Phase::Authenticating => {
+                    let Some(pair) = rest.get(..2) else {
+                        return Ok(Decoded::Incomplete);
+                    };
+                    if pair[0] != AUTH_VERSION {
+                        return Err(ProxyError::Version(pair[0]));
+                    }
+                    if pair[1] != 0 {
+                        return Err(ProxyError::AuthFailed);
+                    }
+                    self.at += 2;
+                    encode_request(self.command, self.target, out);
+                    self.phase = Phase::Requesting;
+                }
+                Phase::Requesting => {
+                    let Decoded::Complete { value, consumed } = decode_reply(rest)? else {
+                        return Ok(Decoded::Incomplete);
+                    };
+                    return Ok(Decoded::Complete {
+                        value,
+                        consumed: self.at + consumed,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// RFC 1929's username/password sub-negotiation. Both lengths fit an octet
+/// because [`Credentials`] refused anything longer at construction.
+fn encode_credentials(credentials: &Credentials, out: &mut Vec<u8>) {
+    out.push(AUTH_VERSION);
+    out.push(credentials.username.len() as u8);
+    out.extend_from_slice(credentials.username.as_bytes());
+    out.push(credentials.password.len() as u8);
+    out.extend_from_slice(credentials.password.as_bytes());
 }
 
 /// A SOCKS5 proxy as a stream egress.
@@ -412,56 +495,24 @@ impl<B: TunnelBypass> Socks5Egress<B> {
         Self { config, bypass }
     }
 
-    /// Opens a connection to the proxy and completes the greeting and, when
-    /// required, authentication. Shared by both commands, because RFC 1928
-    /// makes them identical up to the request byte.
+    /// Opens a connection to the proxy and runs RFC 1928's exchange to
+    /// completion.
     ///
-    /// The buffer comes back with the negotiation's surplus still in it, so the
-    /// caller keeps reading where this stopped rather than from an empty one.
-    async fn negotiate(&self) -> Result<(tokio::net::TcpStream, Vec<u8>), EgressError> {
+    /// **The sequencing is not here.** It is in [`Negotiate`], which is a pure
+    /// state machine a test drives byte at a time; this opens a socket, calls
+    /// [`crate::negotiate`], and hands back what the exchange established
+    /// together with whatever was read past it — the target's first payload,
+    /// which for a server-first protocol is its whole banner.
+    async fn exchange(
+        &self,
+        command: u8,
+        target: &Target,
+    ) -> Result<(tokio::net::TcpStream, Target, Vec<u8>), EgressError> {
         let mut stream =
             crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.config.proxy)).await?;
-        let mut out = Vec::with_capacity(4);
-        encode_greeting(self.config.credentials.as_ref(), &mut out);
-        stream.write_all(&out).await?;
-
-        let mut buf = Vec::with_capacity(64);
-        let method = read_message(&mut stream, &mut buf, decode_method_selection).await?;
-        if method == METHOD_USERPASS {
-            let credentials = self
-                .config
-                .credentials
-                .as_ref()
-                // The greeting offers `USERPASS` only when credentials exist,
-                // so a proxy selecting it without them is the proxy choosing
-                // an unoffered method.
-                .ok_or(ProxyError::UnexpectedMethod(METHOD_USERPASS))?;
-            out.clear();
-            out.push(AUTH_VERSION);
-            out.push(credentials.username.len() as u8);
-            out.extend_from_slice(credentials.username.as_bytes());
-            out.push(credentials.password.len() as u8);
-            out.extend_from_slice(credentials.password.as_bytes());
-            stream.write_all(&out).await?;
-
-            let status = read_message(&mut stream, &mut buf, |bytes| {
-                let Some(pair) = bytes.get(..2) else {
-                    return Ok(Decoded::Incomplete);
-                };
-                if pair[0] != AUTH_VERSION {
-                    return Err(ProxyError::Version(pair[0]));
-                }
-                Ok(Decoded::Complete {
-                    value: pair[1],
-                    consumed: 2,
-                })
-            })
-            .await?;
-            if status != 0 {
-                return Err(ProxyError::AuthFailed.into());
-            }
-        }
-        Ok((stream, buf))
+        let mut machine = Negotiate::new(self.config.credentials.as_ref(), command, target);
+        let (bound, surplus) = crate::negotiate(&mut stream, &mut machine).await?;
+        Ok((stream, bound, surplus))
     }
 }
 
@@ -490,34 +541,24 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            let (mut stream, mut buf) = self.negotiate().await?;
-            let mut out = Vec::with_capacity(32);
-            encode_request(CMD_CONNECT, target, &mut out);
-            stream.write_all(&out).await?;
-
             // The bound address the proxy reports is discarded: this client
             // never needs to name its own side of a CONNECT, and keeping it
             // would invite treating it as authoritative for the target.
-            let _bound = read_message(&mut stream, &mut buf, decode_reply).await?;
+            let (stream, _bound, surplus) = self.exchange(CMD_CONNECT, target).await?;
             // Whatever followed the reply is the target's first payload — a
             // server-first banner, most often — so it is replayed rather than
             // dropped.
-            Ok(Box::new(Prefixed::new(buf, stream)) as Box<dyn AsyncStream>)
+            Ok(Box::new(Prefixed::new(surplus, stream)) as Box<dyn AsyncStream>)
         })
     }
 
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
-            let (mut control, mut buf) = self.negotiate().await?;
             // RFC 1928 §7: the address here is where *this client* will send
             // from. All-zeroes means "not yet known", which is what a client
             // behind an unpredictable source port must say.
             let unspecified = Target::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            let mut out = Vec::with_capacity(32);
-            encode_request(CMD_UDP_ASSOCIATE, &unspecified, &mut out);
-            control.write_all(&out).await?;
-
-            let relay = read_message(&mut control, &mut buf, decode_reply).await?;
+            let (control, relay, _surplus) = self.exchange(CMD_UDP_ASSOCIATE, &unspecified).await?;
             // The relay must be reachable as an address; a proxy naming its
             // relay by domain would need a resolution this layer will not do.
             let Target::Ip(relay) = relay else {
@@ -778,5 +819,151 @@ mod tests {
             Credentials::new("u", "p".repeat(256)).map(|_| ()),
             Err(CredentialsError::PasswordTooLong(256))
         );
+    }
+
+    /// **The exchange, with no socket anywhere.** Before the port this needed a
+    /// live proxy or a mock stream; the sequencing was inside an `async fn` and
+    /// the only way to reach it was to run it. Now it is a value, and a test
+    /// offers it bytes.
+    #[test]
+    fn the_unauthenticated_exchange_greets_requests_and_reads_its_reply() {
+        use crate::Negotiation;
+        let target = Target::Domain {
+            host: crate::DomainName::new("example.com").unwrap(),
+            port: 443,
+        };
+        let mut machine = Negotiate::new(None, CMD_CONNECT, &target);
+
+        // Nothing received yet: the greeting goes out.
+        let mut greeting = Vec::new();
+        assert!(matches!(
+            machine.advance(&[], &mut greeting).unwrap(),
+            Decoded::Incomplete
+        ));
+        assert_eq!(greeting, [VERSION, 1, METHOD_NONE]);
+
+        // The proxy selects "no authentication", so the request follows.
+        let mut request = Vec::new();
+        assert!(matches!(
+            machine
+                .advance(&[VERSION, METHOD_NONE], &mut request)
+                .unwrap(),
+            Decoded::Incomplete
+        ));
+        let mut expected = Vec::new();
+        encode_request(CMD_CONNECT, &target, &mut expected);
+        assert_eq!(request, expected);
+
+        // The reply completes it, and the consumed count covers both messages.
+        let mut wire = vec![VERSION, METHOD_NONE];
+        let reply_at = wire.len();
+        wire.extend_from_slice(&[VERSION, 0, 0]);
+        encode_address(&Target::Ip("198.51.100.7:1080".parse().unwrap()), &mut wire);
+        let consumed_total = wire.len();
+        wire.extend_from_slice(b"220 banner\r\n");
+
+        let mut nothing = Vec::new();
+        let Decoded::Complete { value, consumed } = machine.advance(&wire, &mut nothing).unwrap()
+        else {
+            panic!("the reply completes the exchange");
+        };
+        assert!(nothing.is_empty(), "nothing is written after the request");
+        assert_eq!(value, Target::Ip("198.51.100.7:1080".parse().unwrap()));
+        assert_eq!(
+            consumed, consumed_total,
+            "both messages, and not one byte of the banner behind them"
+        );
+        assert!(reply_at < consumed, "the offset spans more than one phase");
+    }
+
+    /// The authenticated path adds a round trip in the middle, and the machine
+    /// must not re-send the greeting to reach it.
+    #[test]
+    fn the_authenticated_exchange_adds_one_round_trip_and_repeats_nothing() {
+        use crate::Negotiation;
+        let credentials = Credentials::new("user", "pass").unwrap();
+        let target = Target::Ip("198.51.100.9:443".parse().unwrap());
+        let mut machine = Negotiate::new(Some(&credentials), CMD_CONNECT, &target);
+
+        let mut greeting = Vec::new();
+        machine.advance(&[], &mut greeting).unwrap();
+        assert_eq!(
+            greeting,
+            [VERSION, 2, METHOD_NONE, METHOD_USERPASS],
+            "both methods are offered when credentials exist"
+        );
+
+        let mut auth = Vec::new();
+        machine
+            .advance(&[VERSION, METHOD_USERPASS], &mut auth)
+            .unwrap();
+        assert_eq!(auth, b"\x01\x04user\x04pass");
+
+        let mut request = Vec::new();
+        machine
+            .advance(&[VERSION, METHOD_USERPASS, AUTH_VERSION, 0], &mut request)
+            .unwrap();
+        let mut expected = Vec::new();
+        encode_request(CMD_CONNECT, &target, &mut expected);
+        assert_eq!(request, expected, "the request follows the status byte");
+    }
+
+    /// **The property a socket-bound test cannot check cheaply.** A machine
+    /// that only advances when a whole message lands in one read works against
+    /// a loopback proxy and fails behind a middlebox, and the only way to know
+    /// is to offer it every prefix.
+    #[test]
+    fn the_exchange_reaches_the_same_verdict_however_the_bytes_are_split() {
+        use crate::Negotiation;
+        let target = Target::Ip("198.51.100.9:443".parse().unwrap());
+        let mut wire = vec![VERSION, METHOD_NONE, VERSION, 0, 0];
+        encode_address(&Target::Ip("0.0.0.0:0".parse().unwrap()), &mut wire);
+
+        let mut machine = Negotiate::new(None, CMD_CONNECT, &target);
+        let mut verdict = None;
+        for taken in 0..=wire.len() {
+            let mut out = Vec::new();
+            verdict = Some(machine.advance(&wire[..taken], &mut out).unwrap());
+        }
+        assert!(
+            matches!(verdict, Some(Decoded::Complete { consumed, .. }) if consumed == wire.len()),
+            "one byte at a time reaches the same place as one read"
+        );
+    }
+
+    /// A proxy that selects a method the client never offered is refused rather
+    /// than followed: answering `USERPASS` with no credentials would send an
+    /// empty username to a server that asked for one.
+    #[test]
+    fn a_method_that_was_never_offered_is_refused() {
+        use crate::Negotiation;
+        let target = Target::Ip("198.51.100.9:443".parse().unwrap());
+        let mut machine = Negotiate::new(None, CMD_CONNECT, &target);
+        machine.advance(&[], &mut Vec::new()).unwrap();
+        assert!(matches!(
+            machine.advance(&[VERSION, METHOD_USERPASS], &mut Vec::new()),
+            Err(ProxyError::UnexpectedMethod(METHOD_USERPASS))
+        ));
+    }
+
+    /// A rejected credential ends the exchange where it happens, rather than
+    /// sending a request the proxy will refuse anyway.
+    #[test]
+    fn a_rejected_credential_ends_the_exchange() {
+        use crate::Negotiation;
+        let credentials = Credentials::new("user", "wrong").unwrap();
+        let target = Target::Ip("198.51.100.9:443".parse().unwrap());
+        let mut machine = Negotiate::new(Some(&credentials), CMD_CONNECT, &target);
+        machine.advance(&[], &mut Vec::new()).unwrap();
+        machine
+            .advance(&[VERSION, METHOD_USERPASS], &mut Vec::new())
+            .unwrap();
+        assert!(matches!(
+            machine.advance(
+                &[VERSION, METHOD_USERPASS, AUTH_VERSION, 1],
+                &mut Vec::new()
+            ),
+            Err(ProxyError::AuthFailed)
+        ));
     }
 }
