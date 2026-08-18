@@ -971,10 +971,10 @@ impl StreamCodec {
 impl Codec for StreamCodec {
     /// O(chunk), with one copy of the sealed block because opening is in place
     /// and the input is borrowed.
-    fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decode, ProxyError> {
+    fn decode<'a>(&mut self, input: &'a [u8], out: &mut Vec<u8>) -> Result<Decode<'a>, ProxyError> {
         let needed = self.needed();
-        let Some(block) = input.get(..needed) else {
-            return Ok(Decode::Framed { consumed: 0 });
+        let Some((block, rest)) = input.split_at_checked(needed) else {
+            return Ok(Decode::Framed { rest: input });
         };
         let mut block = block.to_vec();
         match self.state {
@@ -1000,7 +1000,7 @@ impl Codec for StreamCodec {
                 self.state = ReadState::Length;
             }
         }
-        Ok(Decode::Framed { consumed: needed })
+        Ok(Decode::Framed { rest })
     }
 
     /// Seals one chunk: a length under the writer's nonce, then the payload
@@ -1520,10 +1520,11 @@ mod tests {
         let mut at = 0usize;
         for taken in 0..=wire.len() {
             loop {
-                let Decode::Framed { consumed } = codec.decode(&wire[at..taken], &mut out).unwrap()
-                else {
+                let offered = &wire[at..taken];
+                let Decode::Framed { rest } = codec.decode(offered, &mut out).unwrap() else {
                     panic!("this framing never ends");
                 };
+                let consumed = offered.len() - rest.len();
                 if consumed == 0 {
                     break;
                 }
@@ -1548,10 +1549,11 @@ mod tests {
         let mut at = 0usize;
         // The salt, then the header.
         for _ in 0..2 {
-            let Decode::Framed { consumed } = codec.decode(&wire[at..], &mut out).unwrap() else {
+            let offered = &wire[at..];
+            let Decode::Framed { rest } = codec.decode(offered, &mut out).unwrap() else {
                 unreachable!()
             };
-            at += consumed;
+            at += offered.len() - rest.len();
         }
         // A payload chunk of the right length whose contents are noise.
         let noise = vec![0u8; 4 + TAG];

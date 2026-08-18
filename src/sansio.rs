@@ -40,6 +40,12 @@
 //! in the protocol's buffer before they can reach the caller's. [`Decode`]
 //! exists to refuse that cost where it is avoidable — a codec whose framing has
 //! *ended* says so, and [`Framed`] stops copying and reads straight through.
+//!
+//! [`Decode`] carries the *remainder* of the input rather than a count of what
+//! was taken, and that is the second thing it is for. A count is a number the
+//! adapter turns into `drain(..n)` and `input[n..]`, so a codec that miscounts
+//! panics a connection task; a remainder is carved out of the input, so the
+//! arithmetic that could be wrong does not exist.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -94,16 +100,38 @@ pub trait Negotiation {
 
 /// Decode result. `Transparent` ends framing, so VLESS avoids copying
 /// subsequent bytes.
+///
+/// Both variants carry the **remainder** of the input rather than a count of
+/// what was taken. See [`Decode::consumed`] for why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decode {
-    /// Took `consumed` bytes; whatever they decoded to is in the sink.
+pub enum Decode<'a> {
+    /// Took a prefix; whatever it decoded to is in the sink, and `rest` is what
+    /// the codec has not consumed.
     ///
-    /// `consumed == 0` with an empty sink means "not enough yet", which is the
-    /// codec's spelling of [`Decoded::Incomplete`].
-    Framed { consumed: usize },
-    /// Took `consumed` bytes, and **everything after them is payload, verbatim
+    /// An empty `rest` equal in length to the input, with an empty sink, means
+    /// "not enough yet" — the codec's spelling of [`Decoded::Incomplete`].
+    Framed { rest: &'a [u8] },
+    /// Took a prefix, and **everything in `rest` and after is payload, verbatim
     /// and forever**. The adapter will not call this codec again.
-    Transparent { consumed: usize },
+    Transparent { rest: &'a [u8] },
+}
+
+impl<'a> Decode<'a> {
+    /// How much of `input` the codec took.
+    ///
+    /// **Cannot exceed the input, which is the point of holding a slice.** A
+    /// count would let a codec name a prefix longer than what it was given, and
+    /// the adapter turns that count into `drain(..consumed)` and
+    /// `input[consumed..]` — an index panic in a network task, guarded by
+    /// nothing but each codec having got its own arithmetic right. A remainder
+    /// is carved out of the input, so the arithmetic that could be wrong no
+    /// longer exists.
+    fn consumed(self, input: &[u8]) -> usize {
+        let rest = match self {
+            Self::Framed { rest } | Self::Transparent { rest } => rest,
+        };
+        input.len().saturating_sub(rest.len())
+    }
 }
 
 /// Post-negotiation framing, as a pure codec.
@@ -116,10 +144,13 @@ pub enum Decode {
 pub trait Codec {
     /// Decodes as much of `input` as it can, appending plaintext to `out`.
     ///
-    /// Must make progress or say it cannot: returning
-    /// `Framed { consumed: 0 }` without appending is the only way to ask for
-    /// more input, and the adapter reads before calling again.
-    fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decode, ProxyError>;
+    /// Must make progress or say it cannot: returning `Framed { rest: input }`
+    /// without appending is the only way to ask for more input, and the adapter
+    /// reads before calling again.
+    /// The returned remainder must be a suffix of `input`; carve it with
+    /// `&input[taken..]` rather than building one, so the adapter's
+    /// "how much was taken" is arithmetic neither side can get wrong.
+    fn decode<'a>(&mut self, input: &'a [u8], out: &mut Vec<u8>) -> Result<Decode<'a>, ProxyError>;
 
     /// Encodes one payload into `out`, whole.
     ///
@@ -209,6 +240,16 @@ where
             stream.flush().await?;
         }
         if let Decoded::Complete { value, consumed } = progress {
+            // Total, rather than `drain(..consumed)`. A negotiation naming more
+            // than it was given is a defect in this crate and not something a
+            // peer can cause, but the alternative to saying so is an index
+            // panic in a connection task. `Codec` does not need this because
+            // [`Decode`] carries the remainder instead of a count; `Decoded` is
+            // shared with a dozen in-scope parsers where a count is the natural
+            // shape, so the check lives at the one boundary that indexes with it.
+            if consumed > received.len() {
+                return Err(ProxyError::Header.into());
+            }
             received.drain(..consumed);
             return Ok((value, received));
         }
@@ -332,17 +373,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Codec + Unpin> AsyncRead for Framed<S
                     .decode(&this.coded, &mut this.plain)
                     .map_err(fatal)?;
                 match outcome {
-                    Decode::Transparent { consumed } => {
+                    Decode::Transparent { rest } => {
                         // Whatever followed the framing is payload the caller
                         // is owed. It moves into `plain` rather than being
                         // handed out here, so a caller with a small buffer
                         // takes it across as many reads as it needs.
-                        this.plain.extend_from_slice(&this.coded[consumed..]);
+                        this.plain.extend_from_slice(rest);
                         this.coded.clear();
                         this.transparent = true;
                         continue;
                     }
-                    Decode::Framed { consumed } => {
+                    Decode::Framed { .. } => {
+                        let consumed = outcome.consumed(&this.coded);
                         this.coded.drain(..consumed);
                         // Progress means something to hand out or something
                         // consumed; neither means the codec needs more input,
@@ -598,15 +640,19 @@ mod tests {
     }
 
     impl Codec for StripTwo {
-        fn decode(&mut self, input: &[u8], _out: &mut Vec<u8>) -> Result<Decode, ProxyError> {
+        fn decode<'a>(
+            &mut self,
+            input: &'a [u8],
+            _out: &mut Vec<u8>,
+        ) -> Result<Decode<'a>, ProxyError> {
             if self.stripped {
-                return Ok(Decode::Transparent { consumed: 0 });
+                return Ok(Decode::Transparent { rest: input });
             }
-            if input.len() < 2 {
-                return Ok(Decode::Framed { consumed: 0 });
-            }
+            let Some((_header, rest)) = input.split_at_checked(2) else {
+                return Ok(Decode::Framed { rest: input });
+            };
             self.stripped = true;
-            Ok(Decode::Transparent { consumed: 2 })
+            Ok(Decode::Transparent { rest })
         }
 
         fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
@@ -672,18 +718,19 @@ mod tests {
     struct LengthPrefixed;
 
     impl Codec for LengthPrefixed {
-        fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decode, ProxyError> {
+        fn decode<'a>(
+            &mut self,
+            input: &'a [u8],
+            out: &mut Vec<u8>,
+        ) -> Result<Decode<'a>, ProxyError> {
             let Some(&length) = input.first() else {
-                return Ok(Decode::Framed { consumed: 0 });
+                return Ok(Decode::Framed { rest: input });
             };
-            let length = usize::from(length);
-            let Some(frame) = input.get(1..1 + length) else {
-                return Ok(Decode::Framed { consumed: 0 });
+            let Some((frame, rest)) = input[1..].split_at_checked(usize::from(length)) else {
+                return Ok(Decode::Framed { rest: input });
             };
             out.extend_from_slice(frame);
-            Ok(Decode::Framed {
-                consumed: 1 + length,
-            })
+            Ok(Decode::Framed { rest })
         }
 
         fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError> {

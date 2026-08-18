@@ -561,16 +561,23 @@ struct ResponseHeader {
 
 impl Codec for ResponseHeader {
     /// O(1): the header is a version byte and a length-prefixed addon block.
-    fn decode(&mut self, input: &[u8], _out: &mut Vec<u8>) -> Result<Decode, ProxyError> {
+    fn decode<'a>(
+        &mut self,
+        input: &'a [u8],
+        _out: &mut Vec<u8>,
+    ) -> Result<Decode<'a>, ProxyError> {
         if self.stripped {
-            return Ok(Decode::Transparent { consumed: 0 });
+            return Ok(Decode::Transparent { rest: input });
         }
         match decode_response(input)? {
             Decoded::Complete { consumed, .. } => {
                 self.stripped = true;
-                Ok(Decode::Transparent { consumed })
+                // Carved out of `input`, so the header length the decoder
+                // reported cannot become an index past the end of it.
+                let rest = input.get(consumed..).ok_or(ProxyError::Header)?;
+                Ok(Decode::Transparent { rest })
             }
-            Decoded::Incomplete => Ok(Decode::Framed { consumed: 0 }),
+            Decoded::Incomplete => Ok(Decode::Framed { rest: input }),
         }
     }
 
@@ -949,14 +956,16 @@ mod tests {
         let mut codec = ResponseHeader::default();
         let mut out = Vec::new();
 
+        // The whole header, with nothing behind it.
         assert_eq!(
             codec.decode(&[0u8, 2, 0xaa, 0xbb], &mut out).unwrap(),
-            Decode::Transparent { consumed: 4 }
+            Decode::Transparent { rest: &[] }
         );
         // Everything after is payload, and the codec claims none of it.
+        let payload = b"\x00\x02more";
         assert_eq!(
-            codec.decode(b"\x00\x02more", &mut out).unwrap(),
-            Decode::Transparent { consumed: 0 },
+            codec.decode(payload, &mut out).unwrap(),
+            Decode::Transparent { rest: payload },
             "bytes that merely look like a header are payload now"
         );
         assert!(out.is_empty(), "a strip produces nothing of its own");

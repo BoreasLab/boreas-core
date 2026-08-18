@@ -44,6 +44,11 @@ the product contract. Do not infer implemented status from visionary scope.
   These are sequential exchanges over transports that already retransmit; the
   deadline that bounds them is a session property and lives in `Wait`. A
   `poll_timeout` that always answers `None` is a busy loop waiting to happen.
+- A pure parser reports what it did **not** consume, not how much it did. A
+  count crossing into a driver becomes `drain(..n)` and `input[n..]`, so an
+  arithmetic slip in any one codec is an index panic in a connection task;
+  a remainder is carved out of the input, so the slip cannot be expressed.
+  `Decode` carries `rest` for exactly this reason.
 - Sans-IO stops where backpressure is owned elsewhere. HTTP/2 flow control and
   a QUIC connection's send window are I/O, not decisions about bytes; lift the
   framing and leave them. `decode_grpc_header` is where that line was drawn and
