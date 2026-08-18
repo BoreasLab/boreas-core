@@ -31,9 +31,7 @@
 //! environment can perform.
 
 use std::{
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -41,12 +39,12 @@ use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::SecureRandom,
 };
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
-    Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
-    EgressError, NatBehavior, PathProperties, ProxyError, StreamEgress, Target, TunnelBypass,
-    decode_address, encode_address,
+    Association, AsyncStream, BoxFuture, Codec, DatagramFidelity, DatagramSink, DatagramSource,
+    Decode, Decoded, EgressError, Framed, NatBehavior, PathProperties, ProxyError, StreamEgress,
+    Target, TunnelBypass, decode_address, encode_address,
 };
 
 /// The BLAKE3 derive-key context, fixed by SIP022. It is part of the wire
@@ -175,7 +173,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(method: Method, subkey: &[u8]) -> Result<Self, EgressError> {
+    fn new(method: Method, subkey: &[u8]) -> Result<Self, ProxyError> {
         let key = UnboundKey::new(method.algorithm(), subkey).map_err(|_| ProxyError::Crypto)?;
         Ok(Self {
             key: LessSafeKey::new(key),
@@ -192,7 +190,7 @@ impl Session {
     }
 
     /// Seals in place, appending the tag. SIP022 uses no associated data.
-    fn seal(&mut self, buf: &mut Vec<u8>) -> Result<(), EgressError> {
+    fn seal(&mut self, buf: &mut Vec<u8>) -> Result<(), ProxyError> {
         let nonce = self.next_nonce();
         self.key
             .seal_in_place_append_tag(nonce, Aad::empty(), buf)
@@ -203,7 +201,7 @@ impl Session {
     /// Opens in place, returning the plaintext. A failure here is an
     /// authentication failure and is fatal to the stream: there is no way to
     /// resynchronise a counter-based AEAD after one.
-    fn open<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a [u8], EgressError> {
+    fn open<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a [u8], ProxyError> {
         let nonce = self.next_nonce();
         let plain = self
             .key
@@ -230,10 +228,10 @@ fn now_seconds() -> u64 {
 /// time, and that bound is only meaningful if a stamp far outside it is
 /// refused. Symmetric in both directions, because a replayed *response* is as
 /// harmful as a replayed request.
-fn check_timestamp(theirs: u64, ours: u64) -> Result<(), EgressError> {
+fn check_timestamp(theirs: u64, ours: u64) -> Result<(), ProxyError> {
     let skew = ours.abs_diff(theirs);
     if skew > CLOCK_SKEW_SECONDS {
-        return Err(ProxyError::Stale { skew }.into());
+        return Err(ProxyError::Stale { skew });
     }
     Ok(())
 }
@@ -281,18 +279,18 @@ fn encode_request_fixed(now: u64, body_len: u16) -> Vec<u8> {
 ///
 /// The salt echo is what makes a replayed response detectable, so verifying it
 /// is not optional politeness — it is the property the field exists for.
-fn decode_response_fixed(plain: &[u8], request_salt: &[u8], now: u64) -> Result<u16, EgressError> {
+fn decode_response_fixed(plain: &[u8], request_salt: &[u8], now: u64) -> Result<u16, ProxyError> {
     let salt_len = request_salt.len();
     if plain.len() != 1 + 8 + salt_len + 2 {
-        return Err(ProxyError::Header.into());
+        return Err(ProxyError::Header);
     }
     if plain[0] != TYPE_RESPONSE {
-        return Err(ProxyError::Header.into());
+        return Err(ProxyError::Header);
     }
     let stamp = u64::from_be_bytes(plain[1..9].try_into().map_err(|_| ProxyError::Header)?);
     check_timestamp(stamp, now)?;
     if &plain[9..9 + salt_len] != request_salt {
-        return Err(ProxyError::SaltMismatch.into());
+        return Err(ProxyError::SaltMismatch);
     }
     let length = u16::from_be_bytes(
         plain[9 + salt_len..]
@@ -906,25 +904,23 @@ impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
             stream.write_all(&out).await?;
             stream.flush().await?;
 
-            Ok(Box::new(ShadowsocksStream {
-                inner: stream,
-                writer,
-                reader: None,
-                method,
-                key: self.config.key.clone(),
-                request_salt: salt,
-                state: ReadState::Salt,
-                cipher: Vec::with_capacity(MAX_CHUNK + TAG),
-                plain: Vec::new(),
-                plain_at: 0,
-            }) as Box<dyn AsyncStream>)
+            Ok(Box::new(Framed::new(
+                stream,
+                StreamCodec {
+                    writer,
+                    reader: None,
+                    method,
+                    key: self.config.key.clone(),
+                    request_salt: salt,
+                    state: ReadState::Salt,
+                },
+            )) as Box<dyn AsyncStream>)
         })
     }
 }
 
-/// What the reader is waiting for. An explicit state rather than a length
-/// guess, because each stage's size is known only once the previous one has
-/// been decrypted.
+/// What the reader is waiting for. See [`StreamCodec::needed`] for why this is
+/// a state and not a length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadState {
     /// The server's salt, in the clear, which keys the response direction.
@@ -937,29 +933,31 @@ enum ReadState {
     Payload(usize),
 }
 
-/// A Shadowsocks session as an ordinary byte stream.
+/// A Shadowsocks session's framing, as a pure codec.
 ///
-/// Reads and writes are chunk-framed and sealed underneath, so everything
-/// above — including the interception exchange — sees only bytes.
-struct ShadowsocksStream<S> {
-    inner: S,
+/// **Everything below reads from a slice and writes to a sink.** The framing
+/// logic was already almost pure — it read only from a buffer the poll loop
+/// filled — and lifting the last of it out removed two defects with the loop it
+/// replaced. One was a busy spin: the old writer looped on `Poll::Pending`
+/// rather than yielding, because a sealed frame whose nonce is already spent
+/// cannot be dropped and re-made, so it had nowhere to put one. [`Framed`] has
+/// somewhere, and parks instead of burning a core until the socket drains.
+struct StreamCodec {
     writer: Session,
-    /// Built lazily: the response direction is keyed by a salt the server
-    /// sends with its first byte, which may be long after connect returns.
+    /// Built lazily: the response direction is keyed by a salt the server sends
+    /// with its first byte, which may be long after connect returned.
     reader: Option<Session>,
     method: Method,
     key: PreSharedKey,
     request_salt: Vec<u8>,
     state: ReadState,
-    /// Ciphertext accumulated toward the current state's requirement.
-    cipher: Vec<u8>,
-    /// Decrypted bytes not yet handed to the caller, and how far they are read.
-    plain: Vec<u8>,
-    plain_at: usize,
 }
 
-impl<S> ShadowsocksStream<S> {
+impl StreamCodec {
     /// How many ciphertext bytes the current state needs before it can act.
+    ///
+    /// **A state rather than a length guess**, because each stage's size is
+    /// known only once the previous one has been decrypted.
     fn needed(&self) -> usize {
         match self.state {
             ReadState::Salt => self.method.salt_len(),
@@ -968,20 +966,20 @@ impl<S> ShadowsocksStream<S> {
             ReadState::Payload(length) => length + TAG,
         }
     }
+}
 
-    /// Consumes exactly the bytes the current state needed, advancing it and
-    /// producing plaintext where there is any.
-    ///
-    /// Pure with respect to I/O: it reads only from `cipher`, which the poll
-    /// loop fills. That is what keeps the framing logic testable and the
-    /// async plumbing trivial.
-    fn advance(&mut self) -> Result<(), EgressError> {
+impl Codec for StreamCodec {
+    /// O(chunk), with one copy of the sealed block because opening is in place
+    /// and the input is borrowed.
+    fn decode(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decode, ProxyError> {
         let needed = self.needed();
-        let mut block: Vec<u8> = self.cipher.drain(..needed).collect();
+        let Some(block) = input.get(..needed) else {
+            return Ok(Decode::Framed { consumed: 0 });
+        };
+        let mut block = block.to_vec();
         match self.state {
             ReadState::Salt => {
-                let session = Session::new(self.method, &self.key.subkey(&block))?;
-                self.reader = Some(session);
+                self.reader = Some(Session::new(self.method, &self.key.subkey(&block))?);
                 self.state = ReadState::FixedHeader;
             }
             ReadState::FixedHeader => {
@@ -998,105 +996,33 @@ impl<S> ShadowsocksStream<S> {
             }
             ReadState::Payload(_) => {
                 let reader = self.reader.as_mut().ok_or(ProxyError::Header)?;
-                let plain = reader.open(&mut block)?;
-                self.plain = plain.to_vec();
-                self.plain_at = 0;
+                out.extend_from_slice(reader.open(&mut block)?);
                 self.state = ReadState::Length;
             }
         }
+        Ok(Decode::Framed { consumed: needed })
+    }
+
+    /// Seals one chunk: a length under the writer's nonce, then the payload
+    /// under the next.
+    ///
+    /// O(payload). The two seals must reach the peer in this order and without
+    /// anything between them, which is why the whole frame goes into one sink
+    /// and [`Framed`] writes it whole.
+    fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError> {
+        let mut length = (payload.len() as u16).to_be_bytes().to_vec();
+        self.writer.seal(&mut length)?;
+        let mut sealed = payload.to_vec();
+        self.writer.seal(&mut sealed)?;
+        out.extend_from_slice(&length);
+        out.extend_from_slice(&sealed);
         Ok(())
     }
-}
 
-fn fatal(error: EgressError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for ShadowsocksStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        loop {
-            // Hand over whatever is already decrypted before doing any work.
-            if this.plain_at < this.plain.len() {
-                let moved = buf.remaining().min(this.plain.len() - this.plain_at);
-                buf.put_slice(&this.plain[this.plain_at..this.plain_at + moved]);
-                this.plain_at += moved;
-                return Poll::Ready(Ok(()));
-            }
-            // A zero-length payload chunk is a keepalive, not end of stream;
-            // fall through and read the next frame rather than reporting EOF.
-            if this.cipher.len() >= this.needed() {
-                this.advance().map_err(fatal)?;
-                continue;
-            }
-            let mut chunk = [0u8; 4096];
-            let mut read_buf = ReadBuf::new(&mut chunk);
-            match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let filled = read_buf.filled();
-                    if filled.is_empty() {
-                        // The peer closed. Mid-frame this is a truncation, but
-                        // the caller's contract is end of stream either way.
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.cipher.extend_from_slice(filled);
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ShadowsocksStream<S> {
-    /// Seals one chunk per call: a length chunk and then a payload chunk, both
-    /// under the writer's advancing nonce.
-    ///
-    /// The whole sealed frame is handed to the inner stream with `write_all`
-    /// semantics deferred to `poll_flush`; a partial write of a sealed frame
-    /// would desynchronise the peer's counter, so the frame is buffered whole.
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let take = buf.len().min(MAX_CHUNK);
-        let mut length = (take as u16).to_be_bytes().to_vec();
-        this.writer.seal(&mut length).map_err(fatal)?;
-        let mut payload = buf[..take].to_vec();
-        this.writer.seal(&mut payload).map_err(fatal)?;
-        length.extend_from_slice(&payload);
-
-        // Written in full here: a sealed frame cannot be split across calls
-        // without the peer's counter losing step with ours.
-        let mut written = 0;
-        while written < length.len() {
-            match Pin::new(&mut this.inner).poll_write(cx, &length[written..]) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero)));
-                }
-                Poll::Ready(Ok(moved)) => written += moved,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                // The frame is already sealed and its nonce spent, so yielding
-                // here would lose it. This is the one place the implementation
-                // is deliberately not cancel-safe, and the bound is one frame.
-                Poll::Pending => continue,
-            }
-        }
-        Poll::Ready(Ok(take))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    /// The two-byte length field's ceiling. A caller writing more is split by
+    /// the adapter rather than discovering the limit here.
+    fn max_payload(&self) -> usize {
+        MAX_CHUNK
     }
 }
 
@@ -1191,7 +1117,7 @@ mod tests {
         let other = build(TYPE_RESPONSE, now, &[6u8; 32], 1);
         assert!(matches!(
             decode_response_fixed(&other, &salt, now),
-            Err(EgressError::Proxy(ProxyError::SaltMismatch))
+            Err(ProxyError::SaltMismatch)
         ));
 
         // A stale stamp is refused in both directions of skew.
@@ -1199,7 +1125,7 @@ mod tests {
             let stale = build(TYPE_RESPONSE, stamp, &salt, 1);
             assert!(matches!(
                 decode_response_fixed(&stale, &salt, now),
-                Err(EgressError::Proxy(ProxyError::Stale { .. }))
+                Err(ProxyError::Stale { .. })
             ));
         }
         // Exactly at the boundary is still admitted.
@@ -1210,13 +1136,13 @@ mod tests {
         let reflected = build(TYPE_REQUEST, now, &salt, 1);
         assert!(matches!(
             decode_response_fixed(&reflected, &salt, now),
-            Err(EgressError::Proxy(ProxyError::Header))
+            Err(ProxyError::Header)
         ));
 
         // A truncated header is refused rather than indexed into.
         assert!(matches!(
             decode_response_fixed(&good[..10], &salt, now),
-            Err(EgressError::Proxy(ProxyError::Header))
+            Err(ProxyError::Header)
         ));
     }
 
@@ -1535,5 +1461,134 @@ mod tests {
             (1..=MAX_PADDING as u16).contains(&length),
             "1 + rand % 900, as both reference implementations do: {length}"
         );
+    }
+
+    /// The response fixed header a server writes, built here from SIP022's
+    /// field table rather than from this file's decoder — so the tests below
+    /// check agreement with the specification and not with themselves.
+    fn server_fixed_header(now: u64, request_salt: &[u8], length: u16) -> Vec<u8> {
+        let mut header = Vec::with_capacity(11 + request_salt.len());
+        header.push(TYPE_RESPONSE);
+        header.extend_from_slice(&now.to_be_bytes());
+        header.extend_from_slice(request_salt);
+        header.extend_from_slice(&length.to_be_bytes());
+        header
+    }
+
+    /// A codec pair keyed the way a real session is, so the two directions can
+    /// be run against each other without a server.
+    fn paired(method: Method) -> (StreamCodec, Session, Vec<u8>, PreSharedKey) {
+        let psk = key(method);
+        let request_salt = vec![7u8; method.salt_len()];
+        let response_salt = vec![9u8; method.salt_len()];
+        // What the client holds.
+        let client = StreamCodec {
+            writer: Session::new(method, &psk.subkey(&request_salt)).unwrap(),
+            reader: None,
+            method,
+            key: psk.clone(),
+            request_salt: request_salt.clone(),
+            state: ReadState::Salt,
+        };
+        // What a server would seal responses with.
+        let server = Session::new(method, &psk.subkey(&response_salt)).unwrap();
+        (client, server, response_salt, psk)
+    }
+
+    /// **Every read boundary, without a socket.** The framing is four states
+    /// whose sizes are each known only after the previous one decrypts, so a
+    /// decoder that assumed a whole stage arrives at once would pass a loopback
+    /// test and stall on a real path.
+    #[test]
+    fn the_stream_framing_decodes_one_byte_at_a_time() {
+        let (mut codec, mut server, response_salt, _psk) = paired(Method::Aes256Gcm);
+
+        // A server's first bytes: its salt, the sealed fixed header naming the
+        // first chunk's length, then that chunk.
+        let payload = b"hello from the far side";
+        let mut wire = response_salt.clone();
+        let mut fixed =
+            server_fixed_header(now_seconds(), &codec.request_salt, payload.len() as u16);
+        server.seal(&mut fixed).unwrap();
+        wire.extend_from_slice(&fixed);
+        let mut sealed = payload.to_vec();
+        server.seal(&mut sealed).unwrap();
+        wire.extend_from_slice(&sealed);
+
+        // Offer a growing prefix, one byte at a time, exactly as `Framed` does.
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for taken in 0..=wire.len() {
+            loop {
+                let Decode::Framed { consumed } = codec.decode(&wire[at..taken], &mut out).unwrap()
+                else {
+                    panic!("this framing never ends");
+                };
+                if consumed == 0 {
+                    break;
+                }
+                at += consumed;
+            }
+        }
+        assert_eq!(out, payload, "every stage crossed a byte at a time");
+    }
+
+    /// A sealed chunk whose tag does not verify ends the stream. Framing is not
+    /// something a peer recovers from mid-connection: a chunk that will not
+    /// open means the two sides no longer agree where the next one begins.
+    #[test]
+    fn a_chunk_that_will_not_open_is_refused() {
+        let (mut codec, mut server, response_salt, _psk) = paired(Method::Aes128Gcm);
+        let mut wire = response_salt.clone();
+        let mut fixed = server_fixed_header(now_seconds(), &codec.request_salt, 4);
+        server.seal(&mut fixed).unwrap();
+        wire.extend_from_slice(&fixed);
+
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        // The salt, then the header.
+        for _ in 0..2 {
+            let Decode::Framed { consumed } = codec.decode(&wire[at..], &mut out).unwrap() else {
+                unreachable!()
+            };
+            at += consumed;
+        }
+        // A payload chunk of the right length whose contents are noise.
+        let noise = vec![0u8; 4 + TAG];
+        assert!(matches!(
+            codec.decode(&noise, &mut out),
+            Err(ProxyError::Crypto)
+        ));
+    }
+
+    /// The two-byte length field is the ceiling, and the adapter splits rather
+    /// than letting a caller discover it mid-encode.
+    #[test]
+    fn a_payload_past_the_length_field_is_the_adapters_problem_not_the_codecs() {
+        let (codec, _server, _salt, _psk) = paired(Method::Aes256Gcm);
+        assert_eq!(codec.max_payload(), MAX_CHUNK);
+        assert_eq!(MAX_CHUNK, 0xffff, "what two bytes can express");
+    }
+
+    /// **The spin this port removed.** The old writer looped on `Poll::Pending`
+    /// because a sealed frame's nonce is already spent and it had nowhere to
+    /// park one; against a peer that stops reading it burned a core. `Framed`
+    /// holds the frame and yields, so a full pipe costs nothing.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_parks_the_writer_rather_than_spinning() {
+        let (peer, ours) = tokio::io::duplex(64);
+        let (mut codec, _server, _salt, _psk) = paired(Method::Aes256Gcm);
+        codec.state = ReadState::Salt;
+        let mut framed = Framed::new(ours, codec);
+
+        // Far more than the pipe holds, and nobody is draining it.
+        let payload = vec![b'x'; 8192];
+        let stalled = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            framed.write_all(&payload),
+        )
+        .await;
+        assert!(stalled.is_err(), "the write is parked, which is the point");
+        drop(peer);
     }
 }
