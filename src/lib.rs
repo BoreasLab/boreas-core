@@ -29,6 +29,8 @@ mod shell;
 mod socks5;
 mod stream;
 mod terminate;
+#[cfg(test)]
+pub(crate) mod testing;
 mod transport;
 mod udp;
 mod upstream;

@@ -683,3 +683,265 @@ fn pump_out(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A QUIC server on loopback, serving exactly one connection.
+    ///
+    /// **A real server rather than two in-process connections pumped by hand**,
+    /// because what is under test here is the driver: the socket, its timers,
+    /// and the loop that joins them. A harness that skipped the socket would
+    /// skip the half most likely to be wrong.
+    ///
+    /// It echoes: bytes on a stream come back on that stream, and a datagram
+    /// comes back as a datagram. That is enough to observe both directions of
+    /// everything this module offers.
+    struct Echo {
+        address: SocketAddr,
+        shutdown: CancellationToken,
+    }
+
+    impl Echo {
+        async fn start(datagrams: bool) -> Self {
+            let (cert, key, dir) = crate::testing::self_signed("quic.example");
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let shutdown = CancellationToken::new();
+            let cancelled = shutdown.clone();
+
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            config
+                .load_cert_chain_from_pem_file(cert.to_str().unwrap())
+                .unwrap();
+            config
+                .load_priv_key_from_pem_file(key.to_str().unwrap())
+                .unwrap();
+            config.set_application_protos(&[b"echo"]).unwrap();
+            config.set_max_idle_timeout(10_000);
+            config.set_initial_max_data(1_000_000);
+            config.set_initial_max_stream_data_bidi_local(100_000);
+            config.set_initial_max_stream_data_bidi_remote(100_000);
+            config.set_initial_max_stream_data_uni(100_000);
+            config.set_initial_max_streams_bidi(16);
+            config.set_initial_max_streams_uni(16);
+            if datagrams {
+                config.enable_dgram(true, 64, 64);
+            }
+
+            tokio::spawn(async move {
+                // The directory outlives the server, so `quiche` can still read
+                // the files if it reloads them.
+                let _dir = dir;
+                let mut config = config;
+                let mut inbound = vec![0u8; 2048];
+                let mut outbound = vec![0u8; 2048];
+                let mut conn: Option<quiche::Connection> = None;
+                let mut peer: Option<SocketAddr> = None;
+                let mut chunk = vec![0u8; 2048];
+
+                loop {
+                    if let Some(established) = conn.as_mut() {
+                        // Echo every readable stream.
+                        for id in established.readable() {
+                            while let Ok((read, fin)) = established.stream_recv(id, &mut chunk) {
+                                let _ = established.stream_send(id, &chunk[..read], fin);
+                            }
+                        }
+                        // And every datagram.
+                        while let Ok(read) = established.dgram_recv(&mut chunk) {
+                            let _ = established.dgram_send(&chunk[..read]);
+                        }
+                        while let Ok((written, info)) = established.send(&mut outbound) {
+                            let _ = socket.send_to(&outbound[..written], info.to).await;
+                        }
+                    }
+
+                    let timer = conn
+                        .as_ref()
+                        .and_then(|established| established.timeout())
+                        .map(|left| TokioInstant::now() + left)
+                        .unwrap_or_else(no_deadline);
+
+                    tokio::select! {
+                        () = cancelled.cancelled() => break,
+                        result = socket.recv_from(&mut inbound) => {
+                            let Ok((read, from)) = result else { break };
+                            if conn.is_none() {
+                                let header = quiche::Header::from_slice(
+                                    &mut inbound[..read],
+                                    quiche::MAX_CONN_ID_LEN,
+                                );
+                                let Ok(header) = header else { continue };
+                                let scid = quiche::ConnectionId::from_ref(&[0xcd; 16]);
+                                conn = quiche::accept(
+                                    &scid,
+                                    Some(&header.dcid),
+                                    address,
+                                    from,
+                                    &mut config,
+                                )
+                                .ok();
+                                peer = Some(from);
+                            }
+                            if let (Some(established), Some(peer)) = (conn.as_mut(), peer) {
+                                let info = quiche::RecvInfo { from: peer, to: address };
+                                let _ = established.recv(&mut inbound[..read], info);
+                            }
+                        }
+                        () = sleep_until(timer) => {
+                            if let Some(established) = conn.as_mut() {
+                                established.on_timeout();
+                            }
+                        }
+                    }
+                }
+            });
+
+            Self { address, shutdown }
+        }
+
+        /// A client configuration that trusts this server's self-signed
+        /// certificate. Verification is the caller's to set, which is exactly
+        /// why `client_config` does not decide it.
+        fn config(datagrams: bool) -> quiche::Config {
+            let mut config = client_config(&[b"echo"], Duration::from_secs(10)).unwrap();
+            config.verify_peer(false);
+            if datagrams {
+                config.enable_dgram(true, 64, 64);
+            }
+            config
+        }
+
+        async fn dial(&self, datagrams: bool) -> Result<Handshake, EgressError> {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.connect(self.address).await.unwrap();
+            Handshake::establish(
+                socket,
+                self.address,
+                "quic.example",
+                Self::config(datagrams),
+            )
+            .await
+        }
+    }
+
+    impl Drop for Echo {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
+
+    /// A real handshake over a real socket, and a stream that carries bytes
+    /// both ways through the driver task.
+    #[tokio::test]
+    async fn a_stream_carries_bytes_through_a_real_connection() {
+        let echo = Echo::start(false).await;
+        let connection = echo
+            .dial(false)
+            .await
+            .expect("the handshake completes")
+            .drive(CancellationToken::new());
+
+        let mut stream = connection.open_bidi().await.expect("a stream opens");
+        stream.write_all(b"question").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut back = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut back))
+            .await
+            .expect("the echo returns")
+            .unwrap();
+        assert_eq!(&back, b"question");
+    }
+
+    /// **The path Hysteria2's UDP rides.** A datagram out, the same datagram
+    /// back, through the driver's send command and its inbound queue.
+    #[tokio::test]
+    async fn a_datagram_crosses_and_comes_back() {
+        let echo = Echo::start(true).await;
+        let connection = echo
+            .dial(true)
+            .await
+            .expect("the handshake completes")
+            .drive(CancellationToken::new());
+
+        let mut inbound = connection
+            .receive_datagrams()
+            .await
+            .expect("nothing has claimed them");
+        connection
+            .send_datagram(b"one datagram".to_vec())
+            .await
+            .expect("it queues");
+
+        let back = tokio::time::timeout(Duration::from_secs(10), inbound.recv())
+            .await
+            .expect("the echo returns")
+            .expect("the channel is open");
+        assert_eq!(back, b"one datagram");
+    }
+
+    /// Claimed once, and once is the right number: two readers of one datagram
+    /// stream would race for each arriving packet and neither would see all of
+    /// them.
+    #[tokio::test]
+    async fn the_datagram_stream_is_claimed_exactly_once() {
+        let echo = Echo::start(true).await;
+        let connection = echo
+            .dial(true)
+            .await
+            .unwrap()
+            .drive(CancellationToken::new());
+
+        assert!(connection.receive_datagrams().await.is_some());
+        assert!(
+            connection.receive_datagrams().await.is_none(),
+            "a second claimant is refused rather than given a queue that will \
+             see half the packets"
+        );
+    }
+
+    /// **A black-holed path fails a connection instead of hanging one**, which
+    /// is the whole reason the handshake carries a deadline: nothing arrives to
+    /// say the peer is gone, so only a timer ever ends this.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_to_a_black_hole_gives_up_on_its_deadline() {
+        // Bound but never read, so packets are accepted by the OS and answered
+        // by nobody.
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = sink.local_addr().unwrap();
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(address).await.unwrap();
+        let attempt = Handshake::establish(socket, address, "quic.example", Echo::config(false));
+
+        let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT * 2, attempt)
+            .await
+            .expect("the deadline fires well inside twice itself");
+        assert!(matches!(outcome, Err(EgressError::Quic)));
+    }
+
+    /// Cancelling the driver ends it, and a handle to a driver that has stopped
+    /// reports itself dead rather than accepting work nothing will do.
+    #[tokio::test]
+    async fn cancelling_the_driver_closes_the_connection() {
+        let echo = Echo::start(false).await;
+        let shutdown = CancellationToken::new();
+        let connection = echo.dial(false).await.unwrap().drive(shutdown.clone());
+        assert!(connection.is_alive());
+
+        shutdown.cancel();
+        // The driver observes cancellation, says goodbye, and drops its
+        // receiver; the handle notices when the channel closes.
+        for _ in 0..100 {
+            if !connection.is_alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the driver did not stop");
+    }
+}

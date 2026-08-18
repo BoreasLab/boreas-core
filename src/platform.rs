@@ -22,6 +22,16 @@ mod android {
         /// Takes ownership of the fd the JNI layer handed over, wrapped in the
         /// `File` that owns its close-on-drop. The adapter never opens the
         /// device; VpnService owns lifecycle and permissions.
+        ///
+        /// **Must be called on a Tokio runtime**, even by a caller that only
+        /// ever uses the sync [`Device`] seam: registration with the reactor
+        /// happens here rather than at first read, so a construction off the
+        /// runtime panics rather than failing later at a less obvious place.
+        ///
+        /// The descriptor must already be non-blocking. `VpnService.establish`
+        /// returns one that is not, so set `O_NONBLOCK` before handing it
+        /// over — a blocking descriptor would stall the whole reactor on its
+        /// first read.
         pub fn from_owned_fd(fd: std::os::fd::OwnedFd, mtu: Mtu) -> io::Result<Self> {
             Ok(Self {
                 fd: tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))?,
@@ -82,6 +92,150 @@ mod android {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::net::UnixDatagram;
+
+        /// A datagram socket pair standing in for the VpnService descriptor.
+        ///
+        /// Datagram rather than stream, deliberately: a TUN preserves packet
+        /// boundaries, and a stream pair would let a test pass that a real
+        /// device would fail. Non-blocking because `AsyncFd` requires it — a
+        /// blocking descriptor here would stall the whole reactor on its first
+        /// read, which is the failure this shim exists to avoid.
+        /// Polls `future` once and drops it, which is exactly what a lost
+        /// `select!` arm does to a `recv`. Two lines here rather than a
+        /// dependency on `futures-util` for one macro.
+        fn poll_once<F: Future>(future: F) -> std::task::Poll<F::Output> {
+            let mut future = std::pin::pin!(future);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            future.as_mut().poll(&mut cx)
+        }
+
+        fn tun() -> (AndroidTun, UnixDatagram) {
+            let (ours, theirs) = UnixDatagram::pair().expect("a socket pair");
+            ours.set_nonblocking(true).expect("non-blocking");
+            let fd = std::os::fd::OwnedFd::from(ours);
+            (
+                AndroidTun::from_owned_fd(fd, Mtu::new(1500).unwrap())
+                    .expect("the adapter wraps it"),
+                theirs,
+            )
+        }
+
+        #[tokio::test]
+        async fn a_packet_crosses_the_seam_whole_in_both_directions() {
+            let (mut tun, peer) = tun();
+
+            peer.send(b"inbound packet").expect("the peer writes");
+            let mut buf = [0u8; 1500];
+            let read = AsyncDevice::recv(&mut tun, &mut buf).await.expect("read");
+            assert_eq!(&buf[..read], b"inbound packet");
+
+            AsyncDevice::send(&mut tun, b"outbound packet")
+                .await
+                .expect("write");
+            let mut back = [0u8; 1500];
+            let read = peer.recv(&mut back).expect("the peer reads");
+            assert_eq!(&back[..read], b"outbound packet");
+        }
+
+        /// **The obligation the seam states, and the one whose breach is
+        /// silent.** The reactor selects over `recv` and drops the future every
+        /// time another arm wins, which is routine. An implementation that had
+        /// already consumed bytes would lose a packet per lost race — and the
+        /// symptom is not an error, it is a connection that stalls for reasons
+        /// nothing records.
+        #[tokio::test]
+        async fn a_dropped_read_consumes_nothing() {
+            let (mut tun, peer) = tun();
+
+            // A read with nothing to read, abandoned.
+            {
+                let mut buf = [0u8; 1500];
+                assert!(
+                    poll_once(AsyncDevice::recv(&mut tun, &mut buf)).is_pending(),
+                    "nothing has arrived yet"
+                );
+            }
+
+            peer.send(b"arrived after the abandoned read").unwrap();
+            let mut buf = [0u8; 1500];
+            let read = AsyncDevice::recv(&mut tun, &mut buf).await.unwrap();
+            assert_eq!(
+                &buf[..read],
+                b"arrived after the abandoned read",
+                "the packet survives a read that was dropped before it landed"
+            );
+        }
+
+        /// Several reads dropped in a row, each after a packet is already
+        /// waiting. This is the shape that catches an implementation which
+        /// consumes on poll rather than on completion.
+        #[tokio::test]
+        async fn repeated_dropped_reads_lose_no_packet() {
+            let (mut tun, peer) = tun();
+            peer.send(b"one").unwrap();
+
+            for _ in 0..8 {
+                let mut buf = [0u8; 1500];
+                // This one *can* complete, since a packet is waiting; whether
+                // it does is not the point. The point is that dropping it
+                // must not be what consumes the packet.
+                if let std::task::Poll::Ready(Ok(read)) =
+                    poll_once(AsyncDevice::recv(&mut tun, &mut buf))
+                {
+                    assert_eq!(&buf[..read], b"one");
+                    return;
+                }
+            }
+
+            let mut buf = [0u8; 1500];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                AsyncDevice::recv(&mut tun, &mut buf),
+            )
+            .await
+            .expect("the packet is still there")
+            .unwrap();
+            assert_eq!(&buf[..read], b"one");
+        }
+
+        /// The sync seam over the same descriptor, which the simulator drives.
+        ///
+        /// A `tokio::test` despite using none of the async seam: construction
+        /// registers with the reactor, so there has to be one.
+        #[tokio::test]
+        async fn the_sync_seam_reads_and_writes_the_same_descriptor() {
+            let (mut tun, peer) = tun();
+            assert_eq!(Device::mtu(&tun).get(), 1500);
+
+            peer.send(b"sync inbound").unwrap();
+            let mut buf = [0u8; 1500];
+            let read = Device::recv(&mut tun, &mut buf).expect("read");
+            assert_eq!(&buf[..read], b"sync inbound");
+
+            Device::send(&mut tun, b"sync outbound").expect("write");
+            let mut back = [0u8; 1500];
+            let read = peer.recv(&mut back).unwrap();
+            assert_eq!(&back[..read], b"sync outbound");
+        }
+
+        /// A descriptor whose peer is gone reports the failure rather than
+        /// pretending the packet left. The reactor treats a device error as
+        /// fatal, which is right — there is nothing left to serve.
+        #[tokio::test]
+        async fn a_write_to_a_closed_peer_is_an_error_not_a_silent_drop() {
+            let (mut tun, peer) = tun();
+            drop(peer);
+            assert!(
+                AsyncDevice::send(&mut tun, b"nowhere to go").await.is_err(),
+                "a packet that did not leave is not a packet that left"
+            );
         }
     }
 }

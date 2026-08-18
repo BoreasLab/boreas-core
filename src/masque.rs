@@ -577,86 +577,14 @@ mod tests {
         "198.51.100.7:443".parse().unwrap()
     }
 
-    /// Writes a self-signed certificate and key to disk, because `quiche`'s
-    /// configuration loads both from PEM files and offers no in-memory form.
-    /// `rcgen` is already in the graph for the interception CA.
-    fn proxy_certificate() -> (std::path::PathBuf, std::path::PathBuf, tempdir::TempDir) {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["proxy.example".to_owned()]).unwrap();
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "proxy.example");
-        let certificate = params.self_signed(&key).unwrap();
-
-        let dir = tempdir::TempDir::new();
-        let cert_path = dir.path().join("proxy.crt");
-        let key_path = dir.path().join("proxy.key");
-        std::fs::write(&cert_path, pem("CERTIFICATE", certificate.der())).unwrap();
-        std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).unwrap();
-        (cert_path, key_path, dir)
-    }
-
-    /// Wraps DER as PEM, because `quiche` loads only PEM files while `rcgen`
-    /// here produces DER.
-    ///
-    /// Written out rather than enabling `rcgen`'s `pem` feature: that feature
-    /// is not `dev`-scoped, so it would ship a base64 implementation into the
-    /// artifact to satisfy a need that exists only in this test.
-    fn pem(label: &str, der: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut encoded = String::new();
-        for chunk in der.chunks(3) {
-            let mut block = [0u8; 3];
-            block[..chunk.len()].copy_from_slice(chunk);
-            let bits = u32::from_be_bytes([0, block[0], block[1], block[2]]);
-            for index in 0..4 {
-                if index <= chunk.len() {
-                    let shift = 18 - index * 6;
-                    encoded.push(ALPHABET[((bits >> shift) & 0x3f) as usize] as char);
-                } else {
-                    encoded.push('=');
-                }
-            }
-        }
-        let wrapped = encoded
-            .as_bytes()
-            .chunks(64)
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n")
-    }
-
-    /// A scratch directory that removes itself, so the test leaves nothing
-    /// behind even when it fails.
-    mod tempdir {
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        pub struct TempDir(PathBuf);
-
-        impl TempDir {
-            pub fn new() -> Self {
-                let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir()
-                    .join(format!("boreas-masque-{}-{unique}", std::process::id()));
-                std::fs::create_dir_all(&path).unwrap();
-                Self(path)
-            }
-
-            pub fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+    /// The credentials `quiche` loads from disk, from the shared test
+    /// helpers: `quiche` offers no in-memory form, and two modules need one.
+    fn proxy_certificate() -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::testing::TempDir,
+    ) {
+        crate::testing::self_signed("proxy.example")
     }
 
     /// The P17 mechanism gate, in process: a real QUIC handshake, a real
