@@ -47,7 +47,7 @@ pub use datapath::{
     Transmit,
 };
 pub use deadline::{Wait, within};
-pub use demote::{Demotion, Demotions, Leg, Standing, Tier, classify};
+pub use demote::{Demotion, Demotions, InterceptedTier, Leg, Standing, Tier, classify};
 pub use device::{Device, Harness, SimDevice};
 pub use dns::{
     AlpnOutcome, AlpnPolicy, AnswerPolicy, Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy,

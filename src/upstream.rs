@@ -409,26 +409,34 @@ impl<B: TunnelBypass> DohUpstream<B> {
     /// resolving the resolver's own name is the bootstrap problem this crate
     /// declines to have.
     pub fn new(url: &str, resolver: SocketAddr, bypass: B) -> Result<Self, UpstreamError> {
-        let rest = url
-            .strip_prefix("https://")
-            .ok_or(UpstreamError::InvalidUrl)?;
-        let (authority, path) = match rest.find('/') {
-            Some(slash) => (&rest[..slash], &rest[slash..]),
-            None => (rest, "/"),
-        };
-        if authority.is_empty() {
+        // **`http::Uri` rather than a split on `:`.** Splitting worked for
+        // `dns.example` and `dns.example:8443` and produced nonsense for
+        // `[2001:db8::1]`, where the rightmost colon is inside the address: the
+        // host became `2001:db8:` and went on to be the name the certificate
+        // was checked against. RFC 3986 section 3.2.2 is why the brackets are
+        // there, and `Uri` is the parser that already knows it.
+        let uri: http::Uri = url.parse().map_err(|_| UpstreamError::InvalidUrl)?;
+        if uri.scheme_str() != Some("https") {
             return Err(UpstreamError::InvalidUrl);
         }
-        // The certificate must carry the host, not the port.
+        let authority = uri.authority().ok_or(UpstreamError::InvalidUrl)?;
+        // The certificate carries the host, not the port, and `Authority::host`
+        // keeps an IPv6 literal's brackets — which belong in a `Host` header
+        // and not in a server name.
         let host = authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host)
+            .host()
             .trim_start_matches('[')
             .trim_end_matches(']');
+        if host.is_empty() {
+            return Err(UpstreamError::InvalidUrl);
+        }
+        let path = uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
 
         Ok(Self {
             dialer: TlsDialer::new(resolver, host, &[b"http/1.1"], bypass)?,
-            authority: authority.to_owned(),
+            authority: authority.as_str().to_owned(),
             path: path.to_owned(),
         })
     }
@@ -830,6 +838,33 @@ mod tests {
         // A URL with no path still addresses the origin's root.
         let bare = DohUpstream::new("https://dns.example", address(443), DirectSockets).unwrap();
         assert_eq!(bare.path, "/");
+    }
+
+    /// **The rightmost colon is not the port separator when the host is an IPv6
+    /// literal.** Splitting on it made `[2001:db8::1]` into the server name
+    /// `2001:db8:` — a name no certificate carries and no handshake completes
+    /// against, from a URL that is perfectly well formed. RFC 3986 section
+    /// 3.2.2 puts the brackets there for exactly this reason.
+    #[test]
+    fn an_ipv6_literal_resolver_keeps_its_address_as_the_server_name() {
+        for (url, server_name, authority) in [
+            (
+                "https://[2001:db8::1]/dns-query",
+                "2001:db8::1",
+                "[2001:db8::1]",
+            ),
+            (
+                "https://[2001:db8::1]:8443/dns-query",
+                "2001:db8::1",
+                "[2001:db8::1]:8443",
+            ),
+        ] {
+            let upstream = DohUpstream::new(url, address(8443), DirectSockets).unwrap();
+            assert_eq!(upstream.dialer.server_name, server_name, "{url}");
+            // The `Host` header keeps the brackets a server name must not have.
+            assert_eq!(upstream.authority, authority, "{url}");
+            assert_eq!(upstream.path, "/dns-query", "{url}");
+        }
     }
 
     #[tokio::test]

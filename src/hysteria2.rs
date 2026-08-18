@@ -130,11 +130,17 @@ pub fn encode_tcp_request(target: &Target, padding: &[u8], out: &mut Vec<u8>) {
 
 /// What the server answered when asked to open a stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TcpResponse {
-    pub ok: bool,
-    /// The server's explanation when it refused. Empty on success, and capped
-    /// at the protocol's 2048-byte ceiling by the decoder.
-    pub message: String,
+pub enum TcpResponse {
+    /// Status zero. The stream carries payload from here.
+    Accepted,
+    /// Any non-zero status, carrying the server's explanation — capped at the
+    /// protocol's 2048-byte ceiling by the decoder.
+    ///
+    /// A sum rather than `{ ok: bool, message: String }`, because that pair
+    /// admitted an acceptance carrying a refusal reason and a refusal
+    /// explaining nothing. Only one of the two fields was ever meaningful at a
+    /// time, and which one is exactly what `status` decides.
+    Refused(String),
 }
 
 /// Reads the response frame: `status || vstring(message) || vbytes(padding)`.
@@ -173,10 +179,10 @@ pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyEr
         .map_err(|_| ProxyError::Header)?
         .to_owned();
     Ok(Decoded::Complete {
-        value: TcpResponse {
-            // The reference treats every non-zero status as a refusal.
-            ok: status == 0,
-            message,
+        // The reference treats every non-zero status as a refusal.
+        value: match status {
+            0 => TcpResponse::Accepted,
+            _ => TcpResponse::Refused(message),
         },
         consumed: bytes.len() - rest.len() + padding_len as usize,
     })
@@ -240,8 +246,8 @@ impl crate::Negotiation for OpenStream {
         let Decoded::Complete { value, consumed } = decode_tcp_response(input)? else {
             return Ok(Decoded::Incomplete);
         };
-        if !value.ok {
-            return Err(ProxyError::Denied(value.message));
+        if let TcpResponse::Refused(message) = value {
+            return Err(ProxyError::Denied(message));
         }
         Ok(Decoded::Complete {
             value: (),
@@ -868,10 +874,7 @@ mod tests {
         assert_eq!(
             decode_tcp_response(&frame),
             Ok(Decoded::Complete {
-                value: TcpResponse {
-                    ok: true,
-                    message: "ok".to_owned(),
-                },
+                value: TcpResponse::Accepted,
                 consumed: frame.len(),
             })
         );
@@ -883,10 +886,7 @@ mod tests {
         assert_eq!(
             decode_tcp_response(&with_payload),
             Ok(Decoded::Complete {
-                value: TcpResponse {
-                    ok: true,
-                    message: "ok".to_owned(),
-                },
+                value: TcpResponse::Accepted,
                 consumed: frame.len(),
             })
         );
@@ -903,8 +903,7 @@ mod tests {
         let Ok(Decoded::Complete { value, .. }) = decode_tcp_response(&frame) else {
             panic!("the frame is complete");
         };
-        assert!(!value.ok);
-        assert_eq!(value.message, "refused");
+        assert_eq!(value, TcpResponse::Refused("refused".to_owned()));
     }
 
     /// Lengths are a promise from an untrusted peer, so a server claiming a

@@ -49,8 +49,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Either, Hello,
-    InterceptDecision, InterceptPolicy, Interceptor, Leg, NoCosmetics, Originator, Prefixed,
-    RequestFilter, RewriteFailures, Rewriting, Standing, StreamBudget, StreamEgress, Target, Tier,
+    InterceptDecision, InterceptPolicy, InterceptedTier, Interceptor, Leg, NoCosmetics, Originator,
+    Prefixed, RequestFilter, RewriteFailures, Rewriting, StreamBudget, StreamEgress, Target,
     VersionCrossings, Wire, classify, run_exchange,
 };
 
@@ -200,7 +200,7 @@ pub enum Handling {
     Intercepted {
         host: DomainName,
         wire: Wire,
-        tier: Tier,
+        tier: InterceptedTier,
     },
     Spliced {
         reason: SpliceReason,
@@ -346,16 +346,16 @@ impl Sessions {
     }
 
     /// The HTML tier this connection gets, given what the host's history
-    /// permits. [`Tier::Splice`] cannot reach here — it is answered before any
-    /// termination — and maps to the same inert value as [`Tier::Inspect`].
-    fn rewriting(&self, tier: Tier, failures: &Arc<RewriteFailures>) -> Rewriting {
+    /// permits. Two arms, exhaustively: a connection that is not terminated
+    /// never reaches here, and [`InterceptedTier`] is what says so.
+    fn rewriting(&self, tier: InterceptedTier, failures: &Arc<RewriteFailures>) -> Rewriting {
         match tier {
-            Tier::Rewrite => Rewriting::On {
+            InterceptedTier::Rewrite => Rewriting::On {
                 source: Arc::clone(&self.cosmetic),
                 budget: self.budget,
                 failures: Arc::clone(failures),
             },
-            Tier::Inspect | Tier::Splice => Rewriting::Off,
+            InterceptedTier::Inspect => Rewriting::Off,
         }
     }
 }
@@ -408,20 +408,25 @@ pub async fn serve_session(
     // **The allowlist says a human chose this host; the standing says whether
     // that choice worked.** P14 could only ask the first question, which is why
     // its list had to stay short enough to maintain by hand.
-    let standing = sessions.demotions.standing(host.as_str(), Instant::now());
-    if let Standing::Limited(cause) = standing
-        && cause.tier() == Tier::Splice
+    let tier = match sessions
+        .demotions
+        .standing(host.as_str(), Instant::now())
+        .permits()
     {
-        return splice(
-            sessions,
-            server,
-            peeked,
-            stream,
-            SpliceReason::Demoted(cause),
-        )
-        .await;
-    }
-    let tier = standing.tier();
+        Ok(tier) => tier,
+        // Only a recorded demotion can forbid interception outright, so the
+        // cause to name is the one `permits` just handed back.
+        Err(cause) => {
+            return splice(
+                sessions,
+                server,
+                peeked,
+                stream,
+                SpliceReason::Demoted(cause),
+            )
+            .await;
+        }
+    };
 
     let target = Target::Domain {
         host: host.clone(),
@@ -865,7 +870,7 @@ mod end_to_end {
 
     use crate::{
         AllowAll, AsyncStream, BoxFuture, CertificateAuthority, DatagramFidelity, Interceptor,
-        MitmResolver, NatBehavior, PathProperties, bridge,
+        MitmResolver, NatBehavior, PathProperties, Standing, bridge,
     };
 
     const ALLOWED: &str = "allowed.example";
@@ -1126,7 +1131,7 @@ mod end_to_end {
             Handling::Intercepted {
                 host: DomainName::new(ALLOWED).unwrap(),
                 wire: Wire::Http1,
-                tier: Tier::Rewrite,
+                tier: InterceptedTier::Rewrite,
             }
         );
         assert_eq!(
@@ -1225,7 +1230,7 @@ mod end_to_end {
             Handling::Intercepted {
                 host: DomainName::new(ALLOWED).unwrap(),
                 wire: Wire::Http1,
-                tier: Tier::TOP,
+                tier: InterceptedTier::TOP,
             }
         );
     }
@@ -1287,9 +1292,12 @@ mod end_to_end {
             }
         );
         assert_eq!(
-            sessions.demotions.standing(ALLOWED, Instant::now()).tier(),
-            Tier::Splice,
-            "the host must stop being intercepted"
+            sessions
+                .demotions
+                .standing(ALLOWED, Instant::now())
+                .permits(),
+            Err(Demotion::LeafRejected),
+            "the host must stop being intercepted, and say why"
         );
     }
 

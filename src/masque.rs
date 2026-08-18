@@ -24,9 +24,12 @@
 //! testable without a connection.
 //!
 //! **The tunnel's states are a closed sum, so an unusable tunnel cannot be
-//! written to.** A flow id exists only inside [`TunnelState::Established`],
-//! which is the proof that the proxy answered `2xx`; there is no way to encode
-//! a datagram before that, because the number it needs does not exist yet.
+//! written to.** A *usable* flow id exists only inside
+//! [`TunnelState::Established`], which is the proof that the proxy answered
+//! `2xx`; there is no way to encode a datagram before that. The id is known
+//! earlier than that — from the moment the request is sent — and it lives in
+//! [`TunnelState::Requested`] until the answer arrives, rather than in a field
+//! beside the state where the two could disagree about which phase this is in.
 
 use std::{
     net::SocketAddr,
@@ -111,8 +114,20 @@ pub enum CloseReason {
 /// carry packets, so no code path can address a datagram before then.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TunnelState {
-    /// The QUIC handshake, or the CONNECT-IP request, is still in flight.
+    /// The QUIC handshake is still in flight; no CONNECT-IP request has been
+    /// sent yet.
     Connecting,
+    /// The CONNECT-IP request is on the wire. `flow_id` is its request stream's
+    /// quarter id, known from the moment the request is sent and load-bearing
+    /// only once the proxy answers.
+    ///
+    /// **This is where a pending flow id belongs.** It used to sit in a field
+    /// beside this enum, so `Established` with nothing pending and `Connecting`
+    /// with something pending were both representable, and the transition read
+    /// two values that could disagree. One of them now implies the other.
+    Requested {
+        flow_id: u64,
+    },
     /// The proxy answered `2xx`. `flow_id` is the request stream's quarter id,
     /// which every HTTP Datagram on this tunnel carries.
     Established {
@@ -166,10 +181,6 @@ pub struct MasqueEgress {
     /// IP packets successfully handed to the tunnel. The MASQUE half of the
     /// fast-path counter `WireGuardEgress` keeps.
     fast_path_packets: u64,
-    /// The quarter stream id of the CONNECT request, known once the request is
-    /// sent but not yet load-bearing: it becomes the tunnel's `flow_id` only
-    /// when the proxy answers `2xx`, which is what `Established` records.
-    pending_flow_id: Option<u64>,
 }
 
 impl MasqueEgress {
@@ -199,7 +210,6 @@ impl MasqueEgress {
             scratch: vec![0u8; max_packet],
             datagram: Vec::new(),
             fast_path_packets: 0,
-            pending_flow_id: None,
         })
     }
 
@@ -293,7 +303,9 @@ impl MasqueEgress {
                 .map_err(|_| EgressError::Masque)?;
             // RFC 9297 §2.1: the Quarter Stream ID is the request stream's id
             // divided by four, which is what every datagram is prefixed with.
-            self.pending_flow_id = Some(stream_id / 4);
+            self.state = TunnelState::Requested {
+                flow_id: stream_id / 4,
+            };
             self.h3 = Some(h3);
         }
 
@@ -316,7 +328,11 @@ impl MasqueEgress {
                         .find(|header| header.name() == b":status")
                         .and_then(|header| std::str::from_utf8(header.value()).ok())
                         .and_then(|value| value.parse::<u16>().ok());
-                    self.state = match (status, self.pending_flow_id) {
+                    let requested = match self.state {
+                        TunnelState::Requested { flow_id } => Some(flow_id),
+                        _ => None,
+                    };
+                    self.state = match (status, requested) {
                         (Some(status), Some(flow_id)) if (200..300).contains(&status) => {
                             TunnelState::Established { flow_id }
                         }

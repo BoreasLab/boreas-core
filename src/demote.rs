@@ -64,10 +64,46 @@ pub enum Tier {
     Rewrite,
 }
 
+/// The tier a connection that *was* terminated is served at.
+///
+/// **[`Tier::Splice`] is not here, and its absence is the whole type.** A
+/// spliced connection is never terminated, so an `Intercepted` outcome carrying
+/// `Splice` claimed a connection had been simultaneously intercepted and left
+/// alone. Nothing could produce one — an early return two hundred lines up saw
+/// to that, and `Sessions::rewriting` carried a prose note saying so — but the
+/// proof lived in comments and in the distance between two call sites, which is
+/// where proofs go to rot. Here the compiler holds it, and the arm that used to
+/// exist only to be unreachable is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterceptedTier {
+    /// Terminate and filter by URL, but forward bodies untouched.
+    Inspect,
+    /// Terminate, filter, and rewrite HTML bodies.
+    Rewrite,
+}
+
+impl InterceptedTier {
+    /// What a host with nothing recorded against it gets.
+    pub const TOP: Self = Self::Rewrite;
+}
+
 impl Tier {
     /// The identity of [`Self::meet`], and what a host with nothing recorded
     /// against it gets.
     pub const TOP: Self = Self::Rewrite;
+
+    /// The interception this tier permits, or `None` when it permits none.
+    ///
+    /// The one boundary a tier crosses to become something a terminated
+    /// connection can be served at.
+    #[must_use]
+    pub fn intercepted(self) -> Option<InterceptedTier> {
+        match self {
+            Self::Splice => None,
+            Self::Inspect => Some(InterceptedTier::Inspect),
+            Self::Rewrite => Some(InterceptedTier::Rewrite),
+        }
+    }
 
     /// Greatest lower bound: the most Boreas may do given both observations.
     ///
@@ -215,6 +251,21 @@ impl Standing {
         match self {
             Self::Unrestricted => Tier::TOP,
             Self::Limited(cause) => cause.tier(),
+        }
+    }
+
+    /// What this standing permits: a tier to intercept at, or the cause that
+    /// forbids intercepting at all.
+    ///
+    /// **Total, and it answers both questions at once.** `Unrestricted` is
+    /// [`Tier::TOP`], which intercepts, so the `Err` half can only come from a
+    /// recorded demotion — which means the caller that has to splice is handed
+    /// the reason rather than asking a second question and matching on an
+    /// answer it already knows.
+    pub fn permits(self) -> Result<InterceptedTier, Demotion> {
+        match self {
+            Self::Unrestricted => Ok(InterceptedTier::TOP),
+            Self::Limited(cause) => cause.tier().intercepted().ok_or(cause),
         }
     }
 
