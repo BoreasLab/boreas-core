@@ -928,6 +928,26 @@ fn encode_grpc_message(payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
+/// Reads a gRPC message header, returning the payload length and the header's
+/// own size.
+///
+/// `None` for a proper prefix, which is the whole reason this is separate:
+/// **an HTTP/2 DATA frame boundary falls wherever the peer's window put it**,
+/// so a header routinely arrives in two pieces and a reader that assumed
+/// otherwise would work against every server that happens to send it whole.
+///
+/// This is as far as sans-IO reaches into [`H2Stream`], and the line is not
+/// arbitrary. The framing is a decision about bytes and lifts cleanly; the
+/// capacity a write must reserve is the connection's flow-control window,
+/// which *is* backpressure and cannot be expressed without the connection that
+/// owns it.
+///
+/// O(header length), which the varint's ten-group ceiling bounds.
+fn decode_grpc_header(head: &[u8]) -> Option<(usize, usize)> {
+    let (length, used) = get_protobuf_varint(head.get(GRPC_HEADER_MIN..)?)?;
+    Some((length as usize, GRPC_HEADER_MIN + used))
+}
+
 impl AsyncRead for H2Stream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -964,11 +984,10 @@ impl AsyncRead for H2Stream {
             }
             if this.framing == Framing::Grpc
                 && this.remaining == 0
-                && this.head.len() > GRPC_HEADER_MIN
-                && let Some((length, used)) = get_protobuf_varint(&this.head[GRPC_HEADER_MIN..])
+                && let Some((length, header)) = decode_grpc_header(&this.head)
             {
-                this.remaining = length as usize;
-                this.pending = bytes::Bytes::from(this.head.split_off(GRPC_HEADER_MIN + used));
+                this.remaining = length;
+                this.pending = bytes::Bytes::from(this.head.split_off(header));
                 this.head.clear();
                 continue;
             }
@@ -1421,5 +1440,45 @@ mod tests {
             upgrade.advance(response, &mut out).unwrap(),
             crate::Decoded::Complete { .. }
         ));
+    }
+
+    /// **A DATA frame boundary falls wherever the peer's window put it**, so a
+    /// gRPC header routinely arrives in two pieces. Every proper prefix must
+    /// say "not yet" rather than guess, and the whole must report both the
+    /// payload length and its own size — reporting the header's size wrong by
+    /// one desynchronises every message after it.
+    #[test]
+    fn a_grpc_header_split_anywhere_is_read_once_it_is_whole() {
+        for payload in [0usize, 1, 63, 64, 300, 100_000] {
+            let mut framed = Vec::new();
+            encode_grpc_message(&vec![b'x'; payload], &mut framed);
+
+            // Every proper prefix of the header is incomplete.
+            let (length, header) = decode_grpc_header(&framed).unwrap_or_else(|| {
+                panic!("a whole message of {payload} bytes carries a whole header")
+            });
+            assert_eq!(length, payload);
+            for taken in 0..header {
+                assert!(
+                    decode_grpc_header(&framed[..taken]).is_none(),
+                    "{payload}-byte message: {taken} header bytes is not a header"
+                );
+            }
+            assert_eq!(
+                &framed[header..],
+                vec![b'x'; payload].as_slice(),
+                "the header size names exactly where the payload starts"
+            );
+        }
+    }
+
+    /// A length field a hostile peer never terminates would otherwise be read
+    /// forever. Ten groups is all a `u64` holds, and past that the frame is
+    /// refused rather than awaited.
+    #[test]
+    fn a_length_field_that_never_ends_is_refused_rather_than_awaited() {
+        let mut endless = vec![0u8; GRPC_HEADER_MIN];
+        endless.extend(std::iter::repeat_n(0xff, 32));
+        assert!(decode_grpc_header(&endless).is_none());
     }
 }
