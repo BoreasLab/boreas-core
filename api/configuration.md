@@ -25,8 +25,15 @@ QUIC survives or is steered to HTTP/2. You never state a layer.
 | `WireGuard { peer, config }` | IP packets | native | `peer` is the socket address; `config` is the cryptographic peer. A peer that roams keeps its keys and changes its address. |
 | `Socks5(config)` | flows | native, via UDP ASSOCIATE | |
 | `Shadowsocks(config)` | flows | native, SIP022 packet format | All three 2022 methods. |
-| `Vless { config, transport }` | flows | **none** | See below. |
-| `Hysteria2(config)` | flows | **none** | See below. |
+| `Hysteria2(config)` | flows | native, QUIC datagrams | Only if the server answers `Hysteria-UDP: true`; if it does not, datagram flows fail rather than disappearing into a relay that discards them. |
+| `Vless { config, transport }` | flows | **emulated** | See below. |
+
+**Native versus emulated is a real distinction and it decides QUIC.** A native
+egress carries a client datagram as a datagram — unreliable and unordered, as it
+was — so QUIC passes through. VLESS frames datagrams over a reliable ordered
+stream: boundaries survive exactly, but a lost packet is retransmitted and
+everything behind it waits. That is fine for DNS and wrong for QUIC, so QUIC
+flows on a VLESS egress are steered to HTTP/2 while UDP flows are carried.
 
 **`nat_behavior`** appears on most of these and is not something Boreas can
 measure. It says what the NAT in front of you does to a mapping, and it is what
@@ -34,9 +41,10 @@ lets the planner decide whether a QUIC flow can survive. If unsure,
 `AddressAndPortDependent` is the conservative answer: it never claims more than
 is true, at the cost of steering some flows that would have worked.
 
-**Datagram support matters more than it looks.** An egress that carries no
-datagrams causes QUIC flows to be steered to HTTP/2 rather than dropped, so
-sites still load — but you lose HTTP/3 everywhere on that egress.
+**Where datagrams are steered rather than carried, sites still load.** A QUIC
+attempt is refused so the browser falls back to HTTP/2 within its own race
+window; the user sees the page, and you see it in
+`Counters::quic_steered`.
 
 ### VLESS transports
 

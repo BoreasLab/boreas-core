@@ -24,21 +24,33 @@
 | 5 | protocol steering and transient UDP/443 backstop | S |
 | 6 | ECH policy in the resolver | S |
 | 7 | scriptlets and redirect resources; generic cosmetic rules | M |
-| 8 | fragment reassembly, PMTU, ICMP PTB generation and validation | M |
+| 8 | fragment reassembly and PMTU measurement on a real path | S |
 | 9 | smoltcp socket-set scaling | M |
 | 10 | RFC 4787 conformance measurement against a live STUN server | S |
-| 11 | Shadowsocks, VLESS, and Hysteria2 datagram halves | M |
 | 12 | VLESS with the V2Ray transport family, and Hysteria2 | L |
 | 13 | CA lifecycle and user-store installation UX | S |
 | 14 | filter-list build pipeline | S |
 
+Numbers are stable identifiers, so a closed gap leaves its row out rather than
+renumbering the ones after it.
+
 Gap 1 shrank because both v1 platforms share one raw-IP datapath. Gaps 3, 4,
-and 13 shrank after arbitrary app interception and iOS left v1 scope. Gaps 10
-and 11 narrowed once the L4 datagram path landed: the relay drives one
-association per client mapping through whichever egress provides one, so what
-is left is measuring the mapping behaviour on a real network and implementing
-the datagram halves of the three proxy protocols that currently claim
-`DatagramFidelity::None`.
+and 13 shrank after arbitrary app interception and iOS left v1 scope.
+
+Gap 11 closed: Shadowsocks carries SIP022 packets under all three methods,
+Hysteria2 carries QUIC datagrams with fragmentation, and VLESS frames them over
+a stream per destination — which is `Emulated` rather than `Native` and says so,
+because boundaries survive a reliable ordered transport but loss tolerance does
+not. Gap 10 is now only the measurement: the relay drives one association per
+client mapping through whichever egress provides one, so what is left is
+observing the mapping behaviour on a real network.
+
+Gap 8 narrowed to measurement as well. ICMP crosses a packet egress whole, and
+over-sized packets that forbid fragmentation are answered with a Packet Too Big
+so a sender learns its path — which is what QUIC needs, since TCP is served by
+the MSS clamp. Inbound PTB *validation* is deliberately not wired: on the fast
+path the client's own stack holds the connection a message quotes and is the
+better authenticator, and it receives the message because Boreas forwards it.
 
 ## Milestones
 
