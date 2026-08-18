@@ -32,10 +32,7 @@
 use std::{net::SocketAddr, ops::Range, sync::Arc, time::Duration};
 
 use ring::rand::SecureRandom;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, mpsc},
-};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -209,6 +206,49 @@ pub struct Hysteria2Config {
 /// reason it is for MASQUE: a test server and a production one differ there and
 /// nowhere else.
 pub type QuicConfigFactory = Box<dyn Fn() -> Result<quiche::Config, EgressError> + Send + Sync>;
+
+/// Opening one proxied TCP stream: the request frame out, the response frame
+/// back.
+///
+/// A single exchange, so the machine has one conditional and no offset —
+/// contrast [`crate::Negotiation`]'s multi-phase users, which have to remember
+/// where earlier phases reached.
+struct OpenStream {
+    /// Taken on the first advance, which is how "write once" is enforced by the
+    /// type rather than by a flag.
+    request: Option<Vec<u8>>,
+}
+
+impl OpenStream {
+    fn new(target: &Target, padding: Vec<u8>) -> Self {
+        let mut request = Vec::with_capacity(128);
+        encode_tcp_request(target, &padding, &mut request);
+        Self {
+            request: Some(request),
+        }
+    }
+}
+
+impl crate::Negotiation for OpenStream {
+    type Output = ();
+
+    /// O(response length), which the frame's own varints bound.
+    fn advance(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decoded<()>, ProxyError> {
+        if let Some(request) = self.request.take() {
+            out.extend_from_slice(&request);
+        }
+        let Decoded::Complete { value, consumed } = decode_tcp_response(input)? else {
+            return Ok(Decoded::Incomplete);
+        };
+        if !value.ok {
+            return Err(ProxyError::Denied(value.message));
+        }
+        Ok(Decoded::Complete {
+            value: (),
+            consumed,
+        })
+    }
+}
 
 // ------------------------------------------------------- UDP over QUIC
 
@@ -748,39 +788,17 @@ impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
             let connection = self.connection().await?;
             let mut stream = connection.open_bidi().await?;
 
-            let mut request = Vec::with_capacity(128);
-            encode_tcp_request(target, &padding(REQUEST_PADDING)?, &mut request);
-            stream.write_all(&request).await?;
-            stream.flush().await?;
-
-            // **The response is read here rather than lazily**, which costs one
-            // round trip before `connect` returns and buys an honest error: a
-            // refusal becomes a failed dial, as it does for SOCKS5, instead of
-            // surfacing later as an unexplained read error on a stream the
+            // **The response is awaited here rather than lazily**, which costs
+            // one round trip before `connect` returns and buys an honest error:
+            // a refusal becomes a failed dial, as it does for SOCKS5, instead
+            // of surfacing later as an unexplained read error on a stream the
             // caller has already committed to.
-            let mut buf = Vec::with_capacity(256);
-            let mut chunk = [0u8; 512];
-            let response = loop {
-                match decode_tcp_response(&buf)? {
-                    Decoded::Complete { value, consumed } => {
-                        buf.drain(..consumed);
-                        break value;
-                    }
-                    Decoded::Incomplete => {}
-                }
-                let read = stream.read(&mut chunk).await?;
-                if read == 0 {
-                    return Err(EgressError::Io(std::io::ErrorKind::UnexpectedEof));
-                }
-                buf.extend_from_slice(&chunk[..read]);
-            };
-            if !response.ok {
-                return Err(ProxyError::Denied(response.message).into());
-            }
+            let mut open = OpenStream::new(target, padding(REQUEST_PADDING)?);
             // Anything past the response frame is the target's first payload,
             // which coalesces into the same stream write for every server-first
             // protocol. Replaying it is what keeps a banner from vanishing.
-            Ok(Box::new(Prefixed::new(buf, stream)) as Box<dyn AsyncStream>)
+            let ((), surplus) = crate::negotiate(&mut stream, &mut open).await?;
+            Ok(Box::new(Prefixed::new(surplus, stream)) as Box<dyn AsyncStream>)
         })
     }
 }
@@ -1083,6 +1101,88 @@ mod tests {
             whole.map(|payload| payload.len()),
             Some(3000),
             "the second packet completes without the first's fragment"
+        );
+    }
+
+    /// A response frame as the protocol specification lays it out:
+    /// `status || vstring(message) || vbytes(padding)`. Built here rather than
+    /// with a shipped encoder, because this crate is a client and never writes
+    /// one — so the tests below check the decoder against the specification
+    /// instead of against its own inverse.
+    fn encode_tcp_response(ok: bool, message: &str, padding: &[u8], out: &mut Vec<u8>) {
+        out.push(if ok { 0 } else { 1 });
+        varint::put(message.len() as u64, out);
+        out.extend_from_slice(message.as_bytes());
+        varint::put(padding.len() as u64, out);
+        out.extend_from_slice(padding);
+    }
+
+    /// The exchange, driven without a QUIC connection anywhere. Before the port
+    /// this needed a live server: the request and the response read were
+    /// sequenced inside `connect`, so there was nothing to hand bytes to.
+    #[test]
+    fn opening_a_stream_writes_the_request_then_reads_its_response() {
+        use crate::Negotiation;
+        let target = Target::Domain {
+            host: crate::DomainName::new("example.com").unwrap(),
+            port: 443,
+        };
+        let mut open = OpenStream::new(&target, b"pad".to_vec());
+
+        let mut request = Vec::new();
+        assert!(matches!(
+            open.advance(&[], &mut request).unwrap(),
+            Decoded::Incomplete
+        ));
+        let mut expected = Vec::new();
+        encode_tcp_request(&target, b"pad", &mut expected);
+        assert_eq!(request, expected);
+
+        // A second offer must not write the request again; a server reading two
+        // would take the first bytes of the second as payload.
+        let mut again = Vec::new();
+        open.advance(&[], &mut again).unwrap();
+        assert!(again.is_empty());
+    }
+
+    /// **Every read boundary.** A response frame is a status byte and two
+    /// length-prefixed strings, so a machine that assumed it arrives whole
+    /// would work against loopback and stall behind a middlebox.
+    #[test]
+    fn the_response_is_read_however_the_bytes_are_split() {
+        use crate::Negotiation;
+        let target = Target::Ip("198.51.100.7:443".parse().unwrap());
+        let mut wire = Vec::new();
+        encode_tcp_response(true, "ok", b"pad", &mut wire);
+        let frame = wire.len();
+        wire.extend_from_slice(b"220 banner");
+
+        let mut open = OpenStream::new(&target, Vec::new());
+        let mut verdict = None;
+        for taken in 0..=wire.len() {
+            let mut out = Vec::new();
+            verdict = Some(open.advance(&wire[..taken], &mut out).unwrap());
+        }
+        assert!(
+            matches!(verdict, Some(Decoded::Complete { consumed, .. }) if consumed == frame),
+            "the frame, and not one byte of the banner behind it"
+        );
+    }
+
+    /// A refusal is a failed dial rather than a stream that fails later, which
+    /// is the whole reason the response is awaited at connect.
+    #[test]
+    fn a_refused_stream_fails_the_dial_and_says_why() {
+        use crate::Negotiation;
+        let target = Target::Ip("198.51.100.7:443".parse().unwrap());
+        let mut wire = Vec::new();
+        encode_tcp_response(false, "no such host", b"", &mut wire);
+
+        let mut open = OpenStream::new(&target, Vec::new());
+        let error = open.advance(&wire, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(&error, ProxyError::Denied(reason) if reason == "no such host"),
+            "{error:?}"
         );
     }
 }
