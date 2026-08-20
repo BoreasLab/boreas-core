@@ -61,6 +61,12 @@ Store and offer unconditionally in both branches. Storing what you just restored
 is a no-op write, and offering a root the user already trusts shows no dialog —
 so there is no branch here to get wrong.
 
+## Not writing Rust?
+
+Read [platform.md](platform.md#if-your-application-is-not-written-in-rust)
+first. The `ffi/` crate carries a C ABI over everything on this page, and it
+is the supported way in from Kotlin, Java, C#, or C.
+
 ## What you cannot configure, and why
 
 Boreas exposes **policy**, not mechanism. You set what your product and your

@@ -1,0 +1,25 @@
+[package]
+name = "boreas-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "boreas"
+# `cdylib` is what Android loads with `System.loadLibrary` and what Windows
+# links as a DLL; `staticlib` is for a host that would rather link it in;
+# `rlib` is what lets this crate's own tests drive its C entry points as
+# ordinary functions, which is the only way any of this is testable at all.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+boreas-core = { path = ".." }
+# The runtime lives on this side of the boundary: a C caller has no executor,
+# so every entry point that awaits blocks on one owned by the handle.
+tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread"] }
+
+# Only Android needs to call *back* into a managed runtime, and it is the one
+# platform where the bypass obligation is a method on a Java object rather than
+# a socket option. `jni` is the de-facto binding, actively released, and its
+# transitive graph is `cesu8`, `combine`, `jni-sys`, `log`, and `thiserror`.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22.4"

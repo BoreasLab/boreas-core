@@ -55,9 +55,12 @@ jobs:
       # The three commands AGENTS.md requires before any change lands.
       # clippy runs as a rustc wrapper, so -D warnings also fails plain
       # rustc lints such as unused imports across tests and benches.
+      # `--workspace`, because `ffi/` is a member and a root-package-only run
+      # would leave the C boundary — the one place an unwind is fatal and a
+      # pointer is unchecked — compiled by nobody.
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
 
   # The suite that checks these protocols against a decoder Boreas did not
   # write. It ran on every pull request already and proved nothing: without
@@ -104,7 +107,7 @@ jobs:
       # ring compiles C with MSVC, so only a real Windows runner can check the
       # Wintun adapter and GotaTun together; the Linux cross-check ended with
       # P10's dependency on ring.
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Android is `#[cfg(unix)]`, so the check job compiles it as generic Linux
   # and has never seen the target it actually ships to. `boring-sys` and `ring`
@@ -143,7 +146,10 @@ jobs:
       # `--lib` rather than `--all-targets`: the library is what ships to a
       # handset, and cross-compiling the test and example targets would gate
       # the Android build on dev-dependencies that never reach the device.
-      - run: cargo check --target "$TARGET" --lib
+      #
+      # Both crates. `boreas-ffi`'s JNI layer is `#[cfg(target_os = "android")]`,
+      # so this job is the only one that compiles it at all.
+      - run: cargo check --target "$TARGET" --lib -p boreas-core -p boreas-ffi
 
   fuzz:
     name: fuzz smoke

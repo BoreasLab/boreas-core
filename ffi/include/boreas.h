@@ -1,0 +1,311 @@
+/*
+ * Boreas — the C boundary.
+ *
+ * Hand-written rather than generated. A generator would reproduce the layouts
+ * and none of the contracts, and the contracts are where the sharp edges are:
+ * which thread a callback runs on, which pointer the callee owns afterwards,
+ * and what a host must still do when a call fails.
+ *
+ * Keep this in step with ffi/src/. The layouts are checked by
+ * `ffi/tests/header.rs`, which is what stops the two drifting.
+ */
+
+#ifndef BOREAS_H
+#define BOREAS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ status */
+
+/*
+ * Zero is success, so `if (boreas_...(...)) { fail; }` reads correctly.
+ */
+typedef enum {
+  BOREAS_OK = 0,
+  /* A required pointer was null. Always a bug in the caller. */
+  BOREAS_NULL_ARGUMENT = 1,
+  /* A string argument was not valid UTF-8. */
+  BOREAS_NOT_UTF8 = 2,
+  /* The configuration describes a tunnel that cannot exist. */
+  BOREAS_CONFIG = 3,
+  /*
+   * Stored certificate authority material was lost, corrupted, or is not two
+   * halves of one authority. Generate afresh and ask the user to trust the new
+   * root; Boreas will not silently substitute one.
+   */
+  BOREAS_AUTHORITY = 4,
+  /* An egress could not be built from its configuration. */
+  BOREAS_EGRESS = 5,
+  /*
+   * The connection ceiling cannot hold a listening backlog for every inspected
+   * port. Raise `terminated_connections`.
+   */
+  BOREAS_TERMINATION = 6,
+  /* The datapath refused the combination it was handed. */
+  BOREAS_DATAPATH = 7,
+  /* A socket the tunnel needs could not be opened through the bypass. */
+  BOREAS_IO = 8,
+  /* The tunnel has stopped. The handle is still valid to free. */
+  BOREAS_STOPPED = 9,
+  /* An output buffer was too small; the length out-parameter says how small. */
+  BOREAS_BUFFER_TOO_SMALL = 10,
+  /*
+   * A panic was caught at the boundary. Always a defect in Boreas. The
+   * tunnel's state is whatever the failed call left it in, so free the handle
+   * and report this; do not retry on it.
+   */
+  BOREAS_PANIC = 11,
+  /* A failure this header predates. */
+  BOREAS_UNRECOGNISED = 12,
+} BoreasStatus;
+
+/* ------------------------------------------------------------------- seams */
+
+/*
+ * A socket to exclude from the tunnel: a file descriptor on Unix, a SOCKET on
+ * Windows. Signed 64-bit because the two platforms disagree about the width
+ * and one of them uses the top bit.
+ */
+typedef int64_t BoreasSocket;
+
+/*
+ * The client's TUN.
+ *
+ * EVERY CALLBACK HERE IS CALLED FROM AN ARBITRARY WORKER THREAD, and not
+ * always the same one. Your implementation must be safe to call from any
+ * thread. This is not advisory: it is the assumption the library is built on.
+ */
+typedef struct {
+  /* Passed back to every call, untouched. Yours. */
+  void *context;
+  /*
+   * Reads one IP packet into `buf`, blocking until one arrives. Returns the
+   * byte count, or a negative errno.
+   */
+  intptr_t (*recv)(void *context, uint8_t *buf, size_t cap);
+  /*
+   * Writes one IP packet, whole. Returns 0, or a negative errno. A short write
+   * is an error, not a success with a count: the remainder of an IP packet
+   * carries no header and cannot be sent as a second one.
+   */
+  intptr_t (*send)(void *context, const uint8_t *buf, size_t len);
+  /*
+   * Makes any in-flight `recv` return, promptly.
+   *
+   * CALLED BEFORE `release`, AND POSSIBLY WHILE A `recv` IS BLOCKED, so it
+   * must be safe to call concurrently with one. A blocking read cannot be
+   * cancelled, so `release` cannot run until the read returns and the read
+   * does not return until you make it: if `release` were the only signal, the
+   * two would wait for each other. On Android this is `close(fd)`.
+   *
+   * May be NULL only if your reads are bounded anyway.
+   */
+  void (*close)(void *context);
+  /* Releases `context`. Called once, after every callback has returned. */
+  void (*release)(void *context);
+  /* The MTU the interface is configured with. Set the TUN to this number and
+   * pass the same one in BoreasConfig.mtu. */
+  uint16_t mtu;
+} BoreasDevice;
+
+/*
+ * Sockets that do not re-enter the tunnel.
+ *
+ * THIS IS THE OBLIGATION THAT IS SILENT WHEN YOU SKIP IT. An unprotected
+ * socket works perfectly until the tunnel comes up, at which point every
+ * packet it sends re-enters the tunnel it was serving. The symptom is a
+ * resolver that hangs and a proxy that never connects.
+ *
+ * Boreas creates the socket and hands it to you before its first packet; you
+ * exclude it. On Android that is VpnService.protect(fd) — see
+ * `boreas_android_bypass`, which does the JNI for you. On Windows, bind the
+ * physical interface's address or set its index.
+ */
+typedef struct {
+  void *context;
+  /* Excludes one socket. Returns 0 on success, negative on refusal. */
+  int32_t (*protect)(void *context, BoreasSocket socket);
+  /* Releases `context`. Called once. */
+  void (*release)(void *context);
+} BoreasBypass;
+
+/* ----------------------------------------------------------- configuration */
+
+typedef enum {
+  /* Out by the host's own routes. Nothing is proxied. */
+  BOREAS_EGRESS_DIRECT = 0,
+  /* A WireGuard peer, carrying whole IP packets. */
+  BOREAS_EGRESS_WIREGUARD = 1,
+} BoreasEgress;
+
+typedef enum {
+  BOREAS_NAT_ENDPOINT_INDEPENDENT = 0,
+  BOREAS_NAT_ADDRESS_DEPENDENT = 1,
+  BOREAS_NAT_ADDRESS_AND_PORT_DEPENDENT = 2,
+} BoreasNat;
+
+typedef struct {
+  /* "host:port" of the peer. Not part of the keys: a peer that roams keeps
+   * its keys and changes its address. */
+  const char *endpoint;
+  uint8_t private_key[32];
+  uint8_t peer_public_key[32];
+  /* The flag distinguishes "no pre-shared key" from "a key of 32 zeroes". */
+  uint8_t preshared_key[32];
+  bool has_preshared_key;
+} BoreasWireGuard;
+
+/* Zero in any field means "use the default for it". */
+typedef struct {
+  size_t buffer_slices;
+  size_t datagrams_per_flow;
+  /* Must be at least (inspected ports x 64), or start fails with
+   * BOREAS_TERMINATION. Below that, later ports get no listener at all. */
+  size_t terminated_connections;
+  size_t associations;
+  size_t inspected_addresses;
+  size_t pending_reassemblies;
+} BoreasCeilings;
+
+typedef struct {
+  BoreasEgress egress;
+  /* Read only when egress is BOREAS_EGRESS_WIREGUARD. */
+  BoreasWireGuard wireguard;
+  /* Read only when egress is BOREAS_EGRESS_DIRECT. */
+  BoreasNat nat_behavior;
+  /* "host:port" of a DNS upstream to filter through, or NULL to forward
+   * queries untouched. Filtering with NULL here is BOREAS_CONFIG: on the
+   * packet path a flow is selected for inspection because a DNS answer named
+   * its address, so a tunnel that never sees a question can filter nothing. */
+  const char *resolver;
+  const char *const *lists;
+  size_t list_count;
+  /* Zero hosts means no interception, which needs no certificate authority. */
+  const char *const *intercept_hosts;
+  size_t intercept_host_count;
+  /* Stored authority material, or NULL to generate. Both halves together. */
+  const uint8_t *root_certificate;
+  size_t root_certificate_len;
+  const uint8_t *authority_keys;
+  size_t authority_keys_len;
+  bool rewrite_documents;
+  uint16_t mtu;
+  BoreasCeilings ceilings;
+} BoreasConfig;
+
+/* ------------------------------------------------------------------ events */
+
+typedef enum {
+  BOREAS_EVENT_RESOLVED = 0,
+  BOREAS_EVENT_RELOADED = 1,
+  BOREAS_EVENT_COUNTED = 2,
+} BoreasEventKind;
+
+/*
+ * Occurrences since the previous BOREAS_EVENT_COUNTED. Every field is a thing
+ * that went wrong or was refused, so a tunnel working normally reports zeroes
+ * and you can surface any non-zero field without knowing what it means.
+ */
+typedef struct {
+  uint64_t datagrams_dropped;
+  uint64_t packets_rejected;
+  uint64_t quic_steered;
+  /* A misconfiguration: your TUN's MTU is wider than BoreasConfig.mtu. */
+  uint64_t paths_reported;
+  uint64_t events_lost;
+  /* A DEFECT IN BOREAS, not a condition of the network. Please report it. */
+  uint64_t tasks_panicked;
+} BoreasCounters;
+
+/* Only the fields `kind` names carry meaning. */
+typedef struct {
+  BoreasEventKind kind;
+  bool blocked;
+  /* The full length of the name before truncation; larger than your capacity
+   * means it did not all fit. */
+  size_t name_len;
+  size_t rule_len;
+  size_t allowed;
+  size_t blocked_rules;
+  size_t inspected;
+  BoreasCounters counters;
+} BoreasEvent;
+
+/* ------------------------------------------------------------------ tunnel */
+
+typedef struct BoreasTunnel BoreasTunnel;
+
+/*
+ * Starts a tunnel, writing its handle through `out`.
+ *
+ * On failure nothing is allocated and `out` is untouched — but both `release`
+ * callbacks are still called, so a context you handed over is always
+ * accounted for and you can retry.
+ */
+BoreasStatus boreas_tunnel_start(const BoreasConfig *config,
+                                 const BoreasDevice *device,
+                                 const BoreasBypass *bypass,
+                                 BoreasTunnel **out);
+
+/*
+ * Blocks until the next event, or BOREAS_STOPPED once none can arrive.
+ *
+ * `name` and `rule` receive BOREAS_EVENT_RESOLVED's strings, truncated to
+ * their capacities and always NUL-terminated. Either may be NULL to discard.
+ */
+BoreasStatus boreas_tunnel_next_event(BoreasTunnel *handle, BoreasEvent *event,
+                                      char *name, size_t name_cap, char *rule,
+                                      size_t rule_cap);
+
+/* Replaces the rules in force, without restarting or dropping a connection. */
+BoreasStatus boreas_tunnel_reload(BoreasTunnel *handle,
+                                  const char *const *lists, size_t count,
+                                  BoreasEvent *out);
+
+/*
+ * Copies out the certificate authority's material.
+ *
+ * Call once with zero capacities to size, then again to fill. Both lengths are
+ * zero for a tunnel that does not intercept, which is an answer rather than a
+ * failure. Store `certificate` where a trust installer can read it and `keys`
+ * where you keep secrets; hand both back next launch.
+ */
+BoreasStatus boreas_tunnel_authority(BoreasTunnel *handle, uint8_t *certificate,
+                                     size_t certificate_cap,
+                                     size_t *certificate_len, uint8_t *keys,
+                                     size_t keys_cap, size_t *keys_len);
+
+/*
+ * Stops the tunnel and frees its handle. ALWAYS frees, whatever it returns.
+ * Passing NULL is a no-op.
+ */
+BoreasStatus boreas_tunnel_stop(BoreasTunnel *handle);
+
+/* ----------------------------------------------------------------- android */
+
+#if defined(__ANDROID__)
+/*
+ * Builds a BoreasBypass over a VpnService, for a Java_... function you wrote.
+ *
+ * Call it from any JNI frame with that frame's JNIEnv and the service object;
+ * it takes a global reference, so the object outlives the frame. Pass the
+ * result straight to boreas_tunnel_start, which releases it exactly once — on
+ * success and on failure alike.
+ *
+ * There is deliberately no Java_... symbol here: that name encodes the package
+ * and class it belongs to, and those are yours to choose.
+ */
+BoreasStatus boreas_android_bypass(void *env, void *service, BoreasBypass *out);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* BOREAS_H */

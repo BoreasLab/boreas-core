@@ -22,8 +22,21 @@
 //! **Stable:** the shape of [`TunnelConfig`] and everything reachable from it,
 //! [`Platform`], [`Tunnel`]'s methods, [`Event`], and the error sums. A field
 //! may be added to a struct here; a variant may be added to an enum here; both
-//! are minor changes and both are why the enums a host matches on are
-//! `#[non_exhaustive]`.
+//! are minor changes.
+//!
+//! **`#[non_exhaustive]` is on exactly the types a host *eliminates*** —
+//! [`Event`], [`Counters`], [`ConfigError`], [`StartError`], and the enums it
+//! may match on. It is deliberately *not* on the structs a host *constructs*,
+//! and the difference is not a nuance: on an eliminated type the attribute
+//! costs a caller one `_` arm and buys room to add a variant, while on a
+//! constructed struct it forbids the struct expression outright. Every config
+//! struct here carried it until `boreas-ffi` became the first consumer outside
+//! this crate and could not build one — the interface documented as stable had
+//! never been compiled against from outside, and could not have been.
+//!
+//! What replaces it for those structs is the ordinary Rust convention: build
+//! from [`Default`] where one exists and update the fields you mean, so a field
+//! added later reaches you with a value rather than a compile error.
 //!
 //! **Not stable, and not reachable from here:** every other item this crate
 //! exports. `Datapath`, `Shell`, `Session`, the egress traits, the DNS message
@@ -92,7 +105,6 @@ pub struct Platform<D, B> {
 /// client's own link looks like, and how much this instance may hold. Nothing
 /// here is optional in the sense of "leave it out and something sensible
 /// happens" except where a `Default` says exactly what that something is.
-#[non_exhaustive]
 pub struct TunnelConfig {
     pub egress: Egress,
     pub resolver: Resolver,
@@ -234,7 +246,6 @@ pub enum Upstream {
 /// Written as three flat fields, "rewrite documents" and "do not intercept"
 /// would be a representable pair with no meaning, and something would have to
 /// notice at runtime. Here there is nothing to notice.
-#[non_exhaustive]
 pub struct Filtering {
     /// Filter-list text, in the syntax [`crate::parse_rule`] accepts. The host
     /// fetches and stores these; this crate compiles them and never keeps them.
@@ -247,7 +258,6 @@ pub struct Filtering {
 }
 
 /// Terminating TLS for named hosts, and filtering the requests inside.
-#[non_exhaustive]
 pub struct Interception {
     /// The hosts a person chose to intercept. **An allowlist, never a
     /// pattern**: interception forges a certificate, and the set of hosts that
@@ -260,7 +270,6 @@ pub struct Interception {
 }
 
 /// Rewriting HTML bodies as they stream past.
-#[non_exhaustive]
 pub struct Documents {
     /// Memory one response may occupy while being rewritten. The ceiling is the
     /// point: a document is transformed as it arrives rather than buffered
@@ -269,7 +278,6 @@ pub struct Documents {
 }
 
 /// The client's own interface.
-#[non_exhaustive]
 pub struct Link {
     /// The MTU configured on the TUN.
     ///
@@ -302,7 +310,6 @@ impl Default for Link {
 /// A handset with 2 GB of RAM running a VPN service that Android will kill for
 /// using too much, and a desktop with 32 GB, want different answers, and
 /// nothing in this crate can tell which it is on.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct Ceilings {
     /// Payload buffers, shared by everything: forwarded packets, queued

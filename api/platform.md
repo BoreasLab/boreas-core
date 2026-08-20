@@ -3,6 +3,27 @@
 Two obligations. Both are things the core is structurally unable to do, and one
 of them fails silently when you skip it.
 
+## If your application is not written in Rust
+
+**Use `ffi/`, not this module.** What follows describes two Rust traits, and
+neither Kotlin nor C# can implement one. `boreas-ffi` is the same two
+obligations as `#[repr(C)]` vtables of function pointers, plus a handle, a
+status enum, and one thing you cannot add yourself: every entry point catches
+panics, because an unwind that reaches an `extern "C"` frame aborts your whole
+application rather than failing one call.
+
+- The C declarations are `ffi/include/boreas.h`, hand-written, with the
+  threading and ownership contracts in the comments.
+- Android's bypass is `boreas_android_bypass`: it caches the `JavaVM` at
+  `JNI_OnLoad` and calls `VpnService.protect(int)` from whichever worker thread
+  is dialling, which is the one obligation that cannot be a plain function
+  pointer.
+- Windows fills in `protect` itself, binding the physical interface.
+
+The rest of this page still applies — the obligations are the same and so are
+the ways of getting them wrong. It just describes them in the language the core
+is written in.
+
 ## 1. The TUN device
 
 Implement `AsyncDevice`: read one IP packet, write one IP packet, report the

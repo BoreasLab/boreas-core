@@ -76,10 +76,16 @@ the product contract. Do not infer implemented status from visionary scope.
 ```sh
 uv run scripts/vendor.py --check
 cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTFLAGS='--cfg fuzzing' cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+`ffi/` is a workspace member, so the commands above need `--workspace` to
+reach it. Nothing there may unwind: an `extern "C"` frame that unwinds aborts
+the host's whole application, so every entry point goes through
+`boundary`, and `ffi/include/boreas.h` is hand-written and checked against the
+Rust types by `ffi/tests/header.rs`.
 
 `cargo test` skips `tests/interop.rs` unless a reference binary is named, and
 an announced skip is not a check. Before a change to any proxy protocol or

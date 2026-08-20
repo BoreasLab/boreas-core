@@ -17,6 +17,18 @@ edition = "2024"
 # fourth field of the Akamai HTTP/2 fingerprint and h2 hard-codes an order no
 # browser sends. `vendor/README.md` carries both arguments and says what
 # retires each entry.
+# `ffi/` is a member rather than its own workspace, unlike `fuzz/`: it links
+# this library and ships beside it, so it must resolve the same dependency
+# versions and the same `[patch.crates-io]` entries below. A second workspace
+# would duplicate both and let them drift.
+[workspace]
+members = ["ffi"]
+# `fuzz/` stays out. It is its own workspace on purpose — a nightly toolchain,
+# sanitiser instrumentation, and `libfuzzer-sys`, none of which belong in the
+# graph an ordinary `cargo build` resolves. Naming it here is what keeps
+# cargo from adopting it because it happens to sit in this directory.
+exclude = ["fuzz"]
+
 [patch.crates-io]
 h2 = { path = "vendor/h2" }
 quiche = { path = "vendor/quiche" }

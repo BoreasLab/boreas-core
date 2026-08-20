@@ -17,7 +17,7 @@
 
 | # | Gap | Size |
 |---:|---|:---:|
-| 1 | Android VpnService/JNI and Windows Wintun adapters | M |
+| 1 | Android VpnService/JNI and Windows Wintun adapters | S |
 | 2 | connection classifier and policy router | M |
 | 3 | pin-failure detection and automatic demotion | S |
 | 4 | memory governor | S |
@@ -34,8 +34,18 @@
 Numbers are stable identifiers, so a closed gap leaves its row out rather than
 renumbering the ones after it.
 
-Gap 1 shrank because both v1 platforms share one raw-IP datapath. Gaps 3, 4,
-and 13 shrank after arbitrary app interception and iOS left v1 scope.
+Gap 1 shrank again, and for a different reason than the first time: `ffi/`
+now carries the C boundary the platforms actually consume. Before it, `api/`
+described two Rust traits and neither Kotlin nor C# can implement one, so the
+interface documented as stable had never been compiled against from outside
+this crate — and could not have been, because its config structs were
+`#[non_exhaustive]`, which forbids the struct expression outside the defining
+crate. What remains under gap 1 is the host-side glue: a `Java_...` entry point
+naming a class only the application can choose, and a Wintun setup path.
+
+Gap 1 shrank the first time because both v1 platforms share one raw-IP
+datapath. Gaps 3, 4, and 13 shrank after arbitrary app interception and iOS
+left v1 scope.
 
 Gap 11 closed: Shadowsocks carries SIP022 packets under all three methods,
 Hysteria2 carries QUIC datagrams with fragmentation, and VLESS frames them over

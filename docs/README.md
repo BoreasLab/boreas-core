@@ -64,4 +64,5 @@ alter what that folder promises is a change that needs to be made there first.
 | `src/rewrite.rs` | the HTML tier: content-coding decode, streaming rewrite under a budget | [Filtering](filtering.md) |
 | `src/demote.rs` | what a failed handshake proved, and the tier a host's history permits | [Filtering](filtering.md) |
 | `src/transport.rs` | proxy transports: TLS, WebSocket, HTTPUpgrade, gRPC, HTTP/2, QUIC | [Egress](egress.md) |
+| `ffi/` | the C boundary and Android's JNI bypass: status codes, handle lifecycle, callback vtables, panic containment | [Platforms](platforms.md) |
 | `vendor/` | crates patched in tree, generated from `vendor/patches/` by `scripts/vendor.py` | [vendor/README.md](../vendor/README.md) |
