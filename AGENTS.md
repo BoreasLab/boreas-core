@@ -81,6 +81,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 RUSTFLAGS='--cfg fuzzing' cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
+`cargo test` skips `tests/interop.rs` unless a reference binary is named, and
+an announced skip is not a check. Before a change to any proxy protocol or
+transport lands, run it for real:
+
+```sh
+BOREAS_INTEROP=required BOREAS_SINGBOX=$(scripts/reference.sh) \
+    cargo test --test interop
+```
+
+That suite is the only thing here that checks a wire format against a decoder
+this project did not write. `BOREAS_INTEROP=required` turns a missing binary
+into a failure, which is what CI sets.
+
 `fuzz/` is its own workspace, so `--all-targets` above does not reach it: a
 renamed field compiles here and breaks there, and `[patch.crates-io]` has to be
 declared in both. Its check is last because it is the slow one.

@@ -11,15 +11,21 @@
 //! byte that survives a round trip here survived Boreas's encoder *and* a
 //! foreign decoder, which is the property the phase actually needs.
 //!
-//! **Opt-in, and skipped rather than failed when absent.** The binary is a
-//! development tool, not a dependency: it is never linked, never distributed,
-//! and runs out of process. Point
-//! `BOREAS_SINGBOX` at it to run these; without it they report that they were
-//! skipped and pass, so a machine without the reference still has a green
-//! suite.
+//! **Opt-in locally, mandatory in CI, and the difference is a variable.** The
+//! binary is a development tool rather than a dependency: never linked, never
+//! distributed, run out of process. So a contributor without one gets an
+//! announced skip and a green suite — which was also, for a while, exactly what
+//! CI got. A suite that exists because self-consistency proves nothing is worth
+//! very little when it can quietly prove nothing itself.
+//!
+//! `BOREAS_INTEROP=required` closes that: a missing or unusable binary becomes
+//! a failure rather than a skip. `scripts/reference.sh` fetches the pinned
+//! version and verifies its digest, and is the same script CI runs.
 //!
 //! ```sh
-//! BOREAS_SINGBOX=/path/to/sing-box cargo test --test interop
+//! # What a contributor runs, and what CI runs.
+//! BOREAS_INTEROP=required BOREAS_SINGBOX=$(scripts/reference.sh) \
+//!     cargo test --test interop
 //! ```
 
 use std::{
@@ -39,19 +45,71 @@ use boreas_core::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// The reference binary, when the operator has pointed us at one.
-fn reference_binary() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("BOREAS_SINGBOX")?);
-    path.is_file().then_some(path)
+/// Whether a missing reference binary is a skip or a failure.
+///
+/// **The hole this closes.** `BOREAS_SINGBOX` unset meant "skip and pass",
+/// which is right on a contributor's laptop and catastrophic in CI: the one
+/// suite that checks these protocols against a foreign decoder reported green
+/// for every run in which it did nothing. A skip is only ever an ergonomic
+/// concession, so it now has to be asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Demand {
+    /// A contributor without the binary. Announce and pass.
+    Optional,
+    /// `BOREAS_INTEROP=required`. A missing or unusable binary fails the test,
+    /// which is what makes CI's green mean something.
+    Required,
 }
 
-/// Announces a skip in a way that shows up in `cargo test -- --nocapture`, so
-/// a green run without the reference is never mistaken for a verified one.
-fn skipped(test: &str) {
-    eprintln!(
-        "SKIPPED {test}: set BOREAS_SINGBOX to a sing-box binary to verify \
-         wire compatibility against the reference implementation"
-    );
+impl Demand {
+    /// Read once, from the environment, at every test's first line.
+    fn current() -> Self {
+        match std::env::var("BOREAS_INTEROP").as_deref() {
+            Ok("required") => Self::Required,
+            _ => Self::Optional,
+        }
+    }
+}
+
+/// The reference binary, or the reason there is none.
+///
+/// `Err(Demand)` is the whole decision: `Optional` announces and returns,
+/// `Required` panics. Every test eliminates it the same way, through
+/// [`reference_or_skip`], so a new test cannot accidentally reintroduce an
+/// unconditional skip.
+fn reference_binary() -> Result<PathBuf, Demand> {
+    let demand = Demand::current();
+    let Some(raw) = std::env::var_os("BOREAS_SINGBOX") else {
+        return Err(demand);
+    };
+    let path = PathBuf::from(raw);
+    path.is_file().then_some(path).ok_or(demand)
+}
+
+/// The binary, or `None` after announcing a permitted skip.
+///
+/// # Panics
+///
+/// Under `BOREAS_INTEROP=required`, when no usable binary was named.
+fn reference_or_skip(test: &str) -> Option<PathBuf> {
+    match reference_binary() {
+        Ok(path) => Some(path),
+        Err(Demand::Required) => panic!(
+            "{test}: BOREAS_INTEROP=required, but BOREAS_SINGBOX does not name a \
+             usable sing-box binary. This suite is the only check that these \
+             protocols interoperate with an implementation Boreas did not write; \
+             skipping it silently is what it exists to prevent."
+        ),
+        Err(Demand::Optional) => {
+            // Announced so a green run without the reference is never mistaken
+            // for a verified one.
+            eprintln!(
+                "SKIPPED {test}: set BOREAS_SINGBOX to a sing-box binary to verify \
+                 wire compatibility against the reference implementation"
+            );
+            None
+        }
+    }
 }
 
 /// A running reference server. Killed on drop, so a failing assertion cannot
@@ -334,8 +392,10 @@ fn psk_base64(len: usize) -> String {
 /// salt echo. Any one of them wrong and sing-box rejects the session.
 #[tokio::test]
 async fn shadowsocks_2022_interoperates_with_the_reference_server() {
-    let Some(binary) = reference_binary() else {
-        return skipped("shadowsocks_2022_interoperates_with_the_reference_server");
+    let Some(binary) =
+        reference_or_skip("shadowsocks_2022_interoperates_with_the_reference_server")
+    else {
+        return;
     };
 
     // Every method, because they differ in key length and cipher: a
@@ -400,8 +460,8 @@ async fn shadowsocks_2022_interoperates_with_the_reference_server() {
 /// repository wrote, and sing-box is not.
 #[tokio::test]
 async fn socks5_interoperates_with_the_reference_server() {
-    let Some(binary) = reference_binary() else {
-        return skipped("socks5_interoperates_with_the_reference_server");
+    let Some(binary) = reference_or_skip("socks5_interoperates_with_the_reference_server") else {
+        return;
     };
     let echo = start_echo().await;
     let port = free_port();
@@ -450,8 +510,8 @@ async fn socks5_interoperates_with_the_reference_server() {
 /// that would be misread as IPv6 if the family bytes were taken from RFC 1928.
 #[tokio::test]
 async fn vless_interoperates_with_the_reference_server() {
-    let Some(binary) = reference_binary() else {
-        return skipped("vless_interoperates_with_the_reference_server");
+    let Some(binary) = reference_or_skip("vless_interoperates_with_the_reference_server") else {
+        return;
     };
     let echo = start_echo().await;
     let port = free_port();
@@ -506,8 +566,9 @@ async fn vless_interoperates_with_the_reference_server() {
 /// connection would still pass a single-flow test.
 #[tokio::test]
 async fn hysteria2_interoperates_with_the_reference_server() {
-    let Some(binary) = reference_binary() else {
-        return skipped("hysteria2_interoperates_with_the_reference_server");
+    let Some(binary) = reference_or_skip("hysteria2_interoperates_with_the_reference_server")
+    else {
+        return;
     };
     let echo = start_echo().await;
     let port = free_port();
@@ -642,8 +703,8 @@ async fn vless_transport_round_trip(
     tls_json: &str,
     build: impl FnOnce(SocketAddr, &Certificate) -> Box<dyn boreas_core::ProxyTransport>,
 ) {
-    let Some(binary) = reference_binary() else {
-        return skipped(name);
+    let Some(binary) = reference_or_skip(name) else {
+        return;
     };
     let echo = start_echo().await;
     let port = free_port();

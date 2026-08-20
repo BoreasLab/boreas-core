@@ -20,6 +20,9 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -56,9 +59,42 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
+  # The suite that checks these protocols against a decoder Boreas did not
+  # write. It ran on every pull request already and proved nothing: without
+  # `BOREAS_SINGBOX` every test skipped itself and passed, so the one gate that
+  # can catch a misread specification was reporting green for doing nothing.
+  # `BOREAS_INTEROP=required` is what turns a missing reference into a failure.
+  interop:
+    name: interop against sing-box
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Version and digest are pinned in the script, so the binary is verified
+      # rather than merely downloaded, and a contributor runs the same one.
+      # Assigned on its own line, then echoed. `echo "X=$(cmd)"` reports
+      # `echo`'s status, so a failed fetch would set an empty variable and pass
+      # this step -- one of the `set -e` gaps that makes a green step a lie.
+      - name: Fetch the pinned reference
+        run: |
+          binary=$(scripts/reference.sh)
+          echo "BOREAS_SINGBOX=$binary" >> "$GITHUB_ENV"
+
+      - run: cargo test --test interop
+        env:
+          BOREAS_INTEROP: required
+
   windows:
     name: windows check
     runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -70,9 +106,51 @@ jobs:
       # P10's dependency on ring.
       - run: cargo clippy --all-targets -- -D warnings
 
+  # Android is `#[cfg(unix)]`, so the check job compiles it as generic Linux
+  # and has never seen the target it actually ships to. `boring-sys` and `ring`
+  # build C, so this needs the NDK's clang rather than the host's -- which is
+  # exactly the class of breakage a Linux build cannot show.
+  android:
+    name: android check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-linux-android
+      # API 26 is the floor `VpnService.Builder.setMetered` needs, and the
+      # oldest the NDK's prebuilt sysroots still carry a clang wrapper for.
+      API: '26'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+
+      # The runner image ships an NDK; naming the variables explicitly is what
+      # points `cc` and the linker at its clang instead of the host's.
+      - name: Point the C toolchain at the NDK
+        run: |
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$bin/clang" || { echo "no NDK clang at $bin"; exit 1; }
+          {
+            echo "CC_${TARGET//-/_}=$bin/${TARGET}${API}-clang"
+            echo "AR_${TARGET//-/_}=$bin/llvm-ar"
+            echo "CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=$bin/${TARGET}${API}-clang"
+          } >> "$GITHUB_ENV"
+
+      # `--lib` rather than `--all-targets`: the library is what ships to a
+      # handset, and cross-compiling the test and example targets would gate
+      # the Android build on dev-dependencies that never reach the device.
+      - run: cargo check --target "$TARGET" --lib
+
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       # cargo-fuzz needs nightly for the sanitizer instrumentation.
@@ -107,6 +185,9 @@ jobs:
   deny:
     name: advisories and sources
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       # No repository config: cargo-deny's built-in defaults already error on
