@@ -539,7 +539,7 @@ impl Originator {
         // critical section holds no `.await`, a build is microseconds against a
         // handshake's milliseconds, and letting two connections race to build
         // the same connector would spend more.
-        let mut connectors = self.connectors.lock().expect("no panic holds this lock");
+        let mut connectors = crate::locked(&self.connectors);
         if let Some(existing) = connectors.get(&key) {
             return Ok(Arc::clone(existing));
         }

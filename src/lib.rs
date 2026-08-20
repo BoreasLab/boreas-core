@@ -38,7 +38,33 @@ mod upstream;
 mod varint;
 mod vless;
 
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
+
+/// Takes a lock, ignoring poisoning.
+///
+/// **One idiom, because poisoning is one failure class.** Before this the crate
+/// answered it four ways — recover here, `expect` there, `unwrap` in a third
+/// place, and one silent `.ok()?` — for data none of which a panic can leave
+/// inconsistent: every mutex in this crate guards a map, a queue, or an option
+/// whose only operations are whole insertions and removals, and `std`'s
+/// collections are exception-safe across those.
+///
+/// The two that panicked amplified one task's panic into a permanently dead
+/// subsystem: a poisoned connector cache fails every subsequent originating
+/// handshake, and poisoned session routes fail every subsequent Hysteria2
+/// datagram. The one that returned `None` was quieter and worse — interception
+/// simply stopped, for the life of the process, with nothing said.
+///
+/// Recovering is not the same as ignoring: the panic that poisoned the lock is
+/// counted at the task boundary and reaches the host as
+/// [`api::Counters::tasks_panicked`].
+pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub use bridge::BridgedStream;
 pub use ca::{CaError, CaKeys, CaMaterial, CertificateAuthority, MitmResolver, Trust};
@@ -108,7 +134,9 @@ pub use session::{
     run_sessions, serve_session,
 };
 pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
-pub use shell::{AsyncDevice, AsyncNetwork, Control, Session, Shell, Telemetry, Termination};
+pub use shell::{
+    AsyncDevice, AsyncNetwork, Control, Panics, Session, Shell, Supervision, Telemetry, Termination,
+};
 pub use socks5::{
     Credentials, CredentialsError, ProxyError, Reply, Socks5Config, Socks5Egress, decode_address,
     decode_datagram, encode_address, encode_datagram,

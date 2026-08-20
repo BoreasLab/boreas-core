@@ -20,7 +20,7 @@
 use std::{
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 /// A bounded budget of equally sized byte buffers.
@@ -129,9 +129,10 @@ impl BufferPool {
     /// none of them can unwind while the invariant is broken. A poisoned lock
     /// therefore carries no corrupted state and recovering from it is sound —
     /// which matters because the alternative, failing closed, would silently
-    /// drop every datagram for the rest of the process's life.
+    /// drop every datagram for the rest of the process's life. That argument
+    /// is now the crate's, in [`crate::locked`], and holds at every mutex here.
     fn state(&self) -> MutexGuard<'_, PoolState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::locked(&self.state)
     }
 }
 

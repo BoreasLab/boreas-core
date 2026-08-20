@@ -611,6 +611,12 @@ pub struct Counters {
     /// Events this tunnel produced and could not deliver, because the host was
     /// not reading them fast enough. Counted so a gap never reads as quiet.
     pub events_lost: u64,
+    /// **A defect in Boreas, not a condition of the network.** Every other
+    /// field here is something a peer, a path, or a ceiling caused; this one is
+    /// a task that ended by panicking, which no input is supposed to be able to
+    /// do. One means a connection died for a reason nothing else records.
+    /// Sustained means a subsystem is failing every time it is used. Report it.
+    pub tasks_panicked: u64,
 }
 
 // ------------------------------------------------------- Running tunnel
@@ -750,6 +756,10 @@ fn project(telemetry: crate::Telemetry) -> Option<Event> {
         }),
         Telemetry::Lost(count) => Event::Counted(Counters {
             events_lost: count,
+            ..Counters::default()
+        }),
+        Telemetry::TasksPanicked(count) => Event::Counted(Counters {
+            tasks_panicked: count,
             ..Counters::default()
         }),
         // Per-flow lifecycle, reassembly, and the internal refusal counters are
@@ -933,6 +943,12 @@ impl Tunnel {
 
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
+        // One token and one counter for every subsystem this tunnel spawns, so
+        // one cancellation stops them all and one report covers their defects.
+        let supervision = crate::Supervision {
+            shutdown: shutdown.clone(),
+            panics: crate::Panics::new(),
+        };
         let (policy_tx, policy_rx) = watch::channel(Arc::new(compile(&filtering.lists)));
 
         // The terminator and the session driver, when flows are terminated.
@@ -944,7 +960,7 @@ impl Tunnel {
                 Arc::clone(&assembly.flows),
                 Arc::clone(&pool),
                 &tasks,
-                &shutdown,
+                &supervision,
             )?;
             (Some(built), authority)
         } else {
@@ -969,7 +985,7 @@ impl Tunnel {
                     ..crate::RelayLimits::default()
                 },
                 counts_tx,
-                shutdown.clone(),
+                supervision.clone(),
             ));
             crate::Relay {
                 outbound: outbound_tx,
@@ -987,6 +1003,7 @@ impl Tunnel {
                     Resolver::Local { upstream } => upstream.build(bypass)?,
                     Resolver::Passthrough => AnyUpstream::Unused,
                 },
+                panics: supervision.panics.clone(),
                 policy: policy_rx,
                 termination,
                 relay,
@@ -1022,7 +1039,7 @@ fn start_termination(
     flows: Arc<dyn StreamEgress>,
     pool: Arc<BufferPool>,
     tasks: &TaskTracker,
-    shutdown: &CancellationToken,
+    supervision: &crate::Supervision,
 ) -> Result<(crate::Termination, Option<Arc<CertificateAuthority>>), StartError> {
     let stack = LocalStack::new(
         link.mtu,
@@ -1041,13 +1058,16 @@ fn start_termination(
     let (replies_tx, replies_rx) = mpsc::channel(CHANNEL_DEPTH);
     let (accepted_tx, accepted_rx) = mpsc::channel(CHANNEL_DEPTH);
 
-    tasks.spawn(crate::run_terminator(
+    // The terminator is one long-lived task rather than one per connection, so
+    // it needs the token but not the counter: if *it* panics the tunnel stops
+    // terminating entirely, which the session driver's own silence reports.
+    tasks.spawn(supervision.panics.watch(crate::run_terminator(
         stack,
         packets_rx,
         replies_tx,
         accepted_tx,
-        shutdown.clone(),
-    ));
+        supervision.shutdown.clone(),
+    )));
 
     let Filtering {
         lists,
@@ -1058,7 +1078,11 @@ fn start_termination(
         // because a terminated flow needs re-originating whether or not anyone
         // reads it, and its allowlist is empty so every host is spliced.
         let sessions = build_sessions(lists, None, ceilings, flows, None)?;
-        tasks.spawn(crate::run_sessions(accepted_rx, sessions, shutdown.clone()));
+        tasks.spawn(crate::run_sessions(
+            accepted_rx,
+            sessions,
+            supervision.clone(),
+        ));
         return Ok((
             crate::Termination {
                 packets: packets_tx,
@@ -1081,7 +1105,11 @@ fn start_termination(
         flows,
         Some(Arc::clone(&authority)),
     )?;
-    tasks.spawn(crate::run_sessions(accepted_rx, sessions, shutdown.clone()));
+    tasks.spawn(crate::run_sessions(
+        accepted_rx,
+        sessions,
+        supervision.clone(),
+    ));
 
     Ok((
         crate::Termination {

@@ -56,6 +56,7 @@ interval rather than one per packet.
 | `quic_steered` | Expected while intercepting — browsers are being pushed off HTTP/3 so their traffic is inspectable. Should fall as they cache the fallback. |
 | `paths_reported` | **A misconfiguration.** Your TUN's MTU is wider than `Link::mtu`. |
 | `events_lost` | You are not reading events fast enough. Counted so a gap never reads as quiet. |
+| `tasks_panicked` | **A defect in Boreas.** Every other counter here is something a peer, a path, or a ceiling caused; this one is a task that ended by panicking, which no input is supposed to be able to do. One means a connection died for a reason nothing else records. Sustained means a subsystem fails every time it is used. Please report it with what the device was doing. |
 
 A tunnel working normally reports zeroes, so you can surface any non-zero field
 without knowing what it means.

@@ -287,6 +287,7 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
     let shell = Shell::start(
         datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device,
             network: net,
             egress: PassThroughEgress { pool },
@@ -331,6 +332,7 @@ async fn the_timer_is_armed_against_the_core_deadline_not_a_poll_interval() {
     let shell = Shell::start(
         datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device,
             network: net,
             egress: PassThroughEgress { pool },
@@ -367,6 +369,7 @@ async fn a_malformed_packet_is_counted_not_fatal() {
     let mut shell = Shell::start(
         datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device,
             network: net,
             egress: PassThroughEgress { pool },
@@ -456,6 +459,7 @@ async fn a_client_datagram_reaches_the_relay_and_its_reply_reaches_the_device() 
     let shell = Shell::start(
         datapath_on(Accepts::Flows, 8, Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device,
             network: net,
             egress: PassThroughEgress {
@@ -525,6 +529,7 @@ async fn control_messages_reach_the_core_in_order() {
     let mut shell = Shell::start(
         datapath_on(Accepts::Flows, 8, Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device,
             network: net,
             egress: PassThroughEgress { pool },

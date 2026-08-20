@@ -532,10 +532,18 @@ impl MitmResolver {
 
     /// The certificate for `host`, cached across calls. Separated from
     /// [`ResolvesServerCert::resolve`] so the cache is testable without
-    /// fabricating a `ClientHello`. `None` on a poisoned lock or a signing
-    /// failure — both of which the caller reads as "cannot intercept, splice."
+    /// fabricating a `ClientHello`. `None` on a signing failure, which the
+    /// caller reads as "cannot intercept, splice."
+    ///
+    /// **A poisoned lock is no longer one of those.** It used to be: `.ok()?`
+    /// turned one panicking mint into `None` *forever*, so interception stopped
+    /// for the life of the process and nothing said so. The cache is an LRU
+    /// whose only operations are whole insertions and evictions — a panic in
+    /// `leaf_for` leaves the entry uninserted and the map intact, which is
+    /// exactly what `std`'s `or_insert_with` guarantees — so recovering costs
+    /// one re-mint and keeps the capability. See [`crate::locked`].
     pub fn leaf(&self, host: &str) -> Option<Arc<CertifiedKey>> {
-        let mut cache = self.cache.lock().ok()?;
+        let mut cache = crate::locked(&self.cache);
         cache.get_or_insert(host, || self.authority.leaf_for(host).ok())
     }
 }

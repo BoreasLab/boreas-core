@@ -90,6 +90,12 @@ pub enum ProxyError {
     /// A response echoing a salt that is not the one we sent: another
     /// session's traffic, replayed at us.
     SaltMismatch,
+    /// A payload was handed to a codec that frames nothing it writes. Nothing
+    /// produces this today: [`crate::Framed`] reads
+    /// [`crate::Codec::writes`] at construction and never routes a write
+    /// through such a codec. It exists so the eliminator is total instead of a
+    /// panic asserting a fact established in another type.
+    Unframed,
 }
 
 impl std::fmt::Display for ProxyError {
@@ -107,6 +113,7 @@ impl std::fmt::Display for ProxyError {
             Self::Header => f.write_str("malformed header"),
             Self::Stale { skew } => write!(f, "peer clock differs by {skew}s"),
             Self::SaltMismatch => f.write_str("response echoed another session's salt"),
+            Self::Unframed => f.write_str("codec frames nothing it writes"),
         }
     }
 }

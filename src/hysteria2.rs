@@ -612,13 +612,7 @@ impl Sessions {
                 let Some(message) = UdpMessage::read(&datagram) else {
                     continue;
                 };
-                let Some(route) = hub
-                    .routes
-                    .lock()
-                    .expect("no panic holds this")
-                    .get(&message.session)
-                    .cloned()
-                else {
+                let Some(route) = crate::locked(&hub.routes).get(&message.session).cloned() else {
                     // A session that has gone away. Its reassembly state goes
                     // with it, or a server that kept sending would keep a
                     // buffer alive for a mapping nobody holds.
@@ -649,15 +643,12 @@ impl Sessions {
     fn open(&self) -> (u32, mpsc::Receiver<(Vec<u8>, Target)>) {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(SESSION_DEPTH);
-        self.routes
-            .lock()
-            .expect("no panic holds this")
-            .insert(id, sender);
+        crate::locked(&self.routes).insert(id, sender);
         (id, receiver)
     }
 
     fn close(&self, id: u32) {
-        self.routes.lock().expect("no panic holds this").remove(&id);
+        crate::locked(&self.routes).remove(&id);
     }
 }
 

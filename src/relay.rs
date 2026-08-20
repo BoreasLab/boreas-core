@@ -124,8 +124,9 @@ pub async fn run_relay(
     inbound: mpsc::Sender<Inbound>,
     limits: RelayLimits,
     counts: mpsc::Sender<RelayCounts>,
-    shutdown: CancellationToken,
+    supervision: crate::Supervision,
 ) {
+    let crate::Supervision { shutdown, panics } = supervision;
     let mut live: HashMap<InternalEndpoint, mpsc::Sender<Outbound>> = HashMap::new();
     let tracker = TaskTracker::new();
     let mut pending = RelayCounts::default();
@@ -164,7 +165,7 @@ pub async fn run_relay(
                 let inbound = inbound.clone();
                 let counts = counts.clone();
                 let shutdown = shutdown.clone();
-                tracker.spawn(async move {
+                tracker.spawn(panics.watch(async move {
                     let report = serve_association(
                         egress.as_ref(),
                         &pool,
@@ -176,7 +177,7 @@ pub async fn run_relay(
                     )
                     .await;
                     let _ = counts.try_send(report);
-                });
+                }));
                 live.entry(client).or_insert(sender)
             }
         };
@@ -414,8 +415,8 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(8);
         let (in_tx, mut in_rx) = mpsc::channel(8);
         let (count_tx, _count_rx) = mpsc::channel(8);
-        let shutdown = CancellationToken::new();
 
+        let supervision = crate::Supervision::new();
         let relay = tokio::spawn(run_relay(
             Arc::new(EchoEgress(Arc::clone(&echo))),
             Arc::clone(&pool),
@@ -423,7 +424,7 @@ mod tests {
             in_tx,
             RelayLimits::default(),
             count_tx,
-            shutdown.clone(),
+            supervision.clone(),
         ));
 
         out_tx
@@ -449,7 +450,7 @@ mod tests {
             "the target the client addressed reached the egress"
         );
 
-        shutdown.cancel();
+        supervision.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), relay)
             .await
             .expect("no association outlives the relay")
@@ -464,7 +465,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(8);
         let (in_tx, mut in_rx) = mpsc::channel(8);
         let (count_tx, _count_rx) = mpsc::channel(8);
-        let shutdown = CancellationToken::new();
+        let supervision = crate::Supervision::new();
         let relay = tokio::spawn(run_relay(
             Arc::new(EchoEgress(Arc::clone(&echo))),
             Arc::clone(&pool),
@@ -472,7 +473,7 @@ mod tests {
             in_tx,
             RelayLimits::default(),
             count_tx,
-            shutdown.clone(),
+            supervision.clone(),
         ));
 
         for port in [49152, 49153] {
@@ -504,7 +505,7 @@ mod tests {
             "each reply came back on the mapping that sent it"
         );
 
-        shutdown.cancel();
+        supervision.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), relay)
             .await
             .expect("clean shutdown")
@@ -520,7 +521,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(8);
         let (in_tx, _in_rx) = mpsc::channel(64);
         let (count_tx, mut count_rx) = mpsc::channel(64);
-        let shutdown = CancellationToken::new();
+        let supervision = crate::Supervision::new();
         let relay = tokio::spawn(run_relay(
             Arc::new(EchoEgress(Arc::clone(&echo))),
             Arc::clone(&pool),
@@ -531,7 +532,7 @@ mod tests {
                 ..RelayLimits::default()
             },
             count_tx,
-            shutdown.clone(),
+            supervision.clone(),
         ));
 
         for port in 49152..49156 {
@@ -602,8 +603,8 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(8);
         let (in_tx, _in_rx) = mpsc::channel(8);
         let (count_tx, mut count_rx) = mpsc::channel(8);
-        let shutdown = CancellationToken::new();
 
+        let supervision = crate::Supervision::new();
         let relay = tokio::spawn(run_relay(
             Arc::new(NeverAnswers),
             Arc::clone(&pool),
@@ -611,7 +612,7 @@ mod tests {
             in_tx,
             RelayLimits::default(),
             count_tx,
-            shutdown.clone(),
+            supervision.clone(),
         ));
 
         out_tx
@@ -635,7 +636,7 @@ mod tests {
             "and the queued payload with it"
         );
 
-        shutdown.cancel();
+        supervision.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), relay)
             .await
             .expect("no association outlives the relay")

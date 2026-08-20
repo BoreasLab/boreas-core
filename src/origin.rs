@@ -131,11 +131,7 @@ impl Ports {
     }
 
     fn take(self: &Arc<Self>) -> Option<PortLease> {
-        let port = self
-            .free
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .pop()?;
+        let port = crate::locked(&self.free).pop()?;
         Some(PortLease {
             port,
             ports: Arc::clone(self),
@@ -151,11 +147,7 @@ struct PortLease {
 
 impl Drop for PortLease {
     fn drop(&mut self) {
-        self.ports
-            .free
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(self.port);
+        crate::locked(&self.ports.free).push(self.port);
     }
 }
 

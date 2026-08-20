@@ -34,7 +34,10 @@
 use std::{
     io,
     num::NonZeroU64,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -149,6 +152,11 @@ pub enum Telemetry {
     /// terminator configured. TCP retransmits, so this is congestion or
     /// misconfiguration rather than data loss.
     TerminationDropped(u64),
+    /// Tasks that ended by unwinding. **Always a defect in this crate**, never
+    /// something a peer can cause and never routine load: a non-zero count is
+    /// the one number here that means "read the crash log", and before
+    /// [`Panics`] there was no number at all.
+    TasksPanicked(u64),
     /// Telemetry observations this channel could not accept.
     Lost(u64),
 }
@@ -169,6 +177,9 @@ pub struct Session<D, N, E, U> {
     /// The DNS upstream. Never consulted by a session configured with
     /// [`crate::DnsPolicy::Forward`], because the core emits no queries.
     pub upstream: U,
+    /// Tasks that ended by unwinding, shared with every subsystem this session
+    /// spawns so one report covers them all.
+    pub panics: Panics,
     /// Host rules, hot-swappable.
     ///
     /// A `watch` channel rather than an `Arc` because a filter-list build
@@ -254,6 +265,7 @@ impl Shell {
             network,
             egress,
             upstream,
+            panics,
             policy,
             termination,
             relay,
@@ -266,6 +278,7 @@ impl Shell {
             query_rx,
             answer_tx,
             shutdown.clone(),
+            panics.clone(),
         ));
 
         let reactor = tokio::spawn(reactor_loop(
@@ -286,6 +299,7 @@ impl Shell {
             termination,
             relay,
             shutdown.clone(),
+            panics,
         ));
 
         Self {
@@ -466,6 +480,7 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
     mut queries: mpsc::Receiver<DnsQuery>,
     answers: mpsc::Sender<Answer>,
     shutdown: CancellationToken,
+    panics: Panics,
 ) {
     let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_QUERIES));
     let tracker = TaskTracker::new();
@@ -488,14 +503,14 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
         // reload cannot change a decision half-way through it.
         let policy = Arc::clone(&policy.borrow());
         let answers = answers.clone();
-        tracker.spawn(async move {
+        tracker.spawn(panics.watch(async move {
             let _permit = permit;
             if let Some(answer) = resolve(upstream.as_ref(), &pool, policy.as_ref(), query).await {
                 // Best-effort: a reactor that cannot accept the answer is one
                 // whose client has long since retried.
                 let _ = answers.try_send(answer);
             }
-        });
+        }));
     }
 
     tracker.close();
@@ -606,6 +621,99 @@ async fn resolve<U: DnsUpstream>(
     })
 }
 
+/// Tasks that ended by unwinding, counted.
+///
+/// **A panicking task is otherwise perfectly silent.** `tokio` catches the
+/// unwind at the task boundary and `TaskTracker::wait` discards join results,
+/// so a panic in a per-connection task ends that connection and nothing else:
+/// this crate has no logger, emits no event for it, and kept no counter. On a
+/// handset nobody can attach a debugger to, that was a whole class of failure
+/// with no evidence at all — and the one that matters most, because a panic
+/// under a lock also poisons it, which is what [`crate::locked`] now recovers
+/// from rather than propagates.
+///
+/// Cheap: one `Arc<AtomicU64>`, `Relaxed` on both ends because the only
+/// consumer is a report and no other memory is ordered against it.
+#[derive(Clone, Debug, Default)]
+pub struct Panics(Arc<AtomicU64>);
+
+impl Panics {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wraps `work` so that ending by unwind is counted.
+    ///
+    /// **A drop guard rather than `catch_unwind`.** A future is not
+    /// `UnwindSafe` in general, and asserting it would be asserting the very
+    /// thing in question; the guard needs no such claim. `tokio`'s task
+    /// harness drops the future from a `Drop` that runs *during* the unwind
+    /// out of `poll`, before its `catch_unwind` catches it — so
+    /// `thread::panicking()` is true exactly when this future is being torn
+    /// down by a panic, and false when it is merely being cancelled. The test
+    /// below pins that, because it is a fact about `tokio` rather than about
+    /// this crate.
+    /// `use<F>` is load-bearing: the returned future clones the counter and
+    /// borrows nothing, so a caller can spawn it from a loop without keeping
+    /// this alive.
+    pub fn watch<F: Future>(&self, work: F) -> impl Future<Output = F::Output> + use<F> {
+        let counter = Arc::clone(&self.0);
+        async move {
+            let _guard = Sentinel(counter);
+            work.await
+        }
+    }
+
+    /// Takes the count since the last call.
+    fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// How a long-lived subsystem is stopped, and where its defects are counted.
+///
+/// **A product because the two are never apart.** Every subsystem this crate
+/// spawns — the session driver, the relay, the terminator — needs a token to
+/// observe and a counter to report a panicking child into, and threading them
+/// as two parameters grew every one of those signatures past the point clippy
+/// stops believing them. Both halves are cheap clones of shared state, so this
+/// is passed by value and cloned per child.
+#[derive(Clone, Debug, Default)]
+pub struct Supervision {
+    /// Cancelled once, observed everywhere.
+    pub shutdown: CancellationToken,
+    /// Shared across every subsystem, so one report covers them all.
+    pub panics: Panics,
+}
+
+impl Supervision {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Spawns `work` on `tracker` under this supervision's counter.
+    ///
+    /// Cancellation is *not* applied here: some children select on the token
+    /// and some run to completion by design, and hiding that difference behind
+    /// one spawn would make a child's shutdown behaviour invisible at the
+    /// place it is decided.
+    pub fn watch<F: Future<Output = ()> + Send + 'static>(&self, tracker: &TaskTracker, work: F) {
+        tracker.spawn(self.panics.watch(work));
+    }
+}
+
+struct Sentinel(Arc<AtomicU64>);
+
+impl Drop for Sentinel {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Best-effort telemetry with visible loss. Never awaits: telemetry must not be
 /// able to stall the datapath.
 struct TelemetrySink {
@@ -643,6 +751,9 @@ struct Counters {
     quic_steered: u64,
     paths_reported: u64,
     termination_dropped: u64,
+    /// Not folded by the reactor: tasks panic on other threads, so this one is
+    /// read from the shared counter at flush time rather than incremented here.
+    panics: Panics,
 }
 
 impl Counters {
@@ -668,6 +779,8 @@ impl Counters {
         report(&mut self.quic_steered, Telemetry::QuicSteered);
         report(&mut self.paths_reported, Telemetry::PathsReported);
         report(&mut self.termination_dropped, Telemetry::TerminationDropped);
+        let mut panicked = self.panics.take();
+        report(&mut panicked, Telemetry::TasksPanicked);
     }
 }
 
@@ -719,6 +832,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     mut termination: Option<Termination>,
     mut relay: Option<Relay>,
     shutdown: CancellationToken,
+    panics: Panics,
 ) -> io::Result<()> {
     // Both buffers are sized from the seam that fills them rather than from a
     // constant: the device states its own MTU, and the egress states the
@@ -730,7 +844,10 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     // the drain phase empties it, so a packet costs no allocation for the
     // container it travels in.
     let mut emits: Vec<EgressEmit> = Vec::new();
-    let mut counters = Counters::default();
+    let mut counters = Counters {
+        panics,
+        ..Counters::default()
+    };
     let mut next_flush = TokioInstant::now() + TELEMETRY_INTERVAL;
     let tick_interval = egress.tick_interval();
     let mut next_tick = TokioInstant::now() + tick_interval;
@@ -1032,4 +1149,36 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The fact this counter rests on, pinned because it is `tokio`'s and
+    /// not ours.** A task's future is dropped by a guard that runs *during* the
+    /// unwind out of `poll`, before `tokio`'s own `catch_unwind` catches it, so
+    /// `thread::panicking()` is true there. A cancelled task is dropped with no
+    /// unwind in progress, so it is false. If an upgrade ever reorders those,
+    /// this fails — rather than the counter silently reading zero while
+    /// connections die.
+    #[tokio::test]
+    async fn a_panicking_task_is_counted_and_a_cancelled_one_is_not() {
+        let panics = Panics::new();
+
+        let handle = tokio::spawn(panics.watch(async { panic!("a defect") }));
+        assert!(handle.await.is_err(), "the task ended by unwinding");
+
+        // Cancellation drops the future without completing it, which must not
+        // read as a panic.
+        let handle = tokio::spawn(panics.watch(std::future::pending::<()>()));
+        handle.abort();
+        assert!(handle.await.is_err(), "the task was cancelled");
+
+        // And a task that simply finishes counts as nothing at all.
+        tokio::spawn(panics.watch(async {})).await.unwrap();
+
+        assert_eq!(panics.take(), 1, "exactly the panicking one");
+        assert_eq!(panics.take(), 0, "and taking it resets the count");
+    }
 }

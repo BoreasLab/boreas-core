@@ -156,7 +156,17 @@ pub trait Codec {
     ///
     /// The payload is never longer than [`Self::max_payload`]; the adapter
     /// splits before calling.
-    fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError>;
+    ///
+    /// **A [`Writes::Verbatim`] codec does not implement this**, and the
+    /// default is why: [`Framed`] reads [`Self::writes`] once at construction
+    /// and routes such a codec's writes straight to the inner stream, so this
+    /// is not called. Saying so with `unreachable!` put a panic in a
+    /// connection task to assert a fact established in a different type; the
+    /// remaining partiality is explicit instead, and is an error nothing
+    /// currently produces.
+    fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
+        Err(ProxyError::Unframed)
+    }
 
     /// The largest payload a single [`Self::encode`] may be handed.
     ///
@@ -655,20 +665,29 @@ mod tests {
             Ok(Decode::Transparent { rest })
         }
 
-        fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
-            unreachable!("this codec writes verbatim, so nothing is encoded")
-        }
-
         fn writes(&self) -> Writes {
             Writes::Verbatim
         }
     }
 
-    /// A codec that frames only what it reads must not pay to write. The
-    /// `unreachable!` in `StripTwo::encode` is the assertion: reaching it means
-    /// the adapter routed a write through a codec that has no framing for it.
+    /// A codec that frames only what it reads must not pay to write.
+    ///
+    /// `StripTwo` implements no `encode`, so the trait's default answers
+    /// [`ProxyError::Unframed`] — and the round trip below is what proves the
+    /// adapter never reaches it. This used to be an `unreachable!`, which put a
+    /// panic in a connection task to assert something `Writes::Verbatim`
+    /// already decided; the assertion is the same and the failure is now an
+    /// error the write returns.
     #[tokio::test]
     async fn a_read_only_framing_writes_without_touching_the_codec() {
+        assert!(
+            matches!(
+                StripTwo::default().encode(b"anything", &mut Vec::new()),
+                Err(ProxyError::Unframed)
+            ),
+            "a verbatim codec has no encoder to reach"
+        );
+
         let (mut peer, ours) = tokio::io::duplex(4096);
         let mut framed = Framed::new(ours, StripTwo::default());
         framed.write_all(b"straight through").await.unwrap();

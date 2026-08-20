@@ -45,7 +45,7 @@ use tokio::{
     io::{AsyncReadExt, copy_bidirectional},
     sync::mpsc,
 };
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::task::TaskTracker;
 
 use crate::{
     Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Either, Hello,
@@ -643,8 +643,9 @@ async fn splice(
 pub async fn run_sessions(
     mut accepted: mpsc::Receiver<Accepted>,
     sessions: Arc<Sessions>,
-    shutdown: CancellationToken,
+    supervision: crate::Supervision,
 ) {
+    let crate::Supervision { shutdown, panics } = supervision;
     let tracker = TaskTracker::new();
     loop {
         let next = tokio::select! {
@@ -657,12 +658,15 @@ pub async fn run_sessions(
         let server = std::net::SocketAddr::new(terminated.server.address, terminated.server.port);
         let sessions = Arc::clone(&sessions);
         let shutdown = shutdown.clone();
-        tracker.spawn(async move {
+        // One connection's panic ends that connection and nothing else, which
+        // is the right blast radius and the wrong amount of evidence: without
+        // this it leaves none at all.
+        tracker.spawn(panics.watch(async move {
             tokio::select! {
                 () = shutdown.cancelled() => {}
                 _ = serve_session(stream, server, sessions) => {}
             }
-        });
+        }));
     }
 
     // Admission closes first, so nothing joins the set after the wait begins;

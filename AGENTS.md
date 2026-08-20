@@ -56,6 +56,11 @@ the product contract. Do not infer implemented status from visionary scope.
   arithmetic slip in any one codec is an index panic in a connection task;
   a remainder is carved out of the input, so the slip cannot be expressed.
   `Decode` carries `rest` for exactly this reason.
+- Take a lock with `locked`, and spawn a long-lived task through
+  `Supervision`. Poisoning is one failure class with one answer, and a task
+  that ends by unwinding must be counted — `tokio` catches the unwind and
+  `TaskTracker::wait` discards the result, so an unwatched task's panic leaves
+  no evidence on a device nobody can attach a debugger to.
 - Sans-IO stops where backpressure is owned elsewhere. HTTP/2 flow control and
   a QUIC connection's send window are I/O, not decisions about bytes; lift the
   framing and leave them. `decode_grpc_header` is where that line was drawn and

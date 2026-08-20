@@ -316,6 +316,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
     let mut shell = Shell::start(
         datapath(Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device: MockDevice {
                 inbound: inbound_rx,
                 sent: sent_tx,
@@ -499,6 +500,7 @@ async fn a_forwarding_session_never_intercepts() {
     let shell = Shell::start(
         forwarding,
         Session {
+            panics: boreas_core::Panics::new(),
             device: MockDevice {
                 inbound: inbound_rx,
                 sent: sent_tx,
@@ -544,6 +546,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
     let mut shell = Shell::start(
         datapath(Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device: MockDevice {
                 inbound: inbound_rx,
                 sent: sent_tx,
@@ -681,6 +684,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
     let mut shell = Shell::start(
         datapath(Arc::clone(&pool)),
         Session {
+            panics: boreas_core::Panics::new(),
             device: MockDevice {
                 inbound: inbound_rx,
                 sent: sent_tx,

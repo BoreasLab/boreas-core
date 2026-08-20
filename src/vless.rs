@@ -581,10 +581,6 @@ impl Codec for ResponseHeader {
         }
     }
 
-    fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
-        unreachable!("VLESS frames nothing it writes; see `writes`")
-    }
-
     /// **VLESS writes raw bytes.** The request header went out once, in
     /// `connect`; everything after it is the client's own stream, so it reaches
     /// the transport untouched.

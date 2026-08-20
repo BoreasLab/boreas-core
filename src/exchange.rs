@@ -501,10 +501,7 @@ impl Proxy {
             && response.status() == StatusCode::SWITCHING_PROTOCOLS
         {
             let upstream = hyper::upgrade::on(&mut response);
-            *self
-                .upgrade
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = Some(Pending { client, upstream });
+            *crate::locked(&self.upgrade) = Some(Pending { client, upstream });
             // Relayed verbatim: the 101's `Connection` and `Upgrade` are what
             // tell the client the switch happened, and no body follows to
             // rewrite.
@@ -522,10 +519,7 @@ impl Proxy {
     }
 
     fn take_upgrade(&self) -> Option<Pending> {
-        self.upgrade
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
+        crate::locked(&self.upgrade).take()
     }
 }
 
