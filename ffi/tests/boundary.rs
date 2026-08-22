@@ -146,6 +146,26 @@ fn config(lists: &[*const c_char], resolver: *const c_char) -> BoreasConfig {
     }
 }
 
+/// Waits for something a spawned task will do, rather than assuming it already
+/// has.
+///
+/// **A count a background thread produces cannot be asserted on immediately.**
+/// The device's `recv` sleeps before it answers, so on a loaded machine the
+/// whole start-reload-stop sequence below finishes inside one call and the
+/// count is legitimately still zero. Waiting for the observable is what makes
+/// that an assertion instead of a race; the bound is generous because only a
+/// genuine failure should ever reach it.
+fn eventually(ready: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if ready() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
 fn empty_event() -> BoreasEvent {
     BoreasEvent {
         kind: BoreasEventKind::Counted,
@@ -198,6 +218,14 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
     assert_eq!(event.kind, BoreasEventKind::Reloaded);
     assert_eq!(event.blocked_rules, 2, "both rules are in force");
 
+    // Before tearing anything down, because `close` ends the read loop: a
+    // count still zero after shutdown stays zero, and the wait would never
+    // finish.
+    assert!(
+        eventually(|| host.polled.load(Ordering::Relaxed) > 0),
+        "a zero-length read must be asked again rather than forwarded as a packet"
+    );
+
     // **No closing from the test.** A real host stops the tunnel first and
     // tears its interface down afterwards, which is exactly the ordering that
     // deadlocks if `release` is the only signal: the read waits for the host
@@ -217,10 +245,6 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
         Arc::strong_count(&host),
         1,
         "and every leaked reference reclaimed, so nothing outlived the tunnel"
-    );
-    assert!(
-        host.polled.load(Ordering::Relaxed) > 0,
-        "a zero-length read must be asked again rather than forwarded as a packet"
     );
 }
 
