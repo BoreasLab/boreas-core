@@ -683,6 +683,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::Reader;
     use std::num::NonZeroUsize;
 
     use http_body_util::Empty;
@@ -1436,28 +1437,18 @@ mod tests {
                 FRAME_SETTINGS if frame.flags & 0x1 != 0 => {}
                 FRAME_SETTINGS => {
                     // RFC 9113 section 6.5.1: each setting is a two-byte
-                    // identifier and a four-byte value. Walked with a cursor
-                    // rather than chunked, so the six bytes are split by the
-                    // same `split_at_checked` that decides whether a whole
-                    // setting is even there — a trailing partial one stops the
-                    // iterator instead of being indexed into.
-                    let mut rest = frame.payload.as_slice();
-                    settings = std::iter::from_fn(|| {
-                        let (setting, tail) = rest.split_at_checked(6)?;
-                        rest = tail;
-                        Some(setting)
-                    })
-                    .map(|setting| {
-                        let (id, value) = setting.split_at(2);
-                        let id = u16::from_be_bytes(id.try_into().expect("two bytes"));
-                        let value = u32::from_be_bytes(value.try_into().expect("four bytes"));
-                        format!("{id}:{value}")
-                    })
-                    .collect();
+                    // identifier and a four-byte value. Read as those two
+                    // fields rather than as six bytes to be divided, so a
+                    // trailing partial setting ends the iterator instead of
+                    // being indexed into.
+                    let mut reader = Reader::new(&frame.payload);
+                    settings =
+                        std::iter::from_fn(|| Some(format!("{}:{}", reader.u16()?, reader.u32()?)))
+                            .collect();
                 }
                 FRAME_WINDOW_UPDATE => {
                     assert_eq!(frame.stream, 0, "the connection window, not a stream's");
-                    increment = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                    increment = Reader::new(&frame.payload).u32().expect("a full increment");
                 }
                 FRAME_PRIORITY => panic!("Chrome sends no PRIORITY frame"),
                 FRAME_HEADERS => break frame,

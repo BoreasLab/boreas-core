@@ -21,7 +21,11 @@
 //! destination for every name and every IPv6 address. They are separate
 //! functions for that reason, and the tests pin both.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -33,6 +37,7 @@ use crate::{
     Association, AsyncStream, BoxFuture, Codec, DatagramFidelity, DatagramSink, DatagramSource,
     Decode, Decoded, DomainName, EgressError, Framed, NatBehavior, PathProperties, ProxyError,
     ProxyTransport, StreamEgress, Target, Writes,
+    wire::{Reader, Writer},
 };
 
 /// The only VLESS version, and the only one the reference implementations
@@ -128,74 +133,57 @@ impl std::fmt::Display for UserId {
 /// formats differ in field order *and* in two of three family bytes; sharing
 /// one function would silently mis-address every name and every IPv6 host.
 pub fn encode_addr_port(target: &Target, out: &mut Vec<u8>) {
-    out.extend_from_slice(&target.port().to_be_bytes());
+    let mut writer = Writer::new(out);
+    writer.u16(target.port());
     match target {
-        Target::Ip(SocketAddr::V4(address)) => {
-            out.push(ATYP_IPV4);
-            out.extend_from_slice(&address.ip().octets());
-        }
-        Target::Ip(SocketAddr::V6(address)) => {
-            out.push(ATYP_IPV6);
-            out.extend_from_slice(&address.ip().octets());
-        }
-        Target::Domain { host, .. } => {
-            out.push(ATYP_DOMAIN);
-            // Safe without a check: `DomainName` bounds itself at 255 bytes.
-            out.push(host.wire_len());
-            out.extend_from_slice(host.as_str().as_bytes());
-        }
-    }
+        Target::Ip(SocketAddr::V4(address)) => writer.u8(ATYP_IPV4).bytes(&address.ip().octets()),
+        Target::Ip(SocketAddr::V6(address)) => writer.u8(ATYP_IPV6).bytes(&address.ip().octets()),
+        // The length octet needs no check: `DomainName` bounds itself at 255.
+        Target::Domain { host, .. } => writer.u8(ATYP_DOMAIN).vector_u8(host.as_str().as_bytes()),
+    };
 }
 
 /// Reads a destination in VMess/VLESS form. Total on untrusted input, and
 /// `Incomplete` rather than an error while bytes are still missing.
 pub fn decode_addr_port(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
-    let Some(port_bytes) = bytes.get(..2) else {
+    let mut reader = Reader::new(bytes);
+    let (Some(port), Some(atyp)) = (reader.u16(), reader.u8()) else {
         return Ok(Decoded::Incomplete);
     };
-    let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
-    let Some(&atyp) = bytes.get(2) else {
-        return Ok(Decoded::Incomplete);
-    };
-    let rest = &bytes[3..];
-    let (target, used) = match atyp {
-        ATYP_IPV4 => {
-            let Some(octets) = rest.get(..4) else {
-                return Ok(Decoded::Incomplete);
-            };
-            let octets: [u8; 4] = octets.try_into().map_err(|_| ProxyError::Address)?;
-            (
-                Target::Ip(SocketAddr::new(std::net::IpAddr::from(octets), port)),
-                4,
-            )
-        }
-        ATYP_IPV6 => {
-            let Some(octets) = rest.get(..16) else {
-                return Ok(Decoded::Incomplete);
-            };
-            let octets: [u8; 16] = octets.try_into().map_err(|_| ProxyError::Address)?;
-            (
-                Target::Ip(SocketAddr::new(std::net::IpAddr::from(octets), port)),
-                16,
-            )
-        }
-        ATYP_DOMAIN => {
-            let Some(&length) = rest.first() else {
-                return Ok(Decoded::Incomplete);
-            };
-            let length = usize::from(length);
-            let Some(name) = rest.get(1..1 + length) else {
-                return Ok(Decoded::Incomplete);
-            };
-            let name = std::str::from_utf8(name).map_err(|_| ProxyError::Address)?;
-            let host = DomainName::new(name).map_err(|_| ProxyError::Address)?;
-            (Target::Domain { host, port }, 1 + length)
-        }
+    // Port first, then the family byte: the field order is what this shares
+    // nothing with the SOCKS5 decoder over. The widths below are read the same
+    // way, so only the order and the family bytes differ between the two.
+    let body = match atyp {
+        ATYP_IPV4 => reader.take(4),
+        ATYP_IPV6 => reader.take(16),
+        ATYP_DOMAIN => reader.vector_u8(),
         _ => return Err(ProxyError::Address),
+    };
+    let Some(body) = body else {
+        return Ok(Decoded::Incomplete);
+    };
+
+    let mut body = Reader::new(body);
+    let target = match atyp {
+        ATYP_IPV4 => Target::Ip(SocketAddr::new(
+            IpAddr::V4(body.ipv4().ok_or(ProxyError::Address)?),
+            port,
+        )),
+        ATYP_IPV6 => Target::Ip(SocketAddr::new(
+            IpAddr::V6(body.ipv6().ok_or(ProxyError::Address)?),
+            port,
+        )),
+        _ => Target::Domain {
+            host: std::str::from_utf8(body.rest())
+                .ok()
+                .and_then(|name| DomainName::new(name).ok())
+                .ok_or(ProxyError::Address)?,
+            port,
+        },
     };
     Ok(Decoded::Complete {
         value: target,
-        consumed: 3 + used,
+        consumed: reader.position(),
     })
 }
 
@@ -217,10 +205,11 @@ pub fn encode_datagram_request(user: &UserId, target: &Target, out: &mut Vec<u8>
 }
 
 fn request(user: &UserId, target: &Target, command: u8, out: &mut Vec<u8>) {
-    out.push(VERSION);
-    out.extend_from_slice(user.as_bytes());
-    out.push(0); // addons length: no flow
-    out.push(command);
+    Writer::new(out)
+        .u8(VERSION)
+        .bytes(user.as_bytes())
+        .u8(0) // addons length: no flow
+        .u8(command);
     encode_addr_port(target, out);
 }
 
@@ -229,22 +218,21 @@ fn request(user: &UserId, target: &Target, command: u8, out: &mut Vec<u8>) {
 /// Returns how many bytes the header used, so the caller can hand the
 /// remainder to the application as payload.
 pub fn decode_response(bytes: &[u8]) -> Result<Decoded<()>, ProxyError> {
-    let Some(&version) = bytes.first() else {
+    let mut reader = Reader::new(bytes);
+    let Some(version) = reader.u8() else {
         return Ok(Decoded::Incomplete);
     };
     if version != VERSION {
         return Err(ProxyError::Version(version));
     }
-    let Some(&addons_len) = bytes.get(1) else {
-        return Ok(Decoded::Incomplete);
-    };
-    let consumed = 2 + usize::from(addons_len);
-    if bytes.len() < consumed {
+    // The addon block is skipped rather than read: this client sends no flow,
+    // so anything a server puts there is not addressed to it.
+    if reader.vector_u8().is_none() {
         return Ok(Decoded::Incomplete);
     }
     Ok(Decoded::Complete {
         value: (),
-        consumed,
+        consumed: reader.position(),
     })
 }
 
@@ -276,7 +264,7 @@ const INBOUND_DEPTH: usize = 64;
 
 /// The sending half of one destination's stream. Shared, because `send_to`
 /// takes `&self` and every flow in the mapping writes through the same one.
-type Writer = Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
+type SharedSink = Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
 
 /// One VLESS datagram association: a stream per destination, and one queue for
 /// what comes back.
@@ -299,7 +287,7 @@ struct VlessDatagrams<T> {
     /// use. An async mutex because opening one awaits, and because two flows to
     /// the same peer arriving together must produce *one* stream rather than
     /// two — the second waits and finds the first's.
-    streams: Mutex<HashMap<Target, Writer>>,
+    streams: Mutex<HashMap<Target, SharedSink>>,
     inbound: mpsc::Sender<(Vec<u8>, Target)>,
     /// Ends every reader task this association started. Its lifetime is the
     /// association's, so a dropped association leaves no task holding a socket.
@@ -320,7 +308,7 @@ impl<T: ProxyTransport + 'static> VlessDatagrams<T> {
     /// what makes concurrent first datagrams to one peer share a stream instead
     /// of racing to build two, and a second stream would mean a second source
     /// port the peer sees.
-    async fn stream(&self, target: &Target) -> Result<Writer, EgressError> {
+    async fn stream(&self, target: &Target) -> Result<SharedSink, EgressError> {
         let mut held = self.streams.lock().await;
         if let Some(stream) = held.get(target) {
             return Ok(Arc::clone(stream));
@@ -340,7 +328,7 @@ impl<T: ProxyTransport + 'static> VlessDatagrams<T> {
             self.shutdown.clone(),
         ));
 
-        let writer: Writer = Arc::new(Mutex::new(Box::new(writer)));
+        let writer: SharedSink = Arc::new(Mutex::new(Box::new(writer)));
         held.insert(target.clone(), Arc::clone(&writer));
         Ok(writer)
     }
@@ -387,8 +375,7 @@ async fn read_datagrams<R: AsyncRead + Unpin + Send + 'static>(
         // Every whole frame currently held. A partial one stays for the next
         // read rather than being delivered short: half a datagram is not a
         // smaller datagram.
-        while held.len() >= LENGTH_PREFIX {
-            let length = usize::from(u16::from_be_bytes([held[0], held[1]]));
+        while let Some(length) = Reader::new(&held).u16().map(usize::from) {
             if held.len() < LENGTH_PREFIX + length {
                 break;
             }

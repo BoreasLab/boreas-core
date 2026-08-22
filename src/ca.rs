@@ -56,6 +56,8 @@ use rustls::{
     sign::{CertifiedKey, SigningKey},
 };
 
+use crate::wire::{Reader, Writer};
+
 /// What went wrong provisioning a certificate. All three are construction-time
 /// or per-leaf defects rather than routine outcomes: the routine "cannot forge
 /// a leaf" case is an `Option::None` at the resolver, not one of these.
@@ -247,9 +249,9 @@ impl CaKeys {
 
     fn pack(root: &[u8], leaf: &[u8]) -> Self {
         let mut bytes = vec![Self::VERSION];
+        let mut writer = Writer::new(&mut bytes);
         for part in [root, leaf] {
-            bytes.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(part);
+            writer.vector_u32(part);
         }
         Self(bytes)
     }
@@ -258,19 +260,19 @@ impl CaKeys {
     /// from a future version is [`CaError::Material`], never a panic and never
     /// a key half-read.
     fn unpack(&self) -> Result<(&[u8], &[u8]), CaError> {
-        let (&version, mut rest) = self.0.split_first().ok_or(CaError::Material)?;
-        if version != Self::VERSION {
+        let mut reader = Reader::new(&self.0);
+        if reader.u8() != Some(Self::VERSION) {
             return Err(CaError::Material);
         }
         let mut parts = [&[][..]; 2];
         for slot in &mut parts {
-            let (length, tail) = rest.split_at_checked(4).ok_or(CaError::Material)?;
-            let length = u32::from_be_bytes(length.try_into().expect("4 bytes")) as usize;
-            let (part, tail) = tail.split_at_checked(length).ok_or(CaError::Material)?;
-            *slot = part;
-            rest = tail;
+            let length = reader.u32().ok_or(CaError::Material)?;
+            let length = usize::try_from(length).map_err(|_| CaError::Material)?;
+            *slot = reader.take(length).ok_or(CaError::Material)?;
         }
-        if !rest.is_empty() {
+        // Nothing may follow the second part. A trailing byte means the blob
+        // was written by something this format does not describe.
+        if !reader.is_empty() {
             return Err(CaError::Material);
         }
         Ok((parts[0], parts[1]))

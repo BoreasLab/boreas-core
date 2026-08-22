@@ -25,7 +25,7 @@
 //! after it appeared to start.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -33,6 +33,7 @@ use crate::{
     Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
     DomainName, EgressError, NatBehavior, PathProperties, Prefixed, StreamEgress, Target,
     TunnelBypass,
+    wire::{Reader, Writer},
 };
 
 /// The only protocol version this crate speaks, and the only one that exists.
@@ -159,24 +160,15 @@ impl Reply {
 /// O(address length). Appends rather than clearing, so a caller composing a
 /// request header keeps what it already wrote.
 pub fn encode_address(target: &Target, out: &mut Vec<u8>) {
+    let mut writer = Writer::new(out);
     match target {
-        Target::Ip(SocketAddr::V4(address)) => {
-            out.push(ATYP_IPV4);
-            out.extend_from_slice(&address.ip().octets());
-        }
-        Target::Ip(SocketAddr::V6(address)) => {
-            out.push(ATYP_IPV6);
-            out.extend_from_slice(&address.ip().octets());
-        }
-        Target::Domain { host, .. } => {
-            out.push(ATYP_DOMAIN);
-            // The length octet is safe without a check: `DomainName` cannot
-            // hold more than 255 bytes, which is the invariant it exists for.
-            out.push(host.wire_len());
-            out.extend_from_slice(host.as_str().as_bytes());
-        }
-    }
-    out.extend_from_slice(&target.port().to_be_bytes());
+        Target::Ip(SocketAddr::V4(address)) => writer.u8(ATYP_IPV4).bytes(&address.ip().octets()),
+        Target::Ip(SocketAddr::V6(address)) => writer.u8(ATYP_IPV6).bytes(&address.ip().octets()),
+        // The length octet needs no check of its own: `DomainName` cannot hold
+        // more than 255 bytes, which is the invariant it exists for.
+        Target::Domain { host, .. } => writer.u8(ATYP_DOMAIN).vector_u8(host.as_str().as_bytes()),
+    };
+    writer.u16(target.port());
 }
 
 /// Reads an address in RFC 1928 form.
@@ -185,48 +177,45 @@ pub fn encode_address(target: &Target, out: &mut Vec<u8>) {
 /// name. Total on untrusted input: every short buffer is `Incomplete` and
 /// every unknown type byte is [`ProxyError::Address`].
 pub fn decode_address(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
-    let Some((&atyp, rest)) = bytes.split_first() else {
+    let mut reader = Reader::new(bytes);
+    let Some(atyp) = reader.u8() else {
         return Ok(Decoded::Incomplete);
     };
-    // Address payload length, excluding the two port bytes.
-    let payload = match atyp {
-        ATYP_IPV4 => 4,
-        ATYP_IPV6 => 16,
-        ATYP_DOMAIN => match rest.first() {
-            // The length octet is itself part of the payload.
-            Some(&length) => 1 + usize::from(length),
-            None => return Ok(Decoded::Incomplete),
-        },
+    // The body's width is what its own type byte decides — and for the domain
+    // form the length octet is the prefix rather than a separate field, so it
+    // is named once here instead of twice. The port follows the body in every
+    // form, and a short buffer at either step is `Incomplete`.
+    let body = match atyp {
+        ATYP_IPV4 => reader.take(4),
+        ATYP_IPV6 => reader.take(16),
+        ATYP_DOMAIN => reader.vector_u8(),
         _ => return Err(ProxyError::Address),
     };
-    let Some(body) = rest.get(..payload) else {
+    let (Some(body), Some(port)) = (body, reader.u16()) else {
         return Ok(Decoded::Incomplete);
     };
-    let Some(port_bytes) = rest.get(payload..payload + 2) else {
-        return Ok(Decoded::Incomplete);
-    };
-    let port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
 
+    let mut body = Reader::new(body);
     let target = match atyp {
-        ATYP_IPV4 => {
-            let octets: [u8; 4] = body.try_into().map_err(|_| ProxyError::Address)?;
-            Target::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
-        }
-        ATYP_IPV6 => {
-            let octets: [u8; 16] = body.try_into().map_err(|_| ProxyError::Address)?;
-            Target::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
-        }
-        // The leading length octet is dropped; the rest is the name.
-        _ => {
-            let name = std::str::from_utf8(&body[1..]).map_err(|_| ProxyError::Address)?;
-            let host = DomainName::new(name).map_err(|_| ProxyError::Address)?;
-            Target::Domain { host, port }
-        }
+        ATYP_IPV4 => Target::Ip(SocketAddr::new(
+            IpAddr::V4(body.ipv4().ok_or(ProxyError::Address)?),
+            port,
+        )),
+        ATYP_IPV6 => Target::Ip(SocketAddr::new(
+            IpAddr::V6(body.ipv6().ok_or(ProxyError::Address)?),
+            port,
+        )),
+        _ => Target::Domain {
+            host: std::str::from_utf8(body.rest())
+                .ok()
+                .and_then(|name| DomainName::new(name).ok())
+                .ok_or(ProxyError::Address)?,
+            port,
+        },
     };
     Ok(Decoded::Complete {
         value: target,
-        // ATYP + payload + port.
-        consumed: 1 + payload + 2,
+        consumed: reader.position(),
     })
 }
 
@@ -270,19 +259,17 @@ impl Credentials {
 /// credentials exist keeps a proxy from selecting a method this client would
 /// then be unable to complete.
 fn encode_greeting(credentials: Option<&Credentials>, out: &mut Vec<u8>) {
-    out.push(VERSION);
+    let mut writer = Writer::new(out);
+    writer.u8(VERSION);
     match credentials {
-        Some(_) => out.extend_from_slice(&[2, METHOD_NONE, METHOD_USERPASS]),
-        None => out.extend_from_slice(&[1, METHOD_NONE]),
-    }
+        Some(_) => writer.bytes(&[2, METHOD_NONE, METHOD_USERPASS]),
+        None => writer.bytes(&[1, METHOD_NONE]),
+    };
 }
 
 /// The two-byte method selection. `Incomplete` until both bytes are present.
 fn decode_method_selection(bytes: &[u8]) -> Result<Decoded<u8>, ProxyError> {
-    let Some(&[version, method]) = bytes.get(..2).map(|slice| {
-        let pair: &[u8; 2] = slice.try_into().expect("checked length");
-        pair
-    }) else {
+    let Some(&[version, method]) = Reader::new(bytes).array::<2>() else {
         return Ok(Decoded::Incomplete);
     };
     if version != VERSION {
@@ -299,9 +286,7 @@ fn decode_method_selection(bytes: &[u8]) -> Result<Decoded<u8>, ProxyError> {
 }
 
 fn encode_request(command: u8, target: &Target, out: &mut Vec<u8>) {
-    out.push(VERSION);
-    out.push(command);
-    out.push(0); // RSV
+    Writer::new(out).u8(VERSION).u8(command).u8(0); // RSV
     encode_address(target, out);
 }
 
@@ -309,17 +294,18 @@ fn encode_request(command: u8, target: &Target, out: &mut Vec<u8>) {
 /// only known from its own type byte — which is exactly why this returns
 /// `Incomplete` rather than taking a length.
 fn decode_reply(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
-    let Some(header) = bytes.get(..3) else {
+    let mut reader = Reader::new(bytes);
+    let Some(&[version, code, _reserved]) = reader.array::<3>() else {
         return Ok(Decoded::Incomplete);
     };
-    if header[0] != VERSION {
-        return Err(ProxyError::Version(header[0]));
+    if version != VERSION {
+        return Err(ProxyError::Version(version));
     }
-    let reply = Reply::from_byte(header[1]);
+    let reply = Reply::from_byte(code);
     if reply != Reply::Succeeded {
         return Err(ProxyError::Refused(reply));
     }
-    match decode_address(&bytes[3..])? {
+    match decode_address(reader.rest())? {
         Decoded::Incomplete => Ok(Decoded::Incomplete),
         Decoded::Complete { value, consumed } => Ok(Decoded::Complete {
             value,
@@ -332,9 +318,9 @@ fn decode_reply(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
 /// number this client never sets, then the target address.
 pub fn encode_datagram(target: &Target, payload: &[u8], out: &mut Vec<u8>) {
     out.clear();
-    out.extend_from_slice(&[0, 0, 0]); // RSV, RSV, FRAG
+    Writer::new(out).bytes(&[0, 0, 0]); // RSV, RSV, FRAG
     encode_address(target, out);
-    out.extend_from_slice(payload);
+    Writer::new(out).bytes(payload);
 }
 
 /// Reads a relayed datagram, returning where it came from and its payload.
@@ -344,15 +330,17 @@ pub fn encode_datagram(target: &Target, payload: &[u8], out: &mut Vec<u8>) {
 /// keyed on an attacker-suppliable fragment number is state this crate will not
 /// grow for a case that does not occur.
 pub fn decode_datagram(bytes: &[u8]) -> Result<(Target, &[u8]), ProxyError> {
-    let Some(header) = bytes.get(..3) else {
+    let mut reader = Reader::new(bytes);
+    let Some(&[_, _, fragment]) = reader.array::<3>() else {
         return Err(ProxyError::Address);
     };
-    if header[2] != 0 {
+    if fragment != 0 {
         return Err(ProxyError::Fragmented);
     }
-    match decode_address(&bytes[3..])? {
+    let rest = reader.rest();
+    match decode_address(rest)? {
         Decoded::Incomplete => Err(ProxyError::Address),
-        Decoded::Complete { value, consumed } => Ok((value, &bytes[3 + consumed..])),
+        Decoded::Complete { value, consumed } => Ok((value, &rest[consumed..])),
     }
 }
 
@@ -458,13 +446,13 @@ impl crate::Negotiation for Negotiate<'_> {
                     }
                 }
                 Phase::Authenticating => {
-                    let Some(pair) = rest.get(..2) else {
+                    let Some(&[version, status]) = Reader::new(rest).array::<2>() else {
                         return Ok(Decoded::Incomplete);
                     };
-                    if pair[0] != AUTH_VERSION {
-                        return Err(ProxyError::Version(pair[0]));
+                    if version != AUTH_VERSION {
+                        return Err(ProxyError::Version(version));
                     }
-                    if pair[1] != 0 {
+                    if status != 0 {
                         return Err(ProxyError::AuthFailed);
                     }
                     self.at += 2;
@@ -488,11 +476,12 @@ impl crate::Negotiation for Negotiate<'_> {
 /// RFC 1929's username/password sub-negotiation. Both lengths fit an octet
 /// because [`Credentials`] refused anything longer at construction.
 fn encode_credentials(credentials: &Credentials, out: &mut Vec<u8>) {
-    out.push(AUTH_VERSION);
-    out.push(credentials.username.len() as u8);
-    out.extend_from_slice(credentials.username.as_bytes());
-    out.push(credentials.password.len() as u8);
-    out.extend_from_slice(credentials.password.as_bytes());
+    // Both halves are `1..=255` by `Credentials::new`, so each length octet
+    // is written from a value the type already proved fits.
+    Writer::new(out)
+        .u8(AUTH_VERSION)
+        .vector_u8(credentials.username.as_bytes())
+        .vector_u8(credentials.password.as_bytes());
 }
 
 /// A SOCKS5 proxy as a stream egress.

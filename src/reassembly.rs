@@ -37,7 +37,7 @@ use std::{
 
 use etherparse::{Ipv6ExtensionSlice, NetSlice, SlicedPacket};
 
-use crate::PacketError;
+use crate::{PacketError, wire::checksum};
 
 const MAX_DATAGRAM_BYTES: usize = u16::MAX as usize;
 /// The wire offset unit is 8 bytes, so reassembly tracks one bit per block.
@@ -299,7 +299,7 @@ fn rebuild(
             // and every downstream parser that verifies it would reject the
             // datagram.
             packet[10..12].copy_from_slice(&[0, 0]);
-            let checksum = ones_complement(&packet[..(usize::from(packet[0] & 0x0f) * 4)]);
+            let checksum = checksum(&[&packet[..(usize::from(packet[0] & 0x0f) * 4)]]);
             packet[10..12].copy_from_slice(&checksum.to_be_bytes());
         }
         Some(next_header_at) => {
@@ -319,17 +319,6 @@ fn rebuild(
         }
     }
     Some(packet)
-}
-
-/// The internet checksum of `header`: the one's complement of the one's
-/// complement sum of its 16-bit words (RFC 1071). O(header bytes).
-fn ones_complement(header: &[u8]) -> u16 {
-    let sum = header
-        .chunks(2)
-        .map(|word| u32::from(u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)])))
-        .sum::<u32>();
-    let folded = (sum & 0xffff) + (sum >> 16);
-    !u16::try_from((folded & 0xffff) + (folded >> 16)).unwrap_or(u16::MAX)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -710,7 +699,7 @@ mod tests {
         packet[6] = 0;
         packet[7] = 0;
         packet[10..12].copy_from_slice(&[0, 0]);
-        let checksum = ones_complement(&packet[..20]);
+        let checksum = checksum(&[&packet[..20]]);
         packet[10..12].copy_from_slice(&checksum.to_be_bytes());
         ReassembledPacket(packet)
     }

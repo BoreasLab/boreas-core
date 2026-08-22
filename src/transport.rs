@@ -51,6 +51,7 @@ use crate::{
     AsyncStream, BoxFuture, ClientProfile, EgressError, Originator, Prefixed, ProxyError,
     TunnelBypass,
     quic::{Handshake, QuicConnection, client_config},
+    wire::Writer,
 };
 
 /// How a proxy protocol obtains the byte stream it speaks over.
@@ -921,11 +922,12 @@ fn get_protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 fn encode_grpc_message(payload: &[u8], out: &mut Vec<u8>) {
     let mut length = Vec::with_capacity(10);
     put_protobuf_varint(payload.len() as u64, &mut length);
-    out.push(0); // not compressed
-    out.extend_from_slice(&((1 + length.len() + payload.len()) as u32).to_be_bytes());
-    out.push(0x0A); // protobuf field 1, wire type 2
-    out.extend_from_slice(&length);
-    out.extend_from_slice(payload);
+    Writer::new(out)
+        .u8(0) // not compressed
+        .u32((1 + length.len() + payload.len()) as u32)
+        .u8(0x0A) // protobuf field 1, wire type 2
+        .bytes(&length)
+        .bytes(payload);
 }
 
 /// Reads a gRPC message header, returning the payload length and the header's
@@ -1192,13 +1194,13 @@ mod tests {
         for value in [0u64, 1, 63] {
             let (mut protobuf, mut quic) = (Vec::new(), Vec::new());
             put_protobuf_varint(value, &mut protobuf);
-            crate::varint::put(value, &mut quic);
+            Writer::new(&mut quic).varint(value);
             assert_eq!(protobuf, quic, "the two agree below 64");
         }
         for value in [64u64, 128, 300, 16_384] {
             let (mut protobuf, mut quic) = (Vec::new(), Vec::new());
             put_protobuf_varint(value, &mut protobuf);
-            crate::varint::put(value, &mut quic);
+            Writer::new(&mut quic).varint(value);
             assert_ne!(
                 protobuf, quic,
                 "{value} must not encode identically, or the wrong codec would pass tests"

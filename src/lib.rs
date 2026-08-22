@@ -35,8 +35,8 @@ pub(crate) mod testing;
 mod transport;
 mod udp;
 mod upstream;
-mod varint;
 mod vless;
+mod wire;
 
 use std::{
     error::Error,

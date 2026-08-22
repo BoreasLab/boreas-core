@@ -6,7 +6,7 @@ use std::{
 
 use etherparse::{IpEcn, NetSlice, SlicedPacket, TransportSlice};
 
-use crate::{InternalEndpoint, path::checksum};
+use crate::{InternalEndpoint, wire::checksum};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {

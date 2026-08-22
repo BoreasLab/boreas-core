@@ -51,7 +51,7 @@ use crate::{
     Accepted, CosmeticSource, Demotion, Demotions, DomainName, EgressError, Either, Hello,
     InterceptDecision, InterceptPolicy, InterceptedTier, Interceptor, Leg, NoCosmetics, Originator,
     Prefixed, RequestFilter, RewriteFailures, Rewriting, StreamBudget, StreamEgress, Target,
-    VersionCrossings, Wire, classify, run_exchange,
+    VersionCrossings, Wire, classify, run_exchange, wire::Reader,
 };
 
 /// A TLS record carrying handshake messages.
@@ -124,14 +124,14 @@ enum Approach {
 pub fn introduce(bytes: &[u8]) -> Introduction {
     // TLS record header: type(1), legacy version(2), length(2). Too few bytes
     // to recognise one is also too few to hold a request line.
-    let Some(header) = bytes.get(..5) else {
+    let mut reader = Reader::new(bytes);
+    let Some(&[content, major, _minor]) = reader.array::<3>() else {
         return Introduction::Incomplete;
     };
-    if header[0] != RECORD_HANDSHAKE || header[1] != RECORD_MAJOR {
+    if content != RECORD_HANDSHAKE || major != RECORD_MAJOR {
         return request_head(bytes);
     }
-    let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
-    let Some(record) = bytes.get(5..5 + length) else {
+    let Some(record) = reader.vector_u16() else {
         return Introduction::Incomplete;
     };
     Introduction::Tls(crate::read_hello(record))

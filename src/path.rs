@@ -1,7 +1,10 @@
 //! Path MTU handling: TCP MSS clamping on SYN, and authentication of inbound
 //! ICMP Packet Too Big messages against known flows.
 
-use crate::{IngressPacket, InternalEndpoint, MIN_QUIC_MTU, Mtu, Transport, UdpFlowTable};
+use crate::{
+    IngressPacket, InternalEndpoint, MIN_QUIC_MTU, Mtu, Transport, UdpFlowTable,
+    wire::{Reader, checksum},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathUpdate {
@@ -141,26 +144,25 @@ fn tcp_options(segment: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
     // simply produces an empty option list.
     let options = segment.get(20..header_len).unwrap_or_default();
 
-    let mut at = 0;
+    let mut reader = Reader::new(options);
     std::iter::from_fn(move || {
         loop {
-            match *options.get(at)? {
+            match reader.u8()? {
                 OPTION_END => return None,
-                OPTION_NOOP => at += 1,
+                OPTION_NOOP => {}
                 kind => {
-                    let length = usize::from(*options.get(at + 1)?);
-                    // `at + 2 > at + length` when `length < 2`, and the range
-                    // slice rejects that as it rejects running off the end, so
-                    // one `get` enforces both bounds. `length >= 2` on success
-                    // is what guarantees progress.
-                    let value = options.get(at + 2..at + length)?;
-                    let option = TcpOption {
+                    // The declared length counts the kind and length bytes
+                    // themselves, so the payload is two shorter — and a
+                    // declared length below two is refused by the subtraction
+                    // rather than by a check of its own. That it is at least
+                    // two on success is what guarantees progress.
+                    let length = usize::from(reader.u8()?).checked_sub(2)?;
+                    let at = 20 + reader.position();
+                    return Some(TcpOption {
                         kind,
-                        at: 20 + at + 2,
-                        value,
-                    };
-                    at += length;
-                    return Some(option);
+                        at,
+                        value: reader.take(length)?,
+                    });
                 }
             }
         }
@@ -177,39 +179,9 @@ fn mss_above(segment: &[u8], clamp: u16) -> Option<usize> {
 
     let mss = tcp_options(segment).find(|option| option.kind == OPTION_MSS)?;
     // RFC 9293: the MSS option's value is exactly two bytes. A shorter one is
-    // malformed, and `first_chunk` refuses it rather than reading past it.
-    let advertised = u16::from_be_bytes(*mss.value.first_chunk()?);
+    // malformed, and the reader refuses it rather than reading past it.
+    let advertised = Reader::new(mss.value).u16()?;
     (advertised > clamp).then_some(mss.at)
-}
-
-/// The internet checksum (RFC 1071) over a sequence of parts, treated as one
-/// byte stream. Shared with `packet::write_udp`, which needs the same sum over
-/// a pseudo-header it assembles from pieces.
-pub(crate) fn checksum(parts: &[&[u8]]) -> u16 {
-    let mut sum = 0_u32;
-    let mut pending_high = None;
-    for part in parts {
-        let mut bytes = part.iter().copied();
-        if let Some(high) = pending_high.take() {
-            match bytes.next() {
-                Some(low) => sum += u32::from(u16::from_be_bytes([high, low])),
-                None => pending_high = Some(high),
-            }
-        }
-        while let Some(high) = bytes.next() {
-            match bytes.next() {
-                Some(low) => sum += u32::from(u16::from_be_bytes([high, low])),
-                None => pending_high = Some(high),
-            }
-        }
-    }
-    if let Some(high) = pending_high {
-        sum += u32::from(u16::from_be_bytes([high, 0]));
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
 }
 
 #[cfg(test)]

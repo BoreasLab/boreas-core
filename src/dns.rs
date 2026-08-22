@@ -39,6 +39,8 @@ use std::{
     ops::Range,
 };
 
+use crate::wire::{Bounded, Reader};
+
 /// The UDP and TCP port DNS is served on. Interception keys on the port
 /// rather than on a resolver address: the client's configured resolver lives
 /// inside the tunnel, so every query on this port is one Boreas owns.
@@ -53,6 +55,11 @@ pub const MAX_NAME_CHARS: usize = 253;
 const MAX_LABEL_LEN: usize = 63;
 
 const HEADER_BYTES: usize = 12;
+
+/// Where `ANCOUNT` sits in that header: after `ID`, the flags, and `QDCOUNT`.
+/// Named because `write_response` patches it once the answers are counted, and
+/// a bare `6` there would be the only unexplained offset in the module.
+const ANCOUNT_AT: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DnsError {
@@ -226,22 +233,20 @@ impl Name {
     fn read(message: &[u8], at: usize) -> Result<(Self, usize), DnsError> {
         let mut bytes = [0; MAX_NAME_CHARS];
         let mut len = 0usize;
-        let mut cursor = at;
+        let mut reader = Reader::at(message, at).ok_or(DnsError::Truncated)?;
         // Set by the first pointer: everything after it is elsewhere in the
         // message and costs nothing at the original position.
         let mut consumed: Option<usize> = None;
 
         loop {
-            let length = *message.get(cursor).ok_or(DnsError::Truncated)?;
+            let cursor = reader.position();
+            let length = reader.u8().ok_or(DnsError::Truncated)?;
             match length & 0xc0 {
-                0x00 if length == 0 => {
-                    cursor += 1;
-                    break;
-                }
+                0x00 if length == 0 => break,
                 0x00 => {
-                    let start = cursor + 1;
-                    let end = start + usize::from(length);
-                    let label = message.get(start..end).ok_or(DnsError::Truncated)?;
+                    let label = reader
+                        .take(usize::from(length))
+                        .ok_or(DnsError::Truncated)?;
                     if label.contains(&b'.') {
                         return Err(DnsError::SeparatorInLabel);
                     }
@@ -256,18 +261,17 @@ impl Name {
                     bytes[len..len + label.len()].copy_from_slice(label);
                     bytes[len..len + label.len()].make_ascii_lowercase();
                     len += label.len();
-                    cursor = end;
                 }
                 0xc0 => {
-                    let low = *message.get(cursor + 1).ok_or(DnsError::Truncated)?;
+                    let low = reader.u8().ok_or(DnsError::Truncated)?;
                     let target = usize::from(u16::from_be_bytes([length & 0x3f, low]));
                     // Strictly backwards, so the cursor strictly decreases and
                     // the chain is finite. This is the whole loop defense.
                     if target >= cursor {
                         return Err(DnsError::ForwardPointer);
                     }
-                    consumed.get_or_insert(cursor + 2);
-                    cursor = target;
+                    consumed.get_or_insert(reader.position());
+                    reader = Reader::at(message, target).ok_or(DnsError::Truncated)?;
                 }
                 _ => return Err(DnsError::ReservedLabel),
             }
@@ -278,25 +282,24 @@ impl Name {
                 bytes,
                 len: len as u8,
             },
-            consumed.unwrap_or(cursor) - at,
+            consumed.unwrap_or(reader.position()) - at,
         ))
     }
 
     /// Writes the wire encoding at `at`, returning the new offset. Never
     /// compressed: see [`write_response`] for why.
     fn write(&self, out: &mut [u8], at: usize) -> Result<usize, DnsError> {
-        let mut cursor = at;
+        let mut writer = Bounded::at(out, at).ok_or(DnsError::OutputTooSmall)?;
         if !self.is_root() {
+            // Each label is its own length-prefixed vector. Both constructors
+            // bound a label at `MAX_LABEL_LEN`, which is what keeps every
+            // length prefix inside its one byte.
             for label in self.as_bytes().split(|byte| *byte == b'.') {
-                let end = cursor + 1 + label.len();
-                let slot = out.get_mut(cursor..end).ok_or(DnsError::OutputTooSmall)?;
-                slot[0] = label.len() as u8;
-                slot[1..].copy_from_slice(label);
-                cursor = end;
+                writer.vector_u8(label);
             }
         }
-        *out.get_mut(cursor).ok_or(DnsError::OutputTooSmall)? = 0;
-        Ok(cursor + 1)
+        writer.u8(0); // the root label, which terminates every name
+        writer.finish().ok_or(DnsError::OutputTooSmall)
     }
 }
 
@@ -458,9 +461,19 @@ pub struct Message<'a> {
 
 impl<'a> Message<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, DnsError> {
-        let header = bytes.get(..HEADER_BYTES).ok_or(DnsError::Truncated)?;
-        let word = |at: usize| u16::from_be_bytes([header[at], header[at + 1]]);
-        let (id, flags, question_count, answer_count) = (word(0), word(2), word(4), word(6));
+        let mut reader = Reader::new(bytes);
+        let (Some(id), Some(flags), Some(question_count), Some(answer_count)) =
+            (reader.u16(), reader.u16(), reader.u16(), reader.u16())
+        else {
+            return Err(DnsError::Truncated);
+        };
+        // Advance to the end of the fixed header, over `nscount` and
+        // `arcount`. Both must be present and neither is read: a stub
+        // resolver's query carries no authority or additional section, and
+        // this shell answers from the question alone.
+        reader
+            .skip(HEADER_BYTES - reader.position())
+            .ok_or(DnsError::Truncated)?;
         // Exactly one, which is what the single `Question` below asserts and
         // what everything after `answers_at` depends on. A drop rather than the
         // FORMERR RFC 9619 section 4.3 asks middleboxes for: this shell has no
@@ -472,16 +485,19 @@ impl<'a> Message<'a> {
             count => return Err(DnsError::MultipleQuestions(count)),
         }
 
-        let (name, name_len) = Name::read(bytes, HEADER_BYTES)?;
+        let question_at = reader.position();
+        let (name, name_len) = Name::read(bytes, question_at)?;
         if name_len != name.wire_len() {
             // A pointer was followed, so the encoding is shorter than the name
             // it denotes. See `DnsError::CompressedQuestion`.
             return Err(DnsError::CompressedQuestion);
         }
-        let fields_at = HEADER_BYTES + name_len;
-        let fields = bytes
-            .get(fields_at..fields_at + 4)
-            .ok_or(DnsError::Truncated)?;
+        // `Name::read` already proved these bytes are there; skipping them is
+        // how the cursor learns what it read.
+        reader.skip(name_len).ok_or(DnsError::Truncated)?;
+        let (Some(qtype), Some(qclass)) = (reader.u16(), reader.u16()) else {
+            return Err(DnsError::Truncated);
+        };
 
         Ok(Self {
             bytes,
@@ -490,11 +506,11 @@ impl<'a> Message<'a> {
             answer_count,
             question: Question {
                 name,
-                qtype: RecordType::from_wire(u16::from_be_bytes([fields[0], fields[1]])),
-                qclass: u16::from_be_bytes([fields[2], fields[3]]),
+                qtype: RecordType::from_wire(qtype),
+                qclass,
             },
-            question_bytes: &bytes[HEADER_BYTES..fields_at + 4],
-            answers_at: fields_at + 4,
+            question_bytes: &bytes[question_at..reader.position()],
+            answers_at: reader.position(),
         })
     }
 
@@ -555,24 +571,22 @@ impl<'a> Iterator for Answers<'a> {
 impl<'a> Answers<'a> {
     fn read(&mut self) -> Result<ResourceRecord<'a>, DnsError> {
         let (name, name_len) = Name::read(self.message, self.cursor)?;
-        let fields_at = self.cursor + name_len;
-        let fields = self
-            .message
-            .get(fields_at..fields_at + 10)
-            .ok_or(DnsError::Truncated)?;
-        let rdlength = usize::from(u16::from_be_bytes([fields[8], fields[9]]));
-        let rdata_at = fields_at + 10;
-        let rdata = self
-            .message
-            .get(rdata_at..rdata_at + rdlength)
-            .ok_or(DnsError::Truncated)?;
-        self.cursor = rdata_at + rdlength;
+        let mut reader =
+            Reader::at(self.message, self.cursor + name_len).ok_or(DnsError::Truncated)?;
+        let (Some(rtype), Some(class), Some(ttl)) = (reader.u16(), reader.u16(), reader.u32())
+        else {
+            return Err(DnsError::Truncated);
+        };
+        // `RDLENGTH` and `RDATA` are one length-prefixed vector, which is what
+        // makes an over-long declared length a refusal rather than a slice.
+        let rdata = reader.vector_u16().ok_or(DnsError::Truncated)?;
+        self.cursor = reader.position();
 
         Ok(ResourceRecord {
             name,
-            rtype: RecordType::from_wire(u16::from_be_bytes([fields[0], fields[1]])),
-            class: u16::from_be_bytes([fields[2], fields[3]]),
-            ttl: u32::from_be_bytes([fields[4], fields[5], fields[6], fields[7]]),
+            rtype: RecordType::from_wire(rtype),
+            class,
+            ttl,
             rdata,
         })
     }
@@ -714,14 +728,12 @@ impl<'a> Iterator for SvcParams<'a> {
 impl<'a> SvcParams<'a> {
     fn read(&mut self) -> Result<SvcParam<'a>, DnsError> {
         let start = self.cursor;
-        let header = self
-            .rdata
-            .get(start..start + 4)
-            .ok_or(DnsError::Truncated)?;
-        let key = u16::from_be_bytes([header[0], header[1]]);
-        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
-        let end = start + 4 + length;
-        let value = self.rdata.get(start + 4..end).ok_or(DnsError::Truncated)?;
+        let mut reader = Reader::at(self.rdata, start).ok_or(DnsError::Truncated)?;
+        let Some(key) = reader.u16() else {
+            return Err(DnsError::Truncated);
+        };
+        let value = reader.vector_u16().ok_or(DnsError::Truncated)?;
+        let end = reader.position();
         // RFC 9460 section 2.2 requires strictly increasing keys, which also
         // makes a duplicated key unrepresentable rather than ambiguous.
         if self.previous.is_some_and(|previous| key <= previous) {
@@ -1233,7 +1245,12 @@ pub fn write_response(
         answers += 1;
     }
 
-    out[6..8].copy_from_slice(&answers.to_be_bytes());
+    // `ancount`, now that the loop knows it. The header is already written, so
+    // this offset is inside the buffer by construction — but the writer is
+    // what says so rather than an index that has to be read against it.
+    let mut ancount = Bounded::at(out, ANCOUNT_AT).ok_or(DnsError::OutputTooSmall)?;
+    ancount.u16(answers);
+    ancount.finish().ok_or(DnsError::OutputTooSmall)?;
     Ok(Rewritten {
         len: cursor,
         answers,
@@ -1307,14 +1324,14 @@ fn write_header_and_question(
     query: &Message<'_>,
     flags: u16,
 ) -> Result<usize, DnsError> {
-    let end = HEADER_BYTES + query.question_bytes.len();
-    let header = out.get_mut(..end).ok_or(DnsError::OutputTooSmall)?;
-    header[0..2].copy_from_slice(&query.id.to_be_bytes());
-    header[2..4].copy_from_slice(&flags.to_be_bytes());
-    header[4..6].copy_from_slice(&1u16.to_be_bytes());
-    header[6..12].fill(0);
-    header[HEADER_BYTES..].copy_from_slice(query.question_bytes);
-    Ok(end)
+    let mut writer = Bounded::at(out, 0).ok_or(DnsError::OutputTooSmall)?;
+    writer
+        .u16(query.id)
+        .u16(flags)
+        .u16(1) // qdcount: exactly one, which `Message::parse` enforced
+        .zeros(6) // ancount, nscount, arcount — the first is patched later
+        .bytes(query.question_bytes);
+    writer.finish().ok_or(DnsError::OutputTooSmall)
 }
 
 fn write_record(
@@ -1323,25 +1340,20 @@ fn write_record(
     record: &ResourceRecord<'_>,
     rdata: Rdata<'_>,
 ) -> Result<usize, DnsError> {
-    let mut cursor = record.name.write(out, at)?;
-    let fields = out
-        .get_mut(cursor..cursor + 10)
-        .ok_or(DnsError::OutputTooSmall)?;
-    fields[0..2].copy_from_slice(&record.rtype.to_wire().to_be_bytes());
-    fields[2..4].copy_from_slice(&record.class.to_be_bytes());
-    fields[4..8].copy_from_slice(&record.ttl.to_be_bytes());
     let length = u16::try_from(rdata.len()).map_err(|_| DnsError::OutputTooSmall)?;
-    fields[8..10].copy_from_slice(&length.to_be_bytes());
-    cursor += 10;
-
+    let at = record.name.write(out, at)?;
+    let mut writer = Bounded::at(out, at).ok_or(DnsError::OutputTooSmall)?;
+    writer
+        .u16(record.rtype.to_wire())
+        .u16(record.class)
+        .u32(record.ttl)
+        // Not `vector_u16`: the parts are contiguous on the wire but held
+        // apart here, so the length is the sum rather than any one of them.
+        .u16(length);
     for part in rdata.parts {
-        let end = cursor + part.len();
-        out.get_mut(cursor..end)
-            .ok_or(DnsError::OutputTooSmall)?
-            .copy_from_slice(part);
-        cursor = end;
+        writer.bytes(part);
     }
-    Ok(cursor)
+    writer.finish().ok_or(DnsError::OutputTooSmall)
 }
 
 #[cfg(test)]

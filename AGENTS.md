@@ -42,6 +42,19 @@ the product contract. Do not infer implemented status from visionary scope.
   A number `api.rs` computes from another already has its proof in the
   arithmetic, and wrapping it buys a type around a literal. The test is
   reachability from outside the crate, not representability.
+- Read and write a wire format through `wire`, never by hand. `Reader` is
+  total and hands back the caller's own bytes at their own lifetime, `Writer`
+  appends to a `Vec`, and `Bounded` writes into a buffer that cannot grow. The
+  three exist because ten formats each carried their own index arithmetic, and
+  the mistake that invites is the same one every time: a length checked in one
+  place and assumed in the next. `src/wire.rs`'s header says why no crate was
+  added for this and why there is no SIMD path.
+  Two things stay as literal indices, deliberately. A fixed-offset read or
+  write inside an IP header whose length is already guarded — `datagram[12..16]`
+  beside "source address at offset 12" — is the RFC's own diagram, and a cursor
+  there would hide it. And **a test builds its wire bytes as literals**: a test
+  that assembles its input with the encoder under test proves the two agree,
+  not that either is right.
 - Write a wire protocol in `sansio`'s vocabulary, not in an `async fn`. A
   negotiation is a `Negotiation` and framing is a `Codec`: bytes in, bytes out,
   no socket and no clock. `negotiate` and `Framed` are the only things that

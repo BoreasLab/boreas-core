@@ -55,6 +55,7 @@ has to read `src/` or `ffi/src/` to make progress has found a defect in
 | `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
 | `src/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
 | `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
+| `src/wire.rs` | the byte alphabet every wire format is read and written through: total reader, growable and bounded writers, RFC 1071 checksum | [Architecture](architecture.md) |
 | `src/dns.rs` | DNS parsing, host policy, verdict provenance, ECH policy | [Filtering](filtering.md) |
 | `src/filter.rs` | filter-list parsing, deferral accounting, policy compilation | [Filtering](filtering.md) |
 | `src/egress.rs` | egress sum (packet vs stream), sans-io packet-egress interface, WireGuard via GotaTun | [Egress](egress.md) |

@@ -45,6 +45,7 @@ use crate::{
     Association, AsyncStream, BoxFuture, Codec, DatagramFidelity, DatagramSink, DatagramSource,
     Decode, Decoded, EgressError, Framed, NatBehavior, PathProperties, ProxyError, StreamEgress,
     Target, TunnelBypass, decode_address, encode_address,
+    wire::{Reader, Writer},
 };
 
 /// The BLAKE3 derive-key context, fixed by SIP022. It is part of the wire
@@ -257,9 +258,7 @@ fn encode_request_body(target: &Target, padding: &[u8], initial: &[u8]) -> Vec<u
     debug_assert!(padding.len() <= MAX_PADDING);
     let mut body = Vec::with_capacity(initial.len() + padding.len() + 32);
     encode_address(target, &mut body);
-    body.extend_from_slice(&(padding.len() as u16).to_be_bytes());
-    body.extend_from_slice(padding);
-    body.extend_from_slice(initial);
+    Writer::new(&mut body).vector_u16(padding).bytes(initial);
     body
 }
 
@@ -267,9 +266,10 @@ fn encode_request_body(target: &Target, padding: &[u8], initial: &[u8]) -> Vec<u
 /// variable-length header that follows it.
 fn encode_request_fixed(now: u64, body_len: u16) -> Vec<u8> {
     let mut header = Vec::with_capacity(11);
-    header.push(TYPE_REQUEST);
-    header.extend_from_slice(&now.to_be_bytes());
-    header.extend_from_slice(&body_len.to_be_bytes());
+    Writer::new(&mut header)
+        .u8(TYPE_REQUEST)
+        .u64(now)
+        .u16(body_len);
     header
 }
 
@@ -280,24 +280,21 @@ fn encode_request_fixed(now: u64, body_len: u16) -> Vec<u8> {
 /// The salt echo is what makes a replayed response detectable, so verifying it
 /// is not optional politeness — it is the property the field exists for.
 fn decode_response_fixed(plain: &[u8], request_salt: &[u8], now: u64) -> Result<u16, ProxyError> {
-    let salt_len = request_salt.len();
-    if plain.len() != 1 + 8 + salt_len + 2 {
+    // An exact length, not a minimum: this header is opened from a block whose
+    // size the state machine already chose, so a different size is a framing
+    // error rather than a short read.
+    if plain.len() != 1 + 8 + request_salt.len() + 2 {
         return Err(ProxyError::Header);
     }
-    if plain[0] != TYPE_RESPONSE {
+    let mut reader = Reader::new(plain);
+    let (Some(TYPE_RESPONSE), Some(stamp)) = (reader.u8(), reader.u64()) else {
         return Err(ProxyError::Header);
-    }
-    let stamp = u64::from_be_bytes(plain[1..9].try_into().map_err(|_| ProxyError::Header)?);
+    };
     check_timestamp(stamp, now)?;
-    if &plain[9..9 + salt_len] != request_salt {
+    if reader.take(request_salt.len()) != Some(request_salt) {
         return Err(ProxyError::SaltMismatch);
     }
-    let length = u16::from_be_bytes(
-        plain[9 + salt_len..]
-            .try_into()
-            .map_err(|_| ProxyError::Header)?,
-    );
-    Ok(length)
+    reader.u16().ok_or(ProxyError::Header)
 }
 
 /// Static configuration for one Shadowsocks server.
@@ -483,14 +480,17 @@ impl PacketCipher {
         Ok(Self::identify(&identity, message))
     }
 
+    /// Splits a `SEPARATE_HEADER`-sized identity into its session and packet
+    /// id. Every caller has already sized `identity`, so a short one is a
+    /// defect here rather than something a peer can send.
     fn identify(identity: &[u8], message: Vec<u8>) -> Opened {
-        let mut session = [0u8; 8];
-        session.copy_from_slice(&identity[..8]);
+        let mut reader = Reader::new(identity);
+        let (Some(session), Some(packet_id)) = (reader.array::<8>(), reader.u64()) else {
+            unreachable!("identify is only reached with a {SEPARATE_HEADER}-byte identity");
+        };
         Opened {
-            session,
-            packet_id: u64::from_be_bytes(
-                identity[8..SEPARATE_HEADER].try_into().expect("16 bytes"),
-            ),
+            session: *session,
+            packet_id,
             message,
         }
     }
@@ -585,12 +585,12 @@ fn encode_packet_request(
 ) -> Result<Vec<u8>, EgressError> {
     let pad = padding_for(target)?;
     let mut out = Vec::with_capacity(11 + pad.len() + 22 + payload.len());
-    out.push(PACKET_TO_SERVER);
-    out.extend_from_slice(&now.to_be_bytes());
-    out.extend_from_slice(&(pad.len() as u16).to_be_bytes());
-    out.extend_from_slice(&pad);
+    Writer::new(&mut out)
+        .u8(PACKET_TO_SERVER)
+        .u64(now)
+        .vector_u16(&pad);
     encode_address(target, &mut out);
-    out.extend_from_slice(payload);
+    Writer::new(&mut out).bytes(payload);
     Ok(out)
 }
 
@@ -619,24 +619,22 @@ fn decode_packet_response(
     client_session: &[u8; 8],
     now: u64,
 ) -> Result<(Target, usize), EgressError> {
-    // type(1) + timestamp(8) + client session(8) + padding length(2)
-    let fixed = message.get(..19).ok_or(ProxyError::Header)?;
-    if fixed[0] != PACKET_TO_CLIENT {
+    // type(1) + timestamp(8) + client session(8) + padding
+    let mut reader = Reader::new(message);
+    let (Some(PACKET_TO_CLIENT), Some(stamp), Some(session)) =
+        (reader.u8(), reader.u64(), reader.array::<8>())
+    else {
         return Err(ProxyError::Header.into());
-    }
-    check_timestamp(
-        u64::from_be_bytes(fixed[1..9].try_into().expect("8 bytes")),
-        now,
-    )?;
-    if &fixed[9..17] != client_session {
+    };
+    check_timestamp(stamp, now)?;
+    if session != client_session {
         return Err(ProxyError::SaltMismatch.into());
     }
-    let pad = usize::from(u16::from_be_bytes(
-        fixed[17..19].try_into().expect("2 bytes"),
-    ));
-    let at = 19usize.checked_add(pad).ok_or(ProxyError::Header)?;
-    let rest = message.get(at..).ok_or(ProxyError::Header)?;
-    match decode_address(rest)? {
+    if reader.vector_u16().is_none() {
+        return Err(ProxyError::Header.into());
+    }
+    let at = reader.position();
+    match decode_address(reader.rest())? {
         Decoded::Complete { value, consumed } => Ok((value, at + consumed)),
         Decoded::Incomplete => Err(ProxyError::Header.into()),
     }
@@ -991,7 +989,7 @@ impl Codec for StreamCodec {
             ReadState::Length => {
                 let reader = self.reader.as_mut().ok_or(ProxyError::Header)?;
                 let plain = reader.open(&mut block)?;
-                let length = u16::from_be_bytes(plain.try_into().map_err(|_| ProxyError::Header)?);
+                let length = Reader::new(plain).u16().ok_or(ProxyError::Header)?;
                 self.state = ReadState::Payload(usize::from(length));
             }
             ReadState::Payload(_) => {
@@ -1010,12 +1008,12 @@ impl Codec for StreamCodec {
     /// anything between them, which is why the whole frame goes into one sink
     /// and [`Framed`] writes it whole.
     fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError> {
-        let mut length = (payload.len() as u16).to_be_bytes().to_vec();
+        let mut length = Vec::with_capacity(2);
+        Writer::new(&mut length).u16(payload.len() as u16);
         self.writer.seal(&mut length)?;
         let mut sealed = payload.to_vec();
         self.writer.seal(&mut sealed)?;
-        out.extend_from_slice(&length);
-        out.extend_from_slice(&sealed);
+        Writer::new(out).bytes(&length).bytes(&sealed);
         Ok(())
     }
 

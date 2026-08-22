@@ -40,7 +40,7 @@ use crate::{
     EgressError, NatBehavior, PathProperties, Prefixed, ProxyError, StreamEgress, Target,
     TunnelBypass,
     quic::{Handshake, QuicConnection, client_config},
-    varint,
+    wire::{Reader, Writer, varint_len},
 };
 
 /// The `:authority` and `:path` the authentication request carries. Fixed
@@ -121,11 +121,10 @@ fn padding(range: Range<usize>) -> Result<Vec<u8>, ProxyError> {
 /// O(address length + padding length).
 pub fn encode_tcp_request(target: &Target, padding: &[u8], out: &mut Vec<u8>) {
     let address = target.to_string();
-    varint::put(FRAME_TCP_REQUEST, out);
-    varint::put(address.len() as u64, out);
-    out.extend_from_slice(address.as_bytes());
-    varint::put(padding.len() as u64, out);
-    out.extend_from_slice(padding);
+    Writer::new(out)
+        .varint(FRAME_TCP_REQUEST)
+        .vector_varint(address.as_bytes())
+        .vector_varint(padding);
 }
 
 /// What the server answered when asked to open a stream.
@@ -150,26 +149,26 @@ pub enum TcpResponse {
 ///
 /// O(message length + padding length), and it allocates only for the message.
 pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyError> {
-    let Some((&status, rest)) = bytes.split_first() else {
+    let mut reader = Reader::new(bytes);
+    let Some(status) = reader.u8() else {
         return Ok(Decoded::Incomplete);
     };
-    let Some((message_len, rest)) = varint::get(rest) else {
+    let Some(message_len) = reader.varint() else {
         return Ok(Decoded::Incomplete);
     };
     if message_len > MAX_MESSAGE_LEN {
         return Err(ProxyError::Header);
     }
-    let Some(message) = rest.get(..message_len as usize) else {
+    let Some(message) = reader.take(message_len as usize) else {
         return Ok(Decoded::Incomplete);
     };
-    let rest = &rest[message_len as usize..];
-    let Some((padding_len, rest)) = varint::get(rest) else {
+    let Some(padding_len) = reader.varint() else {
         return Ok(Decoded::Incomplete);
     };
     if padding_len > MAX_PADDING_LEN {
         return Err(ProxyError::Header);
     }
-    if rest.len() < padding_len as usize {
+    if reader.skip(padding_len as usize).is_none() {
         return Ok(Decoded::Incomplete);
     }
     // A message that is not UTF-8 is a malformed frame rather than a lossy
@@ -184,7 +183,7 @@ pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyEr
             0 => TcpResponse::Accepted,
             _ => TcpResponse::Refused(message),
         },
-        consumed: bytes.len() - rest.len() + padding_len as usize,
+        consumed: reader.position(),
     })
 }
 
@@ -302,49 +301,42 @@ impl UdpMessage<'_> {
     }
 
     fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.session.to_be_bytes());
-        out.extend_from_slice(&self.packet.to_be_bytes());
-        out.push(self.fragment);
-        out.push(self.fragments);
-        varint::put(self.address.len() as u64, out);
-        out.extend_from_slice(self.address.as_bytes());
-        out.extend_from_slice(self.payload);
+        Writer::new(out)
+            .u32(self.session)
+            .u16(self.packet)
+            .u8(self.fragment)
+            .u8(self.fragments)
+            .vector_varint(self.address.as_bytes())
+            .bytes(self.payload);
     }
 
     /// Total on untrusted input: every short buffer, over-long length, and
     /// non-UTF-8 address is `None` rather than a panic or a partial read.
     fn read(bytes: &[u8]) -> Option<UdpMessage<'_>> {
-        let fixed = bytes.get(..UDP_FIXED)?;
-        let (length, rest) = varint::get(&bytes[UDP_FIXED..])?;
+        let mut reader = Reader::new(bytes);
+        let session = reader.u32()?;
+        let packet = reader.u16()?;
+        let fragment = reader.u8()?;
+        let fragments = reader.u8()?;
+        let length = reader.varint()?;
         if length == 0 || length > MAX_MESSAGE_LEN {
             return None;
         }
-        let (address, payload) = rest.split_at_checked(length as usize)?;
+        let address = reader.take(length as usize)?;
+        let payload = reader.rest();
         // The reference requires at least one payload byte, so a zero-length
         // one is not representable and is refused rather than delivered empty.
         if payload.is_empty() {
             return None;
         }
         Some(UdpMessage {
-            session: u32::from_be_bytes(fixed[..4].try_into().expect("4 bytes")),
-            packet: u16::from_be_bytes(fixed[4..6].try_into().expect("2 bytes")),
-            fragment: fixed[6],
-            fragments: fixed[7],
+            session,
+            packet,
+            fragment,
+            fragments,
             address: std::str::from_utf8(address).ok()?,
             payload,
         })
-    }
-}
-
-/// How many bytes a QUIC varint of `value` occupies. `varint::put` picks the
-/// shortest form, so this has to agree with it exactly or a fragment's payload
-/// budget is wrong by a byte and the last fragment overflows the frame.
-fn varint_len(value: u64) -> usize {
-    match value {
-        0..=63 => 1,
-        64..=16_383 => 2,
-        16_384..=1_073_741_823 => 4,
-        _ => 8,
     }
 }
 
@@ -858,10 +850,11 @@ mod tests {
     /// can keep what followed.
     #[test]
     fn every_proper_prefix_of_a_response_is_incomplete() {
-        let mut frame = vec![0u8];
-        varint::put(2, &mut frame);
+        // Written as the specification lays the frame out, one literal byte
+        // per varint, so this checks the decoder rather than our encoder.
+        let mut frame = vec![0u8, 0x02];
         frame.extend_from_slice(b"ok");
-        varint::put(4, &mut frame);
+        frame.push(0x04);
         frame.extend_from_slice(b"pppp");
 
         for cut in 0..frame.len() {
@@ -896,10 +889,9 @@ mod tests {
     /// makes it a refusal.
     #[test]
     fn a_non_zero_status_is_a_refusal_carrying_its_message() {
-        let mut frame = vec![1u8];
-        varint::put(7, &mut frame);
+        let mut frame = vec![1u8, 0x07];
         frame.extend_from_slice(b"refused");
-        varint::put(0, &mut frame);
+        frame.push(0x00);
         let Ok(Decoded::Complete { value, .. }) = decode_tcp_response(&frame) else {
             panic!("the frame is complete");
         };
@@ -912,12 +904,11 @@ mod tests {
     #[test]
     fn a_length_beyond_the_protocol_ceiling_is_refused_not_allocated() {
         let mut frame = vec![0u8];
-        varint::put(MAX_MESSAGE_LEN + 1, &mut frame);
+        Writer::new(&mut frame).varint(MAX_MESSAGE_LEN + 1);
         assert_eq!(decode_tcp_response(&frame), Err(ProxyError::Header));
 
-        let mut frame = vec![0u8];
-        varint::put(0, &mut frame);
-        varint::put(MAX_PADDING_LEN + 1, &mut frame);
+        let mut frame = vec![0u8, 0x00];
+        Writer::new(&mut frame).varint(MAX_PADDING_LEN + 1);
         assert_eq!(decode_tcp_response(&frame), Err(ProxyError::Header));
     }
 
@@ -1109,11 +1100,10 @@ mod tests {
     /// one — so the tests below check the decoder against the specification
     /// instead of against its own inverse.
     fn encode_tcp_response(ok: bool, message: &str, padding: &[u8], out: &mut Vec<u8>) {
-        out.push(if ok { 0 } else { 1 });
-        varint::put(message.len() as u64, out);
-        out.extend_from_slice(message.as_bytes());
-        varint::put(padding.len() as u64, out);
-        out.extend_from_slice(padding);
+        Writer::new(out)
+            .u8(if ok { 0 } else { 1 })
+            .vector_varint(message.as_bytes())
+            .vector_varint(padding);
     }
 
     /// The exchange, driven without a QUIC connection anywhere. Before the port

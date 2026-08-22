@@ -75,6 +75,8 @@ use boring::{
 use hyper::client::conn::http2::Builder as H2Builder;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::wire::Reader;
+
 /// Handshake extensions this module reads out of a ClientHello.
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 0x000a;
@@ -288,7 +290,10 @@ pub fn read_hello(record: &[u8]) -> Hello {
     // A handshake body longer than this record is a ClientHello fragmented
     // across records. Legal, vanishingly rare, and not reassembled here: the
     // result names no host, which splices.
-    let Some(body) = reader.u24().and_then(|length| reader.take(length)) else {
+    let Some(body) = reader
+        .u24()
+        .and_then(|length| reader.take(usize::try_from(length).ok()?))
+    else {
         return hello;
     };
 
@@ -383,51 +388,6 @@ fn server_name(body: &[u8]) -> Option<crate::DomainName> {
         }
     }
     None
-}
-
-/// A forward cursor over untrusted bytes. Every accessor is total: it returns
-/// `None` rather than panicking, so the parser above never indexes.
-struct Reader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    fn take(&mut self, length: usize) -> Option<&'a [u8]> {
-        let taken = self.bytes.get(..length)?;
-        self.bytes = &self.bytes[length..];
-        Some(taken)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|byte| byte[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        self.take(2)
-            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn u24(&mut self) -> Option<usize> {
-        self.take(3).map(|bytes| {
-            usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2])
-        })
-    }
-
-    /// A length-prefixed vector with a one-byte length, returning its body.
-    fn vector_u8(&mut self) -> Option<&'a [u8]> {
-        let length = usize::from(self.u8()?);
-        self.take(length)
-    }
-
-    /// A length-prefixed vector with a two-byte length, returning its body.
-    fn vector_u16(&mut self) -> Option<&'a [u8]> {
-        let length = usize::from(self.u16()?);
-        self.take(length)
-    }
 }
 
 /// Brotli certificate decompression, RFC 8879.

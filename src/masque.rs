@@ -41,7 +41,8 @@ use quiche::h3::NameValue;
 
 use crate::{
     BufferPool, DatagramFidelity, EgressEmit, EgressError, NatBehavior, PacketEgress,
-    PathProperties, varint,
+    PathProperties,
+    wire::{Reader, Writer},
 };
 
 /// The CONNECT-IP context ID for a full IP packet, fixed by RFC 9484 §6.
@@ -142,9 +143,10 @@ pub enum TunnelState {
 /// the caller's buffer and no allocation of its own.
 pub fn encode_ip_datagram(flow_id: u64, packet: &[u8], out: &mut Vec<u8>) {
     out.clear();
-    varint::put(flow_id, out);
-    varint::put(IP_PACKET_CONTEXT, out);
-    out.extend_from_slice(packet);
+    Writer::new(out)
+        .varint(flow_id)
+        .varint(IP_PACKET_CONTEXT)
+        .bytes(packet);
 }
 
 /// Reads the IP packet out of a CONNECT-IP HTTP Datagram payload.
@@ -153,14 +155,14 @@ pub fn encode_ip_datagram(flow_id: u64, packet: &[u8], out: &mut Vec<u8>) {
 /// context 0: another context is a capsule this tunnel does not implement, and
 /// another flow is not ours to interpret. O(1) — two varints and a slice.
 pub fn decode_ip_datagram(datagram: &[u8], expected_flow_id: u64) -> Option<&[u8]> {
-    let (flow_id, rest) = varint::get(datagram)?;
-    if flow_id != expected_flow_id {
+    let mut reader = Reader::new(datagram);
+    if reader.varint()? != expected_flow_id {
         return None;
     }
-    let (context, packet) = varint::get(rest)?;
-    if context != IP_PACKET_CONTEXT {
+    if reader.varint()? != IP_PACKET_CONTEXT {
         return None;
     }
+    let packet = reader.rest();
     (!packet.is_empty()).then_some(packet)
 }
 
@@ -490,20 +492,18 @@ mod tests {
             assert_eq!(decode_ip_datagram(&encoded, flow_id.wrapping_add(1)), None);
         }
 
-        // Context 1 is a capsule this tunnel does not implement.
-        let mut other_context = Vec::new();
-        varint::put(4, &mut other_context);
-        varint::put(1, &mut other_context);
+        // Context 1 is a capsule this tunnel does not implement. The two
+        // varints are written as the literal bytes RFC 9000 gives them, so
+        // this asserts against the wire rather than against our own encoder.
+        let mut other_context = vec![0x04, 0x01];
         other_context.extend_from_slice(&packet);
         assert_eq!(decode_ip_datagram(&other_context, 4), None);
 
         // Truncated input is `None`, never a panic: these bytes are untrusted.
         assert_eq!(decode_ip_datagram(&[], 0), None);
         assert_eq!(decode_ip_datagram(&[0x40], 0), None);
-        let mut empty_payload = Vec::new();
-        varint::put(4, &mut empty_payload);
-        varint::put(0, &mut empty_payload);
-        assert_eq!(decode_ip_datagram(&empty_payload, 4), None);
+        // Flow 4, context 0, and no packet behind them.
+        assert_eq!(decode_ip_datagram(&[0x04, 0x00], 4), None);
     }
 
     /// A minimal MASQUE proxy: a real `quiche` server that accepts one
