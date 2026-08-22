@@ -334,10 +334,7 @@ pub fn read_hello(record: &[u8]) -> Hello {
                 // above, so it is read on its own terms.
                 let mut inner = Reader::new(body);
                 if let Some(list) = inner.vector_u8() {
-                    hello.profile.compression = list
-                        .chunks_exact(2)
-                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-                        .collect();
+                    hello.profile.compression = u16s(list).collect();
                 }
             }
             _ => {}
@@ -346,12 +343,26 @@ pub fn read_hello(record: &[u8]) -> Hello {
     hello
 }
 
+/// Every `u16` in `body`, in order, ignoring a trailing odd byte.
+///
+/// **A reader rather than a chunked slice.** Both callers had taken the bytes
+/// out of a [`Reader`] and then re-derived the pairs with `chunks_exact(2)` and
+/// two index expressions — which is [`Reader::u16`] written again, by hand, in
+/// a place where the length is no longer checked by the thing that knows it.
+/// Reading them back through the reader is the same iterator with none of that:
+/// it stops when fewer than two bytes remain, which *is* "skip a trailing odd
+/// byte".
+///
+/// O(bytes), lazily, with no allocation.
+fn u16s(body: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    let mut reader = Reader::new(body);
+    std::iter::from_fn(move || reader.u16())
+}
+
 /// The u16 codepoints of a two-byte-length-prefixed vector, skipping a
 /// trailing odd byte rather than failing on it.
 fn codepoints(body: &[u8]) -> impl Iterator<Item = u16> + '_ {
-    let list = Reader::new(body).vector_u16().unwrap_or_default();
-    list.chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+    u16s(Reader::new(body).vector_u16().unwrap_or_default())
 }
 
 /// The SNI host from a `server_name` extension body.
