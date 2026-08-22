@@ -40,8 +40,13 @@ jobs:
       # re-materialised, fails here rather than riding into a commit.
       - run: uv run scripts/vendor.py --check
       - run: uv run scripts/vendor.py --selftest
-      - run: uvx ruff@0.16.1 check scripts/vendor.py
-      - run: uvx ruff@0.16.1 format --check scripts/vendor.py
+      - run: uvx ruff@0.16.1 check scripts/
+      - run: uvx ruff@0.16.1 format --check scripts/
+
+      # `api/` is a contract, and a downstream integrator following a link into
+      # nothing pays for it in trust before they pay for it in time. A rename
+      # is what breaks these, so the check belongs where a rename lands.
+      - run: uv run scripts/doclinks.py
 
       # One ignore file, at the root, because a nested one outranks it: that is
       # how a vendored crate's own rules once hid a file from `git add` that

@@ -113,3 +113,22 @@ graph than the campaign it stands in for.
 Update the owning document when a decision, constraint, acceptance criterion,
 dependency, risk, or verification status changes. Record unresolved claims in
 [docs/verification.md](docs/verification.md), never as settled fact.
+
+## The Downstream Contract
+
+[api/](api/README.md) is written for two applications that are not in this
+repository: **boreas-android** (Kotlin) and **boreas-windows** (C#). Both
+consume the C ABI in `ffi/`, so that folder leads with it and the Rust API is a
+third consumer, not the primary one.
+
+- **It aims for sufficiency.** A downstream integration that has to read `src/`
+  or `ffi/src/` to make progress has found a defect in `api/`. Fix it there.
+- **A change to `ffi/`'s surface is a change to `api/` first.** The header, the
+  entry points, and the four pages that describe them move together or not at
+  all; `ffi/tests/header.rs` catches the layout half, and nothing catches the
+  prose half but this rule.
+- **Every external claim in `api/` is fact-checked against a primary source and
+  quoted**, because a downstream developer cannot tell a confident sentence from
+  a correct one. What could not be confirmed says so in the page and is logged
+  in [docs/verification.md](docs/verification.md).
+- `scripts/doclinks.py` fails the build on a link into nothing.

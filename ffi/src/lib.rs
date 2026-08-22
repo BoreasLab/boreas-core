@@ -61,5 +61,6 @@ pub use seam::{BoreasBypass, BoreasDevice, BoreasSocket};
 pub use status::{Status, boundary};
 pub use tunnel::{
     BoreasCounters, BoreasEvent, BoreasEventKind, BoreasTunnel, boreas_tunnel_authority,
-    boreas_tunnel_next_event, boreas_tunnel_reload, boreas_tunnel_start, boreas_tunnel_stop,
+    boreas_tunnel_free, boreas_tunnel_next_event, boreas_tunnel_reload, boreas_tunnel_shutdown,
+    boreas_tunnel_start,
 };

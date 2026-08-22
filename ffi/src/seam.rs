@@ -27,11 +27,15 @@ pub type BoreasSocket = i64;
 pub struct BoreasDevice {
     /// Passed back to every call, untouched. The host's own state.
     pub context: *mut c_void,
-    /// Reads one IP packet into `buf`, blocking until one arrives. Returns the
-    /// number of bytes written, or a negative value on error.
+    /// Reads one IP packet into `buf`. Returns the number of bytes written,
+    /// **zero for "nothing yet, ask again"**, or a negative value on error.
     ///
-    /// **Blocking is expected.** A callback cannot be a future, so this runs on
-    /// a blocking thread and its result is held across polls; see [`Device`].
+    /// **Blocking is expected but not required.** A callback cannot be a
+    /// future, so this runs on a blocking thread and its result is held across
+    /// polls; see [`Device`]. A host that must not block indefinitely may wait
+    /// for a bounded interval and return zero — there is no zero-length IP
+    /// packet, so the value is free to mean "ask again", and it costs nothing
+    /// but another call.
     pub recv: Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize>,
     /// Writes one IP packet, whole. Returns 0, or a negative value on error.
     /// A short write is an error rather than a success with a count.
@@ -275,36 +279,52 @@ impl AsyncDevice for Device {
         // therefore consumes nothing, which is the seam's stated obligation
         // and the one thing a callback-shaped device makes hard.
         async move {
-            if self.pending.is_none() {
-                let ops = self.ops;
-                // Held for the life of the call, so the host's `release`
-                // cannot run while this callback is inside it.
-                let context = Arc::clone(&self.context);
-                let capacity = buf.len();
-                self.pending = Some(tokio::task::spawn_blocking(move || {
-                    let _context = context;
-                    let mut owned = vec![0u8; capacity];
-                    // SAFETY: the host's contract is that its callbacks are
-                    // safe from any thread, which is what a blocking pool
-                    // gives them, and `_context` keeps them live.
-                    let read = unsafe { ops.read_into(&mut owned) }?;
-                    owned.truncate(read);
-                    Ok(owned)
-                }));
+            loop {
+                if self.pending.is_none() {
+                    let ops = self.ops;
+                    // Held for the life of the call, so the host's `release`
+                    // cannot run while this callback is inside it.
+                    let context = Arc::clone(&self.context);
+                    let capacity = buf.len();
+                    self.pending = Some(tokio::task::spawn_blocking(move || {
+                        let _context = context;
+                        let mut owned = vec![0u8; capacity];
+                        // SAFETY: the host's contract is that its callbacks
+                        // are safe from any thread, which is what a blocking
+                        // pool gives them, and `_context` keeps them live.
+                        let read = unsafe { ops.read_into(&mut owned) }?;
+                        owned.truncate(read);
+                        Ok(owned)
+                    }));
+                }
+
+                let joined = self
+                    .pending
+                    .as_mut()
+                    .expect("the read was just started")
+                    .await;
+                // Reached only once the join resolved, so the packet is in
+                // hand and the slot is genuinely free.
+                self.pending = None;
+
+                let bytes = joined.map_err(io::Error::other)??;
+                // **Zero is "nothing yet", not "a packet of no bytes".**
+                //
+                // There is no such thing as a zero-length IP packet, so the
+                // value is free to mean something else, and what a host needs
+                // it to mean is "ask me again". A device that must not block
+                // indefinitely — a .NET callback runs in the CLR's cooperative
+                // mode, where a long block stalls every managed thread's
+                // garbage collection — can then wait for a bounded interval
+                // and return here. Handing the empty slice on would make the
+                // datapath reject it and charge `packets_rejected` for a
+                // packet nobody sent.
+                if bytes.is_empty() {
+                    continue;
+                }
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                return Ok(bytes.len());
             }
-
-            let joined = self
-                .pending
-                .as_mut()
-                .expect("the read was just started")
-                .await;
-            // Reached only once the join resolved, so the packet is in hand
-            // and the slot is genuinely free.
-            self.pending = None;
-
-            let bytes = joined.map_err(io::Error::other)??;
-            buf[..bytes.len()].copy_from_slice(&bytes);
-            Ok(bytes.len())
         }
     }
 

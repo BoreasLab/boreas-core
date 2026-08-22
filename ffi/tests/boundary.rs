@@ -18,8 +18,8 @@ use std::{
 
 use boreas::{
     BoreasBypass, BoreasConfig, BoreasDevice, BoreasEgress, BoreasEvent, BoreasEventKind,
-    BoreasTunnel, Status, boreas_tunnel_authority, boreas_tunnel_next_event, boreas_tunnel_reload,
-    boreas_tunnel_start, boreas_tunnel_stop,
+    BoreasTunnel, Status, boreas_tunnel_authority, boreas_tunnel_free, boreas_tunnel_next_event,
+    boreas_tunnel_reload, boreas_tunnel_shutdown, boreas_tunnel_start,
 };
 
 /// What the host's callbacks do, and a record of what was asked of them.
@@ -34,6 +34,8 @@ struct Host {
     protected: AtomicUsize,
     released: AtomicUsize,
     sent: AtomicUsize,
+    /// How many times `recv` answered "nothing yet".
+    polled: AtomicUsize,
 }
 
 impl Host {
@@ -43,6 +45,7 @@ impl Host {
             protected: AtomicUsize::new(0),
             released: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
+            polled: AtomicUsize::new(0),
         })
     }
 }
@@ -52,12 +55,17 @@ impl Host {
 /// `context` must be an `Arc<Host>` leaked by [`vtables`].
 unsafe extern "C" fn recv(context: *mut c_void, _buf: *mut u8, _cap: usize) -> isize {
     let host = unsafe { &*context.cast::<Host>() };
-    // A TUN read blocks until a packet arrives; this one blocks until the host
-    // says the interface is gone, which is what `close(fd)` does to a real one.
-    while !host.closed.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    if host.closed.load(Ordering::Relaxed) {
+        return -5; // EIO: the interface went away
     }
-    -5 // EIO: the interface went away
+    // **A bounded wait, then "nothing yet".** This is the shape the ABI exists
+    // to allow: a host that must not sit in a callback indefinitely waits a
+    // little and returns zero, and Boreas asks again. A .NET host has to work
+    // this way, because a callback blocked in cooperative mode stalls every
+    // managed thread's collection.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    host.polled.fetch_add(1, Ordering::Relaxed);
+    0
 }
 
 /// # Safety
@@ -193,8 +201,12 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
     // **No closing from the test.** A real host stops the tunnel first and
     // tears its interface down afterwards, which is exactly the ordering that
     // deadlocks if `release` is the only signal: the read waits for the host
-    // and the host waits for `release`. `stop` calls `close` for it.
-    assert_eq!(unsafe { boreas_tunnel_stop(handle) }, Status::Ok);
+    // and the host waits for `release`. `free` calls `close` for it.
+    assert_eq!(unsafe { boreas_tunnel_shutdown(handle) }, Status::Ok);
+    // Idempotent: a teardown path that must remember whether it already ran
+    // is a teardown path with a race in it.
+    assert_eq!(unsafe { boreas_tunnel_shutdown(handle) }, Status::Ok);
+    assert_eq!(unsafe { boreas_tunnel_free(handle) }, Status::Ok);
 
     assert_eq!(
         host.released.load(Ordering::Relaxed),
@@ -206,7 +218,118 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
         1,
         "and every leaked reference reclaimed, so nothing outlived the tunnel"
     );
+    assert!(
+        host.polled.load(Ordering::Relaxed) > 0,
+        "a zero-length read must be asked again rather than forwarded as a packet"
+    );
 }
+
+/// **The guarantee `obligations.md` is built on.** A reader parked in
+/// `next_event` must not delay anything else, because a healthy idle tunnel
+/// emits nothing and that reader can be parked for hours. If the handle reached
+/// the tunnel directly the two calls would alias a `&mut`, and the honest
+/// contract would be "one call at a time" — which is no contract at all when
+/// the one permitted caller never returns.
+#[test]
+fn a_blocked_reader_delays_nothing_else() {
+    let host = Host::new();
+    let (device, bypass) = vtables(&host);
+    let resolver = CString::new("127.0.0.1:53").unwrap();
+    let list = CString::new("||ads.example^").unwrap();
+    let lists = [list.as_ptr()];
+
+    let mut handle: *mut BoreasTunnel = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            boreas_tunnel_start(
+                &config(&lists, resolver.as_ptr()),
+                &device,
+                &bypass,
+                &mut handle,
+            )
+        },
+        Status::Ok
+    );
+
+    // A reader on a thread of its own, exactly as a host runs one. It parks:
+    // nothing has gone wrong, so nothing is reported.
+    let parked = Sendable(handle);
+    let reader = std::thread::spawn(move || {
+        let handle = parked;
+        let mut event = empty_event();
+        // A real loop, because a reload publishes a `Reloaded` on the stream as
+        // well as returning one — so a reader legitimately wakes mid-test.
+        loop {
+            let status = unsafe {
+                boreas_tunnel_next_event(
+                    handle.0,
+                    &mut event,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if status != Status::Ok {
+                return status;
+            }
+        }
+    });
+    // Long enough that the reader is certainly inside the call.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Every other entry point, while it is parked there.
+    let replacement = CString::new("||tracker.example^\n||other.example^").unwrap();
+    let replacements = [replacement.as_ptr()];
+    let mut event = empty_event();
+    assert_eq!(
+        unsafe {
+            boreas_tunnel_reload(
+                handle,
+                replacements.as_ptr(),
+                replacements.len(),
+                &mut event,
+            )
+        },
+        Status::Ok,
+        "a reload must not wait for a reader that may never return"
+    );
+    assert_eq!(event.blocked_rules, 2);
+
+    let (mut certificate_len, mut keys_len) = (0usize, 0usize);
+    assert_eq!(
+        unsafe {
+            boreas_tunnel_authority(
+                handle,
+                ptr::null_mut(),
+                0,
+                &mut certificate_len,
+                ptr::null_mut(),
+                0,
+                &mut keys_len,
+            )
+        },
+        Status::Ok
+    );
+    assert_eq!(certificate_len, 0, "this tunnel does not intercept");
+
+    // And shutdown is what releases the reader, which is how a host ends the
+    // loop without a second signalling mechanism of its own.
+    assert_eq!(unsafe { boreas_tunnel_shutdown(handle) }, Status::Ok);
+    assert_eq!(
+        reader.join().expect("the reader thread must not panic"),
+        Status::Stopped,
+        "shutdown must release a parked reader"
+    );
+    assert_eq!(unsafe { boreas_tunnel_free(handle) }, Status::Ok);
+    assert_eq!(host.released.load(Ordering::Relaxed), 2);
+}
+
+/// A handle is `Send` to a host in any other language; Rust needs telling.
+struct Sendable(*mut BoreasTunnel);
+// SAFETY: the ABI's contract is that every entry point but `free` is callable
+// from any thread concurrently, which is exactly what this test exercises.
+unsafe impl Send for Sendable {}
 
 /// A null argument is a caller's bug, and it must be told rather than
 /// dereferenced.
@@ -290,7 +413,7 @@ fn every_entry_point_refuses_a_null_argument() {
     );
     // Freeing null is the one exception: a host that unconditionally frees an
     // initialised pointer is doing the right thing, not a wrong one.
-    assert_eq!(unsafe { boreas_tunnel_stop(ptr::null_mut()) }, Status::Ok);
+    assert_eq!(unsafe { boreas_tunnel_free(ptr::null_mut()) }, Status::Ok);
 }
 
 /// A configuration that cannot be a tunnel is refused before anything is

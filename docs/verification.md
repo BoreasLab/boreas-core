@@ -320,6 +320,40 @@ Numbered as above, with reserved slots for retired questions.
     whole. `Defragmenter::push` matches them. Revisit only if a server is
     observed emitting zero, which neither reference's own fragmenter can.
 
+16. **Android CA installation from API 30:** unverified, 2026-08-22. `api/`
+    documents `KeyChain.createInstallIntent()` with `EXTRA_CERTIFICATE` as the
+    route for offering the root, which the
+    [KeyChain reference](https://developer.android.com/reference/android/security/KeyChain)
+    documents. Widespread secondary reports say Android 11 (API 30) removed the
+    ability to install *CA* certificates through that intent, leaving Settings →
+    "Install from storage". We could not confirm that against a primary Android
+    source: the Android 14, 15, and 16 behaviour-changes pages contain no
+    mention of CA certificates, KeyChain, or trust anchors. `api/android.md`
+    flags the one-tap flow as unverified and tells hosts to have the manual path
+    ready. Settle it on a device before any UX depends on it.
+
+17. **Wintun and MTU:** unverified, 2026-08-22. Neither `wintun.net` nor
+    `wintun.h` mentions MTU at all, so `api/windows.md` tells hosts to set it
+    themselves through the IP Helper API (`SetIpInterfaceEntry`, `NlMtu`). That
+    instruction comes from a 2021 WireGuard mailing-list thread, not from a
+    Wintun document. Check the current `wintun.h` before relying on it.
+
+    Two things around it *are* primary-source confirmed and are load-bearing in
+    that page: the read-wait event's contract, and that `WintunEndSession` is
+    documented as saying nothing about waking a waiter — Wintun's own example
+    waits on `[readWaitEvent, quitEvent]` rather than relying on it.
+
+18. **Closing a file descriptor to unblock a read:** verified as *unsafe*,
+    2026-08-22, and the interface changed because of it. `close(2)`'s CAVEATS
+    section calls closing a descriptor another thread is blocked on "probably
+    unwise", and states that on Linux the blocked call holds a reference to the
+    open file description — so it may not return at all while the descriptor
+    number is already free for reuse. `ffi/include/boreas.h` had told Android
+    hosts to implement the device's `close` callback as `close(fd)`; it now
+    tells them to signal an `eventfd(2)` watched by `poll(2)`, or to use a
+    bounded `recv` that needs no `close`. No Android-specific source addresses
+    the TUN case, so the conclusion rests on Linux semantics, which Android has.
+
 ## Updating This Ledger
 
 For each new external claim, record the primary source, source date, observed

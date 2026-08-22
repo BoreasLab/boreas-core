@@ -2,70 +2,68 @@
 
 Boreas is a filtering VPN core. It takes raw IP packets from a platform TUN
 device, decides what to do with them, and sends them out by whatever egress you
-configure. This folder is everything you need to embed it. It is self-contained
-— the `docs/` folder next to it is internal design material and will change
-without notice.
+configure.
 
-| Document | What it answers |
+This folder is the whole contract. It is self-contained: the `docs/` folder next
+to it is internal design material and changes without notice.
+
+## Start here
+
+**Boreas is consumed through a C ABI.** The two applications it exists for are
+written in Kotlin and C#, so the C boundary is the interface — not a wrapper
+over a "real" Rust one. The Rust API is a third consumer with the same standing
+as the other two.
+
+| You are writing | Start at |
 | --- | --- |
-| [platform.md](platform.md) | What your app must supply, and what happens when it doesn't |
+| **Kotlin / Java** (Android) | [android.md](android.md) |
+| **C# / .NET** (Windows) | [windows.md](windows.md) |
+| C or C++ | [abi.md](abi.md) |
+| Rust | [rust.md](rust.md) |
+
+| Then read | What it answers |
+| --- | --- |
+| [obligations.md](obligations.md) | **What each side owes the other.** Threading, ownership, blocking, failure. Read this one whatever language you are in. |
+| [abi.md](abi.md) | Every type, every function, every status code, and the exact width of every field |
 | [configuration.md](configuration.md) | Every knob, its default, and its constraint |
 | [lifecycle.md](lifecycle.md) | Start, observe, reload, stop — and what to persist |
 | [stability.md](stability.md) | What we promise not to break |
 
 ## The shape of it
 
-Your application does four things. Nothing else is required and nothing else is
+Your application does five things. Nothing else is required and nothing else is
 supported.
 
-1. **Supply what only a platform can.** A TUN device and sockets that do not
-   re-enter the tunnel.
-2. **Describe the tunnel.** One configuration value.
-3. **Run it**, and read events until you stop it.
+1. **Supply what only a platform can.** A TUN device and a way to keep our own
+   sockets out of the tunnel. Two vtables of function pointers.
+2. **Describe the tunnel.** One `BoreasConfig`.
+3. **Start it**, and read events on a thread of your own until you stop it.
 4. **Keep one thing.** The certificate authority's material — and only if you
    intercept.
+5. **Stop, join, free.** In that order, and they are three separate steps for a
+   reason: see [obligations.md](obligations.md#teardown).
 
-```rust
-use boreas_core::api::*;
-
-let tunnel = Tunnel::start(
-    TunnelConfig {
-        egress: Egress::Direct { nat_behavior: NatBehavior::AddressAndPortDependent },
-        resolver: Resolver::Local {
-            upstream: Upstream::Dot {
-                resolver: "9.9.9.9:853".parse()?,
-                server_name: "dns.quad9.net".to_owned(),
-            },
-        },
-        filtering: Filtering {
-            lists: vec![easylist_text],
-            interception: Some(Interception {
-                hosts: vec!["news.example.com".to_owned()],
-                trust: stored_material.map_or(Trust::Generate, Trust::Restore),
-                documents: Some(Documents { budget: StreamBudget::default() }),
-            }),
-        },
-        link: Link { mtu: Mtu::new(1400)?, ..Link::default() },
-        ceilings: Ceilings::default(),
-    },
-    Platform { device: tun, bypass: protected_sockets },
-).await?;
-
-if let Some(material) = tunnel.authority() {
-    keystore.write(material.keys().as_bytes());       // secret
-    trust_store.offer(material.root_certificate());   // public
+```c
+BoreasTunnel *tunnel = NULL;
+if (boreas_tunnel_start(&config, &device, &bypass, &tunnel)) {
+    /* nothing was allocated; both release callbacks already ran */
 }
+
+/* on a thread of your own */
+BoreasEvent event;
+char name[256], rule[256];
+while (!boreas_tunnel_next_event(tunnel, &event, name, sizeof name,
+                                 rule, sizeof rule)) {
+    /* ... */
+}
+
+/* from anywhere, at any time */
+boreas_tunnel_shutdown(tunnel);   /* releases the reader */
+join(reader_thread);              /* yours */
+boreas_tunnel_free(tunnel);
 ```
 
-Store and offer unconditionally in both branches. Storing what you just restored
-is a no-op write, and offering a root the user already trusts shows no dialog —
-so there is no branch here to get wrong.
-
-## Not writing Rust?
-
-Read [platform.md](platform.md#if-your-application-is-not-written-in-rust)
-first. The `ffi/` crate carries a C ABI over everything on this page, and it
-is the supported way in from Kotlin, Java, C#, or C.
+That is the whole surface: six functions, two vtables, one config struct.
 
 ## What you cannot configure, and why
 
@@ -90,14 +88,13 @@ is on. See [configuration.md](configuration.md#ceilings).
 ## The three tiers
 
 Filtering escalates, and each tier includes the ones below it. You choose how
-far up to go; the type makes the tiers nest, so you cannot ask for a higher one
-without the ones beneath.
+far up to go.
 
 | Tier | What it does | What it costs |
 | --- | --- | --- |
 | **Names** | Answers DNS locally against your lists; refuses blocked names | Nothing visible. No certificates, no termination. |
 | **Requests** | Adds: terminates TLS for named hosts, filters the requests inside | A root certificate the user must install |
-| **Documents** | Adds: rewrites HTML bodies as they stream | Memory per response, bounded by a budget you set |
+| **Documents** | Adds: rewrites HTML bodies as they stream | Memory per response, bounded by a budget |
 
 Most products want **Names** everywhere and **Requests** for a short,
 user-visible allowlist. Interception forges certificates, so the set of hosts it

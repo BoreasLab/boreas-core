@@ -85,8 +85,15 @@ typedef struct {
   /* Passed back to every call, untouched. Yours. */
   void *context;
   /*
-   * Reads one IP packet into `buf`, blocking until one arrives. Returns the
-   * byte count, or a negative errno.
+   * Reads one IP packet into `buf`. Returns the byte count, ZERO for "nothing
+   * yet, ask again", or a negative errno.
+   *
+   * Blocking is expected but not required. There is no zero-length IP packet,
+   * so zero is free to mean "ask again" — which is what lets a host that must
+   * not sit in a callback indefinitely wait for a bounded interval instead.
+   * A .NET host MUST work this way: an [UnmanagedCallersOnly] method runs in
+   * the CLR's cooperative GC mode, and a thread blocked there prevents any
+   * garbage collection from completing process-wide.
    */
   intptr_t (*recv)(void *context, uint8_t *buf, size_t cap);
   /*
@@ -102,9 +109,18 @@ typedef struct {
    * must be safe to call concurrently with one. A blocking read cannot be
    * cancelled, so `release` cannot run until the read returns and the read
    * does not return until you make it: if `release` were the only signal, the
-   * two would wait for each other. On Android this is `close(fd)`.
+   * two would wait for each other.
    *
-   * May be NULL only if your reads are bounded anyway.
+   * DO NOT implement this by closing the file descriptor `recv` is blocked
+   * on. close(2)'s own CAVEATS section calls that "probably unwise", and on
+   * Linux the blocked read holds a reference to the open file description, so
+   * it may not return at all until data arrives — while the descriptor number
+   * is already free to be reused by another thread. Signal an eventfd(2) that
+   * `recv` waits on with poll(2), or return zero from a bounded `recv` and
+   * let this set a flag the next call sees.
+   *
+   * May be NULL if `recv` never blocks indefinitely — which, if it returns
+   * zero on a timeout, it does not.
    */
   void (*close)(void *context);
   /* Releases `context`. Called once, after every callback has returned. */
@@ -258,13 +274,20 @@ BoreasStatus boreas_tunnel_start(const BoreasConfig *config,
  *
  * `name` and `rule` receive BOREAS_EVENT_RESOLVED's strings, truncated to
  * their capacities and always NUL-terminated. Either may be NULL to discard.
+ *
+ * One reader at a time; a second concurrent caller queues behind the first.
+ * Every OTHER entry point is safe to call while a reader is blocked here —
+ * that is what the const handle means, and reload in particular depends on it,
+ * because a healthy idle tunnel emits nothing and this call can block for as
+ * long as nothing goes wrong.
  */
-BoreasStatus boreas_tunnel_next_event(BoreasTunnel *handle, BoreasEvent *event,
+BoreasStatus boreas_tunnel_next_event(const BoreasTunnel *handle,
+                                      BoreasEvent *event,
                                       char *name, size_t name_cap, char *rule,
                                       size_t rule_cap);
 
 /* Replaces the rules in force, without restarting or dropping a connection. */
-BoreasStatus boreas_tunnel_reload(BoreasTunnel *handle,
+BoreasStatus boreas_tunnel_reload(const BoreasTunnel *handle,
                                   const char *const *lists, size_t count,
                                   BoreasEvent *out);
 
@@ -276,16 +299,33 @@ BoreasStatus boreas_tunnel_reload(BoreasTunnel *handle,
  * failure. Store `certificate` where a trust installer can read it and `keys`
  * where you keep secrets; hand both back next launch.
  */
-BoreasStatus boreas_tunnel_authority(BoreasTunnel *handle, uint8_t *certificate,
+BoreasStatus boreas_tunnel_authority(const BoreasTunnel *handle,
+                                     uint8_t *certificate,
                                      size_t certificate_cap,
                                      size_t *certificate_len, uint8_t *keys,
                                      size_t keys_cap, size_t *keys_len);
 
 /*
- * Stops the tunnel and frees its handle. ALWAYS frees, whatever it returns.
- * Passing NULL is a no-op.
+ * Stops carrying traffic, and releases any thread blocked in
+ * boreas_tunnel_next_event (which then returns BOREAS_STOPPED).
+ *
+ * Separate from boreas_tunnel_free because a blocked reader cannot be freed
+ * out from under itself. Stop, join your reader thread, then free. Safe from
+ * any thread, concurrently with anything, and calling it twice is not an
+ * error. When it returns, every socket is closed and every pooled buffer is
+ * back.
  */
-BoreasStatus boreas_tunnel_stop(BoreasTunnel *handle);
+BoreasStatus boreas_tunnel_shutdown(const BoreasTunnel *handle);
+
+/*
+ * Frees the handle. Passing NULL is a no-op.
+ *
+ * Call boreas_tunnel_shutdown first and join whatever thread was reading
+ * events. A tunnel not already stopped is stopped here, so freeing without
+ * stopping still closes sockets — but a reader blocked at that moment is a
+ * use-after-free, which is why these are two calls.
+ */
+BoreasStatus boreas_tunnel_free(BoreasTunnel *handle);
 
 /* ----------------------------------------------------------------- android */
 

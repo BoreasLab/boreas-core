@@ -1,17 +1,24 @@
 # Configuration reference
 
-One `TunnelConfig` describes a tunnel completely. Five independent choices.
-
-```rust
-TunnelConfig { egress, resolver, filtering, link, ceilings }
-```
+One configuration value describes a tunnel completely: a `BoreasConfig` across
+the C ABI, a `TunnelConfig` in Rust. Five independent choices — where traffic
+leaves by, how names are answered, what is done to what crosses, your own
+interface, and how much the tunnel may hold.
 
 The configuration is checked in full before a socket is opened, so a refusal
-leaves nothing half-started. Every `ConfigError` names a combination that would
-**run and filter nothing** — those are the dangerous ones, because such a tunnel
+leaves nothing half-started. Every refusal names a combination that would **run
+and filter nothing** — those are the dangerous ones, because such a tunnel
 reports itself healthy.
 
+> **Reading this from Kotlin or C#?** The field names and widths are in
+> [abi.md](abi.md#boreasconfig); this page is what the fields *mean*. Not every
+> option below is reachable across the C ABI yet — [what the ABI does not expose
+> yet](abi.md#what-the-abi-does-not-expose-yet) is the list, and the resolver is
+> the one with a security consequence.
+
 ---
+
+<a id="egress"></a>
 
 ## `egress` — where traffic leaves by
 
@@ -73,6 +80,8 @@ to tell a configured exception from an attack.
 
 ---
 
+<a id="resolver"></a>
+
 ## `resolver` — how names are answered
 
 | Variant | Meaning |
@@ -91,12 +100,15 @@ All four verify against the bundled Mozilla anchors rather than the platform
 store, deliberately: the set your resolver is trusted against should not be one
 a device owner or an MDM profile can widen.
 
-> **`Passthrough` plus filtering is refused** (`ConfigError::NothingToFilter`).
+> **A tunnel that filters but never sees a question is refused** — no resolver
+> in C, `Resolver::Passthrough` in Rust.
 > On the packet fast path, a flow is selected for inspection *because a DNS
 > answer named its address*. A tunnel that never sees a question can never
 > select one — it would carry traffic, filter nothing, and look configured.
 
 ---
+
+<a id="filtering"></a>
 
 ## `filtering` — what is done to what crosses
 
@@ -122,7 +134,7 @@ without an authority — those are not representable, so nothing has to check.
 | --- | --- |
 | `lists` | Filter-list text, in the syntax [AdGuard and uBlock use](https://adguard.com/kb/general/ad-filtering/create-own-filters/). You fetch and store these; Boreas compiles them and keeps none. Malformed lines are counted and skipped — one bad line in fifty thousand must not cost a user their rule set. |
 | `hosts` | The hosts to intercept. **An allowlist, never a pattern.** Interception forges a certificate, and the set of hosts that happens to should be one a user can read. |
-| `trust` | `Trust::Generate` on first run, `Trust::Restore(material)` after. See [platform.md](platform.md#3-installing-the-root-certificate). |
+| `trust` | Generate on first run, restore after. Across the C ABI this is the `root_certificate` / `authority_keys` pair: both, or neither. See [lifecycle.md](lifecycle.md#the-one-thing-you-persist). |
 | `documents.budget` | Memory one response may occupy while being rewritten. A document is transformed as it arrives rather than buffered whole; this is what makes that a bound rather than an intention. Default 2 MiB. Build a non-default one with `StreamBudget::new(ceiling, parsing_buffer)`, which refuses a zero ceiling and a parsing buffer larger than the ceiling charged against it — both of those rewrite nothing, once per response, with no error a user could see. |
 
 Refusals: empty `hosts` with interception on is `NoHostsToIntercept` — forging
@@ -132,14 +144,18 @@ tell the user which line to fix.
 
 ---
 
+<a id="link"></a>
+
 ## `link` — your own interface
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `mtu` | 1280 | The MTU configured on your TUN. Set both to the same number; see [platform.md](platform.md#set-the-mtu-to-the-same-number-twice). Minimum 1280, the IPv6 floor. |
+| `mtu` | 1280 | The MTU configured on your TUN. Set both to the same number; see [obligations.md](obligations.md#set-the-mtu-to-the-same-number-twice). Minimum 1280, the IPv6 floor. |
 | `origination_ports` | 45000–45999 | Local ports reserved for re-originated connections, and therefore never themselves inspected. Without this reservation, a re-originated connection would be selected for inspection and re-originated again, forever. |
 
 ---
+
+<a id="ceilings"></a>
 
 ## `ceilings` — how much this tunnel may hold
 
@@ -156,5 +172,8 @@ gets the process killed. Raise them on a desktop.
 | `inspected_addresses` | 1024 | Addresses remembered as belonging to an intercepted host. |
 | `pending_reassemblies` | 64 | Fragmented packets held awaiting the rest of themselves. |
 
-Sustained non-zero `Counters::datagrams_dropped` means these are too small for
-this device's traffic. See [lifecycle.md](lifecycle.md#events).
+Across the C ABI, **zero in any ceiling means "use the default for it"**, so an
+all-zero `BoreasCeilings` gives you exactly the table above.
+
+Sustained non-zero `datagrams_dropped` means these are too small for this
+device's traffic. See [lifecycle.md](lifecycle.md#counters).

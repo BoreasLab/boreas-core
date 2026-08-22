@@ -8,6 +8,13 @@ are not a contract. An application embedding this crate reads [api/](../api/READ
 instead, which is self-contained and versioned — and a change here that would
 alter what that folder promises is a change that needs to be made there first.
 
+`api/` is written for the two applications that exist: **boreas-android**
+(Kotlin) and **boreas-windows** (C#). Both consume the C ABI in `ffi/`, so that
+is the interface the folder leads with; the Rust API is a third consumer with
+the same standing. It aims to be *sufficient* — a downstream integration that
+has to read `src/` or `ffi/src/` to make progress has found a defect in
+`api/`, and it should be fixed there.
+
 ## Product and System
 
 | Document | Read when working on |
