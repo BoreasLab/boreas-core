@@ -1,13 +1,23 @@
 /*
  * Boreas — the C boundary.
  *
- * Hand-written rather than generated. A generator would reproduce the layouts
- * and none of the contracts, and the contracts are where the sharp edges are:
- * which thread a callback runs on, which pointer the callee owns afterwards,
- * and what a host must still do when a call fails.
+ * Hand-written rather than generated, and the reason is narrower than "a
+ * generator would lose the comments": cbindgen propagates Rust doc comments
+ * into the header by default. What it has no equivalent for is everything in
+ * this file that is not attached to one item — the type-width table and the
+ * marshalling traps it names, the section structure, and the layout assertions
+ * below, which fail a host's build when its flags would silently move a field.
+ * cbindgen also emits C and C++ only, so it would not have reduced the work
+ * for either language that actually consumes this.
  *
- * Keep this in step with ffi/src/. The layouts are checked by
- * `ffi/tests/header.rs`, which is what stops the two drifting.
+ * That trade is only worth it while the surface stays small. Six functions and
+ * five structs is small. If this grows past what one person can hold in mind,
+ * generate it and move these notes into Rust doc comments, where cbindgen will
+ * carry them.
+ *
+ * Keep this in step with ffi/src/. `ffi/tests/header.rs` asserts every offset
+ * and constant here against the Rust types, and the assertions further down
+ * pin the same numbers from the C side, so both ends are held to one layout.
  */
 
 #ifndef BOREAS_H
@@ -16,6 +26,59 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * The version of this ABI. Bumped when a symbol, a field, or the meaning of a
+ * call changes; see api/stability.md for what "changes" is allowed to mean.
+ *
+ * The header and the library ship together and must be updated together.
+ * `boreas_abi_version()` is how you prove they were: compare it against
+ * BOREAS_ABI_VERSION once at startup and refuse to run if they differ. That
+ * turns a stale library in an installer -- which otherwise reads fields at the
+ * wrong offsets and behaves inexplicably -- into one clear message.
+ */
+#define BOREAS_ABI_VERSION 1u
+
+/*
+ * Warn when a status is dropped on the floor. Every function here returns one
+ * and none of them can be safely ignored, so this is a real diagnostic rather
+ * than decoration.
+ */
+#if defined(__cplusplus) && __cplusplus >= 201703L
+#define BOREAS_MUST_USE [[nodiscard]]
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ > 201710L
+#define BOREAS_MUST_USE [[nodiscard]]
+#elif defined(__GNUC__) || defined(__clang__)
+#define BOREAS_MUST_USE __attribute__((warn_unused_result))
+#elif defined(_MSC_VER)
+#define BOREAS_MUST_USE _Check_return_
+#else
+#define BOREAS_MUST_USE
+#endif
+
+/*
+ * A compile-time check, where the language has one.
+ *
+ * Used below to pin every layout this ABI depends on. It is not decoration:
+ * the width of a C enum is implementation-defined, and a toolchain built with
+ * `-fshort-enums` -- the default on some ARM toolchains -- makes every enum
+ * here one byte instead of four. That moves `BoreasEvent.blocked` from offset
+ * four to offset one while both sides still compile, and a host then reads
+ * every event field from the wrong place. Failing the host's build is the only
+ * good outcome available.
+ */
+#if defined(__cplusplus) && __cplusplus >= 201103L
+#define BOREAS_ASSERT_LAYOUT(condition, message) static_assert(condition, message)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define BOREAS_ASSERT_LAYOUT(condition, message) _Static_assert(condition, message)
+#else
+/* C99 and older: a negative array bound is the portable stand-in. */
+#define BOREAS_ASSERT_LAYOUT_(condition, line) \
+  typedef char boreas_layout_##line[(condition) ? 1 : -1]
+#define BOREAS_ASSERT_LAYOUT__(condition, line) BOREAS_ASSERT_LAYOUT_(condition, line)
+#define BOREAS_ASSERT_LAYOUT(condition, message) \
+  BOREAS_ASSERT_LAYOUT__(condition, __LINE__)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -253,9 +316,56 @@ typedef struct {
   BoreasCounters counters;
 } BoreasEvent;
 
+/* ------------------------------------------------------------------ layout */
+
+/*
+ * Everything the ABI depends on, asserted where a host compiles rather than
+ * where we do. A build whose flags produce a different layout fails here with
+ * a message, instead of linking cleanly and reading the wrong bytes.
+ *
+ * The same offsets are asserted against the Rust types by `ffi/tests/header.rs`,
+ * so both ends of the boundary are pinned to the same numbers.
+ */
+
+/* Enums are four bytes. See BOREAS_ASSERT_LAYOUT above for why this is here. */
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasStatus) == 4, "BoreasStatus must be 4 bytes");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasEgress) == 4, "BoreasEgress must be 4 bytes");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasNat) == 4, "BoreasNat must be 4 bytes");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasEventKind) == 4, "BoreasEventKind must be 4 bytes");
+
+/* `bool` is one byte, which is the assumption a C# host must be told twice. */
+BOREAS_ASSERT_LAYOUT(sizeof(bool) == 1, "bool must be 1 byte");
+
+/* Pointer-width scalars, so a 32-bit ABI is caught rather than assumed. */
+BOREAS_ASSERT_LAYOUT(sizeof(size_t) == sizeof(void *), "size_t must be pointer-width");
+BOREAS_ASSERT_LAYOUT(sizeof(intptr_t) == sizeof(void *), "intptr_t must be pointer-width");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasSocket) == 8, "BoreasSocket must be 8 bytes");
+
+/* The vtables a host fills in by hand, where a shifted field is a call
+ * through the wrong function pointer rather than a compile error. */
+BOREAS_ASSERT_LAYOUT(offsetof(BoreasDevice, context) == 0, "BoreasDevice.context moved");
+BOREAS_ASSERT_LAYOUT(offsetof(BoreasDevice, mtu) == 5 * sizeof(void *), "BoreasDevice.mtu moved");
+BOREAS_ASSERT_LAYOUT(offsetof(BoreasBypass, context) == 0, "BoreasBypass.context moved");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasBypass) == 3 * sizeof(void *), "BoreasBypass resized");
+
+/* The structs a host reads back. `blocked` is the one that moves under
+ * `-fshort-enums`, which is what makes this block worth its lines. */
+BOREAS_ASSERT_LAYOUT(offsetof(BoreasEvent, kind) == 0, "BoreasEvent.kind moved");
+BOREAS_ASSERT_LAYOUT(offsetof(BoreasEvent, blocked) == 4, "BoreasEvent.blocked moved");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasCounters) == 6 * sizeof(uint64_t), "BoreasCounters resized");
+BOREAS_ASSERT_LAYOUT(sizeof(BoreasCeilings) == 6 * sizeof(size_t), "BoreasCeilings resized");
+BOREAS_ASSERT_LAYOUT(offsetof(BoreasConfig, egress) == 0, "BoreasConfig.egress moved");
+
 /* ------------------------------------------------------------------ tunnel */
 
 typedef struct BoreasTunnel BoreasTunnel;
+
+/*
+ * The ABI version this library was built as. Compare against
+ * BOREAS_ABI_VERSION at startup; a mismatch means the header and the library
+ * came from different builds, and nothing below is safe to call.
+ */
+uint32_t boreas_abi_version(void);
 
 /*
  * Starts a tunnel, writing its handle through `out`.
@@ -264,7 +374,7 @@ typedef struct BoreasTunnel BoreasTunnel;
  * callbacks are still called, so a context you handed over is always
  * accounted for and you can retry.
  */
-BoreasStatus boreas_tunnel_start(const BoreasConfig *config,
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_start(const BoreasConfig *config,
                                  const BoreasDevice *device,
                                  const BoreasBypass *bypass,
                                  BoreasTunnel **out);
@@ -281,13 +391,13 @@ BoreasStatus boreas_tunnel_start(const BoreasConfig *config,
  * because a healthy idle tunnel emits nothing and this call can block for as
  * long as nothing goes wrong.
  */
-BoreasStatus boreas_tunnel_next_event(const BoreasTunnel *handle,
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_next_event(const BoreasTunnel *handle,
                                       BoreasEvent *event,
                                       char *name, size_t name_cap, char *rule,
                                       size_t rule_cap);
 
 /* Replaces the rules in force, without restarting or dropping a connection. */
-BoreasStatus boreas_tunnel_reload(const BoreasTunnel *handle,
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_reload(const BoreasTunnel *handle,
                                   const char *const *lists, size_t count,
                                   BoreasEvent *out);
 
@@ -299,7 +409,7 @@ BoreasStatus boreas_tunnel_reload(const BoreasTunnel *handle,
  * failure. Store `certificate` where a trust installer can read it and `keys`
  * where you keep secrets; hand both back next launch.
  */
-BoreasStatus boreas_tunnel_authority(const BoreasTunnel *handle,
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_authority(const BoreasTunnel *handle,
                                      uint8_t *certificate,
                                      size_t certificate_cap,
                                      size_t *certificate_len, uint8_t *keys,
@@ -315,7 +425,7 @@ BoreasStatus boreas_tunnel_authority(const BoreasTunnel *handle,
  * error. When it returns, every socket is closed and every pooled buffer is
  * back.
  */
-BoreasStatus boreas_tunnel_shutdown(const BoreasTunnel *handle);
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_shutdown(const BoreasTunnel *handle);
 
 /*
  * Frees the handle. Passing NULL is a no-op.
@@ -325,7 +435,7 @@ BoreasStatus boreas_tunnel_shutdown(const BoreasTunnel *handle);
  * stopping still closes sockets — but a reader blocked at that moment is a
  * use-after-free, which is why these are two calls.
  */
-BoreasStatus boreas_tunnel_free(BoreasTunnel *handle);
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_free(BoreasTunnel *handle);
 
 /* ----------------------------------------------------------------- android */
 
@@ -341,7 +451,7 @@ BoreasStatus boreas_tunnel_free(BoreasTunnel *handle);
  * There is deliberately no Java_... symbol here: that name encodes the package
  * and class it belongs to, and those are yours to choose.
  */
-BoreasStatus boreas_android_bypass(void *env, void *service, BoreasBypass *out);
+BOREAS_MUST_USE BoreasStatus boreas_android_bypass(void *env, void *service, BoreasBypass *out);
 #endif
 
 #ifdef __cplusplus

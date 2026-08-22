@@ -45,6 +45,27 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+/// The version of the C ABI this library implements.
+///
+/// **Bumped when a symbol, a field, or the meaning of a call changes.** The
+/// header and the library ship together and must be updated together; this is
+/// how a host proves they were. A stale `libboreas.so` in an installer
+/// otherwise reads fields at the wrong offsets and behaves inexplicably, and
+/// there is no other moment at which that is cheap to notice.
+///
+/// `ffi/include/boreas.h` declares the same number as `BOREAS_ABI_VERSION`,
+/// and `ffi/tests/header.rs` fails the build if the two drift.
+pub const ABI_VERSION: u32 = 1;
+
+/// The ABI version this library was built as.
+///
+/// Compare against `BOREAS_ABI_VERSION` from the header at startup and refuse
+/// to run on a mismatch.
+#[unsafe(no_mangle)]
+pub extern "C" fn boreas_abi_version() -> u32 {
+    ABI_VERSION
+}
+
 mod config;
 mod seam;
 mod status;

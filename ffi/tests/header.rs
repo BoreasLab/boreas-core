@@ -1,22 +1,67 @@
 //! `include/boreas.h` against the types it describes.
 //!
 //! **A hand-written header is a second source of truth, and this is the thing
-//! that stops it becoming a wrong one.** The header is hand-written on purpose
-//! — a generator reproduces layouts and none of the contracts, and the
-//! contracts are the whole value of that file — so the layouts are checked
-//! here instead.
+//! that stops it becoming a wrong one.** See the header's own preamble for why
+//! it is written rather than generated; what follows from that choice is that
+//! nothing but this file keeps the two in step.
 //!
 //! What this can check is what a C compiler would disagree about: the size and
 //! alignment of every struct that crosses, and the discriminant of every enum
 //! constant. What it cannot check is a field *reordered* between two members of
 //! the same size, so every struct below also asserts its field offsets.
 
-use std::mem::{align_of, offset_of, size_of};
+use std::{
+    mem::{align_of, offset_of, size_of},
+    path::Path,
+};
 
 use boreas::{
     BoreasBypass, BoreasCeilings, BoreasConfig, BoreasCounters, BoreasDevice, BoreasEgress,
     BoreasEvent, BoreasEventKind, BoreasNat, BoreasSocket, BoreasWireGuard, Status,
 };
+
+/// The header, read from the source tree.
+fn header() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("include/boreas.h");
+    std::fs::read_to_string(&path).expect("the header ships beside the crate")
+}
+
+/// **The two numbers a host compares must be one number.** The header's macro
+/// is what a host compiles against and `boreas_abi_version()` is what the
+/// library answers; if they could differ, the check a host performs at startup
+/// would pass while the mismatch it exists to catch was present.
+#[test]
+fn the_abi_version_is_the_same_on_both_sides() {
+    let declared = header()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("#define BOREAS_ABI_VERSION ")
+                .map(|value| value.trim().trim_end_matches('u').to_owned())
+        })
+        .expect("the header declares BOREAS_ABI_VERSION");
+    assert_eq!(
+        declared,
+        boreas::ABI_VERSION.to_string(),
+        "boreas.h and the library disagree about the ABI version"
+    );
+    assert_eq!(boreas::boreas_abi_version(), boreas::ABI_VERSION);
+}
+
+/// Every entry point must be declared `BOREAS_MUST_USE`, because every one of
+/// them returns a status and none can be safely dropped. A new function added
+/// to the header without it is the one this catches.
+#[test]
+fn every_status_returning_declaration_is_must_use() {
+    let header = header();
+    let unmarked: Vec<&str> = header
+        .lines()
+        .filter(|line| line.starts_with("BoreasStatus boreas_"))
+        .collect();
+    assert!(
+        unmarked.is_empty(),
+        "these are missing BOREAS_MUST_USE: {unmarked:?}"
+    );
+}
 
 /// Every constant in the header, spelled as the header spells it. A value
 /// changed on one side and not the other is a host that reads a success as a

@@ -6,10 +6,18 @@ this page it is not part of the interface.
 The C declarations also ship as `ffi/include/boreas.h`. This page is the
 normative description; the header is the same content in a form a compiler can
 read. Their layouts are checked against the Rust types by a test that fails the
-build if they drift.
+build if they drift, **and the header asserts the same layouts from the C side
+when you compile it** — so a toolchain whose flags would move a field fails
+your build with a message rather than reading the wrong bytes at run time.
 
 - **Library name.** `libboreas.so` (Android), `boreas.dll` (Windows),
   `libboreas.a` if you would rather link statically.
+- **Version check.** The header defines `BOREAS_ABI_VERSION` and the library
+  exports `uint32_t boreas_abi_version(void)`. Compare them once at startup and
+  refuse to run if they differ: a stale library beside a newer header reads
+  fields at the wrong offsets, and this is the only cheap moment to notice.
+- **Check every return.** Every function is declared with a `nodiscard`
+  equivalent, so a dropped status is a compiler warning.
 - **Calling convention.** C. On x86-64 and ARM64 there is only one, so you do
   not need to name it.
 - **Symbol prefix.** `boreas_`. Nothing else is exported.
@@ -444,6 +452,12 @@ Builds a `BoreasBypass` over a `VpnService`. See
 
 - Every struct here is C layout: fields in declaration order, natural
   alignment, no reordering.
+- **The header asserts these from the C side too.** A C enum's width is
+  implementation-defined, and a toolchain built with `-fshort-enums` — the
+  default on some ARM toolchains — makes every enum here one byte instead of
+  four, which moves `BoreasEvent.blocked` from offset four to offset one while
+  both sides still compile. Static assertions in the header fail that build
+  instead.
 - Every enum is a signed 32-bit integer with the values shown.
 - `BoreasTunnel` is **opaque**. It has no declared size and you may not allocate
   one; the only valid pointer to it is what `boreas_tunnel_start` wrote.
