@@ -10,7 +10,7 @@
 //! over TLS, over WebSocket, over gRPC and over QUIC differ only in how the
 //! byte stream underneath is obtained, so [`ProxyTransport`] names exactly that
 //! and nothing else. Every one of them is an implementation of that one trait
-//! in [`crate::transport`] rather than a change to this file, which is what
+//! in [`crate::egress::transport`] rather than a change to this file, which is what
 //! lets this module stay a codec while the transport family grows.
 //!
 //! **The address encoding is *not* SOCKS5's, and the difference is silent.**

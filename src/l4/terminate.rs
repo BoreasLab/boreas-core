@@ -308,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn a_handshake_yields_a_stream_that_echoes_through_the_bridge() {
         let mut rig = Rig::start(&[443]);
-        let mut client = crate::stream::tests::Client::connect(
+        let mut client = crate::l4::stream::tests::Client::connect(
             Ipv4Addr::new(192, 0, 2, 10),
             49152,
             Ipv4Addr::new(198, 51, 100, 5),

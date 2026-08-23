@@ -52,7 +52,7 @@ cannot rely on SNI. DNS is the durable no-decryption policy signal.
 ECH policy must stay coupled to resolver control. Do not silently disable ECH
 globally when host-level policy or steering is sufficient.
 
-Implemented in `src/dns.rs`. `ech_policy` is the entire decision and its law is
+Implemented in `src/policy/dns.rs`. `ech_policy` is the entire decision and its law is
 that ECH is stripped if and only if the host is inspected, so an allowed host
 in the same session keeps the configuration its authority published; there is
 no global switch in the crate to reach for. Stripping removes the `ech`
@@ -89,7 +89,7 @@ inspection. Deriving both from one entry is what keeps them from disagreeing —
 refusing an address's QUIC so the browser re-races to TCP, and then forwarding
 that TCP past the interceptor, is a steering that achieves nothing.
 
-Alt-Svc *header* rewriting is implemented in `src/exchange.rs`, where the
+Alt-Svc *header* rewriting is implemented in `src/intercept/exchange.rs`, where the
 response head exists. `steer_alt_svc` removes every alternative whose protocol
 identifier names an HTTP/3 version — percent-decoded, so an encoded token
 cannot slip past — and withdraws the advertisement outright with `clear` when
@@ -97,7 +97,7 @@ none survives. An empty field would say nothing and leave the client's cache in
 place, which is the case the backstop exists to cover; `clear` is what RFC 7838
 gives for saying it. A response advertising no h3 is left byte for byte.
 
-Encrypted upstreams are implemented in `src/upstream.rs`. DoT (RFC 7858) and
+Encrypted upstreams are implemented in `src/policy/upstream.rs`. DoT (RFC 7858) and
 DoQ (RFC 9250) are complete; DoH (RFC 8484) speaks HTTP/1.1 rather than the
 HTTP/2 the RFC requires clients to support, an interim gap that closes when
 interception brings an `h2` stack. The `Upstream` a verdict records
@@ -285,7 +285,7 @@ not as post-launch polish.
 splice trades the URL tier for the HTML tier, which is the wrong direction: a
 document whose rewrite blew its memory budget says nothing about whether that
 host's requests can be filtered, and filtering carries most of the product's
-value. `src/demote.rs` therefore demotes along a three-point lattice —
+value. `src/policy/demote.rs` therefore demotes along a three-point lattice —
 `Splice < Inspect < Rewrite` — where the TLS-level failures reach `Splice` as
 written and a rewrite failure stops at `Inspect`. Unsupported encoding is not a
 demotion at all under that reading: it disqualifies the *body*, which is what

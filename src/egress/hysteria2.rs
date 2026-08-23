@@ -19,7 +19,7 @@
 //! and expects status **233**, which is not an HTTP status code — it is a
 //! sentinel chosen so that anything scanning the endpoint, including a browser,
 //! gets a response indistinguishable from a plain web server's. After that the
-//! connection carries raw streams; see [`crate::quic`] for why the HTTP/3 layer
+//! connection carries raw streams; see [`crate::egress::quic`] for why the HTTP/3 layer
 //! must be dropped before the first one is opened.
 //!
 //! **Padding is mandatory on both messages**, which is a lesson this crate has
@@ -39,7 +39,7 @@ use crate::{
     Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
     EgressError, NatBehavior, PathProperties, Prefixed, ProxyError, StreamEgress, Target,
     TunnelBypass,
-    quic::{Handshake, QuicConnection, client_config},
+    egress::quic::{Handshake, QuicConnection, client_config},
     wire::{Reader, Writer, varint_len},
 };
 

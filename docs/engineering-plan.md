@@ -145,7 +145,7 @@ inverts them fails to compile rather than silently reopening the black hole.
 
 **Status: complete.** Delivered:
 
-- `Fragment`/`Reassembler` in `src/reassembly.rs`: dual-family (IPv4 and IPv6)
+- `Fragment`/`Reassembler` in `src/l3/reassembly.rs`: dual-family (IPv4 and IPv6)
   bounded pure state machine. Boreas terminates the TUN packets addressed to
   it, so RFC 8200 section 4.5's reassembly requirement applies in full —
   dropping IPv6 fragments would black-hole senders already at the 1280-byte
@@ -156,10 +156,10 @@ inverts them fails to compile rather than silently reopening the black hole.
   `UdpFlowTable` deadline discipline. The original scope said "overlapping and
   duplicate fragments resolved by a stated policy"; discard-on-overlap is that
   policy.
-- `validate_ptb` in `src/path.rs`: pure, actionable only when the quoted
+- `validate_ptb` in `src/l3/path.rs`: pure, actionable only when the quoted
   transport is TCP/UDP, the quoted source endpoint matches a known flow, and
   the offered MTU is at or above RFC 9000's 1200-byte floor.
-- `clamp_mss` in `src/path.rs`: rewrites an above-budget MSS on IPv4 or IPv6
+- `clamp_mss` in `src/l3/path.rs`: rewrites an above-budget MSS on IPv4 or IPv6
   SYNs and recomputes the TCP checksum in full; absence of a clampable MSS is
   not an error. Extension headers between the IPv6 fixed header and TCP skip
   the clamp (marked `ponytail:`).
@@ -234,7 +234,7 @@ clean.
 
 ### P5: Device seam and simulator
 
-**Status: complete.** `Device` in `src/device.rs` is the three-method seam
+**Status: complete.** `Device` in `src/host/device.rs` is the three-method seam
 (`recv`/`send`/`mtu`) from the plan; `SimDevice` is the second implementation.
 Delivery is scheduled against a virtual tick the harness drives, loss is
 one-in-N on each direction, and reordering is a bounded delivery jitter, all
@@ -306,7 +306,7 @@ clippy clean.
 
 ### P8: Tokio runtime shell
 
-**Status: complete.** `Shell` in `src/shell.rs` interprets the pure core: one
+**Status: complete.** `Shell` in `src/host/shell.rs` interprets the pure core: one
 reactor task owns the `Datapath` by value, so no lock guards it and none can be
 held across an `await`. Three properties define the phase.
 
@@ -368,7 +368,7 @@ full graph is recorded in [Verification](verification.md).
 
 ### P9: Platform adapters
 
-**Status: code complete; device gate unexercised.** `src/platform.rs` holds
+**Status: code complete; device gate unexercised.** `src/host/platform.rs` holds
 both byte shims behind the seam, with no policy in either:
 
 - `AndroidTun` (unix): wraps the VpnService fd in tokio's `AsyncFd`, so
@@ -408,7 +408,7 @@ and lint clean, and the simulator equivalence harness exists from P5.
 
 **Status: code complete; M1 device gate unexercised.** Delivered:
 
-- `src/egress.rs` replaces `PathProperties::accepts` with the
+- `src/egress/mod.rs` replaces `PathProperties::accepts` with the
   `Egress { Packet, Stream }` sum. The layer is the variant and the
   path properties come from the implementation behind it, so a claim can no
   longer disagree with its implementation. `ChainError::MixedLayers` now
@@ -522,7 +522,7 @@ cross-check. 59 tests, fmt, and clippy clean.
 **Status: complete for the phase gate; the encrypted upstreams are deferred
 with a reason, below.** Delivered:
 
-- `src/dns.rs`, the pure core. Borrowed message parsing with no allocation:
+- `src/policy/dns.rs`, the pure core. Borrowed message parsing with no allocation:
   the header and question decode eagerly because every caller needs both, and
   the answer section is walked lazily as a fallible iterator. `Name` is fixed
   inline storage — RFC 1035 caps a name at 255 wire bytes, so parsing a query
@@ -620,9 +620,9 @@ reads `SVCPARAM_ALPN` from the same SvcParam walk this phase added.
 
 Delivered after P13, once P14's dependency question was decided.
 
-- `src/upstream.rs` holds every transport behind `DnsUpstream`, which is only
+- `src/policy/upstream.rs` holds every transport behind `DnsUpstream`, which is only
   the wire: the policy that decides whether to consult one, and what to do with
-  what it says, stays pure in `src/dns.rs`. The single thing a transport
+  what it says, stays pure in `src/policy/dns.rs`. The single thing a transport
   contributes to a verdict is which `Upstream` carried it.
 - **DoT (RFC 7858)**, complete and conformant. The framing is the whole
   protocol — two octets of big-endian length then the message, in both
@@ -677,7 +677,7 @@ streams, because a test that needs somebody else's uptime is not a gate.
 **Status: the name tier is complete; the URL tier is deferred with a reason.**
 Delivered:
 
-- `src/filter.rs`, the compiler between two different worlds. A filter list is
+- `src/policy/filter.rs`, the compiler between two different worlds. A filter list is
   hundreds of thousands of lines written against *URLs*; the tier enforceable
   without a CA is *names*. A line classifies into a closed sum with three real
   answers — enforceable, nothing to enforce, and *well-formed but this tier
@@ -801,7 +801,7 @@ input to P14 is downstream of.
 **Status: substrate complete in-process; the device gate is unexercised, like
 P9's and P10's.** Delivered:
 
-- `src/stream.rs`, `LocalStack`, a sans-io TCP terminator. It owns no socket,
+- `src/l4/stream.rs`, `LocalStack`, a sans-io TCP terminator. It owns no socket,
   no task, and no clock, exactly as the rest of the core: client packets enter
   as borrowed slices, reply packets leave as owned buffers, and time enters as
   an `Instant` argument to `poll`. A `smoltcp` socket set is the state machine
@@ -822,14 +822,14 @@ P9's and P10's.** Delivered:
   than growing state without limit. This is the P6 socket-count budget
   expressed as an admission rule.
 
-**Gate met, in-process:** `src/stream.rs` drives a real `smoltcp` client
+**Gate met, in-process:** `src/l4/stream.rs` drives a real `smoltcp` client
 through a full three-way handshake against the terminator over the virtual
 clock, then bidirectional application bytes, a graceful close observed as a
 distinct `Closed` from "nothing yet", and the socket-ceiling refusal. The
 device gate — the same handshake over a real TUN — needs the device this
 environment does not have.
 
-- `src/terminate.rs`, the reactor bridge. `run_terminator` drives the stack as
+- `src/l4/terminate.rs`, the reactor bridge. `run_terminator` drives the stack as
   a **second task**, for the same reason the resolver is one: serving a
   terminated connection awaits, and an HTTP round trip must never sit in front
   of the packet path. `TerminatedStream` presents each connection as an
@@ -864,7 +864,7 @@ interception. Deliberately narrow: an explicit allowlist, manually maintained.
 
 **Status: complete in-process; the device gate is unexercised.** Delivered:
 
-- `src/ca.rs`, the CA lifecycle. `CertificateAuthority::generate` builds an
+- `src/intercept/ca.rs`, the CA lifecycle. `CertificateAuthority::generate` builds an
   `rcgen` root on the `ring` provider and one long-lived leaf key; `leaf_for`
   mints a per-host certificate over that shared key, so a host costs one
   signature rather than a P-256 keygen — the interception-proxy design.
@@ -874,14 +874,14 @@ interception. Deliberately narrow: an explicit allowlist, manually maintained.
   FIFO leaf cache keyed on the attacker-suppliable SNI. A leaf it cannot forge
   is an `Option::None`, which rustls answers by failing the handshake — the
   fail-open path, not a leak.
-- `src/mitm.rs`, the terminating TLS server and the milestone's two typed
+- `src/intercept/mitm.rs`, the terminating TLS server and the milestone's two typed
   invariants. `Interceptor` presents a forged leaf for any SNI and negotiates
   h2-by-preference or http/1.1, no h3. `InterceptPolicy` is the explicit,
   case-insensitive, exact-match allowlist — everything not named is spliced.
   `VersionCrossings` counts any exchange whose client and upstream wires differ,
   which the design never produces; `Wire` is closed at two members precisely
   because there is no h3 to bridge to.
-- `src/exchange.rs`, the h1/h2 request/response half, on `hyper`. `run_exchange`
+- `src/intercept/exchange.rs`, the h1/h2 request/response half, on `hyper`. `run_exchange`
   serves the client on the ALPN-chosen wire and forwards each request to an
   upstream connection of *the same* wire, so no version is bridged — the h2
   sender is cloned per stream, never locked, keeping the per-stream
@@ -909,7 +909,7 @@ version-crossing counter stays zero across both. This is the whole
 CA-to-resolver-to-server-to-upstream chain, proven without a device.
 
 **Session assembly is complete, and with it P14's in-process scope.**
-`src/session.rs` consumes a terminated connection, applies `InterceptPolicy`,
+`src/intercept/session.rs` consumes a terminated connection, applies `InterceptPolicy`,
 and either terminates and runs an exchange or splices. The upstream dialer it
 needed turned out to be `StreamEgress`, delivered with SOCKS5 — an intercepted
 connection's upstream leg goes through the same egress as everything else,
@@ -989,7 +989,7 @@ tractable, P15 makes maintenance automatic, and only then does the allowlist
 broaden toward the parity corpus.
 
 **Status: complete in-process. The corpus and crawl gates are device-bound.**
-Delivered in `src/demote.rs`, wired through `src/session.rs`:
+Delivered in `src/policy/demote.rs`, wired through `src/intercept/session.rs`:
 
 - **The remedy is a lattice, not a switch.** `Tier` is a three-point chain —
   `Splice < Inspect < Rewrite` — and recording an observation is its meet, so
@@ -1061,7 +1061,7 @@ CSP relaxation, SRI preservation. Rewriters constructed only after `text/html`
 is confirmed. Memory settings and strict bail-out wired to fail open.
 
 **Status: complete in-process.**
-Delivered in `src/rewrite.rs` and `src/rules.rs`:
+Delivered in `src/intercept/rewrite.rs` and `src/policy/rules.rs`:
 
 - **`adblock` decides and `lol_html` transforms**, which is the boundary
   [Filtering](filtering.md) already drew. Brave's engine is the one shipping in
@@ -1140,7 +1140,7 @@ Hysteria2. Each reports live path properties through P3's `replan`.
 complete for their stream paths and interop-verified. TUIC is dropped and
 Reality is dropped; both findings are recorded below.** Delivered:
 
-- `src/masque.rs`, a CONNECT-IP tunnel as a `PacketEgress`. CONNECT-IP carries
+- `src/egress/masque.rs`, a CONNECT-IP tunnel as a `PacketEgress`. CONNECT-IP carries
   *whole IP packets*, so it joins WireGuard on the existing packet seam rather
   than needing a new layer, and the planner reaches it through the path-properties
   claim it already understands.
@@ -1170,7 +1170,7 @@ Reality is dropped; both findings are recorded below.** Delivered:
   A datagram that will not fit is dropped rather than fragmented, because QUIC
   forbids fragmenting one, which is precisely what that ceiling exists to say.
 
-**Gate met, in-process:** `src/masque.rs` drives a real `quiche` client through
+**Gate met, in-process:** `src/egress/masque.rs` drives a real `quiche` client through
 a real handshake against a real `quiche` server, sends an Extended CONNECT
 carrying `:protocol = connect-ip`, and asserts that a whole IP packet crosses as
 an HTTP Datagram and returns byte-identical. The proxy in that test validates
@@ -1236,7 +1236,7 @@ design: it runs *inside* a transport that already provides it. So the transport
 is a trait — `ProxyTransport`, "obtain the byte stream I speak over" — and VLESS
 over TCP, over TLS, over WebSocket, over gRPC and over QUIC are one protocol
 implementation and five transports. Each therefore lands as a new
-`ProxyTransport` rather than as a change to `src/vless.rs`, which is what the
+`ProxyTransport` rather than as a change to `src/egress/vless.rs`, which is what the
 phase order was chosen for.
 
 **The VLESS address encoding is not SOCKS5's, and the difference is silent.**
@@ -1284,11 +1284,11 @@ status-and-message response. Interop-verified: `tests/interop.rs` runs two
 concurrent flows over one connection against a real sing-box server, over TLS
 this client verifies against a generated anchor rather than trusting blindly.
 
-**It needed one piece of infrastructure, and `src/quic.rs` is now it.** Every
+**It needed one piece of infrastructure, and `src/egress/quic.rs` is now it.** Every
 stream egress before this obtained a `TcpStream` from the tunnel bypass, but
 Hysteria2's streams live inside a QUIC connection, so something must own the UDP
 socket and the `quiche::Connection` and expose each bidirectional stream as an
-`AsyncRead + AsyncWrite`. That is structurally the bridge `src/terminate.rs`
+`AsyncRead + AsyncWrite`. That is structurally the bridge `src/l4/terminate.rs`
 already builds for `smoltcp`, so the two now share it: `src/bridge.rs` holds the
 bounded channels, the stream type, and the `poll_read`/`poll_write` contract,
 and each driver keeps its own pump because `smoltcp` and `quiche` genuinely
@@ -1353,7 +1353,7 @@ transport, so it falls to the same rule that dropped TUIC.
 
 **What replaced it is transport breadth, which was the better trade.** VLESS is
 a header and then bytes; everything that makes a deployment survive a hostile
-network lives *under* it. `src/transport.rs` now implements the whole set
+network lives *under* it. `src/egress/transport.rs` now implements the whole set
 sing-box offers — `ws`, `httpupgrade`, `grpc`, `http`, `quic` — beneath an
 optional TLS layer, and each is interop-verified against a sing-box `vless`
 inbound configured for it.
@@ -1509,7 +1509,7 @@ Record outcomes in [Verification](verification.md).
 8. ~~**The plan is missing a phase between P10 and P14: smoltcp integration and
    real local termination.** P14 cannot start without a byte stream.~~
    **Inserted as P13.5.** `smoltcp` is promoted to a real dependency and
-   `LocalStack` in `src/stream.rs` delivers `TransportPath::LocalTermination`
+   `LocalStack` in `src/l4/stream.rs` delivers `TransportPath::LocalTermination`
    for real, gated in-process. Two device-bound measurements remain open under
    it: P6's scaling verdict re-measured under the terminator's live socket set
    rather than the idle-device example, and the reactor wiring's own on-device

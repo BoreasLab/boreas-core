@@ -35,6 +35,14 @@ the product contract. Do not infer implemented status from visionary scope.
   question and no check in this repository gates it.
 - Keep abstractions at ownership boundaries with more than one real
   implementation. No speculative adapters or configuration.
+- **A new module goes in the directory whose name says something its filename
+  does not** — `src/l3/`, `src/l4/`, `src/policy/`, `src/intercept/`,
+  `src/egress/`, `src/host/`, listed in
+  [Architecture](docs/architecture.md)'s Source Layout. What no single layer
+  owns stays flat at `src/`: the pure core, the wire and sans-io vocabulary,
+  the reactor bridge, the API. Export it from `src/lib.rs` regardless — the
+  crate's public surface is flat, so a caller never spells a layer and moving a
+  module between them breaks nothing.
 - **Refine what a client can set; do not refine what the composition root
   derives.** A number a host writes through [api/](api/README.md) reaches a
   place no error can describe, so a pair it can get wrong is parsed where it is

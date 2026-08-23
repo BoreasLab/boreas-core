@@ -1,6 +1,6 @@
 //! P17: the SOCKS5 egress driven against a real proxy.
 //!
-//! The codec's laws are unit-tested in `src/socks5.rs`; what needs a socket is
+//! The codec's laws are unit-tested in `src/egress/socks5.rs`; what needs a socket is
 //! the *driver* — the greeting, the authentication sub-negotiation, the reply
 //! framing, and the UDP relay's lifetime. So this file implements a minimal but
 //! genuine RFC 1928 proxy and makes the egress talk to it.

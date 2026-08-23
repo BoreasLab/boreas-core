@@ -212,16 +212,41 @@ decrypts. Two pools rather than one because the two allocators' buffer types and
 lifetimes differ; one per-packet heap allocation on either would breach the
 engineering plan's budget.
 
+## Source Layout
+
+The layer contract above is the directory tree. A module goes in `src/<layer>/`
+when the layer name says something its own filename does not:
+
+| Directory | Holds |
+|---|---|
+| `src/l3/` | packet parsing, fragment reassembly, path MTU and ICMP, the UDP flow table |
+| `src/l4/` | local TCP termination, its reactor bridge, the datagram relay |
+| `src/policy/` | resolution and its provenance, filter lists, the rule engine, demotion |
+| `src/intercept/` | what happens to a terminated connection: session, CA, mirror, exchange, rewrite |
+| `src/egress/` | the egress sum and every implementation, plus the transports they speak over |
+| `src/host/` | the runtime edge: the device seam, the platform shims, the tokio shell |
+
+What stays flat at `src/` is what no single layer owns: `datapath.rs`, the pure
+core every layer reports to; `wire.rs` and `sansio.rs`, the vocabulary every
+protocol is written in; `bridge.rs`, the sans-io-to-reactor seam that both
+`l4/` and `egress/` cross; and `api.rs`, the surface a host builds against.
+
+**The tree is for the people editing this crate, not the people using it.**
+Every exported type is re-exported flat from `src/lib.rs`, so a caller writes
+`boreas_core::Datapath`, never `boreas_core::l3::packet::IngressPacket`. Moving
+a module between layers is therefore not a breaking change, which is what keeps
+the grouping free to follow the design rather than the other way round.
+
 ## Current Code
 
 - `src/lib.rs` implements path composition, flow planning, and actions.
-- `src/packet.rs` parses IPv4 and IPv6 without allocating and quarantines
+- `src/l3/packet.rs` parses IPv4 and IPv6 without allocating and quarantines
   fragments before L4.
-- `src/udp.rs` implements endpoint-independent mapping state and bounded
+- `src/l3/udp.rs` implements endpoint-independent mapping state and bounded
   per-flow datagram buffering.
-- `src/origin.rs` assembles a configured egress into the packet effect and the
-  flow effect a session runs on.
-- `src/relay.rs` drives the L4 datagram associations a flow egress needs.
+- `src/egress/origin.rs` assembles a configured egress into the packet effect
+  and the flow effect a session runs on.
+- `src/l4/relay.rs` drives the L4 datagram associations a flow egress needs.
 
 The current code is a foundation, not the complete diagram. Missing work is
 tracked in [Delivery](delivery.md).

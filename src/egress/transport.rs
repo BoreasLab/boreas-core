@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AsyncStream, BoxFuture, ClientProfile, EgressError, Originator, Prefixed, ProxyError,
     TunnelBypass,
-    quic::{Handshake, QuicConnection, client_config},
+    egress::quic::{Handshake, QuicConnection, client_config},
     wire::Writer,
 };
 

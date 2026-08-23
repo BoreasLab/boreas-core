@@ -109,8 +109,8 @@ The design investigation reported the following as verified by 2026-08-08:
   intercepted policy as described in the subsystem documents. Chrome's HTTP/2
   preface — `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p` — was taken from
   Chromium's `AddDefaultHttp2Settings` and cross-checked against curl-impersonate
-  and captures through Chrome 147; `src/mirror.rs` holds it as a value and
-  `src/exchange.rs` asserts it against the bytes an origin receives.
+  and captures through Chrome 147; `src/intercept/mirror.rs` holds it as a value and
+  `src/intercept/exchange.rs` asserts it against the bytes an origin receives.
 - QUIC has a 1200-byte path floor and restricted sub-1200 behavior.
 
 Rechecked against primary sources on 2026-08-09:
@@ -282,7 +282,7 @@ Numbered as above, with reserved slots for retired questions.
     buffer growth and cache behaviour rather than fragment count. Before the
     O(1) completion counter the same input cost 36.7 ms, a 29x penalty for an
     ordering the sender chooses. The expiry index no longer grows with
-    fragments at all: `src/reassembly.rs` asserts one slot per pending
+    fragments at all: `src/l3/reassembly.rs` asserts one slot per pending
     datagram after 10,000 rejected fragments.
 12. **Fusion path cost:** measured 2026-08-11, release build, aarch64 dev VM,
     `examples/fusion.rs`: 10,000 packets driven tun → datapath → WireGuard →

@@ -51,7 +51,7 @@ use crate::{
     Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressEmit, FlowEvent, HostPolicy,
     Inbound, InternalEndpoint, Message, PacketEgress, PathProperties, Pooled, Provenance,
     QueryPlan, Rcode, Relay, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses,
-    plan_query, upstream::DnsUpstream, write_failure, write_refusal, write_response,
+    plan_query, policy::upstream::DnsUpstream, write_failure, write_refusal, write_response,
 };
 
 /// Depth of both reactor channels. Bounded is the point; the exact depth trades

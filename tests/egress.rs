@@ -13,7 +13,7 @@ use boreas_core::{
 
 /// Slices large enough for an encapsulated 1420-byte packet, and a budget
 /// nothing here approaches: an exhaustion in this test would be a defect, not
-/// the congestion path (`src/egress.rs` covers that one).
+/// the congestion path (`src/egress/mod.rs` covers that one).
 fn pool() -> Arc<BufferPool> {
     BufferPool::new(
         NonZeroUsize::new(2048).unwrap(),

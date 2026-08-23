@@ -43,7 +43,7 @@ smoltcp bypass.
 ### WireGuard
 
 Use GotaTun. Integrated 2026-08-11 at 0.8.1 as `WireGuardEgress` in
-`src/egress.rs`: a sans-io wrapper over `Tunn`, driven by the shell through
+`src/egress/mod.rs`: a sans-io wrapper over `Tunn`, driven by the shell through
 `EgressEmit::{ToNetwork, ToTunnel}` and an explicit timer tick. The sans-io
 methods live on the `PacketEgress` trait rather than on the concrete type, so
 the reactor drives any packet egress without naming a protocol, and every

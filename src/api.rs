@@ -15,7 +15,7 @@
 //! 3. **Run it.** [`Tunnel::start`], then read [`Tunnel::next_event`] until it
 //!    stops.
 //! 4. **Keep what cannot be relearned.** Exactly one thing: the certificate
-//!    authority's material. See [`crate::ca`] for why that is the only one.
+//!    authority's material. See [`crate::intercept::ca`] for why that is the only one.
 //!
 //! # What is stable and what is not
 //!
@@ -882,7 +882,7 @@ impl crate::AsyncNetwork for Underlay {
         match self {
             Self::Peer(socket) => {
                 let sent = tokio::net::UdpSocket::send(socket, buf).await?;
-                crate::shell::whole(sent, buf.len())
+                crate::host::shell::whole(sent, buf.len())
             }
             Self::Absent => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

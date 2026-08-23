@@ -21,6 +21,20 @@
 //! budget forbids a heap allocation per packet, and an egress sits on the
 //! hottest path there is, so its outputs draw on the same single budget the
 //! datapath's do; exhaustion is a counted drop, never a wait.
+//!
+//! The submodules are the implementations: `origin` re-originates through a
+//! packet egress, `transport` is the family a proxy protocol speaks over,
+//! `quic` the client connection three of them share, and the rest are one
+//! wire protocol each.
+
+pub(crate) mod hysteria2;
+pub(crate) mod masque;
+pub(crate) mod origin;
+pub(crate) mod quic;
+pub(crate) mod shadowsocks;
+pub(crate) mod socks5;
+pub(crate) mod transport;
+pub(crate) mod vless;
 
 use std::{sync::Arc, time::Duration};
 
@@ -523,7 +537,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for DirectEgress<B> {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            let address = crate::origin::resolve(target).await?;
+            let address = origin::resolve(target).await?;
             let stream = crate::within(crate::Wait::TcpConnect, self.bypass.tcp(address)).await?;
             // Nagle would hold a short request waiting for bytes that are not
             // coming, which on a re-originated exchange is pure added latency.
@@ -563,7 +577,7 @@ impl DatagramSink for DirectRelay {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<(), EgressError>> {
         Box::pin(async move {
-            let address = crate::origin::resolve(target).await?;
+            let address = origin::resolve(target).await?;
             self.0.send_to(payload, address).await?;
             Ok(())
         })

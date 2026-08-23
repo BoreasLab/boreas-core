@@ -1,41 +1,36 @@
+//! The layers are directories, in the order a packet meets them: [`l3`] parses
+//! and reassembles IP, [`l4`] turns transport state into a stream or a flow,
+//! [`policy`] decides what that flow is allowed to do, [`intercept`] is what
+//! happens to one this proxy terminates, and [`egress`] is where it leaves.
+//! [`host`] is the runtime edge — OS handles and the reactor that drives the
+//! pure core against them.
+//!
+//! The modules that stayed flat are the ones no single layer owns: [`datapath`]
+//! is the pure core every layer reports to, [`wire`] and [`sansio`] are the
+//! vocabulary every protocol is written in, and [`bridge`] is the seam between
+//! a sans-io state machine and the reactor, which both [`l4`] and [`egress`]
+//! cross.
+//!
+//! Every type this crate exports is re-exported flat from the crate root
+//! below, so a caller never spells a layer. The directories are for the people
+//! editing this crate, not for the people using it.
+
 pub mod api;
+
+mod egress;
+mod host;
+mod intercept;
+mod l3;
+mod l4;
+mod policy;
+
 mod bridge;
-mod ca;
 mod datapath;
 mod deadline;
-mod demote;
-mod device;
-mod dns;
-mod egress;
-mod exchange;
-mod filter;
-mod hysteria2;
-mod masque;
-mod mirror;
-mod mitm;
-mod origin;
-mod packet;
-mod path;
-mod platform;
 mod pool;
-mod quic;
-mod reassembly;
-mod relay;
-mod rewrite;
-mod rules;
 mod sansio;
-mod session;
-mod shadowsocks;
-mod shell;
-mod socks5;
-mod stream;
-mod terminate;
 #[cfg(test)]
 pub(crate) mod testing;
-mod transport;
-mod udp;
-mod upstream;
-mod vless;
 mod wire;
 
 use std::{
@@ -67,15 +62,77 @@ pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub use bridge::BridgedStream;
-pub use ca::{CaError, CaKeys, CaMaterial, CertificateAuthority, MitmResolver, Trust};
 pub use datapath::{
     DEFAULT_INSPECTED_PORTS, Datapath, DatapathError, DnsQuery, FlowEvent, Limits, Outbound, Side,
     Transmit,
 };
 pub use deadline::{Wait, within};
-pub use demote::{Demotion, Demotions, InterceptedTier, Leg, Standing, Tier, classify};
-pub use device::{Device, Harness, SimDevice};
-pub use dns::{
+pub use egress::hysteria2::{
+    Hysteria2Config, Hysteria2Egress, QuicConfigFactory, TcpResponse, decode_tcp_response,
+    encode_tcp_request,
+};
+pub use egress::masque::{
+    CloseReason, MASQUE_OVERHEAD_BYTES, MasqueConfig, MasqueEgress, TunnelState,
+    decode_ip_datagram, encode_ip_datagram,
+};
+pub use egress::origin::{
+    Assembly, DEFAULT_ORIGINATION_PORTS, NoPacketEgress, OriginationPorts, PortRangeError,
+    TunnelledDialer, assemble,
+};
+pub use egress::quic::{H3Response, Handshake, QuicConnection, client_config};
+pub use egress::shadowsocks::{
+    KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress,
+};
+pub use egress::socks5::{
+    Credentials, CredentialsError, ProxyError, Reply, Socks5Config, Socks5Egress, decode_address,
+    decode_datagram, encode_address, encode_datagram,
+};
+pub use egress::{
+    Association, AsyncStream, BoxFuture, DatagramSink, DatagramSource, DirectEgress, DomainName,
+    DomainNameError, Egress, EgressEmit, EgressError, Either, PacketEgress, Prefixed, StreamEgress,
+    Target, WIREGUARD_OVERHEAD_BYTES, WireGuardConfig, WireGuardEgress,
+};
+pub use host::device::{Device, Harness, SimDevice};
+#[cfg(unix)]
+pub use host::platform::AndroidTun;
+#[cfg(windows)]
+pub use host::platform::WintunDevice;
+pub use host::shell::{
+    AsyncDevice, AsyncNetwork, Control, Panics, Session, Shell, Supervision, Telemetry, Termination,
+};
+pub use intercept::ca::{CaError, CaKeys, CaMaterial, CertificateAuthority, MitmResolver, Trust};
+pub use intercept::exchange::{
+    AllowAll, AltSvc, FilterVerdict, ProxyBody, RequestFilter, run_exchange, steer_alt_svc,
+};
+pub use intercept::mirror::{
+    ClientProfile, H2Profile, HandshakeFailure, Hello, MirrorError, Offer, Opaque, Originator,
+    Refusal, alpn_list, read_hello,
+};
+pub use intercept::mitm::{
+    InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire,
+};
+pub use intercept::rewrite::{
+    BudgetError, Coding, CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable,
+    Rewritable, RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, Undecodable,
+    permit_inline_style, rewritable,
+};
+pub use intercept::session::{
+    Handling, Introduction, SessionError, SessionLimits, Sessions, SpliceReason, introduce,
+    run_sessions, serve_session,
+};
+pub use l3::packet::{
+    IcmpClass, IngressPacket, PacketError, Transport, WriteError, forbids_fragmentation,
+    udp_datagram_len, write_too_big, write_udp,
+};
+pub use l3::path::{PathUpdate, clamp_mss, validate_ptb};
+pub use l3::reassembly::{Fragment, PushOutcome, ReassembledPacket, Reassembler};
+pub use l4::relay::{Inbound, Relay, RelayCounts, RelayLimits, run_relay};
+pub use l4::stream::{
+    LocalStack, StreamError, StreamId, Terminated, TerminationError, TerminationLimits,
+};
+pub use l4::terminate::{Accepted, TerminatedStream, run_terminator};
+pub use policy::demote::{Demotion, Demotions, InterceptedTier, Leg, Standing, Tier, classify};
+pub use policy::dns::{
     AlpnOutcome, AlpnPolicy, AnswerPolicy, Answers, DNS_PORT, DnsError, EchOutcome, EchPolicy,
     HostPolicy, HostVerdict, Judgment, Message, Name, Provenance, QueryPlan, Question, Rcode,
     Rdata, RecordType, Resolution, ResourceRecord, Rewritten, RuleCounts, SVCPARAM_ALPN,
@@ -83,84 +140,26 @@ pub use dns::{
     answer_addresses, answer_policy, ech_param, ech_policy, h3_alpn_param, plan_query, svc_params,
     write_failure, write_refusal, write_response,
 };
-pub use egress::{
-    Association, AsyncStream, BoxFuture, DatagramSink, DatagramSource, DirectEgress, DomainName,
-    DomainNameError, Egress, EgressEmit, EgressError, Either, PacketEgress, Prefixed, StreamEgress,
-    Target, WIREGUARD_OVERHEAD_BYTES, WireGuardConfig, WireGuardEgress,
-};
-pub use exchange::{
-    AllowAll, AltSvc, FilterVerdict, ProxyBody, RequestFilter, run_exchange, steer_alt_svc,
-};
-pub use filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
-pub use hysteria2::{
-    Hysteria2Config, Hysteria2Egress, QuicConfigFactory, TcpResponse, decode_tcp_response,
-    encode_tcp_request,
-};
-pub use masque::{
-    CloseReason, MASQUE_OVERHEAD_BYTES, MasqueConfig, MasqueEgress, TunnelState,
-    decode_ip_datagram, encode_ip_datagram,
-};
-pub use mirror::{
-    ClientProfile, H2Profile, HandshakeFailure, Hello, MirrorError, Offer, Opaque, Originator,
-    Refusal, alpn_list, read_hello,
-};
-pub use mitm::{InterceptDecision, InterceptPolicy, Interceptor, VersionCrossings, Wire};
-pub use origin::{
-    Assembly, DEFAULT_ORIGINATION_PORTS, NoPacketEgress, OriginationPorts, PortRangeError,
-    TunnelledDialer, assemble,
-};
-pub use packet::{
-    IcmpClass, IngressPacket, PacketError, Transport, WriteError, forbids_fragmentation,
-    udp_datagram_len, write_too_big, write_udp,
-};
-pub use path::{PathUpdate, clamp_mss, validate_ptb};
-#[cfg(unix)]
-pub use platform::AndroidTun;
-#[cfg(windows)]
-pub use platform::WintunDevice;
-pub use pool::{BufferPool, Pooled};
-pub use quic::{H3Response, Handshake, QuicConnection, client_config};
-pub use reassembly::{Fragment, PushOutcome, ReassembledPacket, Reassembler};
-pub use relay::{Inbound, Relay, RelayCounts, RelayLimits, run_relay};
-pub use rewrite::{
-    BudgetError, Coding, CosmeticSource, HidingRules, InlineStyle, NoCosmetics, NotRewritable,
-    Rewritable, RewriteFailures, Rewriting, RewritingBody, StreamBudget, Truncated, Undecodable,
-    permit_inline_style, rewritable,
-};
-pub use rules::RuleEngine;
-pub use sansio::{Codec, Decode, Decoded, Framed, Negotiation, Writes, negotiate};
-pub use session::{
-    Handling, Introduction, SessionError, SessionLimits, Sessions, SpliceReason, introduce,
-    run_sessions, serve_session,
-};
-pub use shadowsocks::{KeyError, Method, PreSharedKey, ShadowsocksConfig, ShadowsocksEgress};
-pub use shell::{
-    AsyncDevice, AsyncNetwork, Control, Panics, Session, Shell, Supervision, Telemetry, Termination,
-};
-pub use socks5::{
-    Credentials, CredentialsError, ProxyError, Reply, Socks5Config, Socks5Egress, decode_address,
-    decode_datagram, encode_address, encode_datagram,
-};
-pub use stream::{
-    LocalStack, StreamError, StreamId, Terminated, TerminationError, TerminationLimits,
-};
-pub use terminate::{Accepted, TerminatedStream, run_terminator};
-pub use upstream::{
+pub use policy::filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
+pub use policy::rules::RuleEngine;
+pub use policy::upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
     DoqUpstream, DotUpstream, TunnelBypass, UpstreamError,
 };
+pub use pool::{BufferPool, Pooled};
+pub use sansio::{Codec, Decode, Decoded, Framed, Negotiation, Writes, negotiate};
 
-pub use transport::{
+pub use egress::transport::{
     GrpcConfig, GrpcTransport, HttpConfig, HttpHeaders, HttpTransport, HttpUpgradeConfig,
     HttpUpgradeTransport, PlainTransport, ProxyTransport, QuicTransport, QuicTransportConfig,
     TlsConfig, TlsTransport, WebSocketConfig, WebSocketTransport,
 };
-pub use vless::{
+pub use egress::vless::{
     UserId, UserIdError, VlessConfig, VlessEgress, decode_addr_port, decode_response,
     encode_addr_port, encode_request,
 };
 
-pub use udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
+pub use l3::udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
 
 pub const MIN_QUIC_MTU: u16 = 1200;
 

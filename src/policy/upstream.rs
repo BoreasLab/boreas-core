@@ -1,7 +1,7 @@
 //! DNS upstream transports: the wire, and only the wire.
 //!
 //! The policy that decides whether to consult an upstream, and what to do with
-//! what it says, is pure and lives in [`crate::dns`]. The single thing this
+//! what it says, is pure and lives in [`crate::policy::dns`]. The single thing this
 //! module contributes to a verdict is which [`Upstream`] carried it — which
 //! matters because the privacy claim differs per transport, and a user is
 //! entitled to know which one they got.

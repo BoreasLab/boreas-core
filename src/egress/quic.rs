@@ -8,7 +8,7 @@
 //! `quiche::Connection` and hand out each bidirectional stream separately. That
 //! is what this module is.
 //!
-//! **It is the same bridge `src/terminate.rs` builds, against a different state
+//! **It is the same bridge `src/l4/terminate.rs` builds, against a different state
 //! machine.** `quiche` is sans-io exactly as `smoltcp` is, so both need a task
 //! that owns the I/O, both hand each stream to a consumer over bounded
 //! channels, and both take backpressure from the transport's own flow control

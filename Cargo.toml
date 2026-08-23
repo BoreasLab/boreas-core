@@ -76,7 +76,8 @@ lol_html = "3.0.1"
 # **This is not a new C dependency; it is a promotion.** `quiche` already links
 # BoringSSL through this same crate, so the artefact gains no library — it gains
 # a direct edge to one that was already there. See `[patch.crates-io]` above for
-# why the version had to move, and `src/mirror.rs` for what is done with it.
+# why the version had to move, and `src/intercept/mirror.rs` for what is done
+# with it.
 #
 # `tokio-boring` is the async adapter, versioned in lockstep by its authors.
 boring = "5.2"
@@ -104,7 +105,8 @@ tokio-boring = "5.2"
 # artefact: `rust_backend` keeps flate2 on `miniz_oxide` rather than a C zlib,
 # `brotli-decompressor` is the decoder half of the `brotli` crate, and `ruzstd`
 # is a decoder with no libzstd behind it. `ruzstd` offers only a pull interface,
-# so `src/rewrite.rs` carries the push adapter and the bound that goes with it.
+# so `src/intercept/rewrite.rs` carries the push adapter and the bound that
+# goes with it.
 brotli-decompressor = { version = "5.0.3", default-features = false, features = ["std"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 ruzstd = { version = "0.9.0", default-features = false, features = ["std"] }

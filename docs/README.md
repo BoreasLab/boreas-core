@@ -52,25 +52,25 @@ has to read `src/` or `ffi/src/` to make progress has found a defect in
 |---|---|---|
 | `src/lib.rs` | refined `Mtu`, error spine, path composition, flow planning, total ingress classification | [Architecture](architecture.md) |
 | `src/datapath.rs` | sans-io datapath core: dispatch, flow lifecycle, path-change replanning | [Architecture](architecture.md) |
-| `src/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
-| `src/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
-| `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
 | `src/wire.rs` | the byte alphabet every wire format is read and written through: total reader, growable and bounded writers, RFC 1071 checksum | [Architecture](architecture.md) |
-| `src/dns.rs` | DNS parsing, host policy, verdict provenance, ECH policy | [Filtering](filtering.md) |
-| `src/filter.rs` | filter-list parsing, deferral accounting, policy compilation | [Filtering](filtering.md) |
-| `src/egress.rs` | egress sum (packet vs stream), sans-io packet-egress interface, WireGuard via GotaTun | [Egress](egress.md) |
-| `src/upstream.rs` | DNS upstream transports: Do53, DoT, DoH, and the tunnel-bypass seam | [Filtering](filtering.md) |
-| `src/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
-| `src/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
-| `src/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |
-| `src/path.rs` | PTB validation against known flows, SYN MSS clamping | [Networking](networking.md) |
-| `src/udp.rs` | bounded datagrams and endpoint-independent mapping state | [Networking](networking.md) |
-| `src/mitm.rs` | the terminating TLS server, one acceptor per wire, and the interception allowlist | [Filtering](filtering.md) |
-| `src/mirror.rs` | the originating side: the ClientHello every dialling leg sends, and Chrome's HTTP/2 preface | [Decisions](decisions.md) |
-| `src/session.rs` | what happens to one terminated connection: introduce, decide, originate, terminate, serve | [Filtering](filtering.md) |
-| `src/exchange.rs` | the HTTP exchange, URL-tier filtering, hop-by-hop sweep, Alt-Svc steering | [Filtering](filtering.md) |
-| `src/rewrite.rs` | the HTML tier: content-coding decode, streaming rewrite under a budget | [Filtering](filtering.md) |
-| `src/demote.rs` | what a failed handshake proved, and the tier a host's history permits | [Filtering](filtering.md) |
-| `src/transport.rs` | proxy transports: TLS, WebSocket, HTTPUpgrade, gRPC, HTTP/2, QUIC | [Egress](egress.md) |
+| `src/pool.rs` | bounded, recycled, affine payload buffers | [Architecture](architecture.md) |
+| `src/l3/packet.rs` | borrowed IP parsing and fragment classification | [Networking](networking.md) |
+| `src/l3/reassembly.rs` | dual-family fragment reassembly, discard-on-overlap | [Networking](networking.md) |
+| `src/l3/path.rs` | PTB validation against known flows, SYN MSS clamping | [Networking](networking.md) |
+| `src/l3/udp.rs` | bounded datagrams and endpoint-independent mapping state | [Networking](networking.md) |
+| `src/policy/dns.rs` | DNS parsing, host policy, verdict provenance, ECH policy | [Filtering](filtering.md) |
+| `src/policy/filter.rs` | filter-list parsing, deferral accounting, policy compilation | [Filtering](filtering.md) |
+| `src/policy/upstream.rs` | DNS upstream transports: Do53, DoT, DoH, and the tunnel-bypass seam | [Filtering](filtering.md) |
+| `src/policy/demote.rs` | what a failed handshake proved, and the tier a host's history permits | [Filtering](filtering.md) |
+| `src/intercept/mitm.rs` | the terminating TLS server, one acceptor per wire, and the interception allowlist | [Filtering](filtering.md) |
+| `src/intercept/mirror.rs` | the originating side: the ClientHello every dialling leg sends, and Chrome's HTTP/2 preface | [Decisions](decisions.md) |
+| `src/intercept/session.rs` | what happens to one terminated connection: introduce, decide, originate, terminate, serve | [Filtering](filtering.md) |
+| `src/intercept/exchange.rs` | the HTTP exchange, URL-tier filtering, hop-by-hop sweep, Alt-Svc steering | [Filtering](filtering.md) |
+| `src/intercept/rewrite.rs` | the HTML tier: content-coding decode, streaming rewrite under a budget | [Filtering](filtering.md) |
+| `src/egress/mod.rs` | egress sum (packet vs stream), sans-io packet-egress interface, WireGuard via GotaTun | [Egress](egress.md) |
+| `src/egress/transport.rs` | proxy transports: TLS, WebSocket, HTTPUpgrade, gRPC, HTTP/2, QUIC | [Egress](egress.md) |
+| `src/host/device.rs` | device seam, scripted simulator, deterministic harness | [Engineering Plan](engineering-plan.md) |
+| `src/host/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
+| `src/host/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
 | `ffi/` | the C boundary and Android's JNI bypass: status codes, handle lifecycle, callback vtables, panic containment | [Platforms](platforms.md) |
 | `vendor/` | crates patched in tree, generated from `vendor/patches/` by `scripts/vendor.py` | [vendor/README.md](../vendor/README.md) |

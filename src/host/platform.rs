@@ -8,7 +8,7 @@
 mod android {
     use std::io;
 
-    use crate::{AsyncDevice, Device, Mtu, shell::whole};
+    use crate::{AsyncDevice, Device, Mtu, host::shell::whole};
 
     /// Android's VpnService fd. Readiness comes from tokio's `AsyncFd`, so
     /// `recv` is cancel-safe: it registers interest and only reads when the
