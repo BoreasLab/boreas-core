@@ -1,0 +1,245 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""The Android ABI table: one place that knows all three names for one target.
+
+Gradle, Rust, and the NDK each have their own name for the same architecture,
+and they do not all agree. `armeabi-v7a` is `armv7-linux-androideabi` to Rust
+and `armv7a-linux-androideabi` to the NDK's clang wrapper — one letter apart, in
+the one position where a wrong guess produces "no such file" at link time on one
+ABI out of four. Deriving either name from the other works for three of them,
+passes review, and breaks the 32-bit build.
+
+> **Note:** For 32-bit ARM, the compiler is prefixed with
+> `armv7a-linux-androideabi`, but the binutils tools are prefixed with
+> `arm-linux-androideabi`. For other architectures, the prefixes are the same
+> for all tools.
+>
+> — [Use the NDK with other build
+> systems](https://developer.android.com/ndk/guides/other_build_systems),
+> accessed 2026-08-24
+
+The binutils half of that note is why the archiver below is `llvm-ar` rather
+than a prefixed one: the unified tool takes no triple, so the second naming
+split has nowhere to go wrong.
+
+    scripts/android.py --abis                   every ABI name, one per line
+    scripts/android.py --target arm64-v8a       the Rust target triple
+    scripts/android.py --env arm64-v8a          CC/AR/linker, as `key=value`
+    scripts/android.py --selftest               this module's doctests
+
+`--env` writes the lines `cargo` reads to find a cross toolchain, for appending
+to `$GITHUB_ENV`. It verifies the compiler exists before naming it, because an
+environment variable pointing at nothing fails three minutes later as a linker
+error that names neither this script nor the missing file.
+
+**Run it through `uv`.** The PEP 723 block above is the whole environment.
+"""
+
+from __future__ import annotations
+
+import argparse
+import doctest
+import enum
+import os
+import platform
+import sys
+from pathlib import Path
+from typing import NamedTuple
+
+
+class Exit(enum.IntEnum):
+    """Exit statuses, as a closed sum rather than scattered integers."""
+
+    OK = 0
+    ERROR = 1
+    UNKNOWN_ABI = 2
+
+
+class Abi(NamedTuple):
+    """One architecture, under the two names that are not its Gradle name.
+
+    `rust` is what `cargo --target` takes and what names the output directory.
+    `clang` is the NDK's toolchain triple, which prefixes the compiler wrapper.
+    """
+
+    rust: str
+    clang: str
+
+
+#: The four ABIs the NDK supports, keyed by the name Gradle and the Play Store
+#: use — which is also the directory name inside `src/main/jniLibs/`.
+#:
+#: The triples are quoted from the NDK's own table; see the module docstring.
+ABIS: dict[str, Abi] = {
+    "arm64-v8a": Abi("aarch64-linux-android", "aarch64-linux-android"),
+    "armeabi-v7a": Abi("armv7-linux-androideabi", "armv7a-linux-androideabi"),
+    "x86": Abi("i686-linux-android", "i686-linux-android"),
+    "x86_64": Abi("x86_64-linux-android", "x86_64-linux-android"),
+}
+
+#: The minimum API level the shipped library is built against.
+#:
+#: 26 is the floor `VpnService.Builder.setMetered` needs, and the oldest the
+#: NDK's prebuilt sysroots still carry a clang wrapper for. Raising it drops
+#: devices; lowering it does not compile.
+DEFAULT_API = 26
+
+#: The host directories the NDK ships prebuilt toolchains for. Any other host
+#: has no toolchain to point at, which `compiler` reports as a missing file
+#: rather than by guessing.
+HOST_TAGS = {
+    "Linux": "linux-x86_64",
+    "Darwin": "darwin-x86_64",
+    "Windows": "windows-x86_64",
+}
+
+
+def cargo_variables(abi: Abi, compiler: str) -> dict[str, str]:
+    """The environment `cargo` reads to cross-compile for `abi`.
+
+    `cc` and `cargo` spell the same target differently — one lower-cased with
+    underscores, the other upper-cased — so both spellings are derived here
+    rather than written out per ABI.
+
+    >>> vars = cargo_variables(ABIS["armeabi-v7a"], "/ndk/armv7a-linux-androideabi26-clang")
+    >>> vars["CC_armv7_linux_androideabi"]
+    '/ndk/armv7a-linux-androideabi26-clang'
+    >>> vars["CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER"]
+    '/ndk/armv7a-linux-androideabi26-clang'
+    >>> vars["AR_armv7_linux_androideabi"]
+    '/ndk/llvm-ar'
+
+    The compiler is also the linker: the NDK's wrapper is what knows the
+    sysroot and the runtime, and invoking bare `ld` misses both.
+    """
+    lower = abi.rust.replace("-", "_")
+    upper = lower.upper()
+    archiver = str(Path(compiler).parent / "llvm-ar")
+    return {
+        f"CC_{lower}": compiler,
+        f"AR_{lower}": archiver,
+        f"CARGO_TARGET_{upper}_LINKER": compiler,
+    }
+
+
+def compiler(ndk: Path, abi: Abi, api: int, host: str) -> Path:
+    """Where the NDK keeps the clang wrapper for `abi` at `api`.
+
+    >>> path = compiler(Path("/ndk"), ABIS["arm64-v8a"], 26, "Linux")
+    >>> str(path)
+    '/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang'
+
+    The 32-bit ARM row is the one this function exists for: the wrapper is
+    named after the *NDK's* triple, not Rust's.
+
+    >>> compiler(Path("/ndk"), ABIS["armeabi-v7a"], 26, "Linux").name
+    'armv7a-linux-androideabi26-clang'
+
+    A host the NDK ships no toolchain for is an error, not a guess.
+
+    >>> compiler(Path("/ndk"), ABIS["x86"], 26, "Plan9")
+    Traceback (most recent call last):
+    ValueError: the NDK ships no prebuilt toolchain for Plan9
+    """
+    tag = HOST_TAGS.get(host)
+    if tag is None:
+        raise ValueError(f"the NDK ships no prebuilt toolchain for {host}")
+    return ndk / "toolchains/llvm/prebuilt" / tag / "bin" / f"{abi.clang}{api}-clang"
+
+
+def lookup(name: str) -> Abi:
+    """The ABI called `name`, or a refusal naming what is on offer.
+
+    >>> lookup("x86_64").rust
+    'x86_64-linux-android'
+    >>> lookup("arm64")
+    Traceback (most recent call last):
+    KeyError: "no such ABI 'arm64'; the NDK has arm64-v8a, armeabi-v7a, x86, x86_64"
+    """
+    try:
+        return ABIS[name]
+    except KeyError:
+        offered = ", ".join(ABIS)
+        raise KeyError(f"no such ABI {name!r}; the NDK has {offered}") from None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    what = parser.add_mutually_exclusive_group(required=True)
+    what.add_argument("--abis", action="store_true", help="every ABI name")
+    what.add_argument("--target", metavar="ABI", help="the Rust target triple")
+    what.add_argument(
+        "--env", metavar="ABI", help="CC/AR/linker assignments for $GITHUB_ENV"
+    )
+    what.add_argument(
+        "--selftest", action="store_true", help="run this module's doctests and exit"
+    )
+    parser.add_argument(
+        "--api", type=int, default=DEFAULT_API, help="Android API level"
+    )
+    parser.add_argument(
+        "--ndk",
+        type=Path,
+        default=None,
+        help="NDK root; defaults to $ANDROID_NDK_LATEST_HOME, then $ANDROID_NDK_HOME",
+    )
+    arguments = parser.parse_args(argv)
+
+    # A flag rather than a `python -m doctest` invocation, so the tests run
+    # under the interpreter the PEP 723 block pins.
+    if arguments.selftest:
+        results = doctest.testmod(
+            verbose=False, optionflags=doctest.IGNORE_EXCEPTION_DETAIL
+        )
+        print(
+            f"android: {results.attempted} doctests, {results.failed} failed",
+            file=sys.stderr,
+        )
+        return Exit.ERROR if results.failed else Exit.OK
+
+    if arguments.abis:
+        print("\n".join(ABIS))
+        return Exit.OK
+
+    try:
+        abi = lookup(arguments.target or arguments.env)
+    except KeyError as refusal:
+        print(refusal.args[0], file=sys.stderr)
+        return Exit.UNKNOWN_ABI
+
+    if arguments.target:
+        print(abi.rust)
+        return Exit.OK
+
+    root = arguments.ndk or Path(
+        os.environ.get("ANDROID_NDK_LATEST_HOME")
+        or os.environ.get("ANDROID_NDK_HOME")
+        or ""
+    )
+    if not root.name:
+        print("no NDK: set --ndk or ANDROID_NDK_LATEST_HOME", file=sys.stderr)
+        return Exit.ERROR
+
+    try:
+        clang = compiler(root, abi, arguments.api, platform.system())
+    except ValueError as refusal:
+        print(refusal.args[0], file=sys.stderr)
+        return Exit.ERROR
+
+    # Checked before it is named. An environment variable pointing at nothing
+    # fails minutes later as a linker error mentioning neither this script nor
+    # the file it could not find.
+    if not clang.is_file():
+        print(f"no NDK compiler at {clang}", file=sys.stderr)
+        return Exit.ERROR
+
+    for key, value in cargo_variables(abi, str(clang)).items():
+        print(f"{key}={value}")
+    return Exit.OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

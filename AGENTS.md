@@ -131,6 +131,29 @@ dependency — which cargo does not cap lints for, so that crate's own `deny`
 attributes apply to us. Without the flag this command compiles a different
 graph than the campaign it stands in for.
 
+## Releases
+
+**Every push to `main` publishes a pre-release.** `.github/workflows/release.yml`
+builds four Android shared objects and two Windows DLLs, attaches SLSA build
+provenance, and creates a GitHub release tagged
+`v<major>.<minor>.<patch>-dev.<yyyy-mm-dd>.<hh-mm-ss>.<commit>`. Two downstream
+applications consume those artefacts, so a red `main` is a broken build in
+somebody else's repository — the workflow runs its own gate for that reason
+rather than trusting `ci.yml` to have finished first.
+
+A **release** is the one thing a human does: push a `vMAJOR.MINOR.PATCH` tag.
+`scripts/release.py --check` refuses a tag that disagrees with `Cargo.toml`, so
+bump the crate version in the same commit you intend to tag.
+
+The two tables the pipeline stands on are `scripts/release.py` (the tag algebra
+— a pre-release sorts below the release it heads toward, and later builds sort
+later) and `scripts/android.py` (Gradle's ABI name, Rust's target, and the NDK's
+compiler triple, which do not all agree). Their doctests *are* those laws and
+run in the `check` job. Change either table only with its selftest.
+
+`api/artifacts.md` is what downstream reads. A change to what is published, how
+it is laid out, or how it is verified is a change to that page first.
+
 Update the owning document when a decision, constraint, acceptance criterion,
 dependency, risk, or verification status changes. Record unresolved claims in
 [docs/verification.md](docs/verification.md), never as settled fact.

@@ -14,6 +14,10 @@ written in Kotlin and C#, so the C boundary is the interface — not a wrapper
 over a "real" Rust one. The Rust API is a third consumer with the same standing
 as the other two.
 
+**You do not build it.** Every binary is published by GitHub Actions, signed
+with build provenance, and attached to a release —
+[artifacts.md](artifacts.md) is where to get one and how to check it.
+
 | You are writing | Start at |
 | --- | --- |
 | **Kotlin / Java** (Android) | [android.md](android.md) |
@@ -23,6 +27,7 @@ as the other two.
 
 | Then read | What it answers |
 | --- | --- |
+| [artifacts.md](artifacts.md) | **Where the binaries are**, which release to pin, and how to verify one |
 | [obligations.md](obligations.md) | **What each side owes the other.** Threading, ownership, blocking, failure. Read this one whatever language you are in. |
 | [abi.md](abi.md) | Every type, every function, every status code, and the exact width of every field |
 | [configuration.md](configuration.md) | Every knob, its default, and its constraint |
