@@ -32,12 +32,14 @@ pub struct RustTarget(&'static str);
 
 /// What the NDK names its compiler wrappers after.
 ///
-/// **Separate from [`RustTarget`] because they are not always the same string.**
-/// `armeabi-v7a` is `armv7-linux-androideabi` to Rust and
-/// `armv7a-linux-androideabi` to the NDK — one letter, in the one position
-/// where a wrong guess is a missing file at link time on one ABI in four.
-/// Deriving either from the other is correct for the other three, which is what
-/// makes the mistake survive review.
+/// **Separate from [`RustTarget`] because the two are independently defined,
+/// not because they currently differ.** They agree on every ABI shipped today,
+/// and that is a coincidence of which three those are: `armeabi-v7a` was
+/// `armv7-linux-androideabi` to Rust and `armv7a-linux-androideabi` to the NDK
+/// — one letter, in the one position where a wrong guess is a missing file at
+/// link time. It was dropped for reach, not for that; nothing stops the next
+/// ABI diverging the same way, and `the_two_triples_are_not_one_type` keeps the
+/// case on file.
 ///
 /// > **Note:** For 32-bit ARM, the compiler is prefixed with
 /// > `armv7a-linux-androideabi`, but the binutils tools are prefixed with
@@ -78,19 +80,23 @@ pub struct Abi {
     pub ndk: NdkTriple,
 }
 
-/// The four ABIs the NDK supports, and the only four values of [`Abi`] that
-/// exist: the fields are public but the type is only ever read from here, so a
-/// value of this type is the proof that the NDK has a toolchain for it.
-pub const ABIS: [Abi; 4] = [
+/// The ABIs this project ships, and the only values of [`Abi`] that exist: the
+/// fields are public but the type is only ever read from here, so a value of
+/// this type is the proof that the NDK has a toolchain for it.
+///
+/// **`armeabi-v7a` is deliberately absent.** Google requires 64-bit for each
+/// 32-bit architecture shipped and nothing in the other direction — "for each
+/// native 32-bit architecture you support you must include the corresponding
+/// 64-bit architecture" — so omitting it is compliant. It is also where the
+/// platform is going: 16 KB pages, mandatory for API 35 and above, exist only
+/// on arm64, so a 32-bit ARM device cannot run a current Android at all. What
+/// remains is a shrinking tail of Android Go class handsets, which is not the
+/// hardware that terminates TLS and rewrites HTML under a memory budget.
+pub const ABIS: [Abi; 3] = [
     Abi {
         gradle: GradleAbi("arm64-v8a"),
         rust: RustTarget("aarch64-linux-android"),
         ndk: NdkTriple("aarch64-linux-android"),
-    },
-    Abi {
-        gradle: GradleAbi("armeabi-v7a"),
-        rust: RustTarget("armv7-linux-androideabi"),
-        ndk: NdkTriple("armv7a-linux-androideabi"),
     },
     Abi {
         gradle: GradleAbi("x86"),
@@ -349,35 +355,46 @@ mod tests {
         Abi::find(name).expect("a name from the table")
     }
 
-    /// The reason [`RustTarget`] and [`NdkTriple`] are different types. If they
-    /// were one type, this row would be a `.clone()` nobody questioned.
+    /// **Why [`RustTarget`] and [`NdkTriple`] stay two types now that no shipped
+    /// ABI distinguishes them.**
+    ///
+    /// Every row below agrees, and a maintainer reading only the table would be
+    /// right to ask why one string needs two names for it. This is the answer,
+    /// kept as a fixture rather than as a comment: `armeabi-v7a`, which this
+    /// project shipped until it was dropped for reach, disagreed. Merging the
+    /// types would compile today and silently mis-name a compiler the day
+    /// anything like it is added back.
     #[test]
-    fn the_two_triples_differ_on_exactly_one_abi() {
-        let differing: Vec<_> = ABIS
-            .iter()
-            .filter(|a| a.rust.as_str() != a.ndk.as_str())
-            .map(|a| a.gradle.as_str())
-            .collect();
-        assert_eq!(
-            differing,
-            ["armeabi-v7a"],
-            "if this set changes, deriving one triple from the other is wrong \
-             in a new place too"
+    fn the_two_triples_are_not_one_type() {
+        assert!(
+            ABIS.iter().all(|a| a.rust.as_str() == a.ndk.as_str()),
+            "a shipped ABI now distinguishes them; say so here rather than \
+             leaving this test asserting the opposite of the table"
         );
-        assert_eq!(abi("armeabi-v7a").rust.as_str(), "armv7-linux-androideabi");
-        assert_eq!(abi("armeabi-v7a").ndk.as_str(), "armv7a-linux-androideabi");
+
+        // The case on file. One letter, and the NDK's own documentation is why:
+        // "For 32-bit ARM, the compiler is prefixed with
+        // `armv7a-linux-androideabi`, but the binutils tools are prefixed with
+        // `arm-linux-androideabi`."
+        let armv7 = Abi {
+            gradle: GradleAbi("armeabi-v7a"),
+            rust: RustTarget("armv7-linux-androideabi"),
+            ndk: NdkTriple("armv7a-linux-androideabi"),
+        };
+        assert_ne!(armv7.rust.as_str(), armv7.ndk.as_str());
+        assert!(Abi::find("armeabi-v7a").is_none(), "dropped, not hidden");
     }
 
     /// The table is the domain: a name outside it has no `Abi` to become.
     #[test]
-    fn only_the_four_abis_the_ndk_supports_exist() {
-        assert_eq!(ABIS.len(), 4);
+    fn only_the_shipped_abis_exist() {
+        assert_eq!(ABIS.len(), 3);
         assert!(Abi::find("arm64").is_none());
         assert!(
             Abi::find("aarch64-linux-android").is_none(),
             "that is a target, not an ABI"
         );
-        for expected in ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] {
+        for expected in ["arm64-v8a", "x86", "x86_64"] {
             assert_eq!(abi(expected).gradle.as_str(), expected);
         }
     }
@@ -450,14 +467,15 @@ mod tests {
 
     /// The wrapper names the *Gradle* ABI, which is what the NDK's own
     /// toolchain file expects — not the Rust target and not the compiler
-    /// triple. The one ABI where those differ is the one that proves it.
+    /// triple. `arm64-v8a` proves it: its Gradle name shares no substring with
+    /// `aarch64-linux-android`.
     #[test]
     fn the_wrapper_names_the_gradle_abi() {
         let root = fake_ndk("wrapper", &[Half::C, Half::Cxx]);
         let ndk = Ndk::open(root, HostTag::Linux).expect("an NDK");
-        let cmake = ndk.cmake_wrapper(abi("armeabi-v7a"), ApiLevel::MIN);
-        assert!(cmake.contains("\"armeabi-v7a\""), "{cmake}");
-        assert!(!cmake.contains("armv7"), "{cmake}");
+        let cmake = ndk.cmake_wrapper(abi("arm64-v8a"), ApiLevel::MIN);
+        assert!(cmake.contains("\"arm64-v8a\""), "{cmake}");
+        assert!(!cmake.contains("aarch64"), "{cmake}");
     }
 
     // --- fixtures ------------------------------------------------------

@@ -221,7 +221,7 @@ mod tests {
     /// stops it drifting from the table.
     #[test]
     fn the_abi_list_is_the_table() {
-        assert_eq!(abis(), "arm64-v8a\narmeabi-v7a\nx86\nx86_64\n");
+        assert_eq!(abis(), "arm64-v8a\nx86\nx86_64\n");
     }
 
     #[test]
@@ -233,8 +233,8 @@ mod tests {
     #[test]
     fn every_abi_resolves_to_its_rust_target() {
         assert_eq!(
-            android_target("armeabi-v7a").expect("in the table"),
-            "armv7-linux-androideabi\n"
+            android_target("arm64-v8a").expect("in the table"),
+            "aarch64-linux-android\n"
         );
     }
 

@@ -18,8 +18,11 @@ reference.
 
 ### ABIs
 
-The NDK supports four: `armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64`. The Play
-Store and the package manager look for them at a fixed path inside the APK:
+The NDK supports four. **Boreas ships three: `arm64-v8a`, `x86_64`, and
+`x86`.** `armeabi-v7a` is deliberately not built — see [below](#no-32-bit-arm).
+
+The Play Store and the package manager look for them at a fixed path inside the
+APK:
 
 > Both the Play Store and Package Manager expect to find NDK-generated libraries
 > on filepaths inside the APK matching the following pattern:
@@ -31,6 +34,45 @@ Gradle's `jniLibs` source set maps onto that, so build one `libboreas.so` per
 ABI you ship and place each at `src/main/jniLibs/<abi>/libboreas.so`.
 
 Ship `arm64-v8a` at minimum. `x86_64` is worth it for the emulator.
+
+<a id="no-32-bit-arm"></a>
+
+### No 32-bit ARM
+
+There is no `armeabi-v7a` build and there will not be one without a partner who
+needs it. Three reasons, in the order they matter:
+
+**It is compliant.** Google's requirement runs one way only:
+
+> It isn't required to support every 64-bit architecture, but for each native
+> 32-bit architecture you support you must include the corresponding 64-bit
+> architecture.
+>
+> — [Support 64-bit architectures](https://developer.android.com/google/play/requirements/64-bit)
+
+32-bit obliges 64-bit; 64-bit obliges nothing. An app whose only ARM library is
+`arm64-v8a` is a supported app.
+
+**The platform has already left.** 16 KB page sizes — mandatory for anything
+targeting API 35 and above, with a hard cutoff on 1 February 2027 — exist only
+on arm64. A 32-bit ARM device cannot run a current Android at all, so what is
+left is a shrinking tail rather than a market.
+
+**It is not this product's hardware.** What remains 32-bit under `minSdk 26` is
+Android Go class: a handset that is a poor host for a tunnel that terminates
+TLS, forges certificates, and rewrites HTML under a memory budget.
+
+**What this means for you.** Nothing you have to do. An App Bundle's device
+targeting is derived from the native libraries it contains, so Play simply does
+not offer the app to a device with no ABI in common — which is the outcome you
+want, and is not a runtime failure. If you build APKs by hand rather than an
+AAB, set `ndk.abiFilters` to exactly the set above so the same is true there.
+
+Beware the "9–10% of devices are still armeabi-v7a" figure. A 64-bit device
+reports `arm64-v8a`, `armeabi-v7a`, *and* `armeabi` as supported, so that number
+counts devices that merely *can* run 32-bit. The share that *requires* it is far
+smaller, and only your own Play Console can tell you what it is for your users.
+If it turns out to matter, say so: adding the ABI back is two lines.
 
 ### 16 KB page sizes
 

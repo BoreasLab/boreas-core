@@ -158,8 +158,9 @@ rule now is that a pipeline decision is a type, not a string:
   one. `Event` and `Publish` are sums, so "a release with no tag" cannot be
   written down and the workflow needs no branch.
 - `xtask::android` is the ABI table. Gradle's name, Rust's target, and the NDK's
-  compiler triple are three *different types*, because they are not the same
-  string for `armeabi-v7a` and passing one for another used to link. `Ndk` and
+  compiler triple are three *different types*, because they are independently
+  defined — they agreed on nothing but luck for `armeabi-v7a`, and passing one
+  for another used to link. `Ndk` and
   `Compiler` have no constructor that does not check the files exist, so an
   environment naming `CC` without `CXX` is unrepresentable rather than caught.
 

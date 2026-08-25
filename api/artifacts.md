@@ -16,17 +16,17 @@ targeting that platform:
 - **The Windows DLL can only be built on Windows**, against MSVC. There is no
   cross-compile from Linux or macOS worth maintaining.
 - **The Android shared objects need the NDK**, one clang per ABI, and produce
-  four files that must agree about the API level they were built for.
+  a file per ABI that must all agree about the API level they were built for.
 
-Reproducing that on four machines is four chances to ship a binary nobody else
-can reproduce. One builder, attested, is the whole point.
+Reproducing that on every machine that wants one is a chance per machine to ship
+a binary nobody else can reproduce. One builder, attested, is the whole point.
 
 ## The two kinds of release
 
 | | Tag | Cut by | Marked |
 | --- | --- | --- | --- |
 | **Release** | `v0.4.2` | a human, deliberately | Latest |
-| **Pre-release** | `v0.4.3-dev.2026-08-24.11-30-00.a1b2c3d4e5f6` | every push to `main` | Pre-release |
+| **Pre-release** | `v0.4.3-dev.2026-08-25.11-30-00.g1a2b3c4` | every push to `main` | Pre-release |
 
 A pre-release is named for the patch that **has not happened yet**, stamped with
 the build time and the commit it was built from. That is not decoration: both
@@ -35,7 +35,10 @@ its version — so `v0.4.3-dev.…` comes after `v0.4.2` and before `v0.4.3`, an
 tool that sorts tags gets "newest" right without knowing any of this.
 
 The stamp reads `yyyy-mm-dd.hh-mm-ss`, zero-padded, in UTC. Fixed widths are what
-make later builds sort later.
+make later builds sort later. The commit is seven hex digits behind a `g`, the
+way `git describe` writes one: SemVer compares an all-digit identifier
+numerically and ranks it below every alphanumeric one, so a hash that happened to
+be all digits would sort beneath its siblings.
 
 **Which to use.** During integration, a pre-release: it tracks `main` and you get
 a fix the day it lands. Pin the exact tag — never "latest pre-release" — so your
@@ -53,7 +56,6 @@ expects, so unpacking is a copy and never a rename.
 ```
 boreas-0.4.2-android.tar.gz
   jniLibs/arm64-v8a/libboreas.so
-  jniLibs/armeabi-v7a/libboreas.so
   jniLibs/x86/libboreas.so
   jniLibs/x86_64/libboreas.so
   include/boreas.h
@@ -65,6 +67,8 @@ boreas-0.4.2-windows.zip
 ```
 
 `jniLibs/<abi>/` is Gradle's source set: copy it over `src/main/jniLibs/`.
+There is no `armeabi-v7a`, deliberately —
+[android.md](android.md#no-32-bit-arm) says why.
 `runtimes/<rid>/native/` is the layout .NET resolves a native dependency from.
 
 `boreas.h` ships in both. Neither Kotlin nor C# includes it, but it is the source
