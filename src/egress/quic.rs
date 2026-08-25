@@ -1,40 +1,14 @@
-//! A QUIC client connection whose bidirectional streams are ordinary async
-//! byte streams.
+//! QUIC client whose bidirectional streams are async byte streams.
 //!
-//! Every stream egress so far obtains its byte stream from
-//! [`TunnelBypass::tcp`](crate::TunnelBypass) — one socket, one connection, and
-//! the kernel does the multiplexing. Hysteria2's streams live *inside* a QUIC
-//! connection, so something has to own the UDP socket and the
-//! `quiche::Connection` and hand out each bidirectional stream separately. That
-//! is what this module is.
+//! Hysteria2 multiplexes its streams and datagrams inside one QUIC connection.
+//! This module owns the UDP socket and `quiche::Connection`, while
+//! [`crate::bridge`] exposes bounded stream channels to each consumer.
 //!
-//! **It is the same bridge `src/l4/terminate.rs` builds, against a different state
-//! machine.** `quiche` is sans-io exactly as `smoltcp` is, so both need a task
-//! that owns the I/O, both hand each stream to a consumer over bounded
-//! channels, and both take backpressure from the transport's own flow control
-//! rather than by dropping bytes. The channels and the stream type are
-//! [`crate::bridge`]'s, shared; only the pump differs, because the two stacks
-//! disagree about how a peer's FIN and a partial write are reported and
-//! flattening that difference would obscure both.
-//!
-//! **Three phases, and each is a separate type, so a connection cannot be used
-//! out of order.** [`Handshake::establish`] returns only once the peer has
-//! completed the TLS handshake; [`Handshake::http3`] performs the one request a
-//! protocol authenticates with; [`Handshake::drive`] consumes the handshake and
-//! yields a [`QuicConnection`] that opens streams. There is no way to open a
-//! stream before authentication because [`QuicConnection`] does not exist until
-//! the value that could authenticate has been consumed.
-//!
-//! **HTTP/3 is left behind deliberately once it has done its job.** `quiche`'s
-//! `h3::Connection` parses every readable stream as HTTP/3, and Hysteria2's
-//! proxy framing would be mistaken for HTTP/3 frames if it saw one — its
-//! `0x401` frame type is an *unknown* HTTP/3 frame type, which HTTP/3 requires
-//! be skipped along with its length, so the parser would silently consume the
-//! address and padding as an extension frame it was told to ignore. So the h3
-//! layer is dropped after the response arrives, before any proxy stream exists,
-//! and the driver never constructs another. The server's control and QPACK
-//! streams that h3 leaves behind are drained and discarded by stream id, which
-//! keeps their flow control moving without interpreting them.
+//! [`Handshake::establish`], [`Handshake::http3`], and [`Handshake::drive`] are
+//! separate phases. Authentication completes before a [`QuicConnection`] can
+//! open proxy streams. HTTP/3 is dropped after its one authentication request;
+//! proxy framing must never be parsed as HTTP/3, while leftover control and
+//! QPACK streams are drained by id to maintain flow control.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -53,33 +27,23 @@ use crate::{
     bridge::{BridgedStream, CHUNK, Plumbing, pair},
 };
 
-/// Read/write bound; QUIC handles path MTU, and 1500 covers ordinary Ethernet.
+/// Maximum UDP datagram buffer.
 const MAX_DATAGRAM: usize = 1500;
 
-/// Whole-dial timeout, including QUIC handshake, HTTP/3 settings, and auth.
+/// Deadline for handshake, HTTP/3 settings, and authentication.
 const HANDSHAKE_TIMEOUT: Duration = crate::Wait::ProxyDial.budget();
 
-/// Commands in flight toward the driver. Bounded, because an unbounded command
-/// queue is an unbounded number of half-open streams.
+/// Bounded command queue for the driver.
 const COMMAND_DEPTH: usize = 16;
 
-/// Inbound datagrams held for a claimant that is not reading fast enough.
-/// Bounded and lossy, for the reason every other datagram queue in this crate
-/// is: blocking a datagram producer turns loss into head-of-line delay, and the
-/// producer here is a connection carrying every other flow as well.
+/// Bounded inbound datagram queue. A slow claimant loses packets rather than
+/// blocking other flows on the connection.
 const DATAGRAM_DEPTH: usize = 256;
 
-/// A `quiche::Config` with the transport limits a stream-carrying connection
-/// needs.
+/// Builds a QUIC client configuration for stream traffic.
 ///
-/// **Certificate verification is the caller's to set**, exactly as it is for
-/// [`MasqueEgress::client_config`](crate::MasqueEgress::client_config), and for
-/// the same reason: a test proxy and a production one differ there and nowhere
-/// else. `quiche` verifies by default, so a caller that does nothing gets the
-/// safe behaviour and a caller that wants otherwise has to say so.
-///
-/// The stream windows are sized for bulk transfer rather than for control
-/// traffic, because unlike MASQUE's request stream these carry the payload.
+/// Certificate verification remains the caller's choice. `quiche` verifies by
+/// default; tests may explicitly disable it.
 pub fn client_config(
     alpn: &[&[u8]],
     idle_timeout: Duration,
@@ -92,59 +56,45 @@ pub fn client_config(
     config.set_max_idle_timeout(idle_timeout.as_millis() as u64);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM);
-    // Connection and stream windows. The connection window is the ceiling on
-    // all streams at once; the per-stream window is what one transfer can have
-    // in flight, and it must exceed the bandwidth-delay product or a single
-    // download stalls waiting for window updates on a long path.
+    // Set connection and stream flow-control windows for bulk transfer.
     config.set_initial_max_data(16 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_local(4 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_remote(4 * 1024 * 1024);
     config.set_initial_max_stream_data_uni(1024 * 1024);
-    // These bound what the *peer* may open toward us. A proxy has no business
-    // opening request streams back, but HTTP/3 needs its unidirectional control
-    // and QPACK streams, so uni is not zero.
+    // Peers cannot open request streams, but HTTP/3 still needs uni streams.
     config.set_initial_max_streams_bidi(0);
     config.set_initial_max_streams_uni(8);
     Ok(config)
 }
 
-/// A far-future wake for a connection with no timer pending. Keeps the
-/// `select!` arm well formed without waking the task to find nothing to do.
+/// Returns a distant wake time when no QUIC timer is pending.
 fn no_deadline() -> TokioInstant {
     TokioInstant::now() + Duration::from_secs(3600)
 }
 
-/// A QUIC connection that has completed its handshake and is not yet owned by a
-/// driver task.
+/// Handshaken QUIC connection not yet owned by a driver.
 ///
-/// It exists as a separate type so that the authentication a protocol performs
-/// before carrying traffic happens somewhere that *cannot* also open a proxy
-/// stream — see the module note on why HTTP/3 and proxy streams must not share
-/// a connection's readable set.
+/// The type boundary prevents proxy streams from opening before authentication.
 pub struct Handshake {
     conn: quiche::Connection,
     socket: UdpSocket,
     peer: SocketAddr,
     local: SocketAddr,
-    /// The next client-initiated bidirectional stream id to hand out. Client
-    /// bidi ids are `0, 4, 8, …` (RFC 9000 §2.1); this advances past whatever
-    /// [`Handshake::http3`] consumed, so a proxy stream can never collide with
-    /// the authentication request's.
+    /// Next client bidirectional stream id. HTTP/3 authentication advances it
+    /// before proxy streams are allocated.
     next_stream_id: u64,
 }
 
-/// What an HTTP/3 request on a fresh connection answered.
+/// Response headers from the HTTP/3 authentication request.
 #[derive(Clone, Debug)]
 pub struct H3Response {
     pub status: u16,
-    /// Every other header, lowercased by HTTP/3 itself, in arrival order.
+    /// Non-pseudo headers in arrival order.
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl H3Response {
-    /// The first value for `name`, as UTF-8. `None` when absent or not UTF-8,
-    /// which a caller treats as "the server did not say", because a header a
-    /// peer garbled is not information.
+    /// Returns the first UTF-8 value for `name`, if present.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -154,13 +104,7 @@ impl H3Response {
 }
 
 impl Handshake {
-    /// Opens a QUIC connection to `peer` over `socket` and returns once the
-    /// handshake has completed.
-    ///
-    /// `socket` must already be connected to `peer` — that is what
-    /// [`TunnelBypass::udp`](crate::TunnelBypass) returns, and it is also what
-    /// makes the socket exempt from Boreas's own tunnel, which a connection
-    /// carrying the tunnel's traffic must be.
+    /// Opens a QUIC connection over a UDP socket after it is connected to `peer`.
     pub async fn establish(
         socket: UdpSocket,
         peer: SocketAddr,
@@ -194,12 +138,10 @@ impl Handshake {
         Ok(handshake)
     }
 
-    /// Performs one HTTP/3 request and returns its response headers.
+    /// Sends the header-only HTTP/3 authentication request.
     ///
-    /// The request carries no body and is finished immediately, because the one
-    /// caller for this is an authentication exchange whose entire content is in
-    /// its headers. The h3 connection is dropped before returning: see the
-    /// module note on why it must not outlive its single use.
+    /// The HTTP/3 connection is dropped after the response so proxy framing is
+    /// not parsed as HTTP/3.
     pub async fn http3(
         &mut self,
         headers: &[quiche::h3::Header],
@@ -210,15 +152,12 @@ impl Handshake {
         let stream_id = h3
             .send_request(&mut self.conn, headers, true)
             .map_err(|_| EgressError::Quic)?;
-        // Everything h3 opened is now spoken for. A proxy stream starts after
-        // it, so the two framings never share an id.
+        // Reserve stream ids after the authentication request.
         self.next_stream_id = stream_id + 4;
 
         let mut response = None;
         self.pump_until(|this| {
-            // Borrowing `h3` inside a closure that also takes `this` would
-            // conflict, so the poll happens here and the predicate only reports
-            // what it found.
+            // Keep the HTTP/3 borrow local to this polling closure.
             loop {
                 match h3.poll(&mut this.conn) {
                     Ok((_, quiche::h3::Event::Headers { list, .. })) => {
@@ -228,9 +167,7 @@ impl Handshake {
                             .and_then(|header| std::str::from_utf8(header.value()).ok())
                             .and_then(|value| value.parse::<u16>().ok());
                         let Some(status) = status else {
-                            // A response without a parseable status is not a
-                            // response; stopping here surfaces it as a timeout
-                            // rather than as a wrong success.
+                            // Ignore headers without a parseable status.
                             continue;
                         };
                         response = Some(H3Response {
@@ -252,11 +189,10 @@ impl Handshake {
         response.ok_or(EgressError::Quic)
     }
 
-    /// Hands the connection to a background task and returns the handle that
-    /// opens streams on it.
+    /// Starts the background driver and returns its stream handle.
     ///
-    /// The task ends when `shutdown` is cancelled, when the connection closes,
-    /// or when the last handle is dropped — whichever happens first.
+    /// The driver stops on cancellation, connection close, or after all handles
+    /// are dropped and open streams finish.
     pub fn drive(self, shutdown: CancellationToken) -> QuicConnection {
         let (commands, receiver) = mpsc::channel(COMMAND_DEPTH);
         let wake = Arc::new(Notify::new());
@@ -276,20 +212,12 @@ impl Handshake {
         QuicConnection { commands }
     }
 
-    /// Drives the socket and the connection until `ready` reports satisfaction,
-    /// the connection closes, or the handshake deadline passes.
-    ///
-    /// This is the pre-task loop: it exists because both establishing and
-    /// authenticating need I/O before there is anywhere to spawn it, and
-    /// because both want a deadline rather than a background lifetime.
+    /// Drives pre-driver I/O until `ready`, connection close, or timeout.
     async fn pump_until(
         &mut self,
         mut ready: impl FnMut(&mut Self) -> bool,
     ) -> Result<(), EgressError> {
-        // The scratch buffers are locals rather than fields on purpose: a
-        // `select!` arm reading into `self.recv_scratch` and a handler writing
-        // through `self.conn` would be two borrows of `self`, and hoisting them
-        // out is cheaper than the dance required to keep them inside.
+        // Locals avoid overlapping borrows of the connection during `select!`.
         let mut inbound = [0u8; MAX_DATAGRAM];
         let mut outbound = [0u8; MAX_DATAGRAM];
         let deadline = TokioInstant::now() + HANDSHAKE_TIMEOUT;
@@ -301,8 +229,7 @@ impl Handshake {
             if self.conn.is_closed() {
                 return Err(EgressError::Quic);
             }
-            // The earlier of QUIC's own timer and the handshake deadline, so a
-            // loss recovery timeout still fires inside a bounded wait.
+            // Honor QUIC loss recovery without exceeding the dial deadline.
             let timer = self
                 .conn
                 .timeout()
@@ -313,8 +240,7 @@ impl Handshake {
                 result = self.socket.recv(&mut inbound) => {
                     let read = result?;
                     let info = quiche::RecvInfo { from: self.peer, to: self.local };
-                    // A datagram this connection cannot parse is not fatal: on
-                    // a shared path it may not even be addressed to us.
+                    // Ignore datagrams that this connection cannot parse.
                     let _ = self.conn.recv(&mut inbound[..read], info);
                 }
                 () = sleep_until(timer) => {
@@ -333,10 +259,7 @@ impl Handshake {
     }
 }
 
-/// Drains `quiche`'s send queue onto the socket.
-///
-/// Free rather than a method because both the pre-task handshake loop and the
-/// driver need it and they do not share a `self`.
+/// Drains `quiche`'s send queue onto the UDP socket.
 async fn flush(
     conn: &mut quiche::Connection,
     socket: &UdpSocket,
@@ -352,9 +275,7 @@ async fn flush(
     }
 }
 
-/// A handle to a live QUIC connection. Cloneable, and every clone opens streams
-/// on the same connection — which is the point, because a proxy protocol
-/// multiplexes every flow it carries over one.
+/// Cloneable handle for opening streams and using datagrams on one connection.
 #[derive(Clone)]
 pub struct QuicConnection {
     commands: mpsc::Sender<Command>,
@@ -364,23 +285,16 @@ enum Command {
     OpenBidi {
         reply: oneshot::Sender<BridgedStream>,
     },
-    /// One QUIC DATAGRAM to send. Owned, because the driver sends it on its own
-    /// schedule and the caller is not waiting.
+    /// Owned datagram for the driver to send.
     Send(Vec<u8>),
-    /// Claims the inbound datagram stream. Answered once; a second claimant
-    /// gets `None`, because two readers of one datagram stream would race for
-    /// each arriving packet and neither would see all of them.
+    /// Claims the single inbound datagram receiver.
     Receive {
         reply: oneshot::Sender<Option<mpsc::Receiver<Vec<u8>>>>,
     },
 }
 
 impl QuicConnection {
-    /// Opens a bidirectional stream.
-    ///
-    /// Fails when the driver has stopped, which is how a closed connection
-    /// reaches a caller: there is no separate liveness flag to consult and then
-    /// race against.
+    /// Opens a bidirectional stream, or fails if the driver has stopped.
     pub async fn open_bidi(&self) -> Result<BridgedStream, EgressError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -390,13 +304,10 @@ impl QuicConnection {
         response.await.map_err(|_| EgressError::Masque)
     }
 
-    /// Queues one QUIC DATAGRAM.
+    /// Queues one unreliable QUIC datagram.
     ///
-    /// **Unreliable by construction, and the caller must want that.** A
-    /// datagram that does not fit the path, or that arrives when the send queue
-    /// is full, is dropped and never retransmitted — which is the correct
-    /// behaviour for the thing this carries, a client's own UDP packet, and
-    /// would be wrong for anything else.
+    /// Oversized or transport-rejected datagrams are dropped because the payload
+    /// is a client's UDP packet.
     pub async fn send_datagram(&self, payload: Vec<u8>) -> Result<(), EgressError> {
         self.commands
             .send(Command::Send(payload))
@@ -404,22 +315,18 @@ impl QuicConnection {
             .map_err(|_| EgressError::Quic)
     }
 
-    /// Claims the inbound datagram stream, once.
+    /// Claims the inbound datagram stream once.
     ///
-    /// `None` if something already has it. One claimant is the shape a
-    /// multiplexing protocol needs anyway: every session on this connection
-    /// shares one datagram stream, so demultiplexing them is a job for the
-    /// protocol above rather than something several readers can race at.
+    /// A second claimant receives `None`; demultiplexing remains the caller's
+    /// responsibility.
     pub async fn receive_datagrams(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
         let (reply, response) = oneshot::channel();
         self.commands.send(Command::Receive { reply }).await.ok()?;
         response.await.ok().flatten()
     }
 
-    /// Whether the driver is still running. Advisory only — a connection can
-    /// close between this returning `true` and the next call to
-    /// [`Self::open_bidi`] — and useful for deciding whether to reuse a pooled
-    /// connection or dial a new one.
+    /// Advisory driver liveness check. The connection may close immediately
+    /// after this returns.
     pub fn is_alive(&self) -> bool {
         !self.commands.is_closed()
     }
@@ -434,9 +341,7 @@ struct Driver {
     next_stream_id: u64,
     streams: HashMap<u64, Plumbing>,
     commands: mpsc::Receiver<Command>,
-    /// Where inbound datagrams go, once something has claimed them. `None`
-    /// until then, so a connection whose protocol carries no datagrams pays
-    /// nothing for the ones it will never see.
+    /// Inbound datagram sink after a receiver claims it.
     datagrams: Option<mpsc::Sender<Vec<u8>>>,
     wake: Arc<Notify>,
     shutdown: CancellationToken,
@@ -447,9 +352,7 @@ impl Driver {
         let mut inbound = vec![0u8; MAX_DATAGRAM];
         let mut outbound = vec![0u8; MAX_DATAGRAM];
         let mut chunk = vec![0u8; CHUNK];
-        // Set once every handle is gone: the driver stops accepting new streams
-        // but keeps serving the ones already open, because a caller still
-        // holding a stream is still entitled to its bytes.
+        // Stop accepting streams after the last connection handle is dropped.
         let mut closing = false;
 
         loop {
@@ -480,9 +383,7 @@ impl Driver {
                 }
                 command = self.commands.recv(), if !closing => match command {
                     Some(command) => self.dispatch(command),
-                    // Every handle is gone, so no new stream can ever be asked
-                    // for. The open ones are still served until they finish;
-                    // breaking here would cut them off mid-response.
+                    // Keep existing streams alive after all handles disappear.
                     None => closing = true,
                 },
                 () = self.wake.notified() => {}
@@ -490,8 +391,7 @@ impl Driver {
             }
         }
 
-        // Say goodbye rather than vanishing: an application close lets the peer
-        // release the connection's state now instead of on its idle timer.
+        // Send an application close so the peer releases connection state.
         let _ = self.conn.close(true, 0x00, b"done");
         let _ = flush(&mut self.conn, &self.socket, &mut outbound).await;
     }
@@ -499,10 +399,8 @@ impl Driver {
     fn dispatch(&mut self, command: Command) {
         match command {
             Command::Send(payload) => {
-                // A datagram too large for the path, or one the send queue has
-                // no room for, is dropped here. That is the contract: the thing
-                // being carried is a UDP packet, and a UDP packet that does not
-                // arrive is a UDP packet that did not arrive.
+                // QUIC rejects oversized or unavailable datagrams; UDP loss is
+                // the expected result for this payload.
                 let _ = self.conn.dgram_send(&payload);
             }
             Command::Receive { reply } => {
@@ -511,17 +409,13 @@ impl Driver {
                     return;
                 }
                 let (sender, receiver) = mpsc::channel(DATAGRAM_DEPTH);
-                // The channel is kept only if the claimant is still there to
-                // read it; otherwise the driver would fill a queue nobody owns.
+                // Do not retain a sender when the claimant has already gone.
                 if reply.send(Some(receiver)).is_ok() {
                     self.datagrams = Some(sender);
                 }
             }
             Command::OpenBidi { reply } => {
-                // The peer's stream limit is a real refusal, not a wait: a
-                // caller that cannot have a stream now should learn it now and
-                // fail the flow, rather than block behind an unknown number of
-                // other flows finishing.
+                // Report an exhausted peer stream limit immediately.
                 if self.conn.peer_streams_left_bidi() == 0 {
                     return; // dropping `reply` is the refusal
                 }
@@ -535,18 +429,10 @@ impl Driver {
         }
     }
 
-    /// One servicing pass: move bytes in both directions for every live stream,
-    /// then retire the ones that finished in both.
-    ///
-    /// O(readable streams) for the inbound half and O(live streams) for the
-    /// outbound half. The latter is a sweep for the same reason the terminator's
-    /// is — at the stream counts one connection carries, probing a channel is
-    /// cheaper than maintaining a ready list.
+    /// Moves bytes in both directions and retires finished streams.
     fn service(&mut self, chunk: &mut [u8]) {
-        // Datagrams first, and drained fully: `quiche` holds them in a bounded
-        // queue that stops accepting once full, so leaving any behind would
-        // cost later ones. A claimant that is not keeping up loses packets
-        // rather than stalling the connection every stream on it shares.
+        // Drain the transport queue; a slow claimant loses packets rather than
+        // blocking streams on the same connection.
         if let Some(sink) = &self.datagrams {
             while let Ok(len) = self.conn.dgram_recv(chunk) {
                 if sink.try_send(chunk[..len].to_vec()).is_err() {
@@ -555,14 +441,11 @@ impl Driver {
             }
         }
 
-        // `readable()` yields an owned iterator, so the connection is free to
-        // be mutated inside the loop.
+        // The owned iterator permits stream mutation during the sweep.
         for id in self.conn.readable() {
             match self.streams.get_mut(&id) {
                 Some(plumbing) => pump_in(&mut self.conn, id, plumbing, chunk),
-                // A stream we do not own: HTTP/3's leftover control and QPACK
-                // streams. Draining keeps their flow control moving and keeps
-                // them out of the readable set; nothing interprets the bytes.
+                // Drain leftover HTTP/3 control and QPACK streams by id.
                 None => while self.conn.stream_recv(id, chunk).is_ok() {},
             }
         }
@@ -571,17 +454,16 @@ impl Driver {
             pump_out(&mut self.conn, id, plumbing);
         }
 
-        // A stream is done when the peer has finished sending and we have
-        // finished sending. Retiring it here is what bounds the map by live
-        // flows rather than by flows ever opened.
+        // Retain only streams with an active consumer or unfinished output.
         self.streams
             .retain(|_, plumbing| plumbing.to_task.is_some() || !plumbing.finished);
     }
 }
 
-/// Peer to consumer. A permit is taken *before* the stream is read, so bytes
-/// leave `quiche`'s receive buffer only when there is somewhere to put them;
-/// when there is not, the stream's window closes and the peer stops sending.
+/// Moves peer bytes to the consumer without exceeding channel capacity.
+///
+/// Reserving before reading lets QUIC flow control stop the peer when the
+/// consumer is full.
 fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf: &mut [u8]) {
     let mut finished = false;
     let mut abandoned = false;
@@ -589,9 +471,7 @@ fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf:
         let permit = match sender.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => break,
-            // The consumer dropped the stream. Nothing will ever read these
-            // bytes, so tell the peer to stop producing them rather than
-            // letting the window hold data no one wants.
+            // Stop receiving bytes no consumer can use.
             Err(mpsc::error::TrySendError::Closed(())) => {
                 abandoned = true;
                 break;
@@ -608,9 +488,7 @@ fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf:
                 }
             }
             Err(quiche::Error::Done) => break,
-            // A reset stream. The consumer sees end of stream, which is what
-            // `AsyncRead` can express; the distinction is documented on
-            // `BridgedStream` rather than smuggled into a byte count.
+            // AsyncRead exposes a reset as end of stream.
             Err(_) => {
                 finished = true;
                 break;
@@ -621,15 +499,12 @@ fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf:
         let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
     }
     if finished || abandoned {
-        // Dropping the sender gives the consumer its end of stream. Done
-        // outside the loop because a reserved permit borrows the very field
-        // being cleared.
+        // Drop the sender after any reserved permit is released.
         plumbing.to_task = None;
     }
 }
 
-/// Consumer to peer, without ever dropping a byte: the loop stops at the first
-/// sign of a full send buffer and resumes from the same chunk next pass.
+/// Moves consumer bytes to the peer without dropping partial writes.
 fn pump_out(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing) {
     if plumbing.finished {
         return;
@@ -640,8 +515,7 @@ fn pump_out(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing) {
             None => match plumbing.from_task.try_recv() {
                 Ok(chunk) => chunk,
                 Err(mpsc::error::TryRecvError::Empty) => return,
-                // The consumer shut down its write half and everything it wrote
-                // is already queued, so the stream's write half closes now.
+                // Close the peer write half after queued input is exhausted.
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     plumbing.finished = true;
                     let _ = conn.stream_send(id, &[], true);
@@ -651,21 +525,17 @@ fn pump_out(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing) {
         };
         match conn.stream_send(id, &chunk, false) {
             Ok(written) if written < chunk.len() => {
-                // A partial write is the flow control window filling up. Keep
-                // the tail exactly, and resume from it next pass.
+                // Preserve the unwritten tail for the next pass.
                 plumbing.pending_out = Some(chunk.slice(written..));
                 return;
             }
             Ok(_) => {}
-            // No capacity at all. The chunk goes back untouched; `Done` here
-            // means nothing was written, so keeping the whole chunk is correct
-            // rather than merely safe.
+            // `Done` wrote nothing, so retry the complete chunk later.
             Err(quiche::Error::Done) => {
                 plumbing.pending_out = Some(chunk);
                 return;
             }
-            // The peer reset the stream or the connection is gone. Marking it
-            // finished stops the sweep from retrying forever.
+            // Stop retrying a reset or closed stream.
             Err(_) => {
                 plumbing.finished = true;
                 return;
@@ -679,16 +549,10 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A QUIC server on loopback, serving exactly one connection.
+    /// Loopback QUIC server fixture for one connection.
     ///
-    /// **A real server rather than two in-process connections pumped by hand**,
-    /// because what is under test here is the driver: the socket, its timers,
-    /// and the loop that joins them. A harness that skipped the socket would
-    /// skip the half most likely to be wrong.
-    ///
-    /// It echoes: bytes on a stream come back on that stream, and a datagram
-    /// comes back as a datagram. That is enough to observe both directions of
-    /// everything this module offers.
+    /// It echoes streams and datagrams so both driver directions use a real
+    /// socket and timer loop.
     struct Echo {
         address: SocketAddr,
         shutdown: CancellationToken,
@@ -722,8 +586,7 @@ mod tests {
             }
 
             tokio::spawn(async move {
-                // The directory outlives the server, so `quiche` can still read
-                // the files if it reloads them.
+                // Keep certificate files alive for the server task.
                 let _dir = dir;
                 let mut config = config;
                 let mut inbound = vec![0u8; 2048];
@@ -734,13 +597,13 @@ mod tests {
 
                 loop {
                     if let Some(established) = conn.as_mut() {
-                        // Echo every readable stream.
+                        // Echo readable streams.
                         for id in established.readable() {
                             while let Ok((read, fin)) = established.stream_recv(id, &mut chunk) {
                                 let _ = established.stream_send(id, &chunk[..read], fin);
                             }
                         }
-                        // And every datagram.
+                        // Echo datagrams.
                         while let Ok(read) = established.dgram_recv(&mut chunk) {
                             let _ = established.dgram_send(&chunk[..read]);
                         }
@@ -793,9 +656,7 @@ mod tests {
             Self { address, shutdown }
         }
 
-        /// A client configuration that trusts this server's self-signed
-        /// certificate. Verification is the caller's to set, which is exactly
-        /// why `client_config` does not decide it.
+        /// Client configuration for the fixture's self-signed certificate.
         fn config(datagrams: bool) -> quiche::Config {
             let mut config = client_config(&[b"echo"], Duration::from_secs(10)).unwrap();
             config.verify_peer(false);
@@ -824,8 +685,7 @@ mod tests {
         }
     }
 
-    /// A real handshake over a real socket, and a stream that carries bytes
-    /// both ways through the driver task.
+    /// A stream carries bytes both ways through the driver task.
     #[tokio::test]
     async fn a_stream_carries_bytes_through_a_real_connection() {
         let echo = Echo::start(false).await;
@@ -847,8 +707,7 @@ mod tests {
         assert_eq!(&back, b"question");
     }
 
-    /// **The path Hysteria2's UDP rides.** A datagram out, the same datagram
-    /// back, through the driver's send command and its inbound queue.
+    /// A datagram crosses the driver and returns through its inbound queue.
     #[tokio::test]
     async fn a_datagram_crosses_and_comes_back() {
         let echo = Echo::start(true).await;
@@ -874,9 +733,7 @@ mod tests {
         assert_eq!(back, b"one datagram");
     }
 
-    /// Claimed once, and once is the right number: two readers of one datagram
-    /// stream would race for each arriving packet and neither would see all of
-    /// them.
+    /// The inbound datagram stream has exactly one claimant.
     #[tokio::test]
     async fn the_datagram_stream_is_claimed_exactly_once() {
         let echo = Echo::start(true).await;
@@ -894,13 +751,10 @@ mod tests {
         );
     }
 
-    /// **A black-holed path fails a connection instead of hanging one**, which
-    /// is the whole reason the handshake carries a deadline: nothing arrives to
-    /// say the peer is gone, so only a timer ever ends this.
+    /// A black-holed handshake ends at its deadline instead of hanging.
     #[tokio::test(start_paused = true)]
     async fn a_handshake_to_a_black_hole_gives_up_on_its_deadline() {
-        // Bound but never read, so packets are accepted by the OS and answered
-        // by nobody.
+        // The OS accepts packets, but no peer reads or answers them.
         let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = sink.local_addr().unwrap();
 
@@ -914,8 +768,7 @@ mod tests {
         assert!(matches!(outcome, Err(EgressError::Quic)));
     }
 
-    /// Cancelling the driver ends it, and a handle to a driver that has stopped
-    /// reports itself dead rather than accepting work nothing will do.
+    /// Cancellation stops the driver and closes its handle.
     #[tokio::test]
     async fn cancelling_the_driver_closes_the_connection() {
         let echo = Echo::start(false).await;
@@ -924,8 +777,7 @@ mod tests {
         assert!(connection.is_alive());
 
         shutdown.cancel();
-        // The driver observes cancellation, says goodbye, and drops its
-        // receiver; the handle notices when the channel closes.
+        // The handle observes the driver's closed command channel.
         for _ in 0..100 {
             if !connection.is_alive() {
                 return;

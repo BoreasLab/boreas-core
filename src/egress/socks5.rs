@@ -1,28 +1,9 @@
-//! SOCKS5 (RFC 1928) as a stream egress, with UDP ASSOCIATE.
+//! SOCKS5 (RFC 1928) stream egress with UDP ASSOCIATE.
 //!
-//! The protocol is small and entirely framed, so it splits cleanly the way the
-//! rest of this crate does: a **pure codec** that turns bytes into domain
-//! values and back, and a **thin driver** that owns the sockets. Everything
-//! interesting — address forms, reply codes, the datagram header — is in the
-//! first half and is tested without a socket.
-//!
-//! **Decoding is total, and "not yet" is not an error.** A reply's length
-//! depends on an address type that arrives inside it, so a reader cannot know
-//! in advance how many bytes to ask for. Every decoder therefore returns
-//! [`Decoded::Incomplete`] rather than guessing or blocking, and the driver
-//! reads more and retries. Confusing "truncated" with "malformed" is how a
-//! proxy client ends up either hanging on a valid reply or accepting a
-//! half-read one.
-//!
-//! **A name stays a name.** [`Target::Domain`] is encoded as `ATYP=3` rather
-//! than resolved locally, so the exit resolves it in its own DNS view; see
-//! [`Target`] for why that is a product property and not an optimisation.
-//!
-//! **UDP ASSOCIATE keeps its control connection.** RFC 1928 §7 ties the
-//! association's lifetime to the TCP connection that requested it, so the
-//! shared [`Relay`] holds that stream open and drops it with the last half of
-//! the association. Losing it silently is how a UDP relay stops working minutes
-//! after it appeared to start.
+//! Codecs decode complete values or report [`Decoded::Incomplete`]; the driver
+//! owns sockets and supplies more bytes. Domain targets remain unresolved so
+//! the proxy performs resolution in its own network. UDP associations retain
+//! their TCP control connection for the association's lifetime.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -36,9 +17,9 @@ use crate::{
     wire::{Reader, Writer},
 };
 
-/// The only protocol version this crate speaks, and the only one that exists.
+/// SOCKS5 protocol version.
 const VERSION: u8 = 5;
-/// RFC 1929 username/password sub-negotiation carries its own version.
+/// RFC 1929 sub-negotiation version.
 const AUTH_VERSION: u8 = 1;
 
 const CMD_CONNECT: u8 = 1;
@@ -52,20 +33,12 @@ const METHOD_NONE: u8 = 0x00;
 const METHOD_USERPASS: u8 = 0x02;
 const METHOD_UNACCEPTABLE: u8 = 0xff;
 
-/// What a SOCKS5 exchange can get wrong. Distinct from a transport failure,
-/// which is [`EgressError::Io`]: this names a peer that answered, but not with
-/// something this protocol admits.
-/// Not `Copy`, because [`Self::Denied`] carries the server's own explanation.
-/// That text is the one thing an operator has when a proxy refuses a flow for a
-/// reason of its own devising, and dropping it to keep the type a machine word
-/// would be trading the diagnostic for nothing.
+/// Errors reported by a responding SOCKS5 peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyError {
-    /// A version byte that is not 5 (or not 1 in sub-negotiation). Almost
-    /// always something that is not a SOCKS5 proxy at all.
+    /// Unexpected protocol version.
     Version(u8),
-    /// The server refused to open a stream and said why, in its own words.
-    /// Hysteria2's refusals are free text rather than a code table.
+    /// Server-supplied refusal reason.
     Denied(String),
     /// The proxy accepted none of the authentication methods offered.
     NoAcceptableMethod,
@@ -73,29 +46,21 @@ pub enum ProxyError {
     UnexpectedMethod(u8),
     /// Username/password authentication was rejected.
     AuthFailed,
-    /// The proxy refused the request, with RFC 1928 §6's reply code.
+    /// RFC 1928 request refusal.
     Refused(Reply),
-    /// An address type byte outside {1, 3, 4}, or a domain that is not UTF-8.
+    /// Invalid address representation.
     Address,
-    /// A datagram this association cannot deliver: RFC 1928 §7 fragmentation,
-    /// which no modern proxy emits and which this client does not reassemble.
+    /// Fragmented UDP datagram, which this client does not reassemble.
     Fragmented,
-    /// An AEAD operation failed: a bad key length, or a chunk that did not
-    /// authenticate. Fatal to a counter-based stream, which cannot resynchronise.
+    /// Authenticated-encryption failure.
     Crypto,
-    /// A Shadowsocks header that is not the shape its type claims.
+    /// Invalid proxy header.
     Header,
-    /// A peer whose clock is too far from ours for the replay window to mean
-    /// anything.
+    /// Peer clock outside the accepted window.
     Stale { skew: u64 },
-    /// A response echoing a salt that is not the one we sent: another
-    /// session's traffic, replayed at us.
+    /// Response salt did not match the request.
     SaltMismatch,
-    /// A payload was handed to a codec that frames nothing it writes. Nothing
-    /// produces this today: [`crate::Framed`] reads
-    /// [`crate::Codec::writes`] at construction and never routes a write
-    /// through such a codec. It exists so the eliminator is total instead of a
-    /// panic asserting a fact established in another type.
+    /// Payload was passed to a codec without a write frame.
     Unframed,
 }
 
@@ -121,9 +86,7 @@ impl std::fmt::Display for ProxyError {
 
 impl std::error::Error for ProxyError {}
 
-/// RFC 1928 §6 reply codes. Closed, and `Other` carries the byte rather than
-/// discarding it, because a proxy may reply with a code this table predates
-/// and an operator needs the number to diagnose it.
+/// RFC 1928 section 6 reply codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
     Succeeded,
@@ -155,17 +118,13 @@ impl Reply {
     }
 }
 
-/// Writes a target in RFC 1928 address form: `ATYP || ADDR || PORT`.
-///
-/// O(address length). Appends rather than clearing, so a caller composing a
-/// request header keeps what it already wrote.
+/// Appends a target in RFC 1928 address form: `ATYP || ADDR || PORT`.
 pub fn encode_address(target: &Target, out: &mut Vec<u8>) {
     let mut writer = Writer::new(out);
     match target {
         Target::Ip(SocketAddr::V4(address)) => writer.u8(ATYP_IPV4).bytes(&address.ip().octets()),
         Target::Ip(SocketAddr::V6(address)) => writer.u8(ATYP_IPV6).bytes(&address.ip().octets()),
-        // The length octet needs no check of its own: `DomainName` cannot hold
-        // more than 255 bytes, which is the invariant it exists for.
+        // DomainName guarantees that the length fits one octet.
         Target::Domain { host, .. } => writer.u8(ATYP_DOMAIN).vector_u8(host.as_str().as_bytes()),
     };
     writer.u16(target.port());
@@ -173,18 +132,13 @@ pub fn encode_address(target: &Target, out: &mut Vec<u8>) {
 
 /// Reads an address in RFC 1928 form.
 ///
-/// O(address length), and allocates only for the domain form, which owns its
-/// name. Total on untrusted input: every short buffer is `Incomplete` and
-/// every unknown type byte is [`ProxyError::Address`].
+/// Short input is incomplete; unknown types and invalid names are errors.
 pub fn decode_address(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
     let mut reader = Reader::new(bytes);
     let Some(atyp) = reader.u8() else {
         return Ok(Decoded::Incomplete);
     };
-    // The body's width is what its own type byte decides — and for the domain
-    // form the length octet is the prefix rather than a separate field, so it
-    // is named once here instead of twice. The port follows the body in every
-    // form, and a short buffer at either step is `Incomplete`.
+    // The address type determines the body width; the port follows every form.
     let body = match atyp {
         ATYP_IPV4 => reader.take(4),
         ATYP_IPV6 => reader.take(16),
@@ -219,14 +173,9 @@ pub fn decode_address(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
     })
 }
 
-/// Credentials for RFC 1929 username/password authentication.
+/// RFC 1929 username/password credentials.
 ///
-/// Both halves are length-prefixed by one octet on the wire, and RFC 1929's own
-/// request diagram gives their widths as `1 to 255` — not `0 to 255`. An empty
-/// half is therefore not a short credential but an unencodable one, and the
-/// only place to find that out is a proxy that refuses the authentication with
-/// no explanation of which field it disliked. The range is the type's, so a
-/// configuration that cannot be put on the wire fails where it is written.
+/// Both fields must contain 1 to 255 bytes.
 #[derive(Clone, Debug)]
 pub struct Credentials {
     username: String,
@@ -235,8 +184,7 @@ pub struct Credentials {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialsError {
-    /// Outside RFC 1929's `1 to 255`, in either direction. The length is
-    /// carried so a host can say which end of the range it missed.
+    /// Username length is outside RFC 1929's `1..=255` range.
     Username(usize),
     Password(usize),
 }
@@ -255,9 +203,7 @@ impl Credentials {
     }
 }
 
-/// The greeting: version, method count, methods. Offering `USERPASS` only when
-/// credentials exist keeps a proxy from selecting a method this client would
-/// then be unable to complete.
+/// Writes the greeting, offering username/password only when configured.
 fn encode_greeting(credentials: Option<&Credentials>, out: &mut Vec<u8>) {
     let mut writer = Writer::new(out);
     writer.u8(VERSION);
@@ -267,7 +213,7 @@ fn encode_greeting(credentials: Option<&Credentials>, out: &mut Vec<u8>) {
     };
 }
 
-/// The two-byte method selection. `Incomplete` until both bytes are present.
+/// Reads the two-byte method selection.
 fn decode_method_selection(bytes: &[u8]) -> Result<Decoded<u8>, ProxyError> {
     let Some(&[version, method]) = Reader::new(bytes).array::<2>() else {
         return Ok(Decoded::Incomplete);
@@ -290,9 +236,7 @@ fn encode_request(command: u8, target: &Target, out: &mut Vec<u8>) {
     encode_address(target, out);
 }
 
-/// The reply: version, code, reserved, then a bound address whose length is
-/// only known from its own type byte — which is exactly why this returns
-/// `Incomplete` rather than taking a length.
+/// Reads a reply whose bound address supplies its own length.
 fn decode_reply(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
     let mut reader = Reader::new(bytes);
     let Some(&[version, code, _reserved]) = reader.array::<3>() else {
@@ -314,8 +258,7 @@ fn decode_reply(bytes: &[u8]) -> Result<Decoded<Target>, ProxyError> {
     }
 }
 
-/// Writes the RFC 1928 §7 datagram header: two reserved bytes, a fragment
-/// number this client never sets, then the target address.
+/// Writes the RFC 1928 section 7 datagram header and payload.
 pub fn encode_datagram(target: &Target, payload: &[u8], out: &mut Vec<u8>) {
     out.clear();
     Writer::new(out).bytes(&[0, 0, 0]); // RSV, RSV, FRAG
@@ -323,12 +266,7 @@ pub fn encode_datagram(target: &Target, payload: &[u8], out: &mut Vec<u8>) {
     Writer::new(out).bytes(payload);
 }
 
-/// Reads a relayed datagram, returning where it came from and its payload.
-///
-/// A fragmented datagram is refused rather than reassembled: RFC 1928 makes
-/// fragmentation optional, no deployed proxy emits it, and a reassembly buffer
-/// keyed on an attacker-suppliable fragment number is state this crate will not
-/// grow for a case that does not occur.
+/// Reads a relayed datagram and rejects fragmentation.
 pub fn decode_datagram(bytes: &[u8]) -> Result<(Target, &[u8]), ProxyError> {
     let mut reader = Reader::new(bytes);
     let Some(&[_, _, fragment]) = reader.array::<3>() else {
@@ -344,33 +282,20 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<(Target, &[u8]), ProxyError> {
     }
 }
 
-/// Static configuration for one SOCKS5 proxy.
+/// Configuration for one SOCKS5 proxy.
 pub struct Socks5Config {
-    /// The proxy's TCP endpoint.
+    /// Proxy TCP endpoint.
     pub proxy: SocketAddr,
-    /// Credentials, when the proxy requires RFC 1929 authentication.
+    /// Optional RFC 1929 credentials.
     pub credentials: Option<Credentials>,
-    /// What RFC 4787 mapping behavior the proxy's UDP relay provides.
-    ///
-    /// Configuration for the same reason MASQUE's is: the mapping is the
-    /// proxy's, unobservable from here, and the planner is entitled to a
-    /// measured claim rather than an optimistic constant.
+    /// RFC 4787 mapping behavior provided by the UDP relay.
     pub nat_behavior: NatBehavior,
 }
 
-/// RFC 1928's exchange, as a pure state machine.
+/// Pure RFC 1928 negotiation state machine.
 ///
-/// Three phases, one of them conditional: greet and learn the selected method;
-/// if it is username/password, authenticate; then send the command and read the
-/// reply. Both commands share every step up to the request byte, which is why
-/// this is one machine parameterised by the command rather than two that drift.
-///
-/// **The offset is the machine's own, not the driver's.** [`crate::negotiate`]
-/// hands over everything received so far and drains only when the whole
-/// exchange completes, so a machine spanning several messages has to remember
-/// how far into that buffer its earlier phases reached. Keeping it here rather
-/// than widening [`Decoded`] to carry partial progress leaves the sum the same
-/// one sixty other decoders return.
+/// The machine tracks its input offset because the driver may supply several
+/// protocol messages in one buffer.
 struct Negotiate<'a> {
     credentials: Option<&'a Credentials>,
     command: u8,
@@ -380,16 +305,14 @@ struct Negotiate<'a> {
     at: usize,
 }
 
-/// Where the exchange has reached. A closed sum, so a phase that forgot to
-/// advance is a match arm that does not compile rather than a flag that
-/// silently re-sends.
+/// Current negotiation phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Greeting written; awaiting the method the proxy selected.
+    /// Greeting written; waiting for method selection.
     Selecting,
-    /// Credentials written; awaiting the status byte.
+    /// Credentials written; waiting for authentication status.
     Authenticating,
-    /// Command written; awaiting the reply.
+    /// Command written; waiting for the reply.
     Requesting,
 }
 
@@ -406,16 +329,13 @@ impl<'a> Negotiate<'a> {
 }
 
 impl crate::Negotiation for Negotiate<'_> {
-    /// The address the proxy reports it bound. A `CONNECT` caller discards it;
-    /// a `UDP ASSOCIATE` caller sends its datagrams there, which is the only
-    /// reason it is carried at all.
+    /// Address reported by the proxy after the request.
     type Output = Target;
 
-    /// O(bytes offered) per call, over an exchange bounded to a few tens of
-    /// bytes plus one address.
+    /// Advances negotiation using the bytes currently available.
     fn advance(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decoded<Target>, ProxyError> {
         loop {
-            // Everything earlier phases have not already taken.
+            // Continue from the first byte not consumed by an earlier phase.
             let rest = input.get(self.at..).unwrap_or_default();
             match self.phase {
                 Phase::Selecting if self.at == 0 && input.is_empty() && out.is_empty() => {
@@ -430,9 +350,7 @@ impl crate::Negotiation for Negotiate<'_> {
                     self.at += consumed;
                     match value {
                         METHOD_USERPASS => {
-                            // The greeting offers `USERPASS` only when
-                            // credentials exist, so a proxy selecting it
-                            // without them is choosing an unoffered method.
+                            // USERPASS is valid only when credentials were offered.
                             let credentials = self
                                 .credentials
                                 .ok_or(ProxyError::UnexpectedMethod(METHOD_USERPASS))?;
@@ -473,22 +391,18 @@ impl crate::Negotiation for Negotiate<'_> {
     }
 }
 
-/// RFC 1929's username/password sub-negotiation. Both lengths fit an octet
-/// because [`Credentials`] refused anything longer at construction.
+/// Writes the RFC 1929 username/password sub-negotiation.
 fn encode_credentials(credentials: &Credentials, out: &mut Vec<u8>) {
-    // Both halves are `1..=255` by `Credentials::new`, so each length octet
-    // is written from a value the type already proved fits.
+    // Credentials validates both lengths before they reach the wire.
     Writer::new(out)
         .u8(AUTH_VERSION)
         .vector_u8(credentials.username.as_bytes())
         .vector_u8(credentials.password.as_bytes());
 }
 
-/// A SOCKS5 proxy as a stream egress.
+/// SOCKS5 stream and UDP egress.
 ///
-/// `B` is the tunnel bypass, exactly as the DNS upstreams use: the proxy's
-/// socket must not travel through Boreas's own TUN, or the tunnel would carry
-/// the connection that carries the tunnel.
+/// The bypass keeps the proxy connection outside Boreas's own tunnel.
 pub struct Socks5Egress<B> {
     config: Socks5Config,
     bypass: B,
@@ -499,14 +413,7 @@ impl<B: TunnelBypass> Socks5Egress<B> {
         Self { config, bypass }
     }
 
-    /// Opens a connection to the proxy and runs RFC 1928's exchange to
-    /// completion.
-    ///
-    /// **The sequencing is not here.** It is in [`Negotiate`], which is a pure
-    /// state machine a test drives byte at a time; this opens a socket, calls
-    /// [`crate::negotiate`], and hands back what the exchange established
-    /// together with whatever was read past it — the target's first payload,
-    /// which for a server-first protocol is its whole banner.
+    /// Connects to the proxy and completes RFC 1928 negotiation.
     async fn exchange(
         &self,
         command: u8,
@@ -523,17 +430,11 @@ impl<B: TunnelBypass> Socks5Egress<B> {
 impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // The relay re-originates datagrams but preserves their boundaries
-            // one for one, so a QUIC datagram crosses as itself.
+            // UDP relay preserves datagram boundaries.
             datagram_fidelity: DatagramFidelity::Native,
-            // A terminated path re-originates the byte stream, so the client's
-            // packet size stops existing and there is no per-packet header to
-            // charge for.
+            // Stream egress has no packet encapsulation overhead.
             overhead_bytes: 0,
-            // The relay's own datagram ceiling is not advertised by the
-            // protocol, so nothing can be claimed. `plan_flow` reads an absent
-            // ceiling as "cannot be shown to clear the QUIC floor" and steers,
-            // which is the safe direction.
+            // SOCKS5 does not advertise the relay's datagram ceiling.
             max_datagram_size: None,
             preserves_ecn: false,
             nat_behavior: self.config.nat_behavior,
@@ -545,34 +446,24 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            // The bound address the proxy reports is discarded: this client
-            // never needs to name its own side of a CONNECT, and keeping it
-            // would invite treating it as authoritative for the target.
+            // CONNECT does not use the proxy's bound address.
             let (stream, _bound, surplus) = self.exchange(CMD_CONNECT, target).await?;
-            // Whatever followed the reply is the target's first payload — a
-            // server-first banner, most often — so it is replayed rather than
-            // dropped.
+            // Preserve bytes read beyond the negotiation reply.
             Ok(Box::new(Prefixed::new(surplus, stream)) as Box<dyn AsyncStream>)
         })
     }
 
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
-            // RFC 1928 §7: the address here is where *this client* will send
-            // from. All-zeroes means "not yet known", which is what a client
-            // behind an unpredictable source port must say.
+            // RFC 1928 section 7 permits an unspecified client address.
             let unspecified = Target::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
             let (control, relay, _surplus) = self.exchange(CMD_UDP_ASSOCIATE, &unspecified).await?;
-            // The relay must be reachable as an address; a proxy naming its
-            // relay by domain would need a resolution this layer will not do.
+            // The relay address must already be an IP address.
             let Target::Ip(relay) = relay else {
                 return Err(ProxyError::Address.into());
             };
             let socket = self.bypass.udp(relay).await?;
-            // Both halves keep the relay and the control connection alive:
-            // RFC 1928 §7 ends the association when the control connection
-            // closes, so its lifetime *is* the association's and neither half
-            // may outlive it.
+            // RFC 1928 section 7 ties association lifetime to the control stream.
             let shared = Arc::new(Relay {
                 socket,
                 _control: control,
@@ -580,11 +471,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
             Ok(Association {
                 source: Box::new(Socks5Source {
                     relay: Arc::clone(&shared),
-                    // One framing buffer for the association, sized to the
-                    // largest datagram a UDP payload length can describe. Per
-                    // association rather than per datagram, and exact rather
-                    // than generous: nothing larger can arrive, so a payload
-                    // this cannot hold does not exist.
+                    // One association-owned buffer handles the largest UDP payload.
                     framed: vec![0u8; MAX_UDP_PAYLOAD],
                 }),
                 sink: shared,
@@ -593,16 +480,13 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
     }
 }
 
-/// The largest payload a UDP datagram can carry. The receive buffer is sized
-/// to it exactly, which is what makes a short read provably the sender's
-/// message rather than a truncation this client caused.
+/// Largest payload representable by a UDP length field.
 const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
 
-/// One UDP ASSOCIATE relay, and the control connection that keeps it alive.
+/// UDP relay and its lifetime-bound control connection.
 struct Relay {
     socket: tokio::net::UdpSocket,
-    /// Held, never read: its lifetime is the association's. Named with an
-    /// underscore because holding it is the whole contribution.
+    /// Held open for the association lifetime.
     _control: tokio::net::TcpStream,
 }
 
@@ -622,18 +506,16 @@ impl DatagramSink for Relay {
     }
 }
 
-/// The receiving half: the relay plus the one framing buffer it decodes into.
+/// Receiving half of a SOCKS5 association.
 struct Socks5Source {
     relay: Arc<Relay>,
     framed: Vec<u8>,
 }
 
-/// RSV(2) + FRAG(1) + ATYP(1) + the longest address (a 255-byte name behind its
-/// length octet) + port(2).
+/// Maximum SOCKS5 UDP header size.
 const MAX_DATAGRAM_HEADER: usize = 4 + 1 + 255 + 2;
 
-/// A datagram socket delivers a message or nothing; a partial send is a failure
-/// of the send, not a smaller message.
+/// Requires a datagram send to write the complete message.
 fn whole_datagram(written: usize, expected: usize) -> Result<(), EgressError> {
     if written == expected {
         return Ok(());
@@ -682,7 +564,7 @@ mod tests {
             DomainName::new("bad\0name"),
             Err(crate::DomainNameError::Interior)
         );
-        // Exactly 255 is the largest a single octet describes, so it is legal.
+        // 255 bytes is the maximum encodable length.
         assert!(DomainName::new("a".repeat(255)).is_ok());
     }
 
@@ -692,8 +574,7 @@ mod tests {
             Target::Ip("192.0.2.1:443".parse().unwrap()),
             Target::Ip("[2001:db8::1]:8443".parse().unwrap()),
             domain("example.com", 80),
-            // The longest name the wire admits, to exercise the length octet's
-            // boundary rather than only its middle.
+            // Exercise the maximum domain length.
             domain(&"a".repeat(255), 65535),
         ];
         for target in targets {
@@ -708,9 +589,7 @@ mod tests {
                 "{target} must round-trip"
             );
 
-            // Every proper prefix is `Incomplete`, never a spurious parse:
-            // this is the law that makes the streaming reader terminate on
-            // exactly the right byte.
+            // Every proper prefix is incomplete.
             for split in 0..encoded.len() {
                 assert_eq!(
                     decode_address(&encoded[..split]),
@@ -727,7 +606,7 @@ mod tests {
             decode_address(&[0x02, 1, 2, 3, 4]),
             Err(ProxyError::Address)
         );
-        // A domain that is not UTF-8 is an address error, not a panic.
+        // Invalid UTF-8 is an address error.
         assert_eq!(
             decode_address(&[ATYP_DOMAIN, 2, 0xff, 0xfe, 0, 80]),
             Err(ProxyError::Address)
@@ -736,8 +615,7 @@ mod tests {
 
     #[test]
     fn a_refusal_carries_its_reply_code_and_a_short_reply_waits() {
-        // Every code RFC 1928 names, plus one it does not, survives the trip
-        // to the caller as a distinguishable value.
+        // Known and unknown reply codes remain distinguishable.
         for (byte, expected) in [
             (1u8, Reply::GeneralFailure),
             (2, Reply::NotAllowed),
@@ -748,9 +626,7 @@ mod tests {
             assert_eq!(decode_reply(&reply), Err(ProxyError::Refused(expected)));
         }
 
-        // A success whose address has not fully arrived is incomplete, and the
-        // same bytes plus the rest decode. "Not yet" and "no" are different
-        // answers and the reader depends on it.
+        // A truncated success is incomplete rather than refused.
         let full = [VERSION, 0, 0, ATYP_IPV4, 192, 0, 2, 1, 0x01, 0xbb];
         assert_eq!(decode_reply(&full[..6]), Ok(Decoded::Incomplete));
         assert_eq!(
@@ -761,7 +637,7 @@ mod tests {
             })
         );
 
-        // Something that is not SOCKS5 at all is named as such.
+        // A different protocol version is reported explicitly.
         assert_eq!(decode_reply(&[4, 0, 0]), Err(ProxyError::Version(4)));
     }
 
@@ -779,8 +655,7 @@ mod tests {
             decode_method_selection(&[VERSION, METHOD_UNACCEPTABLE]),
             Err(ProxyError::NoAcceptableMethod)
         );
-        // GSSAPI is legal SOCKS5 and is never offered by this client, so a
-        // proxy selecting it is choosing something it was not given.
+        // An unoffered method is rejected.
         assert_eq!(
             decode_method_selection(&[VERSION, 0x01]),
             Err(ProxyError::UnexpectedMethod(0x01))
@@ -795,7 +670,7 @@ mod tests {
         encode_datagram(&target, payload, &mut framed);
         assert_eq!(decode_datagram(&framed), Ok((target, &payload[..])));
 
-        // FRAG != 0 is refused rather than reassembled.
+        // Fragmented datagrams are refused.
         framed[2] = 1;
         assert_eq!(decode_datagram(&framed), Err(ProxyError::Fragmented));
     }
@@ -814,10 +689,7 @@ mod tests {
             vec![VERSION, 2, METHOD_NONE, METHOD_USERPASS]
         );
 
-        // RFC 1929's request diagram gives both halves as `1 to 255`, so both
-        // ends of the range are refused. Empty is the one that mattered: it
-        // encodes a zero length byte, which no conforming server reads back as
-        // a credential, and the only report is an authentication that failed.
+        // Both credential lengths must fit RFC 1929's `1..=255` range.
         for (username, password, expected) in [
             (
                 "u".repeat(256),
@@ -842,10 +714,7 @@ mod tests {
         }
     }
 
-    /// **The exchange, with no socket anywhere.** Before the port this needed a
-    /// live proxy or a mock stream; the sequencing was inside an `async fn` and
-    /// the only way to reach it was to run it. Now it is a value, and a test
-    /// offers it bytes.
+    /// Exercises negotiation without a socket.
     #[test]
     fn the_unauthenticated_exchange_greets_requests_and_reads_its_reply() {
         use crate::Negotiation;
@@ -855,7 +724,7 @@ mod tests {
         };
         let mut machine = Negotiate::new(None, CMD_CONNECT, &target);
 
-        // Nothing received yet: the greeting goes out.
+        // No input starts the greeting.
         let mut greeting = Vec::new();
         assert!(matches!(
             machine.advance(&[], &mut greeting).unwrap(),
@@ -863,7 +732,7 @@ mod tests {
         ));
         assert_eq!(greeting, [VERSION, 1, METHOD_NONE]);
 
-        // The proxy selects "no authentication", so the request follows.
+        // No authentication causes the request to follow.
         let mut request = Vec::new();
         assert!(matches!(
             machine
@@ -875,7 +744,7 @@ mod tests {
         encode_request(CMD_CONNECT, &target, &mut expected);
         assert_eq!(request, expected);
 
-        // The reply completes it, and the consumed count covers both messages.
+        // The reply completes negotiation and reports consumed input.
         let mut wire = vec![VERSION, METHOD_NONE];
         let reply_at = wire.len();
         wire.extend_from_slice(&[VERSION, 0, 0]);
@@ -897,8 +766,7 @@ mod tests {
         assert!(reply_at < consumed, "the offset spans more than one phase");
     }
 
-    /// The authenticated path adds a round trip in the middle, and the machine
-    /// must not re-send the greeting to reach it.
+    /// Authentication adds one round trip without repeating the greeting.
     #[test]
     fn the_authenticated_exchange_adds_one_round_trip_and_repeats_nothing() {
         use crate::Negotiation;
@@ -929,10 +797,7 @@ mod tests {
         assert_eq!(request, expected, "the request follows the status byte");
     }
 
-    /// **The property a socket-bound test cannot check cheaply.** A machine
-    /// that only advances when a whole message lands in one read works against
-    /// a loopback proxy and fails behind a middlebox, and the only way to know
-    /// is to offer it every prefix.
+    /// Negotiation reaches the same result for every input split.
     #[test]
     fn the_exchange_reaches_the_same_verdict_however_the_bytes_are_split() {
         use crate::Negotiation;
@@ -952,9 +817,7 @@ mod tests {
         );
     }
 
-    /// A proxy that selects a method the client never offered is refused rather
-    /// than followed: answering `USERPASS` with no credentials would send an
-    /// empty username to a server that asked for one.
+    /// A proxy cannot select a method the client did not offer.
     #[test]
     fn a_method_that_was_never_offered_is_refused() {
         use crate::Negotiation;
@@ -967,8 +830,7 @@ mod tests {
         ));
     }
 
-    /// A rejected credential ends the exchange where it happens, rather than
-    /// sending a request the proxy will refuse anyway.
+    /// Rejected credentials end negotiation before the request.
     #[test]
     fn a_rejected_credential_ends_the_exchange() {
         use crate::Negotiation;

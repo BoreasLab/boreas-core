@@ -1,40 +1,10 @@
-//! P15 demotion: the machine-maintained half of the interception decision.
+//! Machine-maintained demotion state for interception.
 //!
-//! P14 ships an allowlist a human types. That is only tractable while the list
-//! is short, and the list has to grow toward the parity corpus — so something
-//! has to notice, without being told, that interception does not work for a
-//! host and stop attempting it. That is this module, and it is what makes
-//! broadening the allowlist safe rather than reckless.
-//!
-//! **Demotion only ever does less, which decides how evidence is weighed.** A
-//! false positive costs coverage on one host until the entry expires; a false
-//! negative leaves a site broken for as long as the user keeps visiting it.
-//! Those are not comparable, so the rule here is generous about *which*
-//! failures count and strict about *what counts as a failure*: every TLS alert
-//! but two is admitted, and nothing that merely looks like bad luck — a reset,
-//! a timeout, a refused connection — is admitted at all. A network blip proves
-//! nothing about whether interception works, and treating it as proof would
-//! let a bad minute of Wi-Fi silently disable filtering.
-//!
-//! **The remedy is a lattice, not a switch.** [`Tier`] is a three-point chain:
-//! rewrite bodies, inspect requests without touching bodies, or stand aside
-//! entirely. Recording an observation is a meet, so it is idempotent,
-//! commutative, and associative — the order failures arrive in cannot change
-//! where a host ends up. The middle point earns its place: an HTML rewrite that
-//! blows its memory budget should stop the rewriting, not the URL filtering
-//! that is the more valuable tier by far.
-//!
-//! **One connection is the price, and it cannot be less.** The evidence that
-//! interception fails for a host *is* the failed handshake, and by the time it
-//! arrives Boreas has already sent a forged certificate or already terminated
-//! the client. Nothing can un-send those. So the first attempt after a host
-//! becomes unworkable is lost and the retry succeeds — which is what the
-//! product gate measures, since browsers and apps retry.
-//!
-//! **The table cannot outgrow the allowlist.** Only an allowlisted host is
-//! intercepted, and only an intercepted host can fail in a way recorded here,
-//! so the key space is bounded by a set a human maintains. Pruning exists to
-//! return memory, not to bound it.
+//! Recorded evidence only reduces interception. TLS refusals are evidence;
+//! resets, timeouts, and other transport failures are not. Causes combine by a
+//! three-level meet, so rewriting can be disabled without losing URL filtering.
+//! Entries are bounded by the interception allowlist; pruning only reclaims
+//! expired memory.
 
 use std::{
     collections::HashMap,
@@ -47,55 +17,41 @@ use rustls::{AlertDescription, Error as TlsError};
 
 use crate::{HandshakeFailure, Refusal};
 
-/// How much of the interception stack a host tolerates.
+/// Maximum interception tier still allowed for a host.
 ///
-/// A three-point chain ordered by how much Boreas does, so `Splice < Inspect <
-/// Rewrite` and the derived [`Ord`] *is* the lattice order. [`Self::meet`] is
-/// the greatest lower bound, and it is how two observations about the same host
-/// combine.
+/// The order is `Splice < Inspect < Rewrite`; [`Self::meet`] selects the lower
+/// tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
-    /// Do not terminate. The connection passes through byte for byte, which is
-    /// what a host with no policy at all gets.
+    /// Leave the connection byte-for-byte spliced.
     Splice,
-    /// Terminate and filter by URL, but forward bodies untouched.
+    /// Terminate and filter URLs without rewriting bodies.
     Inspect,
-    /// Terminate, filter, and rewrite HTML bodies.
+    /// Terminate, filter URLs, and rewrite HTML bodies.
     Rewrite,
 }
 
-/// The tier a connection that *was* terminated is served at.
+/// Valid tiers for an already terminated connection.
 ///
-/// **[`Tier::Splice`] is not here, and its absence is the whole type.** A
-/// spliced connection is never terminated, so an `Intercepted` outcome carrying
-/// `Splice` claimed a connection had been simultaneously intercepted and left
-/// alone. Nothing could produce one — an early return two hundred lines up saw
-/// to that, and `Sessions::rewriting` carried a prose note saying so — but the
-/// proof lived in comments and in the distance between two call sites, which is
-/// where proofs go to rot. Here the compiler holds it, and the arm that used to
-/// exist only to be unreachable is gone.
+/// `Splice` is absent because a spliced connection is never terminated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterceptedTier {
-    /// Terminate and filter by URL, but forward bodies untouched.
+    /// Terminate and filter URLs without rewriting bodies.
     Inspect,
-    /// Terminate, filter, and rewrite HTML bodies.
+    /// Terminate, filter URLs, and rewrite HTML bodies.
     Rewrite,
 }
 
 impl InterceptedTier {
-    /// What a host with nothing recorded against it gets.
+    /// Default tier for a host with no demotion.
     pub const TOP: Self = Self::Rewrite;
 }
 
 impl Tier {
-    /// The identity of [`Self::meet`], and what a host with nothing recorded
-    /// against it gets.
+    /// Identity of [`Self::meet`] and default tier.
     pub const TOP: Self = Self::Rewrite;
 
-    /// The interception this tier permits, or `None` when it permits none.
-    ///
-    /// The one boundary a tier crosses to become something a terminated
-    /// connection can be served at.
+    /// Converts an allowed tier to a terminated-connection tier.
     #[must_use]
     pub fn intercepted(self) -> Option<InterceptedTier> {
         match self {
@@ -105,10 +61,7 @@ impl Tier {
         }
     }
 
-    /// Greatest lower bound: the most Boreas may do given both observations.
-    ///
-    /// Idempotent, commutative, associative, with [`Self::TOP`] as identity —
-    /// which is precisely why the order failures arrive in cannot matter.
+    /// Returns the lower of two allowed tiers.
     #[must_use]
     pub fn meet(self, other: Self) -> Self {
         self.min(other)
@@ -125,43 +78,23 @@ impl fmt::Display for Tier {
     }
 }
 
-/// What a host proved about interception.
-///
-/// Each variant names an observation Boreas can actually make, not a cause it
-/// infers. That matters: several distinct server behaviours — a client
-/// certificate challenge, address reputation, TLS fingerprinting — are
-/// indistinguishable from here and share one remedy, so they share one variant
-/// rather than being guessed apart into three.
+/// Observable evidence that interception failed for a host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Demotion {
-    /// The client refused the leaf Boreas forged: a pinned client, or one that
-    /// does not trust the locally installed root. Nothing Boreas can do makes
-    /// this client accept a certificate it did not expect.
+    /// The client rejected the forged leaf certificate.
     LeafRejected,
-    /// The server refused the connection Boreas made in the client's place.
-    /// The canonical case is a client-certificate challenge — terminating puts
-    /// Boreas between the challenge and the key that answers it — and every
-    /// other case has the same remedy: stand aside and let the client connect
-    /// for itself.
+    /// The server refused the connection originated by Boreas.
     UpstreamRefusedProxy,
-    /// The server's own certificate did not validate here. Boreas will not
-    /// stand in for a server it cannot authenticate, and the client is better
-    /// equipped to judge than this process is: splicing hands the decision back
-    /// to the party that owns it.
+    /// The server certificate did not validate.
     UpstreamUntrusted,
-    /// One side would not speak the single protocol the other settled on.
-    /// Offering exactly one ALPN upstream is what makes a crossed HTTP version
-    /// unrepresentable; this is what that invariant costs when a server and a
-    /// client disagree, and standing aside lets them negotiate directly.
+    /// The peers rejected the negotiated application protocol.
     ProtocolRefused,
-    /// An HTML rewrite exceeded its per-stream budget. The only observation
-    /// here that does not reach [`Tier::Splice`]: the body could not be
-    /// rewritten, which says nothing about whether requests can be filtered.
+    /// An HTML rewrite exceeded its per-stream budget.
     RewriteExhausted,
 }
 
 impl Demotion {
-    /// Every variant, in the order ties are broken when several are live.
+    /// All causes in deterministic tie-breaking order.
     pub const ALL: [Self; 5] = [
         Self::LeafRejected,
         Self::UpstreamRefusedProxy,
@@ -172,8 +105,7 @@ impl Demotion {
 
     const COUNT: usize = Self::ALL.len();
 
-    /// This cause's slot in a host's expiry array. Total by construction: the
-    /// sum is closed and every arm names a distinct index below [`Self::COUNT`].
+    /// Expiry-array slot for this cause.
     const fn slot(self) -> usize {
         match self {
             Self::LeafRejected => 0,
@@ -184,7 +116,7 @@ impl Demotion {
         }
     }
 
-    /// The most Boreas may do for a host this was observed against.
+    /// Tier allowed after this cause is observed.
     #[must_use]
     pub const fn tier(self) -> Tier {
         match self {
@@ -196,25 +128,16 @@ impl Demotion {
         }
     }
 
-    /// How long this observation stays believable.
-    ///
-    /// The trade is one-sided in both directions, so it is set per cause rather
-    /// than globally: too short and the user meets the same broken page again,
-    /// too long and coverage never returns after the world changes. What
-    /// changes the world differs by cause — an app ships a new pin set in days,
-    /// a captive portal clears in minutes — so the interval follows the cause
-    /// that would have to change.
+    /// How long this cause remains active.
     #[must_use]
     pub const fn ttl(self) -> Duration {
         const HOUR: u64 = 60 * 60;
         Duration::from_secs(match self {
-            // A pin set or a server's certificate policy changes when software
-            // ships, which is days; re-probing sooner only re-breaks the page.
+            // Software updates change pins and server protocol policy.
             Self::LeafRejected | Self::UpstreamRefusedProxy | Self::ProtocolRefused => 12 * HOUR,
-            // A portal, a skewed clock, or an expired chain resolves in
-            // minutes, and re-probing costs exactly one connection.
+            // Network state and certificate validity can recover quickly.
             Self::UpstreamUntrusted => 5 * 60,
-            // A document changes when the site deploys.
+            // A later document may fit the rewrite budget.
             Self::RewriteExhausted => HOUR,
         })
     }
@@ -232,20 +155,19 @@ impl fmt::Display for Demotion {
     }
 }
 
-/// What a host's recorded history permits.
+/// What a host's live evidence permits.
 ///
-/// The tier is *derived* from the cause rather than stored beside it, so a
-/// standing that claims a tier its cause does not justify cannot be built.
+/// The tier is derived from the cause, so the two values cannot disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Standing {
-    /// Nothing live is recorded: the whole stack applies.
+    /// No live demotion exists.
     Unrestricted,
-    /// A recorded observation caps what Boreas may do, and names itself.
+    /// A live cause caps the permitted tier.
     Limited(Demotion),
 }
 
 impl Standing {
-    /// The cap. [`Tier::TOP`] exactly when nothing is recorded.
+    /// Returns the current tier cap.
     #[must_use]
     pub fn tier(self) -> Tier {
         match self {
@@ -254,14 +176,7 @@ impl Standing {
         }
     }
 
-    /// What this standing permits: a tier to intercept at, or the cause that
-    /// forbids intercepting at all.
-    ///
-    /// **Total, and it answers both questions at once.** `Unrestricted` is
-    /// [`Tier::TOP`], which intercepts, so the `Err` half can only come from a
-    /// recorded demotion — which means the caller that has to splice is handed
-    /// the reason rather than asking a second question and matching on an
-    /// answer it already knows.
+    /// Returns the permitted terminated tier or the cause requiring a splice.
     pub fn permits(self) -> Result<InterceptedTier, Demotion> {
         match self {
             Self::Unrestricted => Ok(InterceptedTier::TOP),
@@ -269,7 +184,7 @@ impl Standing {
         }
     }
 
-    /// The cause, for a caller that needs to say *why* rather than *how much*.
+    /// Returns the active cause, if any.
     #[must_use]
     pub fn cause(self) -> Option<Demotion> {
         match self {
@@ -279,35 +194,19 @@ impl Standing {
     }
 }
 
-/// Which side of an intercepted connection a failure came from.
-///
-/// The legs produce disjoint evidence — the client can only reject the leaf
-/// Boreas forged, and only the server can refuse the proxy or present a
-/// certificate that does not validate — so classification is a function of both
-/// the error and the leg, and neither alone.
+/// Side of the intercepted connection that produced a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leg {
-    /// Boreas as the server, terminating the client's TLS.
+    /// Boreas terminates the client TLS.
     Client,
-    /// Boreas as the client, opening TLS to the real server.
+    /// Boreas originates TLS to the upstream server.
     Upstream,
 }
 
-/// Reads a handshake failure as evidence, or as nothing.
+/// Classifies a TLS handshake failure as demotion evidence.
 ///
-/// Total, with `None` meaning "this proves nothing about interception" — which
-/// is the answer for every I/O error, every timeout, and every reset, because
-/// none of them will recur predictably and demoting on them would let a bad
-/// minute of network disable filtering for half a day.
-///
-/// O(1): one downcast and one match. No allocation.
-/// **The two legs run different TLS implementations, so they carry different
-/// evidence.** Boreas terminates the client with rustls and originates upstream
-/// with BoringSSL — see [`mirror`](crate::Originator) for why the asymmetry is
-/// deliberate — so this dispatches on the leg first and reads each side's own
-/// error type. A single downcast would silently classify nothing on whichever
-/// leg it did not name, which is exactly how half a demotion lattice stops
-/// working without anything failing.
+/// Transport errors return `None`. The two legs use different TLS error types,
+/// so classification selects the leg before downcasting.
 #[must_use]
 pub fn classify(leg: Leg, error: &io::Error) -> Option<Demotion> {
     let inner = error.get_ref()?;
@@ -317,11 +216,7 @@ pub fn classify(leg: Leg, error: &io::Error) -> Option<Demotion> {
     }
 }
 
-/// Evidence from rustls, terminating the client.
-///
-/// `tokio-rustls` reports a protocol failure as `InvalidData` wrapping the
-/// `rustls::Error`, which is the only place the alert survives; anything else
-/// is transport trouble and not evidence.
+/// Classifies rustls evidence from the client leg.
 fn terminating(tls: &TlsError) -> Option<Demotion> {
     match tls {
         TlsError::NoApplicationProtocol
@@ -333,34 +228,25 @@ fn terminating(tls: &TlsError) -> Option<Demotion> {
     }
 }
 
-/// Evidence from BoringSSL, originating to the server.
-///
-/// Total over [`Refusal`], which is the point of that sum: the three arms are
-/// the three distinguishable outcomes, and each maps to exactly one remedy.
+/// Classifies BoringSSL evidence from the upstream leg.
 fn originating(refusal: Refusal) -> Option<Demotion> {
     match refusal {
-        // Either side may be the one that finds no shared protocol, and the
-        // remedy is the same from both.
+        // Either leg can report the same protocol refusal.
         Refusal::NoProtocol | Refusal::Alert(ALERT_NO_APPLICATION_PROTOCOL) => {
             Some(Demotion::ProtocolRefused)
         }
-        // Boreas rejected the server, rather than the server rejecting Boreas.
+        // The upstream certificate failed validation locally.
         Refusal::Untrusted => Some(Demotion::UpstreamUntrusted),
         Refusal::Alert(alert) => conclusive_alert(alert).then_some(Demotion::UpstreamRefusedProxy),
     }
 }
 
-/// RFC 8446's alert descriptions this module names.
+/// TLS alert descriptions used by the raw upstream error path.
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 const ALERT_USER_CANCELED: u8 = 90;
 const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
-/// Whether an alert will recur on the next attempt.
-///
-/// Almost all of them will: an alert is a peer deliberately refusing *this*
-/// handshake, and the next one presents the same certificate from the same
-/// address to the same peer. The two exceptions are the alerts that are not
-/// refusals at all — an orderly close, and a peer that changed its mind.
+/// Whether an alert is evidence likely to recur.
 fn conclusive(alert: AlertDescription) -> bool {
     !matches!(
         alert,
@@ -368,40 +254,27 @@ fn conclusive(alert: AlertDescription) -> bool {
     )
 }
 
-/// The same question asked of BoringSSL's raw description byte, which is what
-/// [`Refusal::Alert`] carries. Kept beside [`conclusive`] so the two exceptions
-/// are stated once and cannot drift apart.
+/// Applies the same recurrence rule to a raw BoringSSL alert byte.
 fn conclusive_alert(alert: u8) -> bool {
     !matches!(alert, ALERT_CLOSE_NOTIFY | ALERT_USER_CANCELED)
 }
 
-/// When each cause was last observed against one host, as the instant it stops
-/// counting. Storing the expiry rather than the observation keeps the read path
-/// to a single comparison and independent of the TTL table.
+/// Expiry for each recorded cause on one host.
 type Expiries = [Option<Instant>; Demotion::COUNT];
 
-/// Hosts to prune at. Not a bound — the key space is already bounded by the
-/// allowlist — just the size at which returning memory is worth a sweep.
+/// Host count at which the next pruning sweep starts.
 const PRUNE_AT: usize = 1024;
 
 struct Table {
     hosts: HashMap<String, Expiries>,
-    /// The size that triggers the next sweep, raised past the live set each
-    /// time so a table that cannot shrink is not swept on every write. This is
-    /// what makes pruning amortized $O(1)$ rather than $O(n)$ per record.
+    /// Next sweep threshold, raised past the live set after each sweep.
     prune_at: usize,
 }
 
-/// What interception has been observed to fail at, per host.
+/// Per-host interception demotion table.
 ///
-/// Reads dominate by orders of magnitude — one per connection against one per
-/// failure — so this is an `RwLock` over a `HashMap` rather than anything
-/// cleverer. The critical sections hold no `await` and perform one hash probe,
-/// so a contended writer cannot stall a reader for longer than that probe.
-///
-/// `HashMap`'s SipHash matters here for the same reason it does in
-/// [`InterceptPolicy`](crate::InterceptPolicy): the key is a name an attacker
-/// chooses.
+/// Reads use a shared lock and one hash lookup; writes hold no asynchronous
+/// boundary. SipHash protects attacker-chosen host names.
 #[derive(Default)]
 pub struct Demotions {
     table: RwLock<Table>,
@@ -430,14 +303,7 @@ impl Demotions {
         Self::default()
     }
 
-    /// What `host` currently permits.
-    ///
-    /// The meet over every live cause, witnessed by the cause that achieves it;
-    /// ties go to the earlier member of [`Demotion::ALL`], so the answer is
-    /// deterministic rather than dependent on iteration order.
-    ///
-    /// $O(1)$ expected: one hash probe under a shared lock, then a fold over a
-    /// constant number of slots, one per variant of [`Demotion`].
+    /// Returns the tier currently permitted for `host`.
     #[must_use]
     pub fn standing(&self, host: &str, now: Instant) -> Standing {
         let table = self
@@ -454,14 +320,7 @@ impl Demotions {
             .map_or(Standing::Unrestricted, Standing::Limited)
     }
 
-    /// Records one observation and reports the standing that results.
-    ///
-    /// Idempotent in the lattice: recording the same cause twice refreshes its
-    /// expiry and changes nothing else, and recording two causes in either
-    /// order reaches the same standing.
-    ///
-    /// $O(1)$ amortized under an exclusive lock; the periodic sweep is $O(n)$
-    /// in hosts but its threshold rises past the live set each time.
+    /// Records a cause and returns the resulting standing.
     pub fn record(&self, host: &str, cause: Demotion, now: Instant) -> Standing {
         let expiry = now.checked_add(cause.ttl());
         let mut table = self
@@ -484,8 +343,7 @@ impl Demotions {
             .map_or(Standing::Unrestricted, Standing::Limited)
     }
 
-    /// Hosts with an entry, live or not. For observability; an operator reading
-    /// a growing number here is reading a growing allowlist.
+    /// Number of hosts with table entries, including expired entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.table
@@ -514,14 +372,12 @@ mod tests {
 
     const HOST: &str = "pinned.example";
 
-    /// A base instant every test measures from, so no test reads the clock
-    /// twice and none of them can be flaky about elapsed real time.
+    /// Shared test instant for deterministic expiry checks.
     fn epoch() -> Instant {
         Instant::now()
     }
 
-    /// The lattice laws, checked exhaustively rather than by sampling: three
-    /// points means 27 triples, which is cheaper to enumerate than to generate.
+    /// Exhaustively checks the three-point lattice laws.
     #[test]
     fn the_tier_meet_is_a_semilattice_with_rewrite_as_identity() {
         let tiers = [Tier::Splice, Tier::Inspect, Tier::Rewrite];
@@ -537,8 +393,7 @@ mod tests {
         }
     }
 
-    /// Every cause must have its own slot, or two causes would overwrite each
-    /// other's expiry and one would silently never apply.
+    /// Each cause must occupy a distinct expiry slot.
     #[test]
     fn every_cause_occupies_a_distinct_slot() {
         let mut slots: Vec<usize> = Demotion::ALL.iter().map(|cause| cause.slot()).collect();
@@ -566,16 +421,14 @@ mod tests {
         assert_eq!(standing, Standing::Limited(Demotion::LeafRejected));
         assert_eq!(standing.tier(), Tier::Splice);
         assert_eq!(demotions.standing(HOST, now).tier(), Tier::Splice);
-        // Other hosts are untouched: demotion is per host, never global.
+        // Demotion is scoped to the recorded host.
         assert_eq!(
             demotions.standing("other.example", now),
             Standing::Unrestricted
         );
     }
 
-    /// The reason [`Tier`] has three points rather than two: a rewrite that
-    /// blew its budget must not cost the URL filtering, which is the tier that
-    /// carries most of the product's value.
+    /// Rewrite exhaustion removes rewriting but preserves URL filtering.
     #[test]
     fn an_exhausted_rewrite_stops_rewriting_and_nothing_else() {
         let now = epoch();
@@ -588,8 +441,7 @@ mod tests {
         );
     }
 
-    /// Recording is a meet, so the order two failures arrive in cannot change
-    /// where the host ends up, and repeating one changes nothing.
+    /// Recording causes is order-independent and idempotent.
     #[test]
     fn recording_is_idempotent_and_order_independent() {
         let now = epoch();
@@ -605,15 +457,14 @@ mod tests {
         assert_eq!(ordered.standing(HOST, now), reversed.standing(HOST, now));
         assert_eq!(ordered.standing(HOST, now).tier(), Tier::Splice);
 
-        // And the witness agrees with the fold the lattice defines.
+        // The recorded witness matches the lattice fold.
         let folded = [Demotion::RewriteExhausted, Demotion::LeafRejected]
             .into_iter()
             .fold(Tier::TOP, |tier, cause| tier.meet(cause.tier()));
         assert_eq!(ordered.standing(HOST, now).tier(), folded);
     }
 
-    /// Expiry is per cause, and a lapsed cause must stop hiding a live one —
-    /// which is exactly what a single "worst tier so far" field would get wrong.
+    /// An expired cause must stop hiding a still-live cause.
     #[test]
     fn a_lapsed_cause_stops_applying_without_hiding_a_live_one() {
         let now = epoch();
@@ -622,8 +473,7 @@ mod tests {
         demotions.record(HOST, Demotion::RewriteExhausted, now);
         assert_eq!(demotions.standing(HOST, now).tier(), Tier::Splice);
 
-        // Past the short-lived cause but not the long-lived one: the host is
-        // intercepted again, and still not rewritten.
+        // Only the longer-lived rewrite demotion remains.
         let later = now + Demotion::UpstreamUntrusted.ttl() + Duration::from_secs(1);
         assert_eq!(
             demotions.standing(HOST, later),
@@ -634,8 +484,7 @@ mod tests {
         assert_eq!(demotions.standing(HOST, much_later), Standing::Unrestricted);
     }
 
-    /// A sweep must reclaim dead hosts and must never drop a live one, or a
-    /// demoted host would silently come back before its interval.
+    /// Pruning removes expired hosts and retains live ones.
     #[test]
     fn pruning_reclaims_dead_hosts_and_keeps_live_ones() {
         let now = epoch();
@@ -649,8 +498,7 @@ mod tests {
         }
         assert_eq!(demotions.len(), PRUNE_AT);
 
-        // Every entry above has lapsed by now; one fresh record triggers the
-        // sweep that reclaims them.
+        // A fresh record triggers pruning after the entries expire.
         let later = now + Demotion::LeafRejected.ttl() + Duration::from_secs(1);
         demotions.record(HOST, Demotion::LeafRejected, later);
         assert_eq!(demotions.len(), 1, "the sweep reclaimed the lapsed hosts");
@@ -661,13 +509,12 @@ mod tests {
         io::Error::new(io::ErrorKind::InvalidData, error)
     }
 
-    /// The upstream leg's shape: BoringSSL's verdict, as `mirror` wraps it.
+    /// Wraps an upstream refusal in the production error shape.
     fn boring_error(refusal: Refusal) -> io::Error {
         io::Error::other(HandshakeFailure::new(Some(refusal), "synthesized"))
     }
 
-    /// The classifier's whole job: name conclusive TLS refusals, and refuse to
-    /// read anything into transport trouble.
+    /// Classifies conclusive TLS refusals and ignores transport failures.
     #[test]
     fn only_conclusive_tls_refusals_are_evidence() {
         assert_eq!(
@@ -677,8 +524,7 @@ mod tests {
             ),
             Some(Demotion::LeafRejected)
         );
-        // The upstream leg is BoringSSL, so its evidence is a `Refusal` and
-        // not a `rustls::Error`. Alert 116 is `certificate_required`.
+        // Upstream evidence uses `Refusal`, not `rustls::Error`.
         assert_eq!(
             classify(Leg::Upstream, &boring_error(Refusal::Alert(116))),
             Some(Demotion::UpstreamRefusedProxy)
@@ -698,8 +544,7 @@ mod tests {
             ),
             Some(Demotion::ProtocolRefused)
         );
-        // Each leg reads only its own implementation's errors: a rustls error
-        // arriving from the upstream leg is not evidence, and vice versa.
+        // Each leg accepts only its own TLS error representation.
         assert_eq!(
             classify(Leg::Upstream, &tls_error(TlsError::NoApplicationProtocol)),
             None
@@ -709,8 +554,7 @@ mod tests {
             None
         );
 
-        // Transport trouble proves nothing, and this is the half that matters:
-        // a flaky network must not disable filtering for half a day.
+        // Transport trouble is not evidence for demotion.
         for kind in [
             io::ErrorKind::ConnectionReset,
             io::ErrorKind::TimedOut,
@@ -724,7 +568,7 @@ mod tests {
             );
             assert_eq!(classify(Leg::Upstream, &io::Error::from(kind)), None);
         }
-        // An orderly close and a peer that changed its mind are not refusals.
+        // Close and cancellation alerts are not refusals.
         for alert in [
             AlertDescription::CloseNotify,
             AlertDescription::UserCanceled,
@@ -744,13 +588,10 @@ mod tests {
         }
     }
 
-    /// The legs read the same error differently, and must: only the server can
-    /// refuse the proxy, and only the client can refuse the forged leaf.
+    /// The same handshake alert maps differently on the two legs.
     #[test]
     fn the_two_legs_read_the_same_alert_as_different_evidence() {
-        // `handshake_failure`, alert 40, seen from each side. The legs run
-        // different TLS implementations, so the same alert arrives in two
-        // shapes — and still has to mean two different things.
+        // Alert 40 is represented by different TLS error types on each leg.
         assert_eq!(
             classify(
                 Leg::Client,
