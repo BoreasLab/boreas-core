@@ -1,26 +1,11 @@
-//! The handle a host holds, and the six calls it makes on it.
+//! C-facing tunnel handle and operations.
 //!
-//! Every entry point here has the same shape: `boundary` around a closure that
-//! borrows its arguments, does the work, and writes an out-parameter. Nothing
-//! returns a pointer the host must free except the handle itself, and nothing
-//! hands out a string it owns — strings are copied into buffers the caller
-//! supplied, which removes an entire class of question about who frees what.
+//! Entry points validate borrowed arguments inside `boundary` and write only
+//! to caller-owned outputs. Strings are copied into caller-provided buffers.
 //!
-//! # Why a driver task sits between the handle and the tunnel
-//!
-//! [`Tunnel::next_event`] takes `&mut self` and blocks until something
-//! happens, and a healthy idle tunnel emits nothing at all: the core reports a
-//! counter only when it is non-zero, so "nothing went wrong" is silence rather
-//! than a zero every interval. A handle that reached the tunnel directly would
-//! therefore have to promise the host one call at a time — and that promise
-//! makes the interface unusable, because the one thread that is allowed to
-//! call is parked in `next_event` forever and can never reload a list.
-//!
-//! So the tunnel is moved into a task that owns it, and the handle keeps two
-//! *disjoint* halves: a receiver for events, and a sender for commands. A
-//! reader blocked on the first cannot delay the second, and neither aliases
-//! the other — which is what makes every entry point take `&self` and makes
-//! concurrent calls sound rather than merely unlikely to break.
+//! The tunnel runs in a driver task because [`Tunnel::next_event`] blocks while
+//! commands must remain available. The handle therefore owns separate event
+//! and command channels, allowing concurrent calls without aliasing the tunnel.
 
 use std::{
     ffi::c_char,
@@ -41,24 +26,13 @@ use crate::{
     status::{borrow, borrow_mut},
 };
 
-/// How long `free` waits for a device read already inside the host's callback.
-///
-/// Short on purpose: the tunnel has stopped carrying traffic by then, so a
-/// `recv` still blocked is one waiting for a packet that is not coming.
+/// Grace period for a device read already inside a host callback.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
-/// Events buffered between the driver and the host's reader.
-///
-/// Small, and bounded rather than unbounded: a host that stops reading stalls
-/// the driver, which stalls the core's own bounded telemetry channel, which
-/// counts the loss as `events_lost`. One accounting point for "the host fell
-/// behind" is worth more than a deeper buffer that reports it twice.
+/// Bounded event buffer between the driver and host.
 const EVENT_DEPTH: usize = 64;
 
-/// What the host asks of a tunnel it cannot touch directly.
-///
-/// Each carries its own reply channel, so a caller blocks exactly until its
-/// own answer arrives and never on another's.
+/// Command sent from a host call to the driver.
 enum Command {
     Reload {
         lists: Vec<String>,
@@ -67,19 +41,13 @@ enum Command {
     Authority {
         reply: oneshot::Sender<Option<CaMaterial>>,
     },
-    /// Stop carrying traffic. The reply arrives once shutdown is ordered and
-    /// complete; the driver then returns, which drops the event sender and
-    /// releases any reader blocked in `next_event`.
+    /// Stop traffic and release blocked event readers.
     Shutdown {
         reply: oneshot::Sender<Result<(), ()>>,
     },
 }
 
-/// Owns the tunnel; serves events and commands until either side is done.
-///
-/// The `select!` is sound because [`Tunnel::next_event`] is documented
-/// cancel-safe: losing that arm to a command loses nothing, because the event
-/// stays in the core's channel until it is taken.
+/// Owns the tunnel and serves events and commands until shutdown.
 async fn drive(
     mut tunnel: Tunnel,
     mut commands: mpsc::Receiver<Command>,
@@ -89,8 +57,7 @@ async fn drive(
         tokio::select! {
             next = tunnel.next_event() => {
                 let Some(event) = next else { break };
-                // Awaited, not tried: a full buffer must slow this loop down
-                // rather than silently drop what the host asked to see.
+                // Backpressure preserves events instead of dropping them.
                 if events.send(event).await.is_err() {
                     break;
                 }
@@ -106,8 +73,7 @@ async fn drive(
                     let _ = reply.send(tunnel.stop().await.map_err(|_| ()));
                     return;
                 }
-                // Every handle is gone without a shutdown: `free` without a
-                // `shutdown`. Stop anyway, so sockets close.
+                // Dropping every handle still stops the tunnel.
                 None => break,
             },
         }
@@ -115,30 +81,18 @@ async fn drive(
     let _ = tunnel.stop().await;
 }
 
-/// A running tunnel, and the runtime it runs on.
-///
-/// **The runtime lives here because a C caller has no executor.** Every entry
-/// point that awaits blocks on this one, so the host's calling thread is the
-/// one that waits — which is what a Kotlin coroutine dispatcher or a C# task
-/// already knows how to arrange.
+/// Running tunnel handle and its runtime.
 pub struct BoreasTunnel {
     runtime: tokio::runtime::Runtime,
-    /// One reader at a time. The mutex makes a second caller queue rather than
-    /// alias the receiver; it is never held by anything but `next_event`, so a
-    /// blocked reader delays no other call.
+    /// Serializes event readers without aliasing the receiver.
     events: Mutex<mpsc::Receiver<Event>>,
     commands: mpsc::Sender<Command>,
-    /// Releases the host's bypass context exactly once, after the tunnel that
-    /// borrowed it is gone. Ordering is the point: dropping this before the
-    /// tunnel would free a context a dialling task may still be inside.
+    /// Releases the bypass context after the tunnel is dropped.
     _bypass: BypassGuard,
 }
 
 impl BoreasTunnel {
-    /// Sends one command and waits for its reply.
-    ///
-    /// `None` once the driver is gone, which is what every entry point turns
-    /// into [`Status::Stopped`].
+    /// Sends one command and waits for its reply; `None` means the driver ended.
     fn ask<T>(&self, build: impl FnOnce(oneshot::Sender<T>) -> Command) -> Option<T> {
         let (reply, answer) = oneshot::channel();
         self.commands.blocking_send(build(reply)).ok()?;
@@ -146,23 +100,19 @@ impl BoreasTunnel {
     }
 }
 
-/// Which of [`BoreasEvent`]'s field groups is meaningful.
+/// Event field group represented by [`BoreasEvent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum BoreasEventKind {
-    /// One name was decided. `blocked`, `name`, and `rule` are meaningful.
+    /// A name was resolved.
     Resolved = 0,
-    /// Rules were reloaded. `allowed`, `blocked_rules`, and `inspected` are.
+    /// Rules were reloaded.
     Reloaded = 1,
-    /// Aggregated counters since the previous one. `counters` is.
+    /// Counters since the previous event.
     Counted = 2,
 }
 
-/// Occurrences since the previous [`BoreasEventKind::Counted`].
-///
-/// A flat mirror of the core's counters. **Every field is a thing that went
-/// wrong or was refused**, so a host can surface any non-zero one without
-/// knowing what it means.
+/// Counters since the previous [`BoreasEventKind::Counted`] event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct BoreasCounters {
@@ -171,26 +121,20 @@ pub struct BoreasCounters {
     pub quic_steered: u64,
     pub paths_reported: u64,
     pub events_lost: u64,
-    /// A defect in Boreas rather than a condition of the network. Report it.
+    /// Number of tasks that panicked.
     pub tasks_panicked: u64,
 }
 
-/// One event, flattened.
-///
-/// A tag and every arm's fields side by side, rather than a union: a union
-/// would save a few dozen bytes per event and cost every binding generator an
-/// unsafe read. Only the fields [`Self::kind`] names carry meaning.
+/// Flattened event record; only fields selected by `kind` are meaningful.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct BoreasEvent {
     pub kind: BoreasEventKind,
-    /// `Resolved`: whether the answer came from policy without leaving the
-    /// device.
+    /// `Resolved`: whether policy blocked the name.
     pub blocked: bool,
-    /// `Resolved`: the full byte length of the name, before truncation. Larger
-    /// than what was written means the caller's buffer was too small.
+    /// `Resolved`: full name length before truncation.
     pub name_len: usize,
-    /// `Resolved`: as `name_len`, for the rule. Zero when no rule decided it.
+    /// `Resolved`: full rule length, or zero when no rule matched.
     pub rule_len: usize,
     pub allowed: usize,
     pub blocked_rules: usize,
@@ -212,7 +156,7 @@ impl BoreasEvent {
         }
     }
 
-    /// The flat form of a `Reloaded`, which two entry points both produce.
+    /// Converts a reload event to its flat representation.
     fn reloaded(event: &Event) -> Self {
         let mut flat = Self::empty(BoreasEventKind::Reloaded);
         if let Event::Reloaded {
@@ -229,13 +173,9 @@ impl BoreasEvent {
     }
 }
 
-/// Copies `text` into `buf` as a NUL-terminated string, returning the full
-/// byte length of `text`.
+/// Copies `text` into a NUL-terminated buffer and returns its full byte length.
 ///
-/// **Truncates rather than failing**, and reports the length that would have
-/// been needed. An event is a diagnostic; losing the tail of a very long name
-/// is better than losing the event, and a caller that cares can compare the
-/// reported length against its capacity.
+/// Truncates at a UTF-8 boundary when the buffer is too small.
 ///
 /// # Safety
 ///
@@ -244,11 +184,9 @@ unsafe fn write_c_string(text: &str, buf: *mut c_char, cap: usize) -> usize {
     if buf.is_null() || cap == 0 {
         return text.len();
     }
-    // One byte reserved for the terminator, always, so the result is a C
-    // string even when the name did not fit.
+    // Reserve one byte for the terminator.
     let taken = text.len().min(cap - 1);
-    // Never split a UTF-8 character: a truncated name is a diagnostic, and a
-    // host that decodes it must not be handed half a code point.
+    // Keep truncation on a UTF-8 boundary.
     let taken = (0..=taken)
         .rev()
         .find(|at| text.is_char_boundary(*at))
@@ -262,11 +200,7 @@ unsafe fn write_c_string(text: &str, buf: *mut c_char, cap: usize) -> usize {
     text.len()
 }
 
-/// Starts a tunnel.
-///
-/// Writes the handle through `out` on success. On any failure nothing is
-/// allocated and `out` is untouched — except that the host's `release`
-/// callbacks are still called, so a context handed in is always accounted for.
+/// Starts a tunnel and writes its handle through `out`.
 ///
 /// # Safety
 ///
@@ -285,8 +219,7 @@ pub unsafe extern "C" fn boreas_tunnel_start(
         let bypass_ops = *borrow!(bypass);
         let out = borrow_mut!(out);
 
-        // The guard is created first and dropped last, so a failure anywhere
-        // below still releases the host's bypass context exactly once.
+        // Drop the guard after all tunnel resources.
         let guard = BypassGuard::new(bypass_ops);
         let Some(device) = Device::new(device_ops) else {
             return Status::Config;
@@ -327,13 +260,10 @@ pub unsafe extern "C" fn boreas_tunnel_start(
     })
 }
 
-/// Blocks until the next event, or until the tunnel stops.
+/// Blocks until the next event or tunnel shutdown.
 ///
-/// `name` and `rule` receive `Resolved`'s strings, truncated to their
-/// capacities and always NUL-terminated; either may be null to discard it.
-/// [`Status::Stopped`] once no further event can arrive — which is how a
-/// reader learns that another thread called
-/// [`boreas_tunnel_shutdown`].
+/// Resolved names and rules are truncated to their capacities and
+/// NUL-terminated; null buffers discard the corresponding text.
 ///
 /// # Safety
 ///
@@ -354,13 +284,7 @@ pub unsafe extern "C" fn boreas_tunnel_next_event(
         let out = borrow_mut!(event);
 
         let mut events = handle.events.lock().unwrap_or_else(PoisonError::into_inner);
-        // **Loops, because an event this ABI predates must not be delivered as
-        // a phantom.** The core's event sum is `#[non_exhaustive]`, so a
-        // variant this build has no field for can arrive; returning success
-        // without writing `*out` would leave the host dispatching on whatever
-        // its own struct happened to contain. Skipping to the next real event
-        // is what the host would do anyway, done here where the alternative is
-        // not visible to it.
+        // Skip core events not represented by this ABI.
         let next = loop {
             let Some(next) = handle.runtime.block_on(events.recv()) else {
                 return Status::Stopped;
@@ -403,18 +327,14 @@ pub unsafe extern "C" fn boreas_tunnel_next_event(
                 };
                 flat
             }
-            // Filtered out by the loop above, which is what keeps this arm
-            // from being a phantom event rather than an absent one.
+            // Kept unreachable by the event filter above.
             _ => return Status::Ok,
         };
         Status::Ok
     })
 }
 
-/// Replaces the rules in force, without restarting the tunnel.
-///
-/// Writes a `Reloaded` event through `out`. Safe to call while another thread
-/// is blocked in [`boreas_tunnel_next_event`].
+/// Replaces the active rules and writes a `Reloaded` event through `out`.
 ///
 /// # Safety
 ///
@@ -444,16 +364,10 @@ pub unsafe extern "C" fn boreas_tunnel_reload(
     })
 }
 
-/// Copies out the certificate authority's material, for the host to store.
+/// Copies the tunnel's certificate authority material into caller buffers.
 ///
-/// Writes the two halves into the caller's buffers and sets the lengths.
-/// [`Status::BufferTooSmall`] when either buffer is short, with both lengths
-/// set to what would be needed — so the idiomatic use is to call once with
-/// zero capacities to size, then again to fill. Both lengths are zero for a
-/// tunnel that does not intercept, which is an answer rather than a failure.
-///
-/// Safe to call while another thread is blocked in
-/// [`boreas_tunnel_next_event`].
+/// Length outputs report required sizes when either buffer is too small. A
+/// tunnel without interception reports two zero lengths.
 ///
 /// # Safety
 ///
@@ -503,16 +417,10 @@ pub unsafe extern "C" fn boreas_tunnel_authority(
     })
 }
 
-/// Stops carrying traffic, and releases any thread blocked in
-/// [`boreas_tunnel_next_event`].
+/// Stops traffic and releases blocked event readers.
 ///
-/// **Separate from [`boreas_tunnel_free`], because a blocked reader cannot be
-/// freed out from under itself.** A host stops, joins its reader thread, then
-/// frees — the same three steps it would take to tear down any of its own
-/// worker loops. Safe to call concurrently with anything, and from any thread;
-/// calling it twice is not an error.
-///
-/// When this returns, every socket is closed and every pooled buffer is back.
+/// Callers should join event-reader threads before freeing the handle. Repeated
+/// shutdown calls are harmless.
 ///
 /// # Safety
 ///
@@ -525,24 +433,15 @@ pub unsafe extern "C" fn boreas_tunnel_shutdown(handle: *const BoreasTunnel) -> 
         match handle.ask(|reply| Command::Shutdown { reply }) {
             Some(Ok(())) => Status::Ok,
             Some(Err(())) => Status::Io,
-            // The driver is already gone, so the tunnel is already stopped.
-            // Idempotent on purpose: a teardown path that has to remember
-            // whether it already ran is a teardown path with a race in it.
+            // The driver is already gone, so shutdown is complete.
             None => Status::Ok,
         }
     })
 }
 
-/// Frees the handle.
+/// Frees the handle after callers have stopped it and joined event readers.
 ///
-/// Call [`boreas_tunnel_shutdown`] first and join whatever thread was reading
-/// events; this reclaims the memory once nothing is inside the tunnel any
-/// more. A tunnel not already stopped is stopped here, so a host that frees
-/// without stopping still closes its sockets — but a reader blocked at that
-/// moment is a use-after-free, which is why the two are separate calls.
-///
-/// Passing null is a no-op, so the C idiom of freeing an unconditionally
-/// initialised pointer is safe.
+/// A non-stopped tunnel is stopped during cleanup. A null handle is a no-op.
 ///
 /// # Safety
 ///
@@ -557,9 +456,7 @@ pub unsafe extern "C" fn boreas_tunnel_free(handle: *mut BoreasTunnel) -> Status
         // SAFETY: the caller's contract is that this came from `start` and is
         // not used again, which makes reclaiming the box sound.
         let owned = unsafe { Box::from_raw(handle) };
-        // Dropping the command sender ends the driver, which stops the tunnel
-        // if `shutdown` did not. Done before the runtime is torn down, so the
-        // shutdown has a runtime to run on.
+        // End the driver before tearing down its runtime.
         let BoreasTunnel {
             runtime,
             events,
@@ -569,13 +466,7 @@ pub unsafe extern "C" fn boreas_tunnel_free(handle: *mut BoreasTunnel) -> Status
         drop(commands);
         drop(events);
 
-        // **Bounded, because a device read cannot be cancelled.** Dropping a
-        // runtime waits for its blocking pool, and the host's `recv` is
-        // blocked in the kernel until a packet arrives — which, on a tunnel
-        // that has just stopped carrying traffic, may be never. Waiting
-        // forever inside `free` would hang the host's UI thread; the read is
-        // therefore given a moment to notice and then detached, and the
-        // refcounted context in `seam` is what keeps that sound.
+        // A device callback may not be cancellable, so bound runtime shutdown.
         runtime.shutdown_timeout(SHUTDOWN_GRACE);
         Status::Ok
     })
