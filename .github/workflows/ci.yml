@@ -127,7 +127,8 @@ jobs:
   android:
     name: android check
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Linking BoringSSL for a foreign architecture is not a five-minute job.
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -155,13 +156,21 @@ jobs:
       - name: Point the C toolchain at the NDK
         run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
 
+      # **`build`, not `check`.** This job ran `cargo check` for its whole life
+      # and never linked anything, which is exactly how a `libcrypto.a` full of
+      # *host* objects rode a green CI run all the way to the first release that
+      # tried to link it. `boreas-ffi` is a `cdylib`, so `build --lib` performs
+      # the link that `check` skips, and the C toolchain is proved rather than
+      # merely configured. It costs a BoringSSL compile; that is the price of
+      # the check being real.
+      #
       # `--lib` rather than `--all-targets`: the library is what ships to a
       # handset, and cross-compiling the test and example targets would gate
       # the Android build on dev-dependencies that never reach the device.
       #
       # Both crates. `boreas-ffi`'s JNI layer is `#[cfg(target_os = "android")]`,
       # so this job is the only one that compiles it at all.
-      - run: cargo check --target "${{ steps.target.outputs.rust }}" --lib -p boreas-core -p boreas-ffi
+      - run: cargo build --target "${{ steps.target.outputs.rust }}" --lib -p boreas-core -p boreas-ffi
 
   fuzz:
     name: fuzz smoke

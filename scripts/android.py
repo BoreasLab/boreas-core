@@ -25,6 +25,14 @@ The binutils half of that note is why the archiver below is `llvm-ar` rather
 than a prefixed one: the unified tool takes no triple, so the second naming
 split has nowhere to go wrong.
 
+**`CXX` is not optional and its absence is silent.** BoringSSL's `crypto/` is
+329 C++ files and no C files, so a cross build that names `CC` and not `CXX`
+compiles the C++ half with the *host* compiler and produces a `libcrypto.a`
+full of host objects. Nothing complains until the final link, which
+`cargo check` never performs — so the whole arrangement can look correct
+through a green CI run and fail the first time anything actually links it.
+That is what this table's `--env` exists to make impossible.
+
     scripts/android.py --abis                   every ABI name, one per line
     scripts/android.py --target arm64-v8a       the Rust target triple
     scripts/android.py --env arm64-v8a          CC/AR/linker, as `key=value`
@@ -97,31 +105,54 @@ HOST_TAGS = {
 }
 
 
-def cargo_variables(abi: Abi, compiler: str) -> dict[str, str]:
-    """The environment `cargo` reads to cross-compile for `abi`.
+def build_environment(abi: Abi, compiler: Path, ndk: Path) -> dict[str, str]:
+    """Every variable a cross build for `abi` needs, and no others.
 
     `cc` and `cargo` spell the same target differently — one lower-cased with
     underscores, the other upper-cased — so both spellings are derived here
     rather than written out per ABI.
 
-    >>> vars = cargo_variables(ABIS["armeabi-v7a"], "/ndk/armv7a-linux-androideabi26-clang")
-    >>> vars["CC_armv7_linux_androideabi"]
-    '/ndk/armv7a-linux-androideabi26-clang'
-    >>> vars["CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER"]
-    '/ndk/armv7a-linux-androideabi26-clang'
-    >>> vars["AR_armv7_linux_androideabi"]
-    '/ndk/llvm-ar'
+    >>> ndk = Path("/ndk")
+    >>> clang = ndk / "bin/armv7a-linux-androideabi26-clang"
+    >>> env = build_environment(ABIS["armeabi-v7a"], clang, ndk)
+    >>> env["CC_armv7_linux_androideabi"]
+    '/ndk/bin/armv7a-linux-androideabi26-clang'
+    >>> env["CXX_armv7_linux_androideabi"]
+    '/ndk/bin/armv7a-linux-androideabi26-clang++'
+    >>> env["CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER"]
+    '/ndk/bin/armv7a-linux-androideabi26-clang'
+    >>> env["AR_armv7_linux_androideabi"]
+    '/ndk/bin/llvm-ar'
+
+    `ANDROID_NDK_HOME` is here because `boring-sys` reads it to find
+    `build/cmake/android.toolchain.cmake`, and a runner that has more than one
+    NDK installed can otherwise point it at a different one than the compilers
+    above came from.
+
+    >>> env["ANDROID_NDK_HOME"]
+    '/ndk'
+
+    **The law this table exists to keep: one NDK, every tool.** A build that
+    mixes a cross compiler with a host C++ compiler produces object files that
+    only disagree at the final link.
+
+    >>> tools = [env[key] for key in env if key.startswith(("CC_", "CXX_", "AR_"))]
+    >>> all(tool.startswith(env["ANDROID_NDK_HOME"]) for tool in tools)
+    True
 
     The compiler is also the linker: the NDK's wrapper is what knows the
     sysroot and the runtime, and invoking bare `ld` misses both.
     """
     lower = abi.rust.replace("-", "_")
     upper = lower.upper()
-    archiver = str(Path(compiler).parent / "llvm-ar")
     return {
-        f"CC_{lower}": compiler,
-        f"AR_{lower}": archiver,
-        f"CARGO_TARGET_{upper}_LINKER": compiler,
+        f"CC_{lower}": str(compiler),
+        # BoringSSL is C++. Omitting this is the bug that builds `libcrypto.a`
+        # for the host and is not detectable until something links.
+        f"CXX_{lower}": f"{compiler}++",
+        f"AR_{lower}": str(compiler.parent / "llvm-ar"),
+        f"CARGO_TARGET_{upper}_LINKER": str(compiler),
+        "ANDROID_NDK_HOME": str(ndk),
     }
 
 
@@ -148,6 +179,15 @@ def compiler(ndk: Path, abi: Abi, api: int, host: str) -> Path:
     if tag is None:
         raise ValueError(f"the NDK ships no prebuilt toolchain for {host}")
     return ndk / "toolchains/llvm/prebuilt" / tag / "bin" / f"{abi.clang}{api}-clang"
+
+
+def ndk_toolchain_file(ndk: Path) -> Path:
+    """The CMake toolchain file `boring-sys` hands to BoringSSL's build.
+
+    >>> str(ndk_toolchain_file(Path("/ndk")))
+    '/ndk/build/cmake/android.toolchain.cmake'
+    """
+    return ndk / "build/cmake/android.toolchain.cmake"
 
 
 def lookup(name: str) -> Abi:
@@ -229,14 +269,18 @@ def main(argv: list[str] | None = None) -> int:
         print(refusal.args[0], file=sys.stderr)
         return Exit.ERROR
 
-    # Checked before it is named. An environment variable pointing at nothing
-    # fails minutes later as a linker error mentioning neither this script nor
-    # the file it could not find.
-    if not clang.is_file():
-        print(f"no NDK compiler at {clang}", file=sys.stderr)
-        return Exit.ERROR
+    # Checked before they are named. An environment variable pointing at
+    # nothing fails minutes later as a linker error mentioning neither this
+    # script nor the file it could not find — and the C++ wrapper is checked
+    # alongside the C one precisely because its absence is the failure that
+    # otherwise reaches the final link disguised as an architecture mismatch.
+    toolchain = ndk_toolchain_file(root)
+    for required in (clang, Path(f"{clang}++"), toolchain):
+        if not required.is_file():
+            print(f"missing from the NDK: {required}", file=sys.stderr)
+            return Exit.ERROR
 
-    for key, value in cargo_variables(abi, str(clang)).items():
+    for key, value in build_environment(abi, clang, root).items():
         print(f"{key}={value}")
     return Exit.OK
 
