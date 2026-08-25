@@ -156,6 +156,24 @@ jobs:
         with:
           key: ${{ matrix.abi }}
 
+      # **A CMake build tree cannot be restored across a toolchain change, and
+      # the cache key cannot be used to prevent it.** `rust-cache` falls back
+      # to a prefix-matched older entry when the exact key misses, so changing
+      # the compilers changes the key and restores the stale tree anyway.
+      #
+      # Two things go stale in there and both are fatal. A toolchain file is
+      # only honoured on a tree's *first* configure, so a restored cache keeps
+      # whatever compiler it was born with. And Google Benchmark writes
+      # `HAVE_STD_REGEX=FALSE` with `CACHE BOOL "" FORCE` when its probe fails,
+      # then short-circuits on `if(DEFINED ...)` ever after — so one bad
+      # configure poisons every later one in that tree, including correct ones,
+      # and the only cure is deleting the directory.
+      #
+      # The cost is a BoringSSL rebuild per run. That is the honest price of
+      # not being able to cache this soundly.
+      - name: Discard any restored BoringSSL build tree
+        run: rm -rf target/*/*/build/boring-sys-* target/*/build/boring-sys-*
+
       - name: Build
         env:
           RUST: ${{ steps.target.outputs.rust }}
