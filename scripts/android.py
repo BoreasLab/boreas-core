@@ -36,12 +36,26 @@ That is what this table's `--env` exists to make impossible.
     scripts/android.py --abis                   every ABI name, one per line
     scripts/android.py --target arm64-v8a       the Rust target triple
     scripts/android.py --env arm64-v8a          CC/AR/linker, as `key=value`
+    scripts/android.py --toolchain arm64-v8a    write a CMake toolchain file
     scripts/android.py --selftest               this module's doctests
 
 `--env` writes the lines `cargo` reads to find a cross toolchain, for appending
 to `$GITHUB_ENV`. It verifies the compiler exists before naming it, because an
 environment variable pointing at nothing fails three minutes later as a linker
 error that names neither this script nor the missing file.
+
+**BoringSSL's test tree cannot cross-compile, and `boring-sys` configures it
+anyway.** `BUILD_TESTING` defaults on, so CMake descends into Google Benchmark
+purely to build nothing — `boring-sys` asks only for the `crypto` and `ssl`
+targets. Benchmark then probes for a regex backend with `try_compile`, writes
+the answer with `CACHE BOOL "" FORCE`, and returns early on `if(DEFINED ...)`
+ever after. `boring-sys` runs CMake twice, once per target, and its explicit
+`-DCMAKE_C_COMPILER` disagrees with whatever `android.toolchain.cmake` installs
+— so the second configure invalidates the cache, re-runs the probes in a
+half-reset tree, and fails. A build that cannot fail is a build that never
+configures Benchmark, which is what `--toolchain` is for: `boring-sys` skips its
+own CMake setup entirely when `CMAKE_TOOLCHAIN_FILE` is set, so a file that
+turns testing off and then includes the NDK's own is the one seam available.
 
 **Run it through `uv`.** The PEP 723 block above is the whole environment.
 """
@@ -67,12 +81,14 @@ class Exit(enum.IntEnum):
 
 
 class Abi(NamedTuple):
-    """One architecture, under the two names that are not its Gradle name.
+    """One architecture, under all three of its names.
 
-    `rust` is what `cargo --target` takes and what names the output directory.
-    `clang` is the NDK's toolchain triple, which prefixes the compiler wrapper.
+    `gradle` is the name the Play Store and `jniLibs/` use, `rust` is what
+    `cargo --target` takes and what names the output directory, and `clang` is
+    the NDK's toolchain triple, which prefixes the compiler wrapper.
     """
 
+    gradle: str
     rust: str
     clang: str
 
@@ -82,10 +98,12 @@ class Abi(NamedTuple):
 #:
 #: The triples are quoted from the NDK's own table; see the module docstring.
 ABIS: dict[str, Abi] = {
-    "arm64-v8a": Abi("aarch64-linux-android", "aarch64-linux-android"),
-    "armeabi-v7a": Abi("armv7-linux-androideabi", "armv7a-linux-androideabi"),
-    "x86": Abi("i686-linux-android", "i686-linux-android"),
-    "x86_64": Abi("x86_64-linux-android", "x86_64-linux-android"),
+    "arm64-v8a": Abi("arm64-v8a", "aarch64-linux-android", "aarch64-linux-android"),
+    "armeabi-v7a": Abi(
+        "armeabi-v7a", "armv7-linux-androideabi", "armv7a-linux-androideabi"
+    ),
+    "x86": Abi("x86", "i686-linux-android", "i686-linux-android"),
+    "x86_64": Abi("x86_64", "x86_64-linux-android", "x86_64-linux-android"),
 }
 
 #: The minimum API level the shipped library is built against.
@@ -98,6 +116,8 @@ DEFAULT_API = 26
 #: The host directories the NDK ships prebuilt toolchains for. Any other host
 #: has no toolchain to point at, which `compiler` reports as a missing file
 #: rather than by guessing.
+ROOT = Path(__file__).resolve().parent.parent
+
 HOST_TAGS = {
     "Linux": "linux-x86_64",
     "Darwin": "darwin-x86_64",
@@ -105,7 +125,9 @@ HOST_TAGS = {
 }
 
 
-def build_environment(abi: Abi, compiler: Path, ndk: Path) -> dict[str, str]:
+def build_environment(
+    abi: Abi, compiler: Path, ndk: Path, wrapper: Path
+) -> dict[str, str]:
     """Every variable a cross build for `abi` needs, and no others.
 
     `cc` and `cargo` spell the same target differently — one lower-cased with
@@ -114,7 +136,7 @@ def build_environment(abi: Abi, compiler: Path, ndk: Path) -> dict[str, str]:
 
     >>> ndk = Path("/ndk")
     >>> clang = ndk / "bin/armv7a-linux-androideabi26-clang"
-    >>> env = build_environment(ABIS["armeabi-v7a"], clang, ndk)
+    >>> env = build_environment(ABIS["armeabi-v7a"], clang, ndk, Path("/wrap.cmake"))
     >>> env["CC_armv7_linux_androideabi"]
     '/ndk/bin/armv7a-linux-androideabi26-clang'
     >>> env["CXX_armv7_linux_androideabi"]
@@ -131,6 +153,13 @@ def build_environment(abi: Abi, compiler: Path, ndk: Path) -> dict[str, str]:
 
     >>> env["ANDROID_NDK_HOME"]
     '/ndk'
+
+    And `CMAKE_TOOLCHAIN_FILE`, target-scoped, is what `boring-sys` and
+    `cmake-rs` both read — see this module's header for why the wrapper exists
+    rather than the NDK's own file being named directly.
+
+    >>> env["CMAKE_TOOLCHAIN_FILE_armv7-linux-androideabi"]
+    '/wrap.cmake'
 
     **The law this table exists to keep: one NDK, every tool.** A build that
     mixes a cross compiler with a host C++ compiler produces object files that
@@ -153,6 +182,9 @@ def build_environment(abi: Abi, compiler: Path, ndk: Path) -> dict[str, str]:
         f"AR_{lower}": str(compiler.parent / "llvm-ar"),
         f"CARGO_TARGET_{upper}_LINKER": str(compiler),
         "ANDROID_NDK_HOME": str(ndk),
+        # Target-scoped: `boring-sys` skips its whole CMake configuration when
+        # it sees this, which is exactly what makes the wrapper effective.
+        f"CMAKE_TOOLCHAIN_FILE_{abi.rust}": str(wrapper),
     }
 
 
@@ -188,6 +220,42 @@ def ndk_toolchain_file(ndk: Path) -> Path:
     '/ndk/build/cmake/android.toolchain.cmake'
     """
     return ndk / "build/cmake/android.toolchain.cmake"
+
+
+def toolchain(abi: Abi, ndk: Path, api: int) -> str:
+    """A CMake toolchain file wrapping the NDK's.
+
+    Two lines of intent and one `include`. `BUILD_TESTING` is what this exists
+    for; the rest is what `boring-sys` would have supplied had it not skipped
+    its own configuration on seeing `CMAKE_TOOLCHAIN_FILE` set.
+
+    `FORCE`, because Benchmark writes its own answers with `FORCE` and a
+    toolchain file is re-read for every `try_compile` — a plain `set` would be
+    overwritten by the first probe it is meant to prevent.
+
+    >>> print(toolchain(ABIS["arm64-v8a"], Path("/ndk"), 26))
+    ... # doctest: +NORMALIZE_WHITESPACE
+    # Generated by scripts/android.py. Do not edit.
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(ANDROID_ABI "arm64-v8a" CACHE STRING "" FORCE)
+    set(ANDROID_PLATFORM "android-26" CACHE STRING "" FORCE)
+    include("/ndk/build/cmake/android.toolchain.cmake")
+
+    The ABI is the Gradle name, which is also what the NDK's own toolchain file
+    expects — not the Rust target, and not the compiler triple.
+
+    >>> 'ANDROID_ABI "armeabi-v7a"' in toolchain(ABIS["armeabi-v7a"], Path("/n"), 21)
+    True
+    """
+    return "\n".join(
+        [
+            "# Generated by scripts/android.py. Do not edit.",
+            'set(BUILD_TESTING OFF CACHE BOOL "" FORCE)',
+            f'set(ANDROID_ABI "{abi.gradle}" CACHE STRING "" FORCE)',
+            f'set(ANDROID_PLATFORM "android-{api}" CACHE STRING "" FORCE)',
+            f'include("{ndk_toolchain_file(ndk)}")',
+        ]
+    )
 
 
 def lookup(name: str) -> Abi:
@@ -280,7 +348,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"missing from the NDK: {required}", file=sys.stderr)
             return Exit.ERROR
 
-    for key, value in build_environment(abi, clang, root).items():
+    # Written where the build can find it and the repository never sees it.
+    wrapper = ROOT / "target" / "android" / f"{abi.gradle}.cmake"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(toolchain(abi, root, arguments.api) + "\n")
+
+    for key, value in build_environment(abi, clang, root, wrapper).items():
         print(f"{key}={value}")
     return Exit.OK
 
