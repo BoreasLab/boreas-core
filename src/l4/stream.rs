@@ -1,34 +1,14 @@
-//! Local TCP termination: the substrate P14 MITM runs on.
+//! Sans-IO TCP termination backed by `smoltcp`.
 //!
-//! The packet fast path forwards whole IP packets and never sees a byte stream.
-//! Interception needs the opposite: the client's TCP connection must *end here*,
-//! so its plaintext (or, one TLS layer up, its ciphertext) becomes an ordered
-//! byte stream the shell can read, filter, and re-originate upstream. This
-//! module is that terminator.
+//! The packet path handles whole IP packets, while interception needs the
+//! client's connection to terminate here as an ordered byte stream. Packets
+//! enter and leave as pooled buffers; time is supplied to [`LocalStack::poll`].
+//! No socket, task, or clock is owned by this module.
 //!
-//! It is sans-io in exactly the sense the rest of the core is: it owns no
-//! socket, no task, and no clock. Client packets enter as pooled buffers
-//! ([`push`](LocalStack::push)); reply packets leave as pooled buffers
-//! ([`poll_transmit`](LocalStack::poll_transmit)); time enters as an `Instant`
-//! argument to [`poll`](LocalStack::poll). A `smoltcp` socket set is the TCP
-//! state machine underneath — the engineering plan's gap 9, admitted here for
-//! real rather than measured in an example — and this type is the seam that
-//! keeps `smoltcp`'s poll-driven, mutable world from leaking into the reactor
-//! that drives it.
-//!
-//! **Any-IP is load-bearing.** A terminating proxy answers a SYN addressed to
-//! an arbitrary upstream server, not to an address this interface owns. The
-//! interface therefore runs with `smoltcp`'s any-IP mode and its listeners bind
-//! the port with no local address, so the destination the client dialled is
-//! taken from the SYN and used as the reply's source. Without it every
-//! handshake would be answered from the wrong address and silently fail.
-//!
-//! **The socket set is the bound.** One listening socket accepts one
-//! connection and becomes it, so the pool is replenished on every accept up to
-//! a fixed ceiling ([`TerminationLimits::max_sockets`]). At the ceiling a new
-//! SYN finds no listener and `smoltcp` refuses it with a RST — connection
-//! refused, which a browser retries — rather than growing state without limit.
-//! This is the P6 socket-count budget expressed as an admission rule.
+//! Any-IP lets a listener accept a SYN for an address the interface does not
+//! own. The destination from that SYN becomes the connection's local endpoint.
+//! The socket ceiling bounds admission: once it is reached, no listener is
+//! available for another SYN and `smoltcp` refuses the connection.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -48,20 +28,16 @@ use smoltcp::{
 
 use crate::{BufferPool, InternalEndpoint, Mtu, Pooled};
 
-/// Opaque handle to one terminated connection. A thin newtype over `smoltcp`'s
-/// own handle so a caller cannot fabricate one or reach past it into the socket
-/// set — the only way to name a stream is to have been handed it by
-/// [`LocalStack::poll_accept`].
+/// Opaque handle for an accepted connection.
+///
+/// Callers can only obtain one from [`LocalStack::poll_accept`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamId(SocketHandle);
 
-/// A connection the stack has accepted: the client's SYN was answered and an
-/// ordered byte stream now exists in both directions.
+/// Accepted connection and both endpoints recovered from its SYN.
 ///
-/// `client` is the remote peer (the application behind the TUN) and `server` is
-/// the original destination it dialled — the address any-IP recovered from the
-/// SYN. The MITM layer needs both: `server` names the host whose certificate it
-/// must present, and `client` addresses the connection for teardown.
+/// `client` is the application-side peer. `server` is the original destination
+/// and supplies the host identity used by interception.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Terminated {
     pub id: StreamId,
@@ -69,53 +45,34 @@ pub struct Terminated {
     pub server: InternalEndpoint,
 }
 
-/// Why a read or write against a stream could not proceed. Absence
-/// (`WouldBlock`) is not an error: it is the ordinary "nothing to read yet" or
-/// "peer window full" that a caller retries after the next [`poll`](LocalStack::poll).
+/// Why a stream operation could not proceed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
-    /// No live stream bears this id: it was never accepted, or it has closed
-    /// and been reaped. Distinct from `WouldBlock`, which names a live stream.
+    /// The id is not live.
     Unknown,
-    /// The stream is live but cannot move bytes in this direction right now —
-    /// an empty receive buffer or a full send window. Retry after `poll`.
+    /// The live stream has no immediate capacity. Retry after `poll`.
     WouldBlock,
-    /// The peer has closed its half: no more bytes will ever arrive (on `recv`)
-    /// or be accepted (on `send`). A terminal condition, not a retry.
+    /// The peer has closed this direction.
     Closed,
 }
 
-/// Memory and cardinality bounds for the terminator. Every field bounds state
-/// fed by network input; none of them changes policy.
+/// Memory and socket bounds for the terminator.
 #[derive(Clone, Copy, Debug)]
 pub struct TerminationLimits {
-    /// Total `smoltcp` sockets — listeners plus established connections. The P6
-    /// socket-count budget: a SYN arriving with the ceiling reached finds no
-    /// listener and is refused with a RST rather than admitted.
+    /// Maximum listeners plus established connections.
     pub max_sockets: NonZeroUsize,
-    /// Listening sockets held open per intercepted port. A backlog absorbs a
-    /// burst of near-simultaneous connections without any being refused while
-    /// the pool replenishes.
+    /// Listening sockets maintained for each intercepted port.
     pub backlog: NonZeroUsize,
-    /// Bytes of receive and of send buffer per connection. The dominant memory
-    /// term: peak is roughly `max_sockets * 2 * socket_buffer`, so on a mobile
-    /// target this trades throughput per connection against how many connections
-    /// fit the RSS budget.
+    /// Receive and send bytes reserved for each connection.
     pub socket_buffer: NonZeroUsize,
 }
 
-/// A ceiling that cannot serve the ports it was given.
+/// A socket ceiling that cannot provide the requested port backlogs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminationError {
-    /// `max_sockets` is smaller than one full backlog per inspected port.
-    ///
-    /// **Not merely tight — silently partial.** Listeners are replenished port
-    /// by port in order and stop at the ceiling, so the first ports get their
-    /// whole backlog and the last ones get *none*. A port with no listener
-    /// refuses every SYN with a RST, permanently, while its neighbours work
-    /// perfectly: with two inspected ports and a ceiling under one backlog,
-    /// plaintext HTTP is intercepted and HTTPS is dead, and nothing anywhere
-    /// says so.
+    /// The ceiling is below one full backlog for every port. Replenishment is
+    /// ordered, so accepting a partial configuration would leave later ports
+    /// without listeners and refuse their SYNs indefinitely.
     SocketsBelowBacklog {
         ports: usize,
         backlog: usize,
@@ -141,20 +98,11 @@ impl std::fmt::Display for TerminationError {
 
 impl std::error::Error for TerminationError {}
 
-/// A `smoltcp` device backed by two byte-buffer queues rather than a NIC.
-/// `inbound` is what the client sent (consumed by `smoltcp` on receive);
-/// `outbound` is what `smoltcp` produced for the client (drained by the shell).
-/// The queues are the whole I/O surface, which is what keeps this sans-io.
+/// Queue-backed `smoltcp` device.
 ///
-/// **Every buffer on both queues is on loan from the shared
-/// [`BufferPool`].** Three things follow, and all three were wrong before:
-/// an inbound packet arrives already pooled and is *moved* in rather than
-/// copied; an outbound segment costs no allocation, because a returned buffer
-/// keeps its capacity; and the outbound queue is bounded by the pool's budget
-/// instead of growing without limit whenever the reactor drains it more slowly
-/// than `smoltcp` fills it. Exhaustion is expressed the way `smoltcp` already
-/// expects — no transmit token — which is the same "try again next poll"
-/// backpressure a real NIC's full ring applies.
+/// Both queues own [`BufferPool`] loans. Incoming packets move in without a
+/// copy, outgoing packets retain their capacity, and pool exhaustion withholds
+/// a transmit token instead of growing unbounded state.
 struct QueueDevice {
     inbound: VecDeque<Pooled>,
     outbound: VecDeque<Pooled>,
@@ -162,9 +110,7 @@ struct QueueDevice {
     mtu: usize,
 }
 
-/// Owns the received packet outright, so the receive token holds no borrow of
-/// the device and can be returned alongside a transmit token that does.
-/// Dropping it is what returns the buffer to the pool.
+/// Receive token owning its packet buffer.
 struct QueueRx(Pooled);
 
 impl RxToken for QueueRx {
@@ -173,11 +119,10 @@ impl RxToken for QueueRx {
     }
 }
 
-/// A reserved buffer and the queue it will be pushed onto.
+/// Transmit token with a buffer reserved before issuance.
 ///
-/// The buffer is reserved when the token is *issued*, not when it is consumed:
-/// `smoltcp` treats a token as a promise that the send will succeed, so the
-/// budget has to be spent before the promise is made.
+/// `smoltcp` treats an issued token as a promise that transmission can happen,
+/// so the pool budget is checked before the token is returned.
 struct QueueTx<'a> {
     buffer: Pooled,
     outbound: &'a mut VecDeque<Pooled>,
@@ -185,9 +130,7 @@ struct QueueTx<'a> {
 
 impl TxToken for QueueTx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, len: usize, f: F) -> R {
-        // The device advertises an MTU no larger than a pool slice, so
-        // `smoltcp` cannot ask for a length this refuses; the branch is the
-        // proof rather than a recovery.
+        // The advertised MTU is bounded by the pool slice size.
         debug_assert!(len <= self.buffer.capacity_hint());
         let _ = self.buffer.resize(len);
         let result = f(&mut self.buffer);
@@ -201,11 +144,7 @@ impl Device for QueueDevice {
     type TxToken<'a> = QueueTx<'a>;
 
     fn receive(&mut self, _now: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // The reply buffer is reserved *first*: a receive may produce a
-        // response, and reserving after the packet had been dequeued would
-        // leave a packet in hand with nowhere to put its answer. A refused
-        // reservation drops the buffer straight back and leaves the queue
-        // untouched, so the packet is still there on the next poll.
+        // Reserve the reply buffer before removing an inbound packet.
         let buffer = self.pool.take_zeroed(0)?;
         let packet = self.inbound.pop_front()?;
         Some((
@@ -229,9 +168,7 @@ impl Device for QueueDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
         capabilities.max_transmission_unit = self.mtu;
-        // The client's stack already checksummed what it sent and will verify
-        // what we send, so both directions are computed and checked in full;
-        // there is no hardware to offload either to.
+        // There is no hardware checksum offload behind this device.
         let mut checksum = ChecksumCapabilities::default();
         checksum.ipv4 = Checksum::Both;
         checksum.tcp = Checksum::Both;
@@ -252,33 +189,23 @@ pub struct LocalStack {
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// The ports the terminator listens on. Under [`crate::FilterPolicy::InspectHttp`]
-    /// the planner routes every TCP flow to termination; this narrows the ones
-    /// this stack actually answers to the HTTP(S) ports interception is for.
+    /// Ports with listeners maintained by this stack.
     ports: Vec<u16>,
     listeners: Vec<Listener>,
     limits: TerminationLimits,
-    /// Live connections and the endpoints they were accepted with. The endpoints
-    /// are cached because a closing socket drops them before the shell reaps it.
+    /// Live connections and cached endpoints.
     established: HashMap<SocketHandle, (InternalEndpoint, InternalEndpoint)>,
     accepted: VecDeque<Terminated>,
     closed: VecDeque<StreamId>,
-    /// Virtual-time base: `smoltcp` counts milliseconds from an arbitrary epoch,
-    /// so caller `Instant`s are mapped through this fixed origin. Deterministic
-    /// given deterministic inputs, which is what lets the harness drive it.
+    /// Origin for mapping caller instants to smoltcp milliseconds.
     base: Instant,
 }
 
 impl LocalStack {
-    /// Builds a terminator listening on `ports`. `mtu` must match the tunnel the
-    /// client's packets arrive on, so a segment the stack emits fits the path
-    /// the reply travels back down.
+    /// Builds a terminator for `ports`.
     ///
-    /// `pool` is the same budget the datapath draws on. The advertised MTU is
-    /// the smaller of `mtu` and a pool slice, so a segment `smoltcp` decides to
-    /// build always fits the buffer reserved for it — the device's capability
-    /// is derived from what the budget can actually carry rather than asserted
-    /// alongside it.
+    /// The device advertises the smaller of `mtu` and the pool slice size, so
+    /// every segment smoltcp creates fits its reserved buffer.
     pub fn new(
         mtu: Mtu,
         ports: &[u16],
@@ -286,10 +213,7 @@ impl LocalStack {
         pool: Arc<BufferPool>,
         base: Instant,
     ) -> Result<Self, TerminationError> {
-        // Checked here rather than left to `replenish_listeners`, which has no
-        // way to report it: it fills ports in order and returns at the ceiling,
-        // so an insufficient ceiling is not a shortage spread thin but whole
-        // ports that never listen at all.
+        // Reject a partial backlog before ordered replenishment can hide it.
         if ports.len() * limits.backlog.get() > limits.max_sockets.get() {
             return Err(TerminationError::SocketsBelowBacklog {
                 ports: ports.len(),
@@ -307,21 +231,15 @@ impl LocalStack {
 
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
-        // Any-IP: accept SYNs to addresses this interface does not own and reply
-        // from the address the client dialled. The assigned addresses below are
-        // only placeholders that mark the interface "up" for each family; the
-        // real local address of every connection comes from its SYN.
+        // Placeholder addresses mark both families up; any-IP supplies the
+        // destination-specific endpoint from each SYN.
         iface.set_any_ip(true);
         iface.update_ip_addrs(|addresses| {
             let _ = addresses.push(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 8));
             let _ = addresses.push(IpCidr::new(IpAddress::v6(0xfd00, 0, 0, 0, 0, 0, 0, 1), 64));
         });
-        // A client dials from an address off the placeholder subnets, so its
-        // reply is off-link and egress needs a route to permit it. On Medium::Ip
-        // there is no L2 and no neighbour to resolve: the gateway only selects
-        // this one interface, and the datagram the device emits still carries
-        // the client as its destination. Both gateways sit inside their
-        // placeholder subnet so they are themselves on-link.
+        // Medium::Ip has no L2 neighbour resolution. These routes select the
+        // interface for replies to client addresses outside the placeholders.
         let _ = iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(10, 0, 0, 254));
@@ -345,55 +263,41 @@ impl LocalStack {
         Ok(stack)
     }
 
-    /// Enqueues one client packet for the next [`poll`](Self::poll).
-    ///
-    /// Takes the buffer by value rather than copying out of a borrow: the
-    /// packet arrives from the datapath already on the shared budget, so moving
-    /// it in costs nothing and the copy it replaces was one per packet.
+    /// Enqueues one pooled client packet for the next [`poll`](Self::poll).
     pub fn push(&mut self, packet: Pooled) {
         self.device.inbound.push_back(packet);
     }
 
-    /// The next reply packet bound for the client, if any. Terminal on the
-    /// tunnel side: it goes straight to the device, and dropping it there is
-    /// what returns its buffer to the pool.
+    /// Removes the next reply packet for the client.
     pub fn poll_transmit(&mut self) -> Option<Pooled> {
         self.device.outbound.pop_front()
     }
 
-    /// The budget this stack draws on, for a caller that has to stage a packet
-    /// onto it before [`push`](Self::push) will take one.
+    /// Returns the pool used by this stack.
     pub fn pool(&self) -> &Arc<BufferPool> {
         &self.device.pool
     }
 
-    /// A connection accepted since the last call.
+    /// Removes the next newly accepted connection.
     pub fn poll_accept(&mut self) -> Option<Terminated> {
         self.accepted.pop_front()
     }
 
-    /// A connection that has fully closed since the last call. After this the
-    /// id is [`StreamError::Unknown`] to every operation.
+    /// Removes the next fully closed connection.
     pub fn poll_closed(&mut self) -> Option<StreamId> {
         self.closed.pop_front()
     }
 
     fn now(&self, now: Instant) -> SmolInstant {
-        // Saturating: a caller that hands back an instant before `base` is a
-        // defect, but the terminator answers it with "no time has passed"
-        // rather than a panic on the datapath.
+        // Treat a pre-origin timestamp as zero elapsed time.
         let millis = now.saturating_duration_since(self.base).as_millis();
         SmolInstant::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
     }
 
-    /// Advances the TCP state machines against `now`: drains queued client
-    /// packets into `smoltcp`, produces reply packets, and harvests the
-    /// connections that opened or closed as a result.
+    /// Advances TCP state, emits replies, and harvests opened or closed streams.
     pub fn poll(&mut self, now: Instant) {
         let now = self.now(now);
-        // One `poll` drains all pending inbound and emits all pending outbound;
-        // looping while it reports progress covers the case where accepting a
-        // connection frees work that a single pass left pending.
+        // Continue until smoltcp reports no more state changes.
         while self.iface.poll(now, &mut self.device, &mut self.sockets)
             == PollResult::SocketStateChanged
         {}
@@ -401,27 +305,17 @@ impl LocalStack {
         self.replenish_listeners();
     }
 
-    /// The earliest instant `smoltcp` wants servicing again (a retransmit, a
-    /// delayed ACK, a TIME-WAIT expiry). The reactor folds this into the one
-    /// timer it already arms against the datapath's own deadline, so there is
-    /// never a timer per socket.
+    /// Returns the next smoltcp service time, if one is scheduled.
     pub fn poll_at(&mut self, now: Instant) -> Option<Instant> {
         let smol_now = self.now(now);
         self.iface.poll_at(smol_now, &self.sockets).map(|at| {
-            // `at` may be at or before `smol_now`, meaning "service immediately".
-            // Both directions map to a non-negative offset from the caller's own
-            // clock, computed in microseconds to avoid the ambiguous `Instant +
-            // Duration` impls that pulling in the `time` crate introduced.
+            // Clamp overdue work to the current caller instant.
             let ahead = (at.total_micros() - smol_now.total_micros()).max(0);
             now + std::time::Duration::from_micros(ahead as u64)
         })
     }
 
-    /// Reads up to `buf.len()` bytes from the stream's receive buffer.
-    ///
-    /// `Ok(n)` moved `n` bytes; `WouldBlock` names a live stream with nothing
-    /// buffered; `Closed` means the peer sent FIN and the buffer is drained, so
-    /// no further bytes will ever arrive.
+    /// Reads up to `buf.len()` bytes from a stream.
     pub fn recv(&mut self, id: StreamId, buf: &mut [u8]) -> Result<usize, StreamError> {
         let socket = self.socket_mut(id)?;
         if socket.can_recv() {
@@ -430,10 +324,7 @@ impl LocalStack {
                 RecvError::InvalidState => StreamError::WouldBlock,
             });
         }
-        // No buffered bytes: distinguish "not yet" from "never again". A socket
-        // still completing its handshake is "not yet" — `may_recv` is false
-        // there, and reporting that as `Closed` would hand the consumer a
-        // spurious end-of-stream before the connection had even opened.
+        // Handshaking sockets are not closed merely because no bytes are ready.
         if socket.may_recv() || handshaking(socket.state()) {
             Err(StreamError::WouldBlock)
         } else {
@@ -441,8 +332,7 @@ impl LocalStack {
         }
     }
 
-    /// Writes up to `buf.len()` bytes into the stream's send buffer, returning
-    /// how many were accepted. A full window is `WouldBlock`, not an error.
+    /// Writes into a stream's send buffer.
     pub fn send(&mut self, id: StreamId, buf: &[u8]) -> Result<usize, StreamError> {
         let socket = self.socket_mut(id)?;
         if !socket.may_send() {
@@ -459,34 +349,31 @@ impl LocalStack {
         }
     }
 
-    /// Whether a `recv` would return bytes right now.
+    /// Whether `recv` can return bytes immediately.
     pub fn can_recv(&self, id: StreamId) -> bool {
         self.socket(id).is_some_and(Socket::can_recv)
     }
 
-    /// Whether a `send` would accept bytes right now.
+    /// Whether `send` can accept bytes immediately.
     pub fn can_send(&self, id: StreamId) -> bool {
         self.socket(id).is_some_and(Socket::can_send)
     }
 
-    /// Closes this half of the connection: a FIN after the send buffer drains.
-    /// The peer may keep sending until it closes too.
+    /// Gracefully closes this local half after buffered bytes drain.
     pub fn close(&mut self, id: StreamId) {
         if let Ok(socket) = self.socket_mut(id) {
             socket.close();
         }
     }
 
-    /// Aborts the connection with a RST. Used for fail-fast teardown when a
-    /// graceful close would strand the peer.
+    /// Aborts the connection with a RST.
     pub fn abort(&mut self, id: StreamId) {
         if let Ok(socket) = self.socket_mut(id) {
             socket.abort();
         }
     }
 
-    /// The number of live `smoltcp` sockets, listeners included. The quantity
-    /// the P6 budget bounds.
+    /// Number of live sockets, including listeners.
     pub fn socket_count(&self) -> usize {
         self.listeners.len() + self.established.len()
     }
@@ -504,12 +391,9 @@ impl LocalStack {
         Ok(self.sockets.get_mut::<Socket>(id.0))
     }
 
-    /// Moves listeners that accepted a connection into `established`, and reaps
-    /// established sockets that have fully closed.
+    /// Publishes accepted listeners and reaps inactive connections.
     fn harvest(&mut self) {
-        // A listener whose socket has left `Listen` has committed to a
-        // connection. Record its endpoints and stop treating it as a listener;
-        // `replenish_listeners` will restore the backlog for its port.
+        // A listener leaving `Listen` has become a connection.
         let mut converted = Vec::new();
         self.listeners.retain(|listener| {
             let socket = self.sockets.get::<Socket>(listener.handle);
@@ -521,9 +405,7 @@ impl LocalStack {
         });
         for handle in converted {
             let socket = self.sockets.get::<Socket>(handle);
-            // Endpoints are present from SYN-RECEIVED onward. A socket that
-            // reached a terminal state before we looked never became a usable
-            // stream, so it is simply dropped rather than surfaced.
+            // An immediately terminal socket never became a usable stream.
             let (Some(client), Some(server)) = (socket.remote_endpoint(), socket.local_endpoint())
             else {
                 self.sockets.remove(handle);
@@ -539,8 +421,7 @@ impl LocalStack {
             self.accepted.push_back(terminated);
         }
 
-        // Reap connections `smoltcp` has finished with: a closed socket holds a
-        // buffer, and leaving it in the set would spend the budget on a corpse.
+        // Remove inactive sockets so their buffers and budget are released.
         let mut finished = Vec::new();
         for &handle in self.established.keys() {
             if !self.sockets.get::<Socket>(handle).is_active() {
@@ -554,9 +435,7 @@ impl LocalStack {
         }
     }
 
-    /// Restores the per-port listening backlog up to the socket ceiling. A port
-    /// that cannot be replenished because the ceiling is reached simply refuses
-    /// new connections until an established one closes — the P6 admission rule.
+    /// Restores each port's listener backlog up to the socket ceiling.
     fn replenish_listeners(&mut self) {
         for &port in &self.ports {
             let live = self.listeners.iter().filter(|l| l.port == port).count();
@@ -567,9 +446,7 @@ impl LocalStack {
                 let rx = SocketBuffer::new(vec![0u8; self.limits.socket_buffer.get()]);
                 let tx = SocketBuffer::new(vec![0u8; self.limits.socket_buffer.get()]);
                 let mut socket = Socket::new(rx, tx);
-                // Bind the port with no address: any-IP then accepts a SYN to
-                // any destination on it. `listen` fails only on a bad endpoint
-                // or a busy socket, and a freshly built one is neither.
+                // An addressless listener accepts any destination under any-IP.
                 if socket.listen(port).is_err() {
                     return;
                 }
@@ -584,14 +461,11 @@ fn endpoint(address: IpAddr, port: u16) -> InternalEndpoint {
     InternalEndpoint { address, port }
 }
 
-/// Whether the connection has not yet reached `ESTABLISHED`.
+/// Whether the connection is still before `ESTABLISHED`.
 ///
-/// A connection is published to its consumer as soon as the listener commits to
-/// it, which is `SYN-RECEIVED` — one ACK before the stream can carry bytes.
-/// `smoltcp` reports neither `may_recv` nor `may_send` there, and the two
-/// readings are indistinguishable from a peer that has closed unless the state
-/// itself is consulted. Naming the pre-established set is what keeps
-/// [`StreamError::Closed`] meaning "never again" rather than "not yet".
+/// Accepted sockets can remain in `SYN-RECEIVED`, where both capability checks
+/// are false. Inspecting the state keeps that condition distinct from a closed
+/// stream.
 fn handshaking(state: State) -> bool {
     matches!(state, State::Listen | State::SynSent | State::SynReceived)
 }
@@ -613,8 +487,7 @@ pub(crate) mod tests {
         Mtu::new(MTU).unwrap()
     }
 
-    /// A budget larger than any of these exchanges needs, so exhaustion here
-    /// would be a defect rather than the backpressure path.
+    /// Fixture pool with enough capacity for the exchange tests.
     fn pool() -> Arc<BufferPool> {
         BufferPool::new(
             NonZeroUsize::new(usize::from(MTU)).unwrap(),
@@ -622,18 +495,13 @@ pub(crate) mod tests {
         )
     }
 
-    /// Builds a terminator on its own budget.
+    /// Builds a terminator with the fixture pool.
     fn stack(ports: &[u16], limits: TerminationLimits, base: Instant) -> LocalStack {
         LocalStack::new(mtu(), ports, limits, pool(), base).expect("the fixture fits")
     }
 
-    /// **A ceiling under one backlog per port does not spread thin — it
-    /// starves the later ports outright.** `replenish_listeners` fills ports in
-    /// order and returns at the ceiling, so with two inspected ports and room
-    /// for one backlog, port 80 gets every listener and port 443 gets none:
-    /// plaintext HTTP intercepted, HTTPS answering RST to every SYN, forever,
-    /// and nothing anywhere reporting it. That is settable through the stable
-    /// interface by lowering `Ceilings::terminated_connections`.
+    /// A ceiling below one backlog per port must be rejected rather than leave
+    /// later ports without listeners.
     #[test]
     fn a_ceiling_that_cannot_hold_a_backlog_per_port_is_refused() {
         assert_eq!(
@@ -644,7 +512,7 @@ pub(crate) mod tests {
                 ceiling: 4,
             })
         );
-        // Exactly enough is enough, and both ports get a full backlog.
+        // The exact required ceiling gives both ports their full backlog.
         let stack = LocalStack::new(mtu(), &[80, 443], limits(8, 4), pool(), Instant::now())
             .expect("eight sockets hold two backlogs of four");
         for port in [80, 443] {
@@ -671,20 +539,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// A bare smoltcp client stack with one connecting TCP socket. It owns its
-    /// source address and dials a concrete destination, so — unlike the
-    /// terminator — it needs no any-IP, only a route to reach the off-link
-    /// server. This is a real peer performing a real handshake; the test asserts
-    /// nothing the TCP state machine did not actually produce.
+    /// Bare client stack with one connecting TCP socket for integration-style
+    /// packet exchange against the terminator.
     pub(crate) struct Client {
         device: QueueDevice,
         iface: Interface,
         sockets: SocketSet<'static>,
         handle: SocketHandle,
-        /// Milliseconds on this client's own virtual clock, advanced by
-        /// [`Client::tick`]. The terminator under test runs on the wall clock,
-        /// so the two need not agree: TCP only requires each side's clock to
-        /// advance monotonically.
+        /// Client-side virtual milliseconds.
         ms: u64,
     }
 
@@ -738,21 +600,19 @@ pub(crate) mod tests {
             self.sockets.get_mut::<Socket>(self.handle)
         }
 
-        /// Advances this client's clock and lets its state machine run. The
-        /// unit of progress for a caller driving the client against a
-        /// terminator that lives in another task.
+        /// Advances the client clock and polls its state machine.
         pub(crate) fn tick(&mut self) {
             self.ms += 20;
             let now = SmolInstant::from_millis(i64::try_from(self.ms).unwrap_or(i64::MAX));
             self.poll(now);
         }
 
-        /// Everything the client has put on the wire since the last call.
+        /// Takes packets emitted since the previous call.
         pub(crate) fn take_outbound(&mut self) -> Vec<Vec<u8>> {
             self.device.outbound.drain(..).map(|p| p.to_vec()).collect()
         }
 
-        /// Hands the client one packet from the wire.
+        /// Delivers one packet to the client.
         pub(crate) fn deliver(&mut self, packet: &[u8]) {
             let pooled = self
                 .device
@@ -762,12 +622,12 @@ pub(crate) mod tests {
             self.device.inbound.push_back(pooled);
         }
 
-        /// Queues application bytes for the peer.
+        /// Queues application bytes in the client socket.
         pub(crate) fn send(&mut self, bytes: &[u8]) -> Result<usize, SendError> {
             self.socket().send_slice(bytes)
         }
 
-        /// Drains whatever application bytes have arrived.
+        /// Takes application bytes received by the client.
         pub(crate) fn take_received(&mut self) -> Vec<u8> {
             let mut buf = [0u8; 512];
             match self.socket().recv_slice(&mut buf) {
@@ -777,10 +637,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// One packet-exchange round: client segments to the server, the server
-    /// advances and replies, the client advances. Both clocks are the same
-    /// millisecond offset, so the terminator's `Instant`-to-`smoltcp` mapping is
-    /// exercised rather than bypassed.
+    /// Moves packets in both directions and advances both TCP clocks once.
     fn relay(server: &mut LocalStack, client: &mut Client, base: Instant, ms: u64) {
         let outbound: Vec<Vec<u8>> = client.take_outbound();
         for packet in outbound {
@@ -817,15 +674,14 @@ pub(crate) mod tests {
 
         let mut ms = pump(&mut server, &mut client, base, 0, 6);
 
-        // Any-IP recovered the destination the client dialled as the local
-        // endpoint, and the client's own address:port as the remote.
+        // Any-IP preserves the dialled destination as the local endpoint.
         let accepted = server.poll_accept().expect("the connection is accepted");
         assert_eq!(accepted.client, v4(Ipv4Addr::new(192, 0, 2, 10), 49152));
         assert_eq!(accepted.server, v4(SERVER, HTTPS));
         assert_eq!(server.poll_accept(), None, "exactly one accept");
         let id = accepted.id;
 
-        // Client to server: the terminator surfaces the bytes in order.
+        // Client to server.
         let request = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
         assert_eq!(client.socket().send_slice(request), Ok(request.len()));
         ms = pump(&mut server, &mut client, base, ms, 4);
@@ -833,7 +689,7 @@ pub(crate) mod tests {
         let read = server.recv(id, &mut buf).expect("readable");
         assert_eq!(&buf[..read], request);
 
-        // Server to client: the reply travels back down the same connection.
+        // Server to client.
         let response = b"HTTP/1.1 204 No Content\r\n\r\n";
         assert_eq!(server.send(id, response), Ok(response.len()));
         pump(&mut server, &mut client, base, ms, 4);
@@ -847,19 +703,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_half_open_connection_reports_not_yet_rather_than_closed() {
-        // A connection is published as soon as the listener commits to it,
-        // which is SYN-RECEIVED — one ACK before it can carry bytes. Both
-        // directions must say `WouldBlock` there. Reporting `Closed` would
-        // hand the consumer an end-of-stream before the stream existed, which
-        // is exactly the defect that made the bridge tear connections down on
-        // arrival.
+        // The accepted SYN-RECEIVED socket is live but cannot move bytes yet.
         let base = Instant::now();
         let mut server = stack(&[HTTPS], limits(64, 4), base);
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
 
-        // One half-round: the client's SYN reaches the terminator, but its ACK
-        // of the SYN-ACK never does, so the socket stays in SYN-RECEIVED.
-        client.tick(); // emits the SYN
+        // Deliver the SYN without its ACK so the socket stays in SYN-RECEIVED.
+        client.tick();
         for packet in client.take_outbound() {
             let pooled = server.pool().take(&packet).expect("the budget holds");
             server.push(pooled);
@@ -887,19 +737,16 @@ pub(crate) mod tests {
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
         let mut ms = pump(&mut server, &mut client, base, 0, 6);
         let id = server.poll_accept().expect("accepted").id;
-        // The backlog is restored after the accept, so the set holds the four
-        // listeners plus this one established connection.
+        // The accepted socket replaces one listener in the restored backlog.
         assert_eq!(server.socket_count(), 5);
 
-        // The client closes its half. Once the FIN is processed the terminator
-        // reports the receive half as closed, distinct from "nothing yet".
+        // After the client's FIN, the receive half is closed.
         client.socket().close();
         ms = pump(&mut server, &mut client, base, ms, 4);
         let mut buf = [0u8; 16];
         assert_eq!(server.recv(id, &mut buf), Err(StreamError::Closed));
 
-        // The terminator closes its half; the connection drains to completion
-        // and is reaped, returning its buffers and its id.
+        // Closing the local half lets the connection finish and be reaped.
         server.close(id);
         pump(&mut server, &mut client, base, ms, 8);
         assert_eq!(server.poll_closed(), Some(id));
@@ -917,9 +764,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_socket_ceiling_refuses_connections_beyond_the_budget() {
-        // Three sockets total, one listener at a time: the set can hold at most
-        // three established connections, and there is no listener to accept a
-        // fourth. This is the P6 admission rule as a test.
+        // Three total sockets permit three connections and refuse the rest.
         let base = Instant::now();
         let mut server = stack(&[HTTPS], limits(3, 1), base);
         let mut clients: Vec<Client> = (0..5)

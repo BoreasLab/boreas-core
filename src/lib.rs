@@ -1,19 +1,10 @@
-//! The layers are directories, in the order a packet meets them: [`l3`] parses
-//! and reassembles IP, [`l4`] turns transport state into a stream or a flow,
-//! [`policy`] decides what that flow is allowed to do, [`intercept`] is what
-//! happens to one this proxy terminates, and [`egress`] is where it leaves.
-//! [`host`] is the runtime edge — OS handles and the reactor that drives the
-//! pure core against them.
+//! Crate root for the layered packet, transport, policy, interception, and
+//! egress core.
 //!
-//! The modules that stayed flat are the ones no single layer owns: [`datapath`]
-//! is the pure core every layer reports to, [`wire`] and [`sansio`] are the
-//! vocabulary every protocol is written in, and [`bridge`] is the seam between
-//! a sans-io state machine and the reactor, which both [`l4`] and [`egress`]
-//! cross.
-//!
-//! Every type this crate exports is re-exported flat from the crate root
-//! below, so a caller never spells a layer. The directories are for the people
-//! editing this crate, not for the people using it.
+//! [`l3`], [`l4`], [`policy`], [`intercept`], and [`egress`] follow a packet's
+//! path. [`host`] supplies runtime handles; [`datapath`], [`wire`],
+//! [`sansio`], and [`bridge`] are shared vocabulary and coordination layers.
+//! Public types are re-exported here so callers do not depend on that layout.
 
 pub mod api;
 
@@ -39,24 +30,11 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-/// Takes a lock, ignoring poisoning.
+/// Takes a lock and recovers from poisoning.
 ///
-/// **One idiom, because poisoning is one failure class.** Before this the crate
-/// answered it four ways — recover here, `expect` there, `unwrap` in a third
-/// place, and one silent `.ok()?` — for data none of which a panic can leave
-/// inconsistent: every mutex in this crate guards a map, a queue, or an option
-/// whose only operations are whole insertions and removals, and `std`'s
-/// collections are exception-safe across those.
-///
-/// The two that panicked amplified one task's panic into a permanently dead
-/// subsystem: a poisoned connector cache fails every subsequent originating
-/// handshake, and poisoned session routes fail every subsequent Hysteria2
-/// datagram. The one that returned `None` was quieter and worse — interception
-/// simply stopped, for the life of the process, with nothing said.
-///
-/// Recovering is not the same as ignoring: the panic that poisoned the lock is
-/// counted at the task boundary and reaches the host as
-/// [`api::Counters::tasks_panicked`].
+/// These mutexes guard maps, queues, and options whose updates are whole
+/// insertions or removals. The panic is accounted for at the task boundary;
+/// poisoning must not silently disable the subsystem that owns the lock.
 pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -163,23 +141,18 @@ pub use l3::udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome,
 
 pub const MIN_QUIC_MTU: u16 = 1200;
 
-/// The port QUIC and HTTPS share. The transient steering backstop acts on
-/// UDP here and nowhere else: TCP on this port is the destination steering is
-/// trying to reach.
+/// Port shared by HTTPS and QUIC.
+///
+/// The transient steering backstop applies to UDP on this port only.
 pub const HTTPS_PORT: u16 = 443;
 
-/// RFC 8200 requires every link carrying IPv6 to have an MTU of at least 1280
-/// bytes. Boreas is dual-stack and configures its own TUN MTU, so this is an
-/// admission rule on our own tunnel rather than a guess about the outside path:
-/// an inner MTU below 1280 cannot carry IPv6 at all.
+/// Minimum dual-stack tunnel MTU.
 ///
-/// RFC 791's 68-byte IPv4 link minimum is deliberately not used. It governs
-/// what a router must forward without fragmenting, not what a tunnel must
-/// offer, and no dual-stack tunnel is usable there.
+/// RFC 8200 requires 1280 bytes for an IPv6 link. RFC 791's 68-byte IPv4
+/// forwarding minimum is not sufficient for a tunnel that also carries IPv6.
 pub const MIN_IPV6_MTU: u16 = 1280;
 
-/// A byte count that a dual-stack IP tunnel can actually carry. The invariant is
-/// established once here so that no later arithmetic has to re-check it.
+/// Validated MTU for a dual-stack IP tunnel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Mtu(u16);
 
@@ -199,37 +172,27 @@ impl Mtu {
         self.0
     }
 
-    /// QUIC pads initial packets to 1200 bytes and forbids IP fragmentation, so
-    /// a path below that floor cannot complete a handshake.
+    /// Whether the MTU can carry QUIC's minimum datagram.
     pub fn admits_quic(self) -> bool {
         self.quic_budget().is_some()
     }
 
-    /// The QUIC budget this MTU affords. Total, because [`MIN_IPV6_MTU`]
-    /// exceeds [`MIN_QUIC_MTU`] and an `Mtu` cannot be below the first.
+    /// Returns the QUIC datagram budget afforded by this MTU.
     pub fn quic_budget(self) -> Option<QuicBudget> {
         QuicBudget::new(self.0)
     }
 }
 
-/// A datagram ceiling proven large enough to carry QUIC.
+/// Validated datagram ceiling for QUIC.
 ///
-/// **Not an [`Mtu`], and the gap between them is eighty bytes of reachable
-/// configuration.** An `Mtu`'s floor is RFC 8200 section 5's 1280-octet IPv6
-/// minimum *link* MTU; a QUIC budget's floor is RFC 9000 section 14's 1200
-/// bytes, "the smallest allowed maximum datagram size". They are different
-/// quantities with different bounds, and an egress may legitimately declare a
-/// ceiling between them. Parsing such a ceiling as an `Mtu` rejected it for
-/// failing a floor it was never subject to, and every path in [1200, 1280) lost
-/// HTTP/3 for a reason that did not apply to it.
-///
-/// The type is the proof, so the question "does QUIC fit" is answered by
-/// whether one exists rather than by a comparison a caller has to remember.
+/// This is separate from [`Mtu`]: RFC 9000 requires 1200 bytes for a QUIC
+/// datagram, while RFC 8200 requires 1280 bytes for an IPv6 link. A flow path
+/// may therefore have a QUIC-valid ceiling below the IPv6 link minimum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuicBudget(u16);
 
 impl QuicBudget {
-    /// The one boundary a declared ceiling crosses to become a budget.
+    /// Validates the QUIC minimum datagram size.
     pub fn new(bytes: u16) -> Option<Self> {
         (bytes >= MIN_QUIC_MTU).then_some(Self(bytes))
     }
@@ -252,11 +215,11 @@ pub enum DatagramFidelity {
     Native,
 }
 
-/// The live path properties of one egress. There is deliberately no
-/// `accepts` field: the accepted layer is a property of the implementation
-/// variant (`Egress::Packet` vs `Egress::Stream`), so a claim can no longer
-/// disagree with the thing it describes. Callers receive the layer alongside
-/// this struct, derived from that variant.
+/// Live properties reported by one egress.
+///
+/// The accepted layer is derived from the egress implementation variant and is
+/// checked where implementations are chained, so this claim cannot disagree
+/// with the implementation that supplies it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathProperties {
     pub datagram_fidelity: DatagramFidelity,
@@ -266,10 +229,7 @@ pub struct PathProperties {
     pub nat_behavior: NatBehavior,
 }
 
-/// RFC 4787 mapping behavior of a NAT or UDP-relaying egress. Endpoint-
-/// independent mapping is the only behavior that keeps QUIC, WebRTC, and VoIP
-/// working unchanged; anything weaker is a property of the egress, not a
-/// defect to engineer around here.
+/// RFC 4787 NAT or UDP-relay mapping behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NatBehavior {
     AddressAndPortDependent,
@@ -284,9 +244,9 @@ pub enum ChainError {
 }
 
 impl PathProperties {
-    /// The weakest-link composition of two claims. Layer agreement is not
-    /// checked here: it is a property of the implementations and is enforced
-    /// by [`Egress::chain`], the only place two implementations meet.
+    /// Composes two property claims using the weaker value in each dimension.
+    /// Layer agreement is checked by [`Egress::chain`], where implementations
+    /// are available.
     pub fn chain(self, next: Self) -> Result<Self, ChainError> {
         Ok(Self {
             datagram_fidelity: self.datagram_fidelity.min(next.datagram_fidelity),
@@ -310,41 +270,24 @@ pub enum FilterPolicy {
     InspectHttp,
 }
 
-/// Whether *this flow* is one the session must terminate in order to inspect
-/// it.
+/// Whether this flow requires local termination for inspection.
 ///
-/// **A session property and a flow property are different things, and
-/// collapsing them is what cost the packet fast path.** [`FilterPolicy`] says
-/// whether inspection is enabled at all; this says whether the flow in front of
-/// us is a candidate for it. Enabling inspection used to route *every* flow —
-/// every UDP datagram, every SSH and IMAP connection, every TCP flow to a host
-/// nobody asked to inspect — through local termination, which is both the
-/// opposite of the architecture's ">90 percent packet-native" claim and, for
-/// the protocols the local stack does not listen for, a connection refused.
-///
-/// Like [`Backstop`], it is computed by the caller against live state rather
-/// than inside [`plan_flow`], because it is a lookup and not a property of the
-/// configuration: keeping it a value keeps the planner a total function of
-/// values. The state it is looked up in is the set of addresses the resolver
-/// saw an inspected host resolve to — which is exactly what
-/// [Filtering](../docs/filtering.md) means by "DNS is the durable
-/// no-decryption policy signal", and the only signal available before a
-/// connection this session has not yet terminated.
+/// [`FilterPolicy`] enables inspection for the session; this value identifies
+/// the individual flow. It is computed from resolver state by the caller so
+/// [`plan_flow`] remains a total function of its value arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Inspection {
-    /// A TCP flow to an address of an inspected host, on a port interception
-    /// serves. The only shape that can require termination on its own.
+    /// TCP flow matching an inspected address and interception port.
     Candidate,
-    /// Everything else, which is nearly everything.
+    /// Flow outside the inspection set.
     Excluded,
 }
 
 impl Inspection {
-    /// Every verdict. The sum is closed at two, so a caller can memoize a
-    /// function of it as an array and there is no key to miss.
+    /// All possible verdicts in index order.
     pub const ALL: [Self; 2] = [Self::Candidate, Self::Excluded];
 
-    /// This verdict's position in [`Self::ALL`].
+    /// Index into [`Self::ALL`].
     pub const fn index(self) -> usize {
         match self {
             Self::Candidate => 0,
@@ -353,26 +296,22 @@ impl Inspection {
     }
 }
 
-/// Whether this session answers DNS itself.
+/// Whether this session answers DNS locally.
 ///
-/// A session property like [`FilterPolicy`], and deliberately separate from
-/// it: DNS filtering is the enforcement tier that reaches every application on
-/// the device, including the ones that reject the Boreas CA and can therefore
-/// never be intercepted at TLS, so it is on or off independently of whether
-/// anything is being inspected.
+/// Independent of [`FilterPolicy`], because DNS enforcement also covers
+/// applications that cannot be intercepted at TLS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DnsPolicy {
-    /// Queries to [`DNS_PORT`] are answered by the local resolver.
+    /// Answer queries to [`DNS_PORT`] locally.
     Intercept,
-    /// Queries cross like any other datagram.
+    /// Forward queries as ordinary datagrams.
     Forward,
 }
 
-/// A packet path carries whole IP packets, so it has a meaningful per-packet
-/// budget. A terminated path re-originates a byte stream upstream, where the
-/// client's packet size stops existing and local MSS clamping governs instead.
-/// Attaching the MTU to the variant that owns it keeps the other one from being
-/// consulted for a number that has no meaning there.
+/// Transport path selected for a flow.
+///
+/// Only a packet path has an inner packet MTU. Local termination re-originates
+/// a byte stream and uses stream-specific sizing instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportPath {
     PacketFastPath { inner_mtu: Mtu },
@@ -426,17 +365,9 @@ pub enum Replan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressAction {
     Reassemble,
-    /// A DNS query this session answers itself. It opens no flow and consults
-    /// no egress: the answer is synthesized locally, and a refused name never
-    /// leaves the device at all.
+    /// DNS query answered locally without opening a flow.
     ResolveDns,
-    /// A QUIC attempt toward a host this session must inspect, dropped while
-    /// its steering window is open.
-    ///
-    /// Not a block: the browser races QUIC against TCP and takes whichever
-    /// answers first, so refusing the QUIC half makes the race resolve to TCP
-    /// within the browser's own 300-to-500 ms window. The user sees the site;
-    /// the session sees a connection it can inspect.
+    /// QUIC attempt dropped while steering an inspected host to HTTP/2.
     DropSteered,
     ForwardPacket(FlowPlan),
     OpenStream(FlowPlan),
@@ -445,41 +376,30 @@ pub enum IngressAction {
     DropUnsupported,
 }
 
-/// Whether the transient UDP/443 steering backstop applies to a packet.
+/// Whether transient UDP/443 steering applies.
 ///
-/// Computed by the caller rather than by [`admit`], because it is a lookup
-/// against live state and not a property of the packet: keeping it a value
-/// keeps the classifier a total function of values.
+/// The caller resolves this live-state lookup; [`admit`] only classifies values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backstop {
-    /// Nothing to steer: the destination is not a steered address, its window
-    /// has closed, or the packet is arriving from the egress side rather than
-    /// leaving for it.
+    /// No active steering window applies.
     Lapsed,
-    /// The destination belongs to a host this session must inspect and its
-    /// window is open.
+    /// The destination is actively steered.
     Active,
 }
 
-/// What can be settled about a packet before its plan is consulted.
+/// Ingress decision before or after flow planning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// Decided. No egress's path properties could have changed this.
+    /// Decision independent of egress properties.
     Settled(IngressAction),
-    /// A whole packet of a carried protocol; [`route_planned`] finishes it.
+    /// Carried protocol awaiting [`route_planned`].
     Planned,
 }
 
-/// The part of ingress classification that no egress path properties can change.
+/// Classifies decisions independent of egress path properties.
 ///
-/// A fragment must be reassembled before L4 can observe it, a protocol this
-/// datapath does not carry must be dropped, and an intercepted DNS query must
-/// be answered locally — whatever the egress can or cannot do. Separating
-/// these is what lets all three still work under a configuration that cannot
-/// plan a flow at all, and it is why the caller never pays for a plan it does
-/// not need.
-///
-/// O(1): a match on a closed sum.
+/// Fragments are reassembled, unsupported protocols are dropped, and local
+/// DNS is answered before a flow plan is consulted. O(1).
 pub fn admit(transport: Transport, dns: DnsPolicy, backstop: Backstop) -> Admission {
     match transport {
         Transport::Fragment => Admission::Settled(IngressAction::Reassemble),
@@ -496,13 +416,9 @@ pub fn admit(transport: Transport, dns: DnsPolicy, backstop: Backstop) -> Admiss
     }
 }
 
-/// Classifies a whole packet of a carried protocol against its plan.
+/// Routes a carried packet using an existing plan.
 ///
-/// Total by construction: possessing a [`FlowPlan`] *is* the proof that the
-/// configuration plans, so there is no error left to return and no caller
-/// handles one per packet.
-///
-/// O(1).
+/// A [`FlowPlan`] proves planning succeeded, so this operation is total. O(1).
 pub fn route_planned(transport: Transport, plan: FlowPlan) -> IngressAction {
     if matches!(plan.transport, TransportPath::PacketFastPath { .. }) {
         return IngressAction::ForwardPacket(plan);
@@ -512,23 +428,15 @@ pub fn route_planned(transport: Transport, plan: FlowPlan) -> IngressAction {
         Transport::Tcp { .. } => IngressAction::OpenStream(plan),
         Transport::Udp { .. } => IngressAction::OpenDatagram(plan),
         Transport::Icmp(_) => IngressAction::HandleIcmp(plan),
-        // Both were settled by `admit`; reaching them here means a caller
-        // bypassed it, and dropping is the answer that cannot be wrong.
+        // These variants should have been settled by `admit`.
         Transport::Other | Transport::Fragment => IngressAction::DropUnsupported,
     }
 }
 
-/// Plans one flow.
+/// Plans transport and QUIC handling for one flow.
 ///
-/// Three facts decide the transport path, and they are read in exactly this
-/// order:
-///
-/// 1. a flow this session must inspect is terminated locally, whatever the
-///    egress accepts — that is what inspection *is*;
-/// 2. an egress that accepts only flows terminates everything, because there is
-///    no packet to forward;
-/// 3. everything else takes the packet fast path, which is the case the
-///    architecture expects to cover more than nine flows in ten.
+/// Inspection forces local termination. An egress that accepts only flows does
+/// the same for every flow; other compatible flows use the packet fast path.
 pub fn plan_flow(
     filter: FilterPolicy,
     inspection: Inspection,
@@ -549,20 +457,15 @@ pub fn plan_flow(
         (true, _) | (false, Accepts::Flows) => TransportPath::LocalTermination,
     };
 
-    // RFC 9000 requires a 1200-byte datagram end to end. On the packet path that
-    // budget is the inner MTU. On a terminated path the client's MTU is gone, so
-    // the egress's own datagram ceiling governs; an egress that does not declare
-    // one cannot be shown to clear the floor, and steering beats a black hole.
+    // QUIC's floor is measured against the packet path's inner MTU or the
+    // terminated egress's declared datagram ceiling.
     let datagram_budget = match transport {
         TransportPath::PacketFastPath { inner_mtu } => inner_mtu.quic_budget(),
-        // A ceiling here is a datagram size, not a link MTU, so it is parsed
-        // against QUIC's floor rather than IPv6's. See [`QuicBudget`].
+        // This is a datagram ceiling, so use QUIC's floor rather than IPv6's.
         TransportPath::LocalTermination => egress.max_datagram_size.and_then(QuicBudget::new),
     };
 
-    // Steering is per flow for the same reason termination is: an inspected
-    // host reached over h3 is a host whose interception silently never fires,
-    // and a host nobody inspects has no reason to lose HTTP/3 at all.
+    // Steer only the flows that need it; unrelated flows retain HTTP/3.
     let quic = if inspected {
         QuicPolicy::SteerToHttp2(SteeringReason::InspectionRequired)
     } else if egress.datagram_fidelity != DatagramFidelity::Native {
@@ -576,12 +479,10 @@ pub fn plan_flow(
     Ok(FlowPlan { transport, quic })
 }
 
-/// Re-plans a live flow after its egress reports a path change (MASQUE's
-/// QUIC-to-HTTP/2 fallback is the driving case). The filter policy and path
-/// MTU are session properties and pass through unchanged; only the egress
-/// moved. Errors only when the new path properties cannot support the flow's layer
-/// or leaves a packet path below the IPv6 floor, and the caller answers those
-/// with `Teardown`.
+/// Re-plans a live flow after its egress properties change.
+///
+/// A layer change or an invalid packet-path MTU returns an error for the caller
+/// to handle as teardown. A QUIC downgrade returns a replacement plan instead.
 pub fn replan(
     current: &FlowPlan,
     filter: FilterPolicy,
@@ -590,10 +491,8 @@ pub fn replan(
     next: PathProperties,
     path_mtu: Mtu,
 ) -> Result<Replan, PlanError> {
-    // A terminated flow does not prove the egress accepts only flows: under
-    // inspection a packet egress terminates too. So the layer a flow needs is
-    // read from its plan *and* from why it got that plan, and a flow the egress
-    // can still carry is not torn down for a layer it never depended on.
+    // Inspection can terminate a packet-capable egress, so recover the required
+    // layer from both the plan and the reason for local termination.
     let inspected = filter == FilterPolicy::InspectHttp && inspection == Inspection::Candidate;
     let flow_layer = match current.transport {
         TransportPath::PacketFastPath { .. } => Accepts::IpPackets,
@@ -605,33 +504,26 @@ pub fn replan(
     }
 
     let next_plan = plan_flow(filter, inspection, accepts, next, path_mtu)?;
-    // Crossing the transport boundary re-originates the flow's bytes; no live
-    // flow survives it. A PacketFastPath whose inner MTU merely moved is the
-    // same transport with a new budget, handled by MTU machinery, not teardown.
+    // Crossing transport paths loses the live byte or packet state. An MTU-only
+    // change stays on the packet path and does not require teardown.
     if std::mem::discriminant(&next_plan.transport) != std::mem::discriminant(&current.transport) {
         return Ok(Replan::Teardown);
     }
 
     Ok(match (current.quic, next_plan.quic) {
-        // A PassThrough flow whose new plan steers must move to HTTP/2.
+        // A newly steered flow needs the replacement plan.
         (QuicPolicy::PassThrough, QuicPolicy::SteerToHttp2(reason)) => Replan::Resteer {
             reason,
             plan: next_plan,
         },
-        // Identical policies, a recovery from steering to pass-through, and a
-        // change of steering reason on an already-steered flow all need no
-        // action.
+        // Existing steering and recovery require no live-flow action here.
         (_, _) => Replan::Unchanged,
     })
 }
 
-/// Classifies one whole packet: [`admit`], then [`route_planned`].
+/// Classifies a packet with [`admit`] and then [`route_planned`].
 ///
-/// The plan is a session property — filter policy, egress path properties, and path
-/// MTU — so deriving it once per configuration change instead of once per
-/// packet is both cheaper and the reason this function is total.
-///
-/// O(1).
+/// The plan is derived per session configuration, not per packet. O(1).
 pub fn route_ingress(
     transport: Transport,
     plan: FlowPlan,
@@ -704,9 +596,7 @@ mod tests {
         Mtu::new(bytes).expect("test MTU is valid")
     }
 
-    // The P3 gate asks for properties, not examples, so these tests iterate
-    // the full product of the domains that drive each law instead of naming
-    // one case per law.
+    // Exercise the full finite input domains for each planning law.
     const FIDELITIES: [DatagramFidelity; 3] = [
         DatagramFidelity::None,
         DatagramFidelity::Emulated,
@@ -768,7 +658,7 @@ mod tests {
                                 properties,
                                 mtu(path),
                             ) else {
-                                continue; // overhead exceeded the path; not admitted
+                                continue; // This path cannot be admitted.
                             };
                             if fidelity != DatagramFidelity::Native {
                                 assert_ne!(
@@ -852,10 +742,8 @@ mod tests {
             if fidelity == DatagramFidelity::Native {
                 assert_eq!(result, Ok(Replan::Unchanged));
             } else {
-                // The verdict carries the plan the flow must adopt, and that
-                // plan is exactly what planning the new egress from scratch
-                // yields. This is the law that lets the caller assign it
-                // without a second, fallible derivation.
+                // Resteer carries the same replacement plan fresh planning
+                // would produce, so the caller need not derive it again.
                 assert_eq!(
                     result,
                     Ok(Replan::Resteer {
@@ -942,13 +830,12 @@ mod tests {
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
         ];
 
-        // Every wire-expressible IPv4 fragment boundary (offset unit or the
-        // more-fragments flag) routes to Reassemble and nothing else.
+        // Both fragment indicators require reassembly.
         for offset_units in [0_u16, 1, 8, 256, 0x1fff] {
             for more_fragments in [true, false] {
                 let mut packet = ipv4_udp;
-                if offset_units == 0 && !more_fragments {
-                    continue; // not a fragment at all
+                    if offset_units == 0 && !more_fragments {
+                    continue; // This is an unfragmented packet.
                 }
                 let flags_offset = offset_units | if more_fragments { 0x2000 } else { 0 };
                 packet[6..8].copy_from_slice(&flags_offset.to_be_bytes());
@@ -967,16 +854,14 @@ mod tests {
             }
         }
 
-        // An IPv6 Fragment header is source-only fragmentation (RFC 8200
-        // section 4.5), but we are the destination, so reassembly is
-        // mandatory; it routes to Reassemble like IPv4.
+        // RFC 8200 section 4.5 requires reassembly for this destination.
         let mut ipv6_fragment = [0_u8; 56];
         ipv6_fragment[0] = 0x60;
         ipv6_fragment[4..6].copy_from_slice(&16_u16.to_be_bytes());
         ipv6_fragment[6] = 44;
         ipv6_fragment[7] = 64;
-        ipv6_fragment[40] = 6; // fragment header: next is TCP
-        ipv6_fragment[43] = 0x01; // offset 0, more fragments
+        ipv6_fragment[40] = 6; // Next header is TCP.
+        ipv6_fragment[43] = 0x01; // Offset zero, more fragments.
         let parsed = IngressPacket::parse(&ipv6_fragment).expect("wire-valid packet");
         assert_eq!(parsed.transport, Transport::Fragment);
         assert_eq!(
@@ -1012,20 +897,19 @@ mod tests {
             }
         );
 
-        // Open: the attempt is refused so the browser's race resolves to TCP.
+        // Active steering drops the QUIC attempt.
         assert_eq!(
             route_ingress(quic, plan, DnsPolicy::Intercept, Backstop::Active),
             IngressAction::DropSteered
         );
-        // Closed: ordinary traffic, whatever the DNS policy.
+        // An expired window forwards ordinary traffic.
         for dns in [DnsPolicy::Intercept, DnsPolicy::Forward] {
             assert_eq!(
                 route_ingress(quic, plan, dns, Backstop::Lapsed),
                 IngressAction::ForwardPacket(plan)
             );
         }
-        // TCP to the same port is the destination steering aims at, so the
-        // backstop must never touch it.
+        // TCP on the same port is never subject to the UDP backstop.
         let https = Transport::Tcp {
             source_port: 50_000,
             destination_port: HTTPS_PORT,
@@ -1034,8 +918,7 @@ mod tests {
             route_ingress(https, plan, DnsPolicy::Intercept, Backstop::Active),
             IngressAction::ForwardPacket(plan)
         );
-        // And a query to the resolver still wins over the backstop, because
-        // the two act on different ports and cannot both apply.
+        // DNS interception remains independent because it uses another port.
         let query = Transport::Udp {
             source_port: 50_000,
             destination_port: DNS_PORT,
@@ -1049,7 +932,7 @@ mod tests {
     #[test]
     fn mtu_rejects_paths_that_cannot_carry_ipv6() {
         assert_eq!(Mtu::new(0), Err(MtuError::BelowMinimum(0)));
-        // RFC 791's 68-byte IPv4 link minimum is not a usable tunnel MTU.
+        // The IPv4 forwarding minimum is not a usable dual-stack tunnel MTU.
         assert_eq!(Mtu::new(68), Err(MtuError::BelowMinimum(68)));
         assert_eq!(
             Mtu::new(MIN_IPV6_MTU - 1),
@@ -1057,9 +940,7 @@ mod tests {
         );
         assert_eq!(Mtu::new(MIN_IPV6_MTU).map(Mtu::get), Ok(MIN_IPV6_MTU));
 
-        // The IPv6 floor sits above the QUIC floor, so every admitted MTU clears
-        // 1200 and steering for MTU can only come from an egress datagram
-        // ceiling, never from an admitted packet path.
+        // Every admitted packet MTU also clears QUIC's lower floor.
         const { assert!(MIN_IPV6_MTU > MIN_QUIC_MTU) };
         assert!(mtu(MIN_IPV6_MTU).admits_quic());
     }
@@ -1083,9 +964,7 @@ mod tests {
             })
         );
 
-        // **Inspection is a property of the flow, not of the session.** A
-        // candidate terminates and loses QUIC; every other flow on the same
-        // inspecting session keeps the packet fast path and keeps HTTP/3.
+        // Inspection affects only the matching flow.
         assert_eq!(
             plan_flow(
                 FilterPolicy::InspectHttp,
@@ -1130,8 +1009,7 @@ mod tests {
             ))
         );
 
-        // On a terminated path the client's MTU is gone, so the egress's own
-        // datagram ceiling decides whether QUIC clears RFC 9000's 1200 floor.
+        // Terminated flows use the egress datagram ceiling for QUIC.
         let native_l4 = egress(DatagramFidelity::Native, 0);
         assert_eq!(
             plan_flow(
@@ -1174,8 +1052,7 @@ mod tests {
             Ok(QuicPolicy::PassThrough)
         );
 
-        // An inner MTU that cannot carry IPv6 is a rejected chain, not a
-        // degraded mode. Distinguish it from overhead exceeding the path.
+        // Separate an invalid inner MTU from path-overhead overflow.
         assert_eq!(
             plan_flow(
                 FilterPolicy::PassThrough,
@@ -1241,9 +1118,7 @@ mod tests {
             })
         );
 
-        // Layer agreement is checked where two implementations meet, not
-        // between two bare claims; the `Egress::chain` conflict path is
-        // covered in `egress.rs`.
+        // Bare claims do not validate implementation-layer agreement.
     }
 
     #[test]
@@ -1296,10 +1171,7 @@ mod tests {
             IngressAction::OpenDatagram(_)
         ));
 
-        // A fragment is classified without consulting the plan at all, which
-        // is what lets the datapath quarantine one under a configuration that
-        // could not plan a flow. The plan passed here is irrelevant, and that
-        // is the point.
+        // Fragments are settled before the plan is consulted.
         assert_eq!(
             route_ingress(
                 Transport::Fragment,

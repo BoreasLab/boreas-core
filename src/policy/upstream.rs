@@ -1,40 +1,13 @@
-//! DNS upstream transports: the wire, and only the wire.
+//! DNS upstream transports and their wire handling.
 //!
-//! The policy that decides whether to consult an upstream, and what to do with
-//! what it says, is pure and lives in [`crate::policy::dns`]. The single thing this
-//! module contributes to a verdict is which [`Upstream`] carried it — which
-//! matters because the privacy claim differs per transport, and a user is
-//! entitled to know which one they got.
+//! Policy remains in [`crate::policy::dns`]; this module supplies transport
+//! provenance and performs only the selected protocol exchange. Mozilla's
+//! trust bundle is independent of the user-installed interception root.
 //!
-//! Three decisions carry the design.
-//!
-//! **The trust anchors are Mozilla's bundle, deliberately not the operating
-//! system's store.** Boreas installs its own root into the user store for
-//! interception, and a resolver trusting the OS store would trust the
-//! certificate authority Boreas itself controls — precisely the relationship
-//! this connection must not have. A static bundle also makes the resolver's
-//! trust independent of anything a user or another application has added.
-//!
-//! **One connection per query on the byte-stream transports, and one
-//! connection for all of them on DoQ — because the correlation differs, not
-//! because the effort did.** Concurrent queries on a shared byte stream must be
-//! matched by transaction id, and the id travelling upstream is the *client's*,
-//! so [`DotUpstream`] and [`DohUpstream`] dial per query and are correct without
-//! any demultiplexer. The cost is bounded by rustls session resumption: the
-//! configuration holds the session cache, each upstream owns one configuration
-//! for its lifetime, so every query after the first is a one-round-trip
-//! resumption rather than a full handshake.
-//!
-//! [`DoqUpstream`] has no such problem. RFC 9250 gives each query its own QUIC
-//! stream and *requires* the message id be zero, so the stream is the
-//! correlation and there is nothing to rewrite between queries — which is why
-//! its connection is held rather than redialled, and why the persistent
-//! pipelining recorded as a follow-up for the others is already the shape here.
-//!
-//! **The socket must leave by a route that is not the tunnel.** A resolver
-//! reached through the tunnel that is resolving for it is a loop, and
-//! excluding it is a platform act this crate cannot perform. [`TunnelBypass`]
-//! names the obligation so no implementation can quietly skip it.
+//! Do53, DoT, and DoH use one connection per query because a shared byte stream
+//! needs transaction-ID demultiplexing. DoQ uses one persistent connection:
+//! RFC 9250 gives each query its own stream and requires a zero message ID.
+//! [`TunnelBypass`] keeps resolver sockets outside the tunnel.
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -43,34 +16,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{ClientProfile, Originator, Upstream};
 
-/// Stub-resolver ceiling; bounds memory an upstream can impose per query.
+/// Maximum DNS message accepted from an upstream.
 pub(crate) const MAX_DNS_MESSAGE: usize = 4096;
 
 /// One DNS upstream transport.
-///
-/// Only the wire. See the module documentation for what is deliberately not
-/// here.
 pub trait DnsUpstream: Send + Sync {
-    /// The transport kind, which is what a verdict's provenance records.
+    /// Transport provenance recorded in a resolution.
     fn kind(&self) -> Upstream;
 
-    /// Sends one DNS message and returns the reply.
-    ///
-    /// Called from a task of its own, never from the reactor, so it may await
-    /// as long as it likes without stalling the datapath. It must impose its
-    /// own timeout: the resolver bounds how many of these run at once, not how
-    /// long any one of them takes.
+    /// Sends one DNS message and returns its reply.
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
 }
 
-/// Creates the sockets a DNS upstream uses.
-///
-/// It exists because those sockets must not travel through Boreas's own TUN —
-/// a resolver reached through the tunnel that is resolving for it is a loop —
-/// and excluding them is a platform act this crate cannot perform:
-/// `VpnService.protect` on the descriptor on Android, binding the physical
-/// interface's address on Windows. The seam names the obligation so that no
-/// implementation can quietly skip it.
+/// Creates resolver sockets outside the tunnel.
 pub trait TunnelBypass: Send + Sync {
     fn udp(
         &self,
@@ -82,35 +40,16 @@ pub trait TunnelBypass: Send + Sync {
         peer: SocketAddr,
     ) -> impl Future<Output = io::Result<tokio::net::TcpStream>> + Send;
 
-    /// A UDP socket with **no peer**, for a datagram relay that names a
-    /// different destination per datagram.
-    ///
-    /// Required rather than defaulted, and deliberately so: a default would be
-    /// an ordinary wildcard bind, which is correct on a desktop and silently
-    /// wrong on Android — the socket would travel through the very tunnel it is
-    /// relaying for. A platform that had to override [`Self::udp`] has to
-    /// override this too, and a required method is what makes the compiler say
-    /// so instead of a comment.
+    /// Creates an unconnected UDP socket for per-datagram destinations.
     fn unbound(&self) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send;
 }
 
-/// The bypass for a host where nothing is in the way: ordinary sockets on the
-/// default route.
-///
-/// Correct on a desktop whose default route is not the tunnel, and the
-/// deliberate wrong answer on Android, where the socket must be protected
-/// before it is connected. Named for what it does not do.
-///
-/// `Clone` because a tunnel needs one bypass per thing that dials -- the
-/// egress, the resolver, a relay -- and this one carries no state to share.
-/// An implementation that holds a JNI handle clones the handle, which is what
-/// `Clone` on such a type means everywhere else.
+/// Default-route sockets for environments without tunnel interception.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectSockets;
 
 impl TunnelBypass for DirectSockets {
-    // Written as explicit future types for the same reason `AsyncDevice` is:
-    // the trait promises `Send`, and only the explicit form states it.
+    // The explicit return type states the trait's `Send` guarantee.
     #[allow(clippy::manual_async_fn)]
     fn udp(
         &self,
@@ -138,30 +77,19 @@ impl TunnelBypass for DirectSockets {
 
     #[allow(clippy::manual_async_fn)]
     fn unbound(&self) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send {
-        // Dual-stack v6, so one socket reaches peers of both families and a
-        // relay does not have to know which it will be asked for next.
+        // One IPv6 socket serves both address families where supported.
         async move { tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).await }
     }
 }
 
 /// Plain DNS over UDP to one resolver.
-///
-/// One ephemeral socket per query, which is what makes concurrent queries
-/// correlate without a transaction-id demultiplexer: a connected socket
-/// receives exactly its own reply, and the random source port is the entropy a
-/// spoofing attacker has to beat.
-///
-/// Do53 is readable by anything on the path, which is why [`Upstream`]
-/// distinguishes it. It is the transport that needs no TLS stack, and so the
-/// one that could exist before the crate admitted one.
 pub struct Do53Upstream<B> {
     resolver: SocketAddr,
     bypass: B,
     timeout: Duration,
 }
 
-/// Two seconds matches what stub resolvers already assume; a longer wait holds
-/// a resolver permit another query could be using.
+/// Default query timeout.
 pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl<B: TunnelBypass> Do53Upstream<B> {
@@ -199,14 +127,7 @@ impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
     }
 }
 
-/// A configured TLS client for one resolver: where it lives, what name its
-/// certificate must carry, and the trust anchors that decide it.
-///
-/// Shared by [`DotUpstream`] and [`DohUpstream`] because the differences
-/// between them start after the handshake. Building one parses the whole
-/// Mozilla bundle, so it is built once per upstream and never per query — and
-/// because rustls keeps its session cache in the configuration, that is also
-/// what makes every query after the first a resumption.
+/// TLS dialer shared by DoT and DoH.
 /// The stream a TLS upstream hands back. Named because two dialers and four
 /// transports return it and the type is a mouthful.
 type UpstreamTls = tokio_boring::SslStream<crate::Opaque<tokio::net::TcpStream>>;
@@ -215,24 +136,20 @@ struct TlsDialer<B> {
     resolver: SocketAddr,
     server_name: String,
     originator: Arc<Originator>,
-    /// The ALPN list in wire format, built once per configured upstream.
+    /// ALPN list in wire format.
     alpn: Vec<u8>,
     bypass: B,
     timeout: Duration,
 }
 
-/// Why a TLS upstream could not be configured. Configuration errors, not
-/// query errors: every one of them is decided before a packet moves.
+/// TLS-upstream configuration failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpstreamError {
-    /// The certificate name is not a DNS name or IP address rustls can verify
-    /// against.
+    /// Server name is not verifiable by rustls.
     InvalidServerName,
-    /// The URL is not an absolute `https://` URL with a host.
+    /// URL is not an absolute `https://` URL with a host.
     InvalidUrl,
-    /// The crypto provider refused the requested protocol versions. Reported
-    /// rather than unwrapped because it is a build-configuration mismatch, and
-    /// a panic at start-up is a worse diagnosis than a named error.
+    /// The crypto provider rejected the requested protocol versions.
     UnsupportedTlsVersions,
 }
 
@@ -249,26 +166,16 @@ impl std::fmt::Display for UpstreamError {
 impl std::error::Error for UpstreamError {}
 
 impl<B: TunnelBypass> TlsDialer<B> {
-    /// `alpn` is the protocol list the handshake offers; empty offers none.
+    /// Creates a dialer with the given ALPN list.
     fn new(
         resolver: SocketAddr,
         server_name: &str,
         alpn: &[&[u8]],
         bypass: B,
     ) -> Result<Self, UpstreamError> {
-        // Parsed only to reject a name no handshake could verify. The value is
-        // discarded: BoringSSL takes the name as a string.
+        // Reject names that no handshake can verify.
         ServerName::try_from(server_name).map_err(|_| UpstreamError::InvalidServerName)?;
 
-        // **BoringSSL, wearing Chrome's hello.** An encrypted DNS query is the
-        // first thing a connection does and the most telling: a resolver
-        // reached with a `rustls` ClientHello names the software, not the
-        // browser it is resolving for. There is no client hello to mirror here,
-        // so the profile is a stated one.
-        //
-        // The anchors are Mozilla's bundle and not the platform store; see the
-        // module documentation for why that is a security property here rather
-        // than a portability shortcut.
         Ok(Self {
             resolver,
             server_name: server_name.to_owned(),
@@ -281,8 +188,7 @@ impl<B: TunnelBypass> TlsDialer<B> {
 
     async fn connect(&self) -> io::Result<UpstreamTls> {
         let stream = crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.resolver)).await?;
-        // Nagle would hold a short query waiting for more bytes that are not
-        // coming, which on a request/response protocol is pure added latency.
+        // DNS requests are request/response traffic; do not delay small writes.
         stream.set_nodelay(true)?;
         self.originator
             .connect(
@@ -295,16 +201,7 @@ impl<B: TunnelBypass> TlsDialer<B> {
     }
 }
 
-/// DNS over TLS, RFC 7858.
-///
-/// The framing is the whole protocol: a two-octet big-endian length followed
-/// by the message, in both directions, exactly as DNS over TCP. Everything
-/// else is the TLS session underneath it.
-///
-/// DoT is encrypted and authenticated but not disguised: it runs on port 853,
-/// which a network that objects to it can block outright. That is the
-/// difference [`DohUpstream`] exists to cover, and the reason a verdict names
-/// which of them answered.
+/// DNS over TLS, RFC 7858, using DNS-over-TCP framing.
 pub struct DotUpstream<B> {
     dialer: TlsDialer<B>,
 }
@@ -313,12 +210,8 @@ pub struct DotUpstream<B> {
 pub const DOT_PORT: u16 = 853;
 
 impl<B: TunnelBypass> DotUpstream<B> {
-    /// `server_name` is the name the resolver's certificate must carry, which
-    /// is not the address it lives at: `1.1.1.1` presents `one.one.one.one`.
-    /// Passing the address as the name is a supported and much weaker
-    /// configuration, so the two are separate parameters rather than one.
+    /// Configures the resolver address and certificate name separately.
     pub fn new(resolver: SocketAddr, server_name: &str, bypass: B) -> Result<Self, UpstreamError> {
-        // RFC 7858 section 3.2 registers the "dot" ALPN identifier.
         Ok(Self {
             dialer: TlsDialer::new(resolver, server_name, &[b"dot"], bypass)?,
         })
@@ -340,9 +233,6 @@ impl<B: TunnelBypass> DnsUpstream for DotUpstream<B> {
         async move {
             let length = u16::try_from(message.len())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "query exceeds 65535"))?;
-            // The timeout covers connect, handshake, and exchange together:
-            // the caller's interest is "an answer within two seconds", not the
-            // budget of any one step.
             tokio::time::timeout(self.dialer.timeout, async {
                 let mut stream = self.dialer.connect().await?;
                 stream.write_all(&length.to_be_bytes()).await?;
@@ -356,11 +246,7 @@ impl<B: TunnelBypass> DnsUpstream for DotUpstream<B> {
     }
 }
 
-/// Reads one two-octet-length-prefixed DNS message.
-///
-/// The declared length is checked against [`MAX_DNS_MESSAGE`] before a buffer
-/// is sized, so a hostile or broken resolver cannot decide how much memory a
-/// query costs.
+/// Reads one bounded two-octet-length-prefixed DNS message.
 async fn read_length_prefixed<S>(stream: &mut S) -> io::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -379,50 +265,24 @@ where
     Ok(reply)
 }
 
-/// DNS over HTTPS, RFC 8484.
-///
-/// One `POST` of `application/dns-message`, which is the wire format already
-/// in hand — no re-encoding, and no base64 as the `GET` form would need.
-///
-/// **Conformance gap, deliberate and bounded.** RFC 8484 section 5.2 requires
-/// a DoH client to support HTTP/2, and this one speaks HTTP/1.1. Public
-/// resolvers accept it, and the alternative today is an HTTP/2 client this
-/// crate has no other use for; the `h2` stack arrives with P14's interception,
-/// at which point this implementation moves onto it behind the same trait. The
-/// request offers `http/1.1` in ALPN, so a server that will not speak it fails
-/// the handshake rather than the exchange.
-///
-/// `Connection: close` and a read to end-of-stream, which is what keeps the
-/// response reader to a status line and headers: there is no chunked transfer
-/// to decode when the body ends with the connection.
+/// DNS over HTTPS, RFC 8484, over HTTP/1.1 with connection-close framing.
 pub struct DohUpstream<B> {
     dialer: TlsDialer<B>,
-    /// The complete request head, built once. Only the body length changes per
-    /// query, so the rest is not rebuilt for each one.
+    /// Request authority and path.
     authority: String,
     path: String,
 }
 
 impl<B: TunnelBypass> DohUpstream<B> {
-    /// `url` is the absolute `https://` endpoint, and `resolver` is the
-    /// address to reach it at — supplied rather than resolved, because
-    /// resolving the resolver's own name is the bootstrap problem this crate
-    /// declines to have.
+    /// Configures an absolute `https://` endpoint and its already-known address.
     pub fn new(url: &str, resolver: SocketAddr, bypass: B) -> Result<Self, UpstreamError> {
-        // **`http::Uri` rather than a split on `:`.** Splitting worked for
-        // `dns.example` and `dns.example:8443` and produced nonsense for
-        // `[2001:db8::1]`, where the rightmost colon is inside the address: the
-        // host became `2001:db8:` and went on to be the name the certificate
-        // was checked against. RFC 3986 section 3.2.2 is why the brackets are
-        // there, and `Uri` is the parser that already knows it.
+        // URI parsing preserves bracketed IPv6 authorities.
         let uri: http::Uri = url.parse().map_err(|_| UpstreamError::InvalidUrl)?;
         if uri.scheme_str() != Some("https") {
             return Err(UpstreamError::InvalidUrl);
         }
         let authority = uri.authority().ok_or(UpstreamError::InvalidUrl)?;
-        // The certificate carries the host, not the port, and `Authority::host`
-        // keeps an IPv6 literal's brackets — which belong in a `Host` header
-        // and not in a server name.
+        // TLS verifies the host; HTTP preserves the authority including port.
         let host = authority
             .host()
             .trim_start_matches('[')
@@ -479,53 +339,26 @@ impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
     }
 }
 
-/// DNS over QUIC, RFC 9250.
-///
-/// **The stream is the correlation, which is why this one connection is
-/// persistent where the TLS transports are not.** DoT and DoH dial per query
-/// because concurrent queries on a shared byte stream must be matched by
-/// transaction id, and the id travelling upstream is the client's. DoQ has no
-/// such problem: each query gets its own bidirectional QUIC stream, the answer
-/// arrives on the stream that asked, and RFC 9250 §4.2.1 requires the message
-/// id be **zero** precisely so that nothing is tempted to correlate on it. So
-/// the connection is held and every query is one stream on it — which is also
-/// the only shape that makes DoQ cheaper than DoT rather than the same thing
-/// with a QUIC handshake in front.
-///
-/// The framing on that stream is DoT's: a two-octet big-endian length, then the
-/// message, in both directions. The client closes its half after the query,
-/// which is what tells the server no more is coming.
-///
-/// **The id is rewritten to zero, and the caller's is restored on the way
-/// back.** A resolver that saw a non-zero id may treat the connection as a
-/// protocol error and close it (§4.2.1), and a stub resolver that saw a zero id
-/// come back would discard the reply as unsolicited. Both halves of the
-/// substitution live here, so no caller has to know DoQ is underneath.
+/// DNS over QUIC, RFC 9250. Each query uses its own stream and a zero message ID.
 pub struct DoqUpstream<B> {
     resolver: SocketAddr,
     server_name: String,
     bypass: B,
     quic: crate::QuicConfigFactory,
-    /// The live connection. An async mutex because establishing one awaits, and
-    /// because two queries arriving together must produce *one* connection
-    /// rather than two — the second waits and finds the first's.
+    /// Shared live connection.
     connection: tokio::sync::Mutex<Option<crate::QuicConnection>>,
-    /// Cancels the driver task, so the connection's lifetime is this value's.
+    /// Cancels the connection driver on drop.
     shutdown: tokio_util::sync::CancellationToken,
     timeout: Duration,
 }
 
-/// RFC 9250 §4.1.1 registers this ALPN, and a resolver that does not offer it
-/// fails the handshake rather than the exchange.
+/// RFC 9250 section 4.1.1 ALPN.
 const DOQ_ALPN: &[u8] = b"doq";
 
-/// The idle timeout the connection is configured with. Long enough that a
-/// browsing session's queries share one connection, short enough that a
-/// forgotten one does not hold a socket for the process's life.
+/// DoQ connection idle timeout.
 const DOQ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The two octets an RFC 9250 message id occupies, which must be zero on the
-/// wire and is restored from the caller's on the way back.
+/// Width of the DNS message ID.
 const DNS_ID_BYTES: usize = 2;
 
 impl<B> Drop for DoqUpstream<B> {
@@ -535,14 +368,7 @@ impl<B> Drop for DoqUpstream<B> {
 }
 
 impl<B: TunnelBypass> DoqUpstream<B> {
-    /// `server_name` is the name the resolver's certificate must carry, which
-    /// is not the address it lives at — the same distinction [`DotUpstream`]
-    /// draws, and for the same reason.
-    ///
-    /// `quic` builds the transport configuration, including certificate
-    /// verification, which is the caller's to set for the same reason it is on
-    /// every other QUIC egress here: a test resolver and a production one
-    /// differ there and nowhere else.
+    /// Configures the resolver address, certificate name, and QUIC factory.
     pub fn new(
         resolver: SocketAddr,
         server_name: &str,
@@ -560,8 +386,7 @@ impl<B: TunnelBypass> DoqUpstream<B> {
         }
     }
 
-    /// A `quiche::Config` with DoQ's ALPN and idle timeout, ready for a caller
-    /// to set verification on.
+    /// Builds a DoQ config with its ALPN and idle timeout.
     pub fn quic_config() -> Result<quiche::Config, crate::EgressError> {
         crate::client_config(&[DOQ_ALPN], DOQ_IDLE_TIMEOUT)
     }
@@ -571,12 +396,7 @@ impl<B: TunnelBypass> DoqUpstream<B> {
         self
     }
 
-    /// The live connection, dialling one if there is none.
-    ///
-    /// Holding the lock across the handshake is deliberate: it is what makes
-    /// concurrent first queries share a connection instead of racing to build
-    /// two, and a second connection would mean a second handshake and a second
-    /// socket for no gain.
+    /// Returns the live connection, establishing one if needed.
     async fn connection(&self) -> io::Result<crate::QuicConnection> {
         let mut held = self.connection.lock().await;
         if let Some(live) = held.as_ref().filter(|live| live.is_alive()) {
@@ -623,18 +443,12 @@ impl<B: TunnelBypass> DnsUpstream for DoqUpstream<B> {
                 let connection = self.connection().await?;
                 let mut stream = connection.open_bidi().await.map_err(quic_failed)?;
                 stream.write_all(&length.to_be_bytes()).await?;
-                // §4.2.1: zero on the wire, whatever the client chose.
                 stream.write_all(&[0, 0]).await?;
                 stream.write_all(&message[DNS_ID_BYTES..]).await?;
                 stream.flush().await?;
-                // Half-close is the whole "no more is coming" signal DoQ has.
                 stream.shutdown().await?;
 
                 let mut reply = read_length_prefixed(&mut stream).await?;
-                // The stub resolver correlates on the id it sent, so a reply
-                // carrying DoQ's mandatory zero would be discarded as
-                // unsolicited. Restoring it is the other half of the same
-                // substitution.
                 if let Some(slot) = reply.get_mut(..DNS_ID_BYTES) {
                     slot.copy_from_slice(&id);
                 }
@@ -646,18 +460,10 @@ impl<B: TunnelBypass> DnsUpstream for DoqUpstream<B> {
     }
 }
 
-/// The largest response head this reader will accept before giving up. A
-/// resolver that needs more than this to say "200" is not one to keep reading
-/// from, and the bound is what stops a hostile one from growing a buffer.
+/// Maximum HTTP response-head size.
 const MAX_HTTP_HEAD: usize = 8 * 1024;
 
-/// Reads an HTTP/1.1 response and returns its body.
-///
-/// Total on the shape this client asks for and refuses everything else: the
-/// request sets `Connection: close`, so the body ends with the stream and
-/// there is no chunked encoding to decode. Only a `200` yields a body; every
-/// other status is an error, because a DNS answer parsed out of an error page
-/// would be worse than no answer.
+/// Reads a `200` HTTP/1.1 response body with bounded connection-close framing.
 async fn read_http_body<S>(stream: &mut S) -> io::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -692,9 +498,6 @@ where
     }
 
     let mut body = buffer.split_off(body_at);
-    // `Connection: close` makes end-of-stream the end of the body, so the read
-    // needs no `Content-Length` and no chunk decoder — only the same bound the
-    // length-prefixed reader applies.
     loop {
         if body.len() > MAX_DNS_MESSAGE {
             return Err(io::Error::new(
@@ -711,7 +514,7 @@ where
     Ok(body)
 }
 
-/// The offset just past the blank line that ends an HTTP head.
+/// Finds the offset just past an HTTP head.
 fn find_head_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(4)
@@ -719,8 +522,7 @@ fn find_head_end(buffer: &[u8]) -> Option<usize> {
         .map(|at| at + 4)
 }
 
-/// Whether the status line reports 200. The version is accepted in either
-/// 1.0 or 1.1 form, because a server may answer 1.0 to a 1.1 request.
+/// Whether an HTTP/1.0 or HTTP/1.1 status line reports 200.
 fn status_is_ok(head: &[u8]) -> bool {
     let line = head.split(|byte| *byte == b'\r').next().unwrap_or_default();
     let mut fields = line.split(|byte| *byte == b' ');
@@ -744,8 +546,6 @@ mod tests {
 
     #[test]
     fn every_transport_names_itself() {
-        // The provenance a verdict records comes from here, and it is the
-        // whole of what a transport contributes to one.
         assert_eq!(
             Do53Upstream::new(address(53), DirectSockets).kind(),
             Upstream::Do53
@@ -768,14 +568,9 @@ mod tests {
         );
     }
 
-    /// DoQ's message-id substitution, which is the one place this transport
-    /// edits what it carries. Both halves must hold: zero on the wire, because
-    /// RFC 9250 §4.2.1 lets a resolver close the connection over a non-zero id;
-    /// and the caller's id restored on the reply, because a stub resolver
-    /// discards an answer whose id is not the one it sent.
+    /// DoQ writes a zero ID upstream and restores the caller's ID downstream.
     #[test]
     fn doq_writes_a_zero_id_upstream_and_restores_the_caller_s_on_the_way_back() {
-        // The exact bytes the query writer produces, assembled the way it does.
         let query = [0xab, 0xcd, 0x01, 0x00, 0x00, 0x01];
         let id = [query[0], query[1]];
         let mut on_the_wire = vec![0u8, 0u8];
@@ -794,15 +589,11 @@ mod tests {
             "the client's id must come back"
         );
 
-        // A message too short to carry an id is not a DNS message, and is
-        // refused rather than padded into one.
         assert!([0u8; 1].get(..DNS_ID_BYTES).is_none());
     }
 
     #[test]
     fn a_tls_upstream_refuses_a_name_it_could_not_verify() {
-        // Configuration errors are decided before a packet moves, which is why
-        // they are a `Result` at construction and not an `io::Error` per query.
         assert_eq!(
             DotUpstream::new(address(DOT_PORT), "not a name", DirectSockets).err(),
             Some(UpstreamError::InvalidServerName)
@@ -818,7 +609,6 @@ mod tests {
                 "{url}"
             );
         }
-        // An address is a weaker but supported server name.
         assert!(DotUpstream::new(address(DOT_PORT), "1.1.1.1", DirectSockets).is_ok());
     }
 
@@ -832,19 +622,13 @@ mod tests {
         .unwrap();
         assert_eq!(upstream.authority, "dns.example:8443");
         assert_eq!(upstream.path, "/resolve");
-        // The certificate carries the host, never the port.
         assert_eq!(upstream.dialer.server_name, "dns.example");
 
-        // A URL with no path still addresses the origin's root.
         let bare = DohUpstream::new("https://dns.example", address(443), DirectSockets).unwrap();
         assert_eq!(bare.path, "/");
     }
 
-    /// **The rightmost colon is not the port separator when the host is an IPv6
-    /// literal.** Splitting on it made `[2001:db8::1]` into the server name
-    /// `2001:db8:` — a name no certificate carries and no handshake completes
-    /// against, from a URL that is perfectly well formed. RFC 3986 section
-    /// 3.2.2 puts the brackets there for exactly this reason.
+    /// URI parsing keeps an IPv6 host separate from its port.
     #[test]
     fn an_ipv6_literal_resolver_keeps_its_address_as_the_server_name() {
         for (url, server_name, authority) in [
@@ -861,7 +645,6 @@ mod tests {
         ] {
             let upstream = DohUpstream::new(url, address(8443), DirectSockets).unwrap();
             assert_eq!(upstream.dialer.server_name, server_name, "{url}");
-            // The `Host` header keeps the brackets a server name must not have.
             assert_eq!(upstream.authority, authority, "{url}");
             assert_eq!(upstream.path, "/dns-query", "{url}");
         }
@@ -869,14 +652,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_length_prefixed_reader_bounds_what_a_resolver_can_make_it_hold() {
-        // RFC 7858 framing: two octets of length, then exactly that many.
         let mut framed: Vec<u8> = 4u16.to_be_bytes().to_vec();
         framed.extend_from_slice(b"abcd");
         let mut cursor = std::io::Cursor::new(framed);
         assert_eq!(read_length_prefixed(&mut cursor).await.unwrap(), b"abcd");
 
-        // A declared length past the bound is refused before a buffer is
-        // sized, so an upstream cannot decide how much memory a query costs.
         let oversized = (MAX_DNS_MESSAGE as u16 + 1).to_be_bytes().to_vec();
         let mut cursor = std::io::Cursor::new(oversized);
         assert_eq!(
@@ -884,7 +664,6 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        // A truncated frame is an error, not a short message.
         let mut short: Vec<u8> = 8u16.to_be_bytes().to_vec();
         short.extend_from_slice(b"abc");
         let mut cursor = std::io::Cursor::new(short);
@@ -908,12 +687,9 @@ mod tests {
         );
         assert_eq!(read_http_body(&mut ok).await.unwrap(), b"\x00\x01dns");
 
-        // A 1.0 answer to a 1.1 request is legal and accepted.
         let mut old = response("HTTP/1.0 200 OK\r\n\r\n", b"dns");
         assert_eq!(read_http_body(&mut old).await.unwrap(), b"dns");
 
-        // Anything else is an error: a DNS answer parsed out of an error page
-        // would be worse than no answer at all.
         for head in [
             "HTTP/1.1 404 Not Found\r\n\r\n",
             "HTTP/1.1 500 Internal Server Error\r\n\r\n",
@@ -928,7 +704,6 @@ mod tests {
             );
         }
 
-        // A head that never ends is bounded rather than read forever.
         let endless = vec![b'x'; MAX_HTTP_HEAD + 1024];
         let mut cursor = std::io::Cursor::new(endless);
         assert_eq!(
@@ -936,7 +711,6 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        // A body past the bound is refused for the same reason.
         let mut huge = response("HTTP/1.1 200 OK\r\n\r\n", &vec![b'x'; MAX_DNS_MESSAGE + 1]);
         assert_eq!(
             read_http_body(&mut huge).await.unwrap_err().kind(),
