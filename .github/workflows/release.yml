@@ -7,10 +7,9 @@ name: Release
 # commit, and GitHub marks it pre-release so it never becomes "Latest".
 #
 # A `v*` tag pushed by hand cuts a **release**. That is the only thing a human
-# does here, and `cargo xtask resolve` refuses one that disagrees with
-# `Cargo.toml` — a shipped artefact whose version does not match the crate it
-# was built from is discovered by a downstream consumer, months later, as a
-# mystery.
+# does here, and it is the whole act: **the tag is the version.** Nothing has to
+# be bumped first, so there is no step to forget and no gate that fires when you
+# forget it.
 #
 # Path filters are deliberately absent. A docs-only push does produce a
 # byte-identical library and one more pre-release, which is a cost; a filter
@@ -49,7 +48,7 @@ jobs:
     steps:
       # `fetch-depth: 0` because the tag algebra reads every release tag to
       # find the newest; a shallow clone carries none of them and the base
-      # version would silently fall back to `Cargo.toml` forever.
+      # version would fall back to `0.0.1` on every build forever.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -58,9 +57,9 @@ jobs:
       # **No branch here, and that is the point.** `xtask resolve` reads the
       # event from `GITHUB_REF_TYPE`, which GitHub already sets, and returns one
       # of two variants; a release event with no tag is not a state it can be
-      # asked about. It refuses a tag that disagrees with `Cargo.toml`, because
-      # a published artefact whose version does not match the crate it was built
-      # from is found by a downstream consumer, months later, as a mystery.
+      # asked about. The only refusal is at the parser — a ref that is not a
+      # release tag never becomes a release — because the tag is the sole place
+      # a version is written and so there is nothing left to disagree with.
       - name: Decide the tag
         id: name
         run: cargo xtask resolve | tee -a "$GITHUB_OUTPUT"

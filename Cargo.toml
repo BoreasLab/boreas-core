@@ -1,5 +1,9 @@
 [package]
 name = "boreas-core"
+# **Not the released version.** Cargo demands a version here; the released one
+# comes from the git tag, and `cargo xtask resolve` never reads this field. It
+# is the fallback an untagged local build carries, and nothing more — a second
+# place to write a version is a second place for it to disagree.
 version = "0.1.0"
 edition = "2024"
 

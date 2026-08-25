@@ -139,27 +139,38 @@ fn ndk_root() -> Result<PathBuf, String> {
 
 /// What this event publishes.
 ///
-/// Reads the event from the variables GitHub already sets, so the workflow
-/// plumbs nothing: `GITHUB_REF_TYPE` is `tag` exactly when a tag was pushed.
+/// **This is where the one untrusted string becomes a version.** `GITHUB_SHA`
+/// and `GITHUB_REF_NAME` arrive as text; both are parsed here, and what reaches
+/// [`release::resolve`] is already a `Version` and a `Sha`. That is the whole
+/// reason the algebra is total — the refusals live at the edge that receives
+/// the strings, not in the function that reasons about them.
+///
+/// Nothing reads a version out of a manifest. The tag is the version.
 fn resolve() -> Fallible {
     let event = match std::env::var("GITHUB_REF_TYPE").as_deref() {
-        Ok("tag") => Event::Release {
-            tag: std::env::var("GITHUB_REF_NAME")?,
-        },
+        // `GITHUB_REF_TYPE` is `tag` exactly when a tag was pushed, so the
+        // workflow plumbs nothing and there is no branch to get wrong.
+        Ok("tag") => {
+            let name = std::env::var("GITHUB_REF_NAME")?;
+            let version = Version::parse_tag(&name).ok_or_else(|| {
+                format!("'{name}' is not a release tag; releases are vMAJOR.MINOR.PATCH")
+            })?;
+            Event::Release(version)
+        }
         _ => Event::Push,
     };
-
-    let manifest = std::fs::read_to_string(repo_root().join("Cargo.toml"))?;
-    let declared = release::manifest_version(&manifest)
-        .ok_or("Cargo.toml declares no [package] version this can read")?;
 
     let sha = match std::env::var("GITHUB_SHA") {
         Ok(full) => Sha::parse(&full).ok_or_else(|| format!("GITHUB_SHA is not hex: {full}"))?,
         Err(_) => head()?,
     };
 
-    let publish = release::resolve(&event, declared, released()?, Stamp::now(), sha)?;
-    Ok(outputs(&publish))
+    Ok(outputs(&release::resolve(
+        event,
+        released()?,
+        Stamp::now(),
+        sha,
+    )))
 }
 
 /// Every release tag in the repository. Anything that is not one — a

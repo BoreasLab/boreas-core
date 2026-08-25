@@ -142,8 +142,11 @@ somebody else's repository — the workflow runs its own gate for that reason
 rather than trusting `ci.yml` to have finished first.
 
 A **release** is the one thing a human does: push a `vMAJOR.MINOR.PATCH` tag.
-`cargo xtask resolve` refuses a tag that disagrees with `Cargo.toml`, so bump
-the crate version in the same commit you intend to tag.
+That is the entire act. **The tag is the version** — nothing is bumped first,
+because a second place to write a version is a second place for it to disagree,
+and the check that policed the disagreement fired on the step people forget.
+`Cargo.toml`'s version is what Cargo demands and a fallback for untagged
+builds; `resolve` never reads it.
 
 **The pipeline is `xtask/`, in Rust, and it is a workspace member so
 `cargo test --workspace` and `cargo clippy --workspace` already cover it.** It

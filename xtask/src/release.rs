@@ -171,24 +171,19 @@ impl fmt::Display for Sha {
 
 /// What triggered a publish.
 ///
-/// A sum rather than a boolean and an optional string: `Release` carries its
-/// tag, `Push` has none, and "a release event with no tag" is not a state that
-/// can be written down. The shell script this replaces had exactly that pair,
-/// and the branch that read them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A sum rather than a boolean and an optional string: `Release` carries a
+/// version, `Push` carries nothing, and "a release event with no version" is
+/// not a state that can be written down.
+///
+/// **`Release` holds a parsed [`Version`], not the tag string.** The string is
+/// untrusted — whatever `GITHUB_REF_NAME` happens to say — so it is parsed at
+/// the boundary that receives it and everything downstream takes a value that
+/// already *is* a version. That is what leaves [`resolve`] total, with no
+/// error type at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Push,
-    Release { tag: String },
-}
-
-/// Why a release was refused. Each variant carries what an operator needs to
-/// fix it, because the only reader is a CI log.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum Refusal {
-    #[error("'{tag}' is not a release tag; releases are vMAJOR.MINOR.PATCH")]
-    NotARelease { tag: String },
-    #[error("tag v{tag} disagrees with Cargo.toml {declared}: bump one to match the other")]
-    ManifestDisagrees { tag: Version, declared: Version },
+    Release(Version),
 }
 
 /// What is being published.
@@ -233,70 +228,38 @@ impl Publish {
     }
 }
 
-/// The whole algebra.
+/// The whole algebra, and it is **total**: every event has a publish.
 ///
-/// Total on `Push`. On `Release`, defined exactly when the tag is a strict
-/// triple that agrees with `Cargo.toml` — because the two ship together and a
-/// published artefact whose version does not match the crate it was built from
-/// is found by a downstream consumer, months later, as a mystery.
+/// There is no gate here and no refusal, because there is nothing left to
+/// disagree with. **The tag is the version.** An earlier design also read a
+/// version out of `Cargo.toml` and refused a tag that differed from it, which
+/// made a release two acts and made the one you forget the one that fails the
+/// build. That check existed only because there were two sources; one source
+/// makes the invariant hold by construction rather than by inspection.
 ///
-/// **The base version is one `max` over a total order rather than a branch.**
-/// The next pre-release heads for the patch above the newest release, but
-/// `Cargo.toml` is also a declaration of where the version is going, and before
-/// the first release it is the only one there is. Taking the larger is right in
-/// every case without asking which source is authoritative.
+/// Where a build system demands a version field of its own, that field is a
+/// fallback for builds with no tag. It is never consulted here.
+///
+/// **The base version has one operand.** The next pre-release heads for the
+/// patch above the newest release, and a repository that has never shipped
+/// starts from [`ORIGIN`]. If the next release should be a minor, tag a minor
+/// — the tag says so, and saying it twice is what this removed.
 ///
 /// O(n) in the tag count, folding from the identity [`ORIGIN`].
 pub fn resolve(
-    event: &Event,
-    declared: Version,
+    event: Event,
     released: impl IntoIterator<Item = Version>,
     now: Stamp,
     sha: Sha,
-) -> Result<Publish, Refusal> {
+) -> Publish {
     match event {
-        Event::Release { tag } => {
-            let version =
-                Version::parse_tag(tag).ok_or_else(|| Refusal::NotARelease { tag: tag.clone() })?;
-            if version == declared {
-                Ok(Publish::Release(version))
-            } else {
-                Err(Refusal::ManifestDisagrees {
-                    tag: version,
-                    declared,
-                })
-            }
-        }
-        Event::Push => Ok(Publish::Pre {
-            version: released
-                .into_iter()
-                .map(Version::successor)
-                .chain([declared])
-                .max()
-                .unwrap_or(ORIGIN),
+        Event::Release(version) => Publish::Release(version),
+        Event::Push => Publish::Pre {
+            version: released.into_iter().max().unwrap_or(ORIGIN).successor(),
             stamp: now,
             sha,
-        }),
+        },
     }
-}
-
-/// The version `Cargo.toml` declares for `[package]`.
-///
-/// A whole TOML parser is not warranted for one field, but the field must come
-/// from the right table: a `version` under `[dependencies.foo]` is not this
-/// crate's. Scanning stops at the next table header for exactly that reason.
-#[must_use]
-pub fn manifest_version(manifest: &str) -> Option<Version> {
-    manifest
-        .lines()
-        .map(str::trim)
-        .skip_while(|line| *line != "[package]")
-        .skip(1)
-        .take_while(|line| !line.starts_with('['))
-        .find_map(|line| line.strip_prefix("version"))
-        .and_then(|rest| rest.trim_start().strip_prefix('='))
-        .map(|value| value.trim().trim_matches('"'))
-        .and_then(Version::parse_triple)
 }
 
 #[cfg(test)]
@@ -318,22 +281,20 @@ mod tests {
         Stamp::from_unix(seconds).expect("in range")
     }
 
-    fn pre(declared: &str, released: &[&str], at: i64) -> Publish {
+    fn pre(released: &[&str], at: i64) -> Publish {
         resolve(
-            &Event::Push,
-            version(declared),
+            Event::Push,
             released.iter().filter_map(|t| Version::parse_tag(t)),
             stamp(at),
             sha(),
         )
-        .expect("a push is total")
     }
 
     /// The shape, exactly. A change here is a change every consumer sees.
     #[test]
     fn a_pre_release_names_its_time_and_its_commit() {
         assert_eq!(
-            pre("0.4.2", &["v0.4.2"], NOON).tag(),
+            pre(&["v0.4.2"], NOON).tag(),
             "v0.4.3-dev.2026-08-25.11-30-00.g1a2b3c4"
         );
     }
@@ -343,7 +304,7 @@ mod tests {
     #[test]
     fn a_pre_release_sorts_between_the_releases_it_lies_between() {
         let before = Publish::Release(version("0.4.2"));
-        let middle = pre("0.4.2", &["v0.4.2"], NOON);
+        let middle = pre(&["v0.4.2"], NOON);
         let after = Publish::Release(version("0.4.3"));
 
         assert_eq!(middle.version(), version("0.4.3"));
@@ -357,8 +318,8 @@ mod tests {
     /// `11-30-00` and reverse two builds an hour apart.
     #[test]
     fn later_builds_sort_later() {
-        let morning = pre("1.0.0", &[], NOON - 2 * 3600).tag();
-        let noon = pre("1.0.0", &[], NOON).tag();
+        let morning = pre(&["v1.0.0"], NOON - 2 * 3600).tag();
+        let noon = pre(&["v1.0.0"], NOON).tag();
         assert!(morning < noon, "{morning} should sort below {noon}");
         assert!(morning.contains("09-30-00"), "{morning}");
         assert!(noon.contains("11-30-00"), "{noon}");
@@ -377,62 +338,60 @@ mod tests {
         );
     }
 
-    /// The base is a `max`, so it is right whichever source moved last.
+    /// The base follows the tags and nothing else.
     #[test]
-    fn the_base_version_is_the_larger_of_the_tags_and_the_manifest() {
-        // Nothing has ever shipped: the manifest is the only claim there is.
-        assert_eq!(pre("0.1.0", &[], NOON).version(), version("0.1.0"));
+    fn the_base_version_is_the_patch_above_the_newest_release() {
+        // Nothing has ever shipped, so the successor of ORIGIN.
+        assert_eq!(pre(&[], NOON).version(), version("0.0.1"));
         // After a release, the patch above it.
-        assert_eq!(pre("0.1.0", &["v0.1.0"], NOON).version(), version("0.1.1"));
-        // A manifest raised ahead of the tags wins.
-        assert_eq!(pre("0.2.0", &["v0.1.0"], NOON).version(), version("0.2.0"));
-        // And tags ahead of a lagging manifest win, so two builds cannot claim
-        // one version.
-        assert_eq!(
-            pre("0.1.0", &["v0.1.0", "v0.3.0"], NOON).version(),
-            version("0.3.1")
-        );
+        assert_eq!(pre(&["v0.1.0"], NOON).version(), version("0.1.1"));
+        // The newest release wins, whatever order the tags arrive in.
+        assert_eq!(pre(&["v0.3.0", "v0.1.0"], NOON).version(), version("0.3.1"));
         // Pre-release tags are not releases and do not raise the base, or the
         // version would climb with commit volume rather than with intent.
         assert_eq!(
-            pre("0.1.0", &["v0.9.9-dev.2026-01-01.00-00-00.gabc1234"], NOON).version(),
-            version("0.1.0")
+            pre(&["v0.1.0", "v0.9.9-dev.2026-01-01.00-00-00.gabc1234"], NOON).version(),
+            version("0.1.1")
         );
     }
 
+    /// **There is no gate, and this is what replaced it.** A release publishes
+    /// whatever version its tag names, because the tag is the only place a
+    /// version is written. What used to be refused — a tag disagreeing with a
+    /// manifest — needs two sources to be expressible, and there is one.
     #[test]
-    fn a_release_must_be_a_triple_that_agrees_with_the_manifest() {
-        let gate = |tag: &str, declared: &str| {
+    fn a_release_publishes_the_version_its_tag_names() {
+        let released = |tag: &str| {
             resolve(
-                &Event::Release {
-                    tag: tag.to_owned(),
-                },
-                version(declared),
+                Event::Release(Version::parse_tag(tag).expect("a release tag")),
                 [],
                 stamp(NOON),
                 sha(),
             )
         };
+        assert_eq!(released("v0.4.2"), Publish::Release(version("0.4.2")));
+        assert_eq!(released("v9.9.9"), Publish::Release(version("9.9.9")));
+    }
 
-        assert_eq!(
-            gate("v0.4.2", "0.4.2"),
-            Ok(Publish::Release(version("0.4.2")))
-        );
-        assert!(matches!(
-            gate("v0.4.3", "0.4.2"),
-            Err(Refusal::ManifestDisagrees { .. })
-        ));
-        for malformed in ["0.4.2", "v0.4", "v0.4.2.1", "v0.04.2", "release-0.4.2", ""] {
+    /// The refusal that remains lives at the parser, not in the algebra: a
+    /// string that is not a release tag never becomes an `Event::Release`.
+    #[test]
+    fn only_a_strict_triple_parses_as_a_release() {
+        for malformed in [
+            "0.4.2",
+            "v0.4",
+            "v0.4.2.1",
+            "v0.04.2",
+            "release-0.4.2",
+            "",
+            // A pre-release tag is not a release, even a well-formed one.
+            "v0.4.2-dev.2026-08-25.11-30-00.gabc1234",
+        ] {
             assert!(
-                matches!(gate(malformed, "0.4.2"), Err(Refusal::NotARelease { .. })),
-                "{malformed} was accepted"
+                Version::parse_tag(malformed).is_none(),
+                "{malformed} parsed as a release"
             );
         }
-        // A pre-release tag is not a release, even a well-formed one.
-        assert!(matches!(
-            gate("v0.4.2-dev.2026-08-24.11-30-00.gabc1234", "0.4.2"),
-            Err(Refusal::NotARelease { .. })
-        ));
     }
 
     #[test]
@@ -443,31 +402,12 @@ mod tests {
         }
     }
 
-    /// The manifest field must come from `[package]` and stop at the next
-    /// table, or a dependency's version could be read as this crate's.
+    /// Nothing here reads a manifest any more. If a version field ever comes
+    /// back as an input, the gate comes back with it — and so does the release
+    /// step you have to remember.
     #[test]
-    fn the_manifest_version_comes_from_the_package_table() {
-        let manifest = "\
-[package]\n\
-name = \"boreas-core\"\n\
-version = \"0.1.0\"\n\
-edition = \"2024\"\n\
-\n\
-[dependencies]\n\
-version = \"9.9.9\"\n";
-        assert_eq!(manifest_version(manifest), Some(version("0.1.0")));
-
-        let no_version = "[package]\nname = \"x\"\n\n[dependencies]\nversion = \"9.9.9\"\n";
-        assert_eq!(manifest_version(no_version), None);
-        assert_eq!(manifest_version(""), None);
-    }
-
-    /// This repository's own manifest, so a rename or a restructure of it is
-    /// caught here rather than at the moment a release is cut.
-    #[test]
-    fn this_repositorys_manifest_parses() {
-        let manifest = std::fs::read_to_string(crate::repo_root().join("Cargo.toml"))
-            .expect("the root manifest");
-        assert!(manifest_version(&manifest).is_some());
+    fn the_algebra_takes_no_manifest() {
+        let pushed = pre(&["v0.1.0"], NOON);
+        assert_eq!(pushed.version(), version("0.1.1"));
     }
 }
