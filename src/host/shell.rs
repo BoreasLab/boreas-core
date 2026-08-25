@@ -1,35 +1,11 @@
-//! The tokio runtime shell. It interprets the pure [`Datapath`]: one reactor
-//! task owns the core by value (no `Arc<Mutex<Datapath>>`), one timer is armed
-//! against the core's own next deadline, and every channel is bounded.
+//! Tokio shell for the pure [`Datapath`]. One reactor owns the core by value,
+//! all channels are bounded, and one timer serves core, telemetry, and egress
+//! deadlines.
 //!
-//! Three properties carry the design.
-//!
-//! **Backpressure is asymmetric, so the channels are separate.** Control
-//! messages are policy: a slow control plane should block its producer, so
-//! [`Control`] is awaited. Datagrams are traffic: blocking a UDP source turns
-//! loss into head-of-line delay, so every datagram channel is offered with
-//! `try_send` and a refusal is a drop. One channel cannot honour both
-//! disciplines, which is why they are separate.
-//!
-//! **A packet is not an error.** Every [`DatapathError`] describes one packet
-//! that did not make it — malformed input, a configuration that cannot plan,
-//! a clock past the end of time. None of them is a reason to stop interpreting
-//! the core, so the reactor counts them and continues. Only the device itself
-//! can fail fatally.
-//!
-//! **Telemetry is aggregated, not per-event.** A per-occurrence message would
-//! make the telemetry stream O(packets) under exactly the floods that matter
-//! most, which is the defect P7 removed from the core's event stream. Counters
-//! are folded here and reported on a fixed interval, and telemetry the channel
-//! could not accept is itself counted so a gap never reads as quiet.
-//!
-//! **The egress is inside the reactor, not beside it.** The fused product is
-//! one interface: a packet from the client's TUN is encapsulated and put on
-//! the network without leaving this task, and a datagram from the network is
-//! decapsulated and re-enters the core the same way. Each transmit names the
-//! side it belongs on ([`crate::Side`]), so the reactor routes rather than
-//! guesses; a shell that owned only a device could do nothing with a fast-path
-//! packet but send it back where it came from.
+//! Control messages await capacity; traffic uses `try_send` and drops on
+//! saturation. A packet error is counted and does not stop the reactor, while
+//! device and network failures remain fatal. The reactor also owns egress
+//! interpretation so each [`crate::Side`] is routed explicitly.
 
 use std::{
     io,
@@ -54,171 +30,86 @@ use crate::{
     plan_query, policy::upstream::DnsUpstream, write_failure, write_refusal, write_response,
 };
 
-/// Depth of both reactor channels. Bounded is the point; the exact depth trades
-/// burst tolerance against queueing delay and is not load-bearing.
+/// Capacity of reactor channels.
 const CHANNEL_DEPTH: usize = 256;
 
-/// Resolutions in flight at once. A browser opening one page asks for tens of
-/// names at the same moment, so serializing them would add a round trip per
-/// name; leaving it unbounded would let one page open unbounded upstream
-/// state. A query that cannot get a permit waits at the resolver, which backs
-/// the bounded query channel up, which turns into a drop at the reactor — and
-/// a stub resolver retries a dropped query, which is exactly what it already
-/// does for a lost datagram.
+/// Maximum concurrent upstream resolutions.
 const MAX_INFLIGHT_QUERIES: usize = 64;
 
-/// The largest response this shell will build.
-///
-/// 1232 bytes is the DNS Flag Day 2020 recommendation: it clears the IPv6
-/// minimum MTU with room for headers, so a synthesized answer never needs IP
-/// fragmentation — which matters because these datagrams are written with the
-/// Don't Fragment bit set. A rewritten response that will not fit becomes a
-/// `SERVFAIL` rather than a truncated answer.
-///
-/// ponytail: the correct answer for an over-large response is `TC=1` and a
-/// retry over TCP/53, which needs the local termination that arrives with
-/// P14. Until then a `SERVFAIL` is the visible failure, and the counter says
-/// how often it happens.
+/// Largest DNS response built by the shell. This stays below the IPv6 MTU;
+/// oversized rewritten responses become `SERVFAIL`.
 const MAX_DNS_RESPONSE: usize = 1232;
 
-/// How often accumulated counters are reported. Reporting on a clock rather
-/// than per occurrence is what keeps the telemetry stream O(time) instead of
-/// O(packets).
+/// Telemetry reporting interval.
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Control messages into the reactor. Bounded and **awaited**: a slow control
-/// plane is backpressure on its producer, which is correct for a stream of
-/// policy.
+/// Control messages into the reactor. Producers await bounded capacity.
 #[derive(Debug)]
 pub enum Control {
-    /// The layer travels with the claim because both are derived from the
-    /// same [`crate::Egress`] variant by the sender; apart they could drift.
+    /// Updated accepted layer and path properties.
     PathChange(Accepts, PathProperties),
-    /// Ordered shutdown: control messages queued ahead of this one are applied
-    /// first. [`Shell::shutdown`] uses the cancellation token instead, which
-    /// needs no channel capacity and therefore cannot be refused.
+    /// Ordered shutdown after preceding control messages.
     Shutdown,
 }
 
-/// Telemetry out of the reactor. Bounded and best-effort: telemetry loss under
-/// saturation is acceptable, flow correctness is not.
-///
-/// Every counting variant reports occurrences *since the previous report*, so
-/// an observer sums rather than diffs.
+/// Bounded, best-effort reactor telemetry. Counting variants are deltas.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Telemetry {
-    /// A per-flow lifecycle event, passed through one for one because the flow
-    /// count bounds it.
+    /// Per-flow lifecycle event.
     Event(FlowEvent),
-    /// Datagrams a full per-flow queue refused. Aggregated rather than carrying
-    /// an endpoint: the storm is the signal, and a message per drop would be
-    /// the very thing the queue exists to bound.
+    /// Datagrams refused by per-flow queues.
     DatagramsDropped(u64),
-    /// Packets the core refused: malformed input, an unplannable flow, or a
-    /// deadline past the end of the clock.
+    /// Packets refused by the core.
     PacketsRejected(u64),
-    /// Fragments discarded by reassembly.
+    /// Reassembly discards.
     ReassemblyDiscarded(u64),
-    /// Packets the core planned to forward but had no pooled buffer for. The
-    /// signal that the shared budget, not the network, is the bottleneck.
+    /// Planned transmits refused by the shared buffer pool.
     TransmitsDropped(u64),
-    /// Datagrams the egress refused: not a WireGuard packet, or no buffer for
-    /// the emission. Routine on a public port, so counted, not fatal.
+    /// Datagrams refused by the egress.
     EgressRejected(u64),
-    /// QUIC attempts the steering backstop refused. Convergence is this
-    /// falling back to zero once the browser has re-raced to TCP.
+    /// QUIC attempts steered to HTTP/2.
     QuicSteered(u64),
-    /// Over-sized packets answered with an ICMP Packet Too Big. A count that
-    /// stays high past a client's path discovery is a link MTU configured
-    /// wider than the tunnel can carry, which is a configuration fault this
-    /// number is the only visible symptom of.
+    /// Oversized packets answered with ICMP Packet Too Big.
     PathsReported(u64),
-    /// One resolved query, with everything needed to explain its verdict.
-    ///
-    /// Passed through whole rather than folded: a query is a flow-scale event,
-    /// not a packet-scale one, and a verdict a user cannot see the reason for
-    /// is a verdict they cannot argue with. Boxed so the common counting
-    /// variants stay small.
+    /// Resolved query and its verdict.
     Resolved(Box<Resolution>),
-    /// Queries dropped because the resolver was saturated. The client's stub
-    /// resolver retries; this is how an operator sees that it had to.
+    /// Queries dropped because the resolver was saturated.
     QueriesDropped(u64),
-    /// A new host policy took effect, with the rules it holds. Emitted on the
-    /// swap rather than counted, because a reload is an operator action and
-    /// there is one of them, not one per packet.
+    /// Complete host policy replacement.
     PolicyReloaded(RuleCounts),
-    /// Packets of terminated flows the local TCP stack could not accept: its
-    /// queue was full, or the session routed a flow to termination without a
-    /// terminator configured. TCP retransmits, so this is congestion or
-    /// misconfiguration rather than data loss.
+    /// Termination packets refused by the local stack.
     TerminationDropped(u64),
-    /// Tasks that ended by unwinding. **Always a defect in this crate**, never
-    /// something a peer can cause and never routine load: a non-zero count is
-    /// the one number here that means "read the crash log", and before
-    /// [`Panics`] there was no number at all.
+    /// Tasks that ended by unwinding; this indicates an internal defect.
     TasksPanicked(u64),
-    /// Telemetry observations this channel could not accept.
+    /// Telemetry observations lost to channel saturation.
     Lost(u64),
 }
 
-/// The effectful half of a session: the four seams the reactor drives, and the
-/// host rules the resolver applies. The pure half is the [`Datapath`].
-///
-/// Grouped rather than passed positionally because they are configuration, and
-/// because the set grows with each egress and filtering phase; a constructor
-/// that reads as a record does not become a nine-argument call.
+/// Effectful seams driven by the reactor and the resolver's live policy.
 pub struct Session<D, N, E, U> {
-    /// The client's TUN.
+    /// Client TUN.
     pub device: D,
-    /// The socket carrying the egress's encapsulated datagrams.
+    /// Egress network socket.
     pub network: N,
-    /// The packet egress.
+    /// Packet egress.
     pub egress: E,
-    /// The DNS upstream. Never consulted by a session configured with
-    /// [`crate::DnsPolicy::Forward`], because the core emits no queries.
+    /// DNS upstream, unused when DNS passes through.
     pub upstream: U,
-    /// Tasks that ended by unwinding, shared with every subsystem this session
-    /// spawns so one report covers them all.
+    /// Shared task-panic counter.
     pub panics: Panics,
-    /// Host rules, hot-swappable.
-    ///
-    /// A `watch` channel rather than an `Arc` because a filter-list build
-    /// replaces the whole index at once and must not stall the datapath doing
-    /// it: the sender publishes a freshly compiled policy, and each query is
-    /// decided against exactly one version — the one current when it was
-    /// admitted — so a reload mid-flight cannot split a decision in half.
-    ///
-    /// Both tasks hold a receiver, which is what a `watch` channel is for: the
-    /// resolver reads it to decide, and the reactor observes the change to
-    /// report it.
+    /// Atomically replaceable host rules.
     pub policy: watch::Receiver<Arc<HostPolicy>>,
-    /// The local TCP terminator, when this session terminates flows.
+    /// Local TCP terminator, if flow termination is enabled.
     pub termination: Option<Termination>,
-    /// The datagram relay, when this session's egress accepts flows rather
-    /// than packets.
-    ///
-    /// An option for the same reason [`Termination`] is: a packet egress
-    /// carries a datagram as the packet it already is, so it needs no
-    /// association and no second task. A flow egress that carries no datagrams
-    /// at all also carries `None`, and its path properties
-    /// (`datagram_fidelity: None`) is what already said so.
+    /// Datagram relay, if the egress carries flow datagrams.
     pub relay: Option<Relay>,
 }
 
-/// The local TCP terminator's two channels, from the reactor's side.
-///
-/// Present only for a session that terminates flows. A pure packet-path
-/// session never routes a flow to [`crate::TransportPath::LocalTermination`],
-/// so it needs no stack and carries `None` — which is why this is an option
-/// rather than a always-present pair of idle channels.
+/// Reactor-facing channels for local TCP termination.
 pub struct Termination {
-    /// Packets of terminated flows, offered to the terminator without waiting:
-    /// a full queue is a counted drop, and TCP retransmits, exactly as the
-    /// forward path treats congestion.
+    /// Terminated packets offered without waiting.
     pub packets: mpsc::Sender<Pooled>,
-    /// Segments the terminator produced for the client. The reactor owns the
-    /// device, so they are written here rather than there — and dropping one
-    /// after the write is what returns its buffer to the shared budget.
+    /// Segments produced for the client.
     pub replies: mpsc::Receiver<Pooled>,
 }
 
@@ -232,21 +123,8 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// Starts the reactor on the current runtime. `device` is a
-    /// file-descriptor-like async reader/writer of raw IP packets, which P9's
-    /// platform adapters supply. The reactor owns the datapath by value, so no
-    /// lock guards it and none can be held across an `await`.
-    ///
-    /// Payload buffers are never allocated here: every one of them is on loan
-    /// from the [`BufferPool`](crate::BufferPool) the datapath already owns,
-    /// which is what makes that budget the real bound on queue memory.
-    ///
-    /// The reactor and the resolver are two tasks, and the split is
-    /// load-bearing: a resolution is a network round trip, and awaiting one
-    /// inside the reactor would stall every packet behind a slow upstream.
-    /// They meet over two bounded channels, so a saturated resolver becomes a
-    /// dropped query — which a stub resolver retries — and never a stalled
-    /// datapath.
+    /// Starts the reactor and resolver on the current runtime. The reactor owns
+    /// the datapath by value; resolver work stays on a separate bounded path.
     pub fn start<D, N, E, U>(datapath: Datapath, session: Session<D, N, E, U>) -> Self
     where
         D: AsyncDevice + Send + 'static,
@@ -311,30 +189,19 @@ impl Shell {
         }
     }
 
-    /// A control-plane handle. Cloning a `Sender` is how tokio models multiple
-    /// producers; the channel stays bounded however many exist.
+    /// Returns a bounded control-plane handle.
     pub fn control(&self) -> mpsc::Sender<Control> {
         self.control.clone()
     }
 
-    /// The next telemetry observation, or `None` once the reactor has stopped.
+    /// Returns the next telemetry observation, or `None` after shutdown.
     pub async fn next_telemetry(&mut self) -> Option<Telemetry> {
         self.telemetry.recv().await
     }
 
-    /// Stops the reactor and drains it: no task outlives this call.
-    ///
-    /// Cancellation rather than an in-band message, because the token needs no
-    /// channel capacity and so cannot be refused by a saturated reactor. A
-    /// caller who instead needs shutdown ordered behind queued policy sends
-    /// [`Control::Shutdown`] through [`control`](Self::control) first.
-    ///
-    /// A panic in the reactor is a defect, not an I/O failure, so it is
-    /// re-raised here rather than laundered into an `io::Error`.
+    /// Cancels and joins the reactor and resolver. Reactor panics are resumed.
     pub async fn shutdown(self) -> io::Result<()> {
         self.shutdown.cancel();
-        // The resolver is joined too, and it joins its own in-flight
-        // resolutions, so no task and no pooled buffer outlives this call.
         let resolver = self.resolver.await;
         let reactor = self.reactor.await;
         if let Err(error) = resolver
@@ -350,72 +217,37 @@ impl Shell {
     }
 }
 
-/// The async side of the device seam: raw IP packets with readiness, supplied
-/// by P9's platform adapters. Futures must be `Send` so the reactor can live on
-/// a multi-threaded runtime; the trait is written with explicit future types
-/// because `async fn` in a public trait cannot promise that.
+/// Async raw-IP device seam supplied by platform adapters.
 pub trait AsyncDevice {
-    /// The MTU the interface is configured with. It sizes the reactor's receive
-    /// buffer, so a packet this device can legitimately present always fits:
-    /// a fixed constant would either waste memory on a small tunnel or truncate
-    /// a valid packet on a large one, and only the adapter knows which.
+    /// Configured interface MTU, used to size the receive buffer.
     fn mtu(&self) -> crate::Mtu;
 
-    /// Reads one packet into `buf`, returning its length.
-    ///
-    /// **Must be cancel-safe.** The reactor selects over this future alongside
-    /// its timer and channels, so a future that is polled and then dropped is
-    /// routine, not exceptional. An implementation that has already consumed a
-    /// packet when its future is dropped loses that packet. A readiness-based
-    /// read over an OS handle satisfies this, as does awaiting a tokio channel;
-    /// an adapter that dequeues before awaiting does not.
+    /// Reads one packet. Must be cancel-safe because the reactor routinely drops
+    /// this future after polling it in `select!`.
     fn recv<'a>(
         &'a mut self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = io::Result<usize>> + Send + 'a;
 
-    /// Writes one packet **whole**. Called only from the reactor's drain phase,
-    /// never concurrently with itself, and never inside a `select!`.
-    ///
-    /// **The unit is the packet, so the result carries no byte count.** A TUN
-    /// write and a datagram send are both all-or-nothing at the OS boundary,
-    /// and there is no correct handling of "some of this IP packet reached the
-    /// wire": the remainder cannot be re-sent as a second packet, because it
-    /// carries no header. An implementation that observes a short write must
-    /// therefore report [`io::ErrorKind::WriteZero`] rather than return, which
-    /// is what makes the absent `usize` a guarantee instead of an omission.
+    /// Writes one complete packet. Short writes must return
+    /// [`io::ErrorKind::WriteZero`]; an IP packet cannot be resumed as a second packet.
     fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a;
 }
 
-/// The network side of the fused interface: encapsulated datagrams to and from
-/// the egress's peer. Shaped like [`AsyncDevice`] and deliberately a separate
-/// trait, because the bytes are not IP packets and the two seams are never
-/// interchangeable — crossing them is the loopback defect [`Side`] exists to
-/// prevent.
-///
-/// A connected `tokio::net::UdpSocket` is the production implementation and is
-/// provided below; tests supply a scripted one.
+/// Async seam for encapsulated datagrams to and from the egress peer.
 pub trait AsyncNetwork {
-    /// Reads one datagram into `buf`, returning its length.
-    ///
-    /// **Must be cancel-safe**, for the same reason as
-    /// [`AsyncDevice::recv`]: the reactor selects over this future and drops
-    /// it routinely.
+    /// Reads one datagram. Must be cancel-safe because the reactor may drop the
+    /// future after polling it in `select!`.
     fn recv<'a>(
         &'a mut self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = io::Result<usize>> + Send + 'a;
 
-    /// Writes one datagram to the peer, whole. Called only from the drain
-    /// phase. See [`AsyncDevice::send`] for why the byte count is absent.
+    /// Writes one complete datagram. Short writes are reported as errors.
     fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a;
 }
 
-/// Reports a short write as the failure it is.
-///
-/// The one place the `usize` an OS returns is turned back into the total
-/// contract the seams declare, so no caller downstream has to remember that
-/// "wrote some bytes" and "sent the packet" are different statements.
+/// Converts an OS short write into the seam's whole-packet error.
 pub(crate) fn whole(written: usize, expected: usize) -> io::Result<()> {
     if written == expected {
         return Ok(());
@@ -437,42 +269,32 @@ impl AsyncNetwork for tokio::net::UdpSocket {
         tokio::net::UdpSocket::recv(self, buf)
     }
 
-    // Written out rather than as an `async fn` so the returned future's `Send`
-    // bound is stated in the signature, which is what the trait requires.
+    // The explicit future keeps the trait's `Send` bound visible.
     #[allow(clippy::manual_async_fn)]
     fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a {
         async move { whole(tokio::net::UdpSocket::send(self, buf).await?, buf.len()) }
     }
 }
 
-/// One resolved query, on its way back to the reactor that will address it.
+/// Resolved query returned to the reactor for addressing.
 struct Answer {
     client: InternalEndpoint,
     resolver: InternalEndpoint,
-    /// The response bytes, on the same budget as every other payload the
-    /// session holds. A `Vec` here would be per-query memory outside every
-    /// bound the crate states, which is precisely the memory a query flood
-    /// grows.
+    /// Response bytes charged to the shared pool.
     message: Pooled,
     resolution: Resolution,
-    /// Addresses this answer resolved to for a steered host. Empty for every
-    /// other verdict, so the index grows only by what inspection put in it.
+    /// Resolved addresses used by inspection steering.
     steered: Vec<std::net::IpAddr>,
 }
 
-/// The reactor's half of the resolver channels.
+/// Reactor side of the resolver channels.
 struct Queries {
     out: mpsc::Sender<DnsQuery>,
     back: mpsc::Receiver<Answer>,
 }
 
-/// Resolves intercepted queries until cancelled.
-///
-/// Concurrency is bounded by a semaphore rather than by the channel alone: a
-/// permit is the admission to hold upstream state, and a query that cannot get
-/// one waits here, which backs the query channel up, which becomes a counted
-/// drop at the reactor. Every spawned resolution is tracked, so shutdown joins
-/// them and no pooled buffer outlives the shell.
+/// Resolves intercepted queries until cancellation. Upstream concurrency and
+/// spawned work are bounded and joined before shutdown.
 async fn resolver_loop<U: DnsUpstream + 'static>(
     upstream: Arc<U>,
     pool: Arc<crate::BufferPool>,
@@ -498,16 +320,13 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
         };
         let upstream = Arc::clone(&upstream);
         let pool = Arc::clone(&pool);
-        // One snapshot, taken as the query is admitted. The borrow is released
-        // before the task is spawned, so no guard crosses an `await` and a
-        // reload cannot change a decision half-way through it.
+        // Snapshot policy before spawning; no borrow crosses an await.
         let policy = Arc::clone(&policy.borrow());
         let answers = answers.clone();
         tracker.spawn(panics.watch(async move {
             let _permit = permit;
             if let Some(answer) = resolve(upstream.as_ref(), &pool, policy.as_ref(), query).await {
-                // Best-effort: a reactor that cannot accept the answer is one
-                // whose client has long since retried.
+                // A saturated reactor means the client can retry the query.
                 let _ = answers.try_send(answer);
             }
         }));
@@ -517,11 +336,8 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
     tracker.wait().await;
 }
 
-/// Resolves one query: plan, consult (or do not), rewrite, explain.
-///
-/// `None` when the query is not a DNS message at all, or when the shared budget
-/// has no room to build a response — both are drops rather than answers, and a
-/// stub resolver retries a dropped query exactly as it does a lost datagram.
+/// Plans, resolves, rewrites, and explains one query. Returns `None` for invalid
+/// input or a response that cannot fit the shared budget.
 async fn resolve<U: DnsUpstream>(
     upstream: &U,
     pool: &Arc<crate::BufferPool>,
@@ -539,8 +355,7 @@ async fn resolve<U: DnsUpstream>(
     let mut steered = Vec::new();
 
     let (len, resolution) = match plan_query(&question, policy) {
-        // A refused name never leaves the device, so the block costs no query
-        // and leaks no name to any upstream.
+        // Refused names never leave the device.
         QueryPlan::Refuse { rule } => (
             write_refusal(&mut message, &request).ok()?,
             Resolution {
@@ -558,9 +373,6 @@ async fn resolve<U: DnsUpstream>(
             let kind = upstream.kind();
             let rewritten = match upstream.query(&payload).await {
                 Ok(reply) => Message::parse(&reply).and_then(|reply| {
-                    // The steering index is fed from the upstream's own
-                    // answers, before the rewrite, so extracting it costs no
-                    // second parse of what this shell just wrote.
                     if policy.steers() {
                         answer_addresses(&reply, &mut steered)?;
                     }
@@ -583,13 +395,8 @@ async fn resolve<U: DnsUpstream>(
                         alpn: rewritten.alpn,
                     },
                 ),
-                // An upstream that did not answer, answered with something
-                // unparseable, or answered with more than this shell will
-                // carry, all reach the client the same visible way: a
-                // `SERVFAIL` its stub resolver retries, never a silent drop
-                // that stalls the application until its own timeout.
                 Err(_) => {
-                    // A failed rewrite must not leave half an index behind.
+                    // Do not retain addresses from a failed response rewrite.
                     steered.clear();
                     (
                         write_failure(&mut message, &request).ok()?,
@@ -609,8 +416,6 @@ async fn resolve<U: DnsUpstream>(
         }
     };
 
-    // Never grows: `len` is a prefix of the buffer just written, so the resize
-    // is a truncation and the pool's slice bound is already satisfied.
     let _ = message.resize(len);
     Some(Answer {
         client,
@@ -621,19 +426,7 @@ async fn resolve<U: DnsUpstream>(
     })
 }
 
-/// Tasks that ended by unwinding, counted.
-///
-/// **A panicking task is otherwise perfectly silent.** `tokio` catches the
-/// unwind at the task boundary and `TaskTracker::wait` discards join results,
-/// so a panic in a per-connection task ends that connection and nothing else:
-/// this crate has no logger, emits no event for it, and kept no counter. On a
-/// handset nobody can attach a debugger to, that was a whole class of failure
-/// with no evidence at all — and the one that matters most, because a panic
-/// under a lock also poisons it, which is what [`crate::locked`] now recovers
-/// from rather than propagates.
-///
-/// Cheap: one `Arc<AtomicU64>`, `Relaxed` on both ends because the only
-/// consumer is a report and no other memory is ordered against it.
+/// Shared count of tasks that ended by unwinding.
 #[derive(Clone, Debug, Default)]
 pub struct Panics(Arc<AtomicU64>);
 
@@ -643,20 +436,8 @@ impl Panics {
         Self::default()
     }
 
-    /// Wraps `work` so that ending by unwind is counted.
-    ///
-    /// **A drop guard rather than `catch_unwind`.** A future is not
-    /// `UnwindSafe` in general, and asserting it would be asserting the very
-    /// thing in question; the guard needs no such claim. `tokio`'s task
-    /// harness drops the future from a `Drop` that runs *during* the unwind
-    /// out of `poll`, before its `catch_unwind` catches it — so
-    /// `thread::panicking()` is true exactly when this future is being torn
-    /// down by a panic, and false when it is merely being cancelled. The test
-    /// below pins that, because it is a fact about `tokio` rather than about
-    /// this crate.
-    /// `use<F>` is load-bearing: the returned future clones the counter and
-    /// borrows nothing, so a caller can spawn it from a loop without keeping
-    /// this alive.
+    /// Wraps `work` so unwinding is counted without requiring `UnwindSafe`.
+    /// A drop guard distinguishes unwinding from cancellation.
     pub fn watch<F: Future>(&self, work: F) -> impl Future<Output = F::Output> + use<F> {
         let counter = Arc::clone(&self.0);
         async move {
@@ -671,19 +452,12 @@ impl Panics {
     }
 }
 
-/// How a long-lived subsystem is stopped, and where its defects are counted.
-///
-/// **A product because the two are never apart.** Every subsystem this crate
-/// spawns — the session driver, the relay, the terminator — needs a token to
-/// observe and a counter to report a panicking child into, and threading them
-/// as two parameters grew every one of those signatures past the point clippy
-/// stops believing them. Both halves are cheap clones of shared state, so this
-/// is passed by value and cloned per child.
+/// Shared cancellation and panic accounting for spawned subsystems.
 #[derive(Clone, Debug, Default)]
 pub struct Supervision {
-    /// Cancelled once, observed everywhere.
+    /// Shared cancellation token.
     pub shutdown: CancellationToken,
-    /// Shared across every subsystem, so one report covers them all.
+    /// Shared panic counter.
     pub panics: Panics,
 }
 
@@ -693,12 +467,7 @@ impl Supervision {
         Self::default()
     }
 
-    /// Spawns `work` on `tracker` under this supervision's counter.
-    ///
-    /// Cancellation is *not* applied here: some children select on the token
-    /// and some run to completion by design, and hiding that difference behind
-    /// one spawn would make a child's shutdown behaviour invisible at the
-    /// place it is decided.
+    /// Spawns `work` under this supervision's panic counter.
     pub fn watch<F: Future<Output = ()> + Send + 'static>(&self, tracker: &TaskTracker, work: F) {
         tracker.spawn(self.panics.watch(work));
     }
@@ -714,17 +483,14 @@ impl Drop for Sentinel {
     }
 }
 
-/// Best-effort telemetry with visible loss. Never awaits: telemetry must not be
-/// able to stall the datapath.
+/// Best-effort telemetry sink. It never awaits or stalls the datapath.
 struct TelemetrySink {
     channel: mpsc::Sender<Telemetry>,
     lost: u64,
 }
 
 impl TelemetrySink {
-    /// Offers one observation. A refusal increments `lost`, which is flushed as
-    /// [`Telemetry::Lost`] on the next send that succeeds, so an observer never
-    /// mistakes a gap in the stream for quiet.
+    /// Offers one observation and reports later channel loss explicitly.
     fn emit(&mut self, observation: Telemetry) {
         if self.channel.try_send(observation).is_err() {
             self.lost = self.lost.saturating_add(1);
@@ -738,8 +504,7 @@ impl TelemetrySink {
     }
 }
 
-/// Occurrences the reactor folds between reports. The identity is zero and the
-/// operation is addition, so a report is a fold that resets its accumulator.
+/// Reactor counters folded between telemetry reports.
 #[derive(Default)]
 struct Counters {
     datagrams_dropped: u64,
@@ -751,15 +516,12 @@ struct Counters {
     quic_steered: u64,
     paths_reported: u64,
     termination_dropped: u64,
-    /// Not folded by the reactor: tasks panic on other threads, so this one is
-    /// read from the shared counter at flush time rather than incremented here.
+    /// Read from the shared counter at flush time.
     panics: Panics,
 }
 
 impl Counters {
-    /// Reports every non-zero counter and resets it. `NonZeroU64` is doing the
-    /// work of the `> 0` test, so "report nothing when nothing happened" is a
-    /// property of the type rather than a branch to keep in step.
+    /// Reports and resets each non-zero counter.
     fn flush(&mut self, sink: &mut TelemetrySink) {
         let mut report = |count: &mut u64, into: fn(u64) -> Telemetry| {
             if let Some(total) = NonZeroU64::new(*count) {
@@ -784,11 +546,7 @@ impl Counters {
     }
 }
 
-/// The terminator's next segment for the client, or a future that never
-/// completes when this session has no terminator.
-///
-/// `recv` is cancel-safe, so losing this arm of the reactor's `select!` to a
-/// busier one costs nothing: the next pass still sees the segment.
+/// Awaits the next termination reply, or remains pending without a terminator.
 async fn next_reply(termination: &mut Option<Termination>) -> Option<Pooled> {
     match termination {
         Some(termination) => termination.replies.recv().await,
@@ -796,9 +554,7 @@ async fn next_reply(termination: &mut Option<Termination>) -> Option<Pooled> {
     }
 }
 
-/// The relay's next datagram from the egress, or a future that never completes
-/// when this session has no relay. `recv` is cancel-safe, so losing this arm
-/// costs nothing.
+/// Awaits the next relay datagram, or remains pending without a relay.
 async fn next_inbound(relay: &mut Option<Relay>) -> Option<Inbound> {
     match relay {
         Some(relay) => relay.inbound.recv().await,
@@ -806,19 +562,8 @@ async fn next_inbound(relay: &mut Option<Relay>) -> Option<Inbound> {
     }
 }
 
-/// Interprets the pure core until cancelled or until its owner drops.
-///
-/// One iteration is: wait for the earliest of cancellation, a control message,
-/// a datagram, a packet from either seam, or the next deadline; advance the
-/// core; then drain whatever the core and the egress produced. The wait is
-/// `select!` without `biased`, so a saturated device cannot starve the control
-/// plane; cancellation is re-polled every pass and therefore wins within a
-/// small, bounded number of them.
-///
-/// Three deadlines share one `Sleep`: the core's own (`poll_timeout`), the
-/// telemetry report, and the egress's tick. The minimum of the three is what
-/// the timer is armed against, so an idle tunnel still wakes on WireGuard's
-/// cadence and nothing wakes on a poll interval.
+/// Runs the reactor until cancellation or owner drop. One timer serves core,
+/// telemetry, and egress deadlines.
 #[allow(clippy::too_many_arguments)]
 async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     mut datapath: Datapath,
@@ -834,15 +579,10 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     shutdown: CancellationToken,
     panics: Panics,
 ) -> io::Result<()> {
-    // Both buffers are sized from the seam that fills them rather than from a
-    // constant: the device states its own MTU, and the egress states the
-    // largest datagram its peer can send it. A fixed 2 KiB was correct for a
-    // 1500-byte tunnel and silently wrong for anything larger.
+    // Size buffers from the device MTU and egress datagram limit.
     let mut tun_buf = vec![0u8; usize::from(device.mtu().get())];
     let mut net_buf = vec![0u8; egress.max_network_datagram()];
-    // One emission sink for the life of the reactor. The egress appends and
-    // the drain phase empties it, so a packet costs no allocation for the
-    // container it travels in.
+    // Reuse one emission container for the reactor lifetime.
     let mut emits: Vec<EgressEmit> = Vec::new();
     let mut counters = Counters {
         panics,
@@ -852,21 +592,13 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     let tick_interval = egress.tick_interval();
     let mut next_tick = TokioInstant::now() + tick_interval;
 
-    // One `Sleep`, reset per iteration rather than reallocated: re-arming an
-    // existing timer entry is what keeps the wait off the per-packet cost.
+    // Re-arm one timer instead of allocating per iteration.
     let sleep = sleep_until(next_flush);
     tokio::pin!(sleep);
 
     loop {
-        // The core's own next deadline, not a poll interval. `None` means no
-        // state machine has pending work, so the reactor waits only for its
-        // reporting tick, the egress's tick, and its input sources.
         let mut reply: Option<Pooled> = None;
         let core_deadline = datapath.poll_timeout().map(TokioInstant::from_std);
-        // The egress may name a deadline more precisely than its cadence —
-        // QUIC's loss-recovery timer moves, where WireGuard's rounds to the
-        // second — so it joins the fold rather than being approximated by the
-        // tick interval. One timer still serves every deadline in the session.
         let egress_deadline = egress.next_deadline().map(TokioInstant::from_std);
         let wake = core_deadline
             .into_iter()
@@ -883,20 +615,12 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 Some(Control::PathChange(accepts, next)) => {
                     datapath.on_path_change(accepts, next);
                 }
-                // An explicit shutdown and a dropped owner are the same
-                // request: nobody is left to steer this reactor.
                 Some(Control::Shutdown) | None => break,
             },
 
-            // A datagram the relay carried back from the egress. It becomes
-            // a synthesized IP packet addressed to the mapping that sent it,
-            // which is the one place the core originates a packet for a flow
-            // rather than forwarding one.
             Some(Inbound { client, peer, payload }) = next_inbound(&mut relay) => {
                 match datapath.deliver_datagram(client, peer, &payload, Instant::now()) {
                     Ok(SendOutcome::Buffered) => {}
-                    // The core already counted the reason; a datagram whose
-                    // mapping has expired has no client left to receive it.
                     Ok(SendOutcome::Dropped) => counters.datagrams_dropped += 1,
                     Err(_) => counters.packets_rejected += 1,
                 }
@@ -904,28 +628,19 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 
             result = device.recv(&mut tun_buf) => match result {
                 Ok(len) => {
-                    // Untrusted input: a rejected packet is an observation, not
-                    // a reason to stop interpreting the core.
                     if datapath.on_tun_packet(&tun_buf[..len], Instant::now()).is_err() {
                         counters.packets_rejected += 1;
                     }
                 }
-                // A signal interrupted the read; the packet is still there.
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                // The device itself failed. That is not recoverable here.
                 Err(error) => return Err(error),
             },
 
-            // A filter-list build replaced the policy. `changed` is
-            // cancel-safe, so losing this arm to a busier one costs nothing:
-            // the next pass still sees the change.
             Ok(()) = policy.changed() => {
                 let counts = policy.borrow_and_update().len();
                 telemetry.emit(Telemetry::PolicyReloaded(counts));
             }
 
-            // A resolved query. Bounded by the answer channel, and addressed
-            // back to the client from the resolver address it asked.
             Some(answer) = queries.back.recv() => {
                 let Answer { client, resolver, message, resolution, steered } = answer;
                 if !steered.is_empty() {
@@ -938,8 +653,6 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             }
 
             result = network.recv(&mut net_buf) => match result {
-                // Anything can arrive on a public UDP port. A datagram the
-                // egress refuses is counted, exactly like a malformed packet.
                 Ok(len) => {
                     if egress.handle_network_packet(&net_buf[..len], &mut emits).is_err() {
                         counters.egress_rejected += 1;
@@ -949,9 +662,6 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 Err(error) => return Err(error),
             },
 
-            // A segment the terminator produced. It is only captured here:
-            // another arm holds `device` for its read, so the write happens
-            // after the `select!` rather than inside this handler.
             Some(segment) = next_reply(&mut termination) => {
                 reply = Some(segment);
             }
@@ -959,9 +669,6 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             () = &mut sleep => {}
         }
 
-        // The terminator's segments are the client's own connection being
-        // served, so they go straight down the device: they are already IP
-        // packets addressed to the client and the core has nothing to add.
         if let Some(segment) = reply.take() {
             device.send(&segment).await?;
         }
@@ -970,9 +677,6 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         if core_deadline.is_some_and(|deadline| deadline <= TokioInstant::from_std(now)) {
             datapath.on_timeout(now);
         }
-        // Tick on the egress's own deadline as well as its cadence: a QUIC
-        // retransmission missed because the fixed interval had not elapsed is
-        // a stalled tunnel, and the cadence remains the worst-case bound.
         let egress_due = egress
             .next_deadline()
             .is_some_and(|deadline| deadline <= now);
@@ -1003,7 +707,6 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         }
     }
 
-    // Everything the core has already decided still belongs on the wire.
     drain(
         &mut datapath,
         &mut device,
@@ -1021,14 +724,8 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     Ok(())
 }
 
-/// Moves what the core and the egress produced to where each belongs.
-///
-/// The two producers feed each other: an egress emission bound for the tunnel
-/// re-enters the core and becomes a transmit, and a transmit bound for the
-/// egress becomes an emission. Neither chain extends further — a tunnel-bound
-/// transmit goes to the device and a network-bound emission goes to the socket,
-/// and both are terminal — so alternating the two drains reaches a fixpoint in
-/// at most two passes and the loop needs no separate iteration limit.
+/// Moves core and egress output to their terminal seams. Cross-fed output
+/// reaches a fixpoint in at most two passes.
 #[allow(clippy::too_many_arguments)]
 async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     datapath: &mut Datapath,
@@ -1048,8 +745,6 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 EgressEmit::ToNetwork(bytes) => {
                     network.send(&bytes).await?;
                 }
-                // A decapsulated packet is ordinary untrusted input on the
-                // egress side of the core, and is classified there.
                 EgressEmit::ToTunnel(bytes) => {
                     if datapath.on_egress_packet(&bytes, Instant::now()).is_err() {
                         counters.packets_rejected += 1;
@@ -1076,25 +771,14 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         }
     }
 
-    // Intercepted queries go to the resolver without waiting. Blocking here
-    // would put a slow upstream in front of every packet, which is the whole
-    // reason the resolver is a separate task; a refusal is a drop the client's
-    // stub resolver retries.
+    // Never put a slow DNS upstream in front of packet processing.
     while let Some(query) = datapath.poll_query() {
         if queries.try_send(query).is_err() {
             counters.queries_dropped += 1;
         }
     }
 
-    // Client datagrams of terminated flows go to the relay, which lives in its
-    // own task because opening and writing an association awaits. Offered
-    // without waiting: a full queue is a counted drop, which is what a UDP
-    // source already expects.
-    //
-    // A session with no relay is one whose egress carries datagrams as packets
-    // — nothing is ever queued there — or one whose egress carries none at all,
-    // which its path properties already state. Both are counted rather than
-    // silently discarded, because the second is a misconfiguration.
+    // Datagram traffic is offered without waiting; saturation is counted.
     while let Some(datagram) = datapath.poll_datagram() {
         match relay {
             Some(relay) => {
@@ -1106,10 +790,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         }
     }
 
-    // Packets of terminated flows go to the local TCP stack, which lives in
-    // its own task for the same reason the resolver does: serving a connection
-    // awaits, and the reactor must not. A full queue is a counted drop and TCP
-    // retransmits, which is the discipline the forward path already uses.
+    // Termination traffic is offered without waiting; TCP retransmits drops.
     while let Some(packet) = datapath.poll_terminate() {
         match termination {
             Some(termination) => {
@@ -1117,13 +798,10 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                     counters.termination_dropped += 1;
                 }
             }
-            // A flow planned for termination with no terminator configured is a
-            // misconfiguration, and counting it is how an operator sees it.
             None => counters.termination_dropped += 1,
         }
     }
 
-    // Whatever the terminator has ready beyond the one the `select!` captured.
     if let Some(termination) = termination {
         while let Ok(segment) = termination.replies.try_recv() {
             device.send(&segment).await?;
@@ -1132,15 +810,11 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 
     while let Some(event) = datapath.poll_event() {
         match event {
-            // All three are per-packet under a flood, so all three are folded
-            // rather than forwarded; see the module documentation.
             FlowEvent::ReassemblyDiscarded => counters.reassembly_discarded += 1,
             FlowEvent::DatagramDropped(_) => counters.datagrams_dropped += 1,
             FlowEvent::TransmitDropped => counters.transmits_dropped += 1,
             FlowEvent::QuicSteered => counters.quic_steered += 1,
             FlowEvent::PathReported(_) => counters.paths_reported += 1,
-            // Flow lifecycle events are bounded by the flow count, so they
-            // pass through one for one.
             event @ (FlowEvent::StreamOpened(_)
             | FlowEvent::DatagramOpened(_)
             | FlowEvent::Resteered(_)
@@ -1155,13 +829,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 mod tests {
     use super::*;
 
-    /// **The fact this counter rests on, pinned because it is `tokio`'s and
-    /// not ours.** A task's future is dropped by a guard that runs *during* the
-    /// unwind out of `poll`, before `tokio`'s own `catch_unwind` catches it, so
-    /// `thread::panicking()` is true there. A cancelled task is dropped with no
-    /// unwind in progress, so it is false. If an upgrade ever reorders those,
-    /// this fails — rather than the counter silently reading zero while
-    /// connections die.
+    /// Pins the distinction between Tokio task unwinding and cancellation.
     #[tokio::test]
     async fn a_panicking_task_is_counted_and_a_cancelled_one_is_not() {
         let panics = Panics::new();
@@ -1169,13 +837,11 @@ mod tests {
         let handle = tokio::spawn(panics.watch(async { panic!("a defect") }));
         assert!(handle.await.is_err(), "the task ended by unwinding");
 
-        // Cancellation drops the future without completing it, which must not
-        // read as a panic.
+        // Cancellation is not an unwind.
         let handle = tokio::spawn(panics.watch(std::future::pending::<()>()));
         handle.abort();
         assert!(handle.await.is_err(), "the task was cancelled");
 
-        // And a task that simply finishes counts as nothing at all.
         tokio::spawn(panics.watch(async {})).await.unwrap();
 
         assert_eq!(panics.take(), 1, "exactly the panicking one");

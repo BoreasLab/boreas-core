@@ -1,35 +1,9 @@
-//! DNS interception, verdict provenance, and ECH policy.
+//! Pure DNS parsing, policy, provenance, and ECH/ALPN response rewriting.
 //!
-//! DNS is the first enforcement tier in [Filtering](../docs/filtering.md): it
-//! reaches every application on the device, including the ones that reject the
-//! Boreas CA and can therefore never be intercepted at TLS. It is also the
-//! durable no-decryption signal now that ECH blinds passive SNI inspection.
-//!
-//! Everything in this module is pure. Messages are parsed from borrowed bytes
-//! with no allocation, policy is a total function of a name and a rule set,
-//! and responses are written into a caller-owned buffer. The upstream
-//! transport — the socket that carries a query to a resolver — lives in the
-//! shell, and the only thing it contributes to a verdict is which
-//! [`Upstream`] it was.
-//!
-//! Three decisions carry the design.
-//!
-//! **A name is decoded once, into fixed storage.** RFC 1035 caps a name at 255
-//! wire bytes, so a [`Name`] is an inline array and parsing a query allocates
-//! nothing at all. Compression pointers must point strictly backwards, which
-//! is what makes decoding terminate on adversarial input rather than needing a
-//! visit set.
-//!
-//! **Provenance travels with the answer, not beside it.** A verdict that
-//! cannot be explained after the fact is a verdict a user cannot argue with,
-//! so every [`Resolution`] names the rule that matched, the transport the
-//! bytes crossed, and what happened to ECH.
-//!
-//! **ECH policy is per host and never global.** Disabling ECH for the whole
-//! session would hand every site's SNI back to the network for the sake of the
-//! few hosts the session actually inspects. [`ech_policy`] therefore strips
-//! only for [`HostVerdict::Inspected`], and the strip is a byte range removed
-//! from one answer.
+//! DNS is the first enforcement tier and reaches applications that reject the
+//! Boreas CA. Names use fixed storage, compression pointers move strictly
+//! backwards, verdict provenance travels with each answer, and ECH policy is
+//! per host rather than a session-wide switch. Upstream I/O lives in the shell.
 
 use std::{
     collections::HashSet,
@@ -41,66 +15,43 @@ use std::{
 
 use crate::wire::{Bounded, Reader};
 
-/// The UDP and TCP port DNS is served on. Interception keys on the port
-/// rather than on a resolver address: the client's configured resolver lives
-/// inside the tunnel, so every query on this port is one Boreas owns.
+/// UDP and TCP port served by DNS interception.
 pub const DNS_PORT: u16 = 53;
 
-/// RFC 1035 section 2.3.4: 255 octets of wire encoding, which is 253
-/// characters of presentation form once the leading length byte and the root
-/// label are accounted for.
+/// RFC 1035 section 2.3.4 presentation-form limit.
 pub const MAX_NAME_CHARS: usize = 253;
 
-/// RFC 1035 section 2.3.4: 63 octets per label.
+/// RFC 1035 section 2.3.4 label limit.
 const MAX_LABEL_LEN: usize = 63;
 
 const HEADER_BYTES: usize = 12;
 
-/// Where `ANCOUNT` sits in that header: after `ID`, the flags, and `QDCOUNT`.
-/// Named because `write_response` patches it once the answers are counted, and
-/// a bare `6` there would be the only unexplained offset in the module.
+/// Header offset of `ANCOUNT`, patched after answer emission.
 const ANCOUNT_AT: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DnsError {
     /// The message ended inside a field.
     Truncated,
-    /// A label length byte used a reserved (0b01 or 0b10) prefix.
+    /// A label length byte used a reserved prefix.
     ReservedLabel,
-    /// A compression pointer did not point strictly backwards. Enforcing that
-    /// is what makes decoding terminate: each pointer strictly decreases the
-    /// cursor, so the chain is finite without tracking visited offsets.
+    /// A compression pointer did not point strictly backwards, so decoding would not be bounded.
     ForwardPointer,
-    /// The decoded name exceeds the RFC 1035 length limit.
+    /// The decoded name exceeds the RFC 1035 limit.
     NameTooLong,
-    /// A label contained the presentation separator. Joining labels with `.`
-    /// would make such a name ambiguous, and suffix matching — the whole basis
-    /// of host policy — depends on the join being unambiguous. Legal on the
-    /// wire, absent from anything a policy list addresses, refused here.
+    /// A label contains `.`, which would make normalized suffix matching ambiguous.
     SeparatorInLabel,
-    /// The message declared no question. Every message Boreas handles is a
-    /// query or its answer, and both carry one.
+    /// The message carries no question.
     NoQuestion,
-    /// More than one entry in the question section. RFC 9619 section 4 makes
-    /// this a malformed message for `OPCODE = 0`: "A DNS message with OPCODE =
-    /// 0 MUST NOT include a QDCOUNT parameter whose value is greater than 1",
-    /// and BIND, Unbound, and Knot all reject it. It matters here beyond
-    /// conformance: the parser reads exactly one question and treats what
-    /// follows as the answer section, so a second question used to be decoded
-    /// as a resource record and the filter ran against a name nobody asked.
+    /// More than one question; RFC 9619 section 4 forbids this for `OPCODE = 0`.
     MultipleQuestions(u16),
-    /// The question's name used compression. Nothing precedes the question but
-    /// the fixed header, so a pointer there targets the header and is
-    /// nonsense; refusing it is what lets the question section be copied
-    /// verbatim into a response without rewriting a pointer.
+    /// The question uses compression and cannot be copied verbatim safely.
     CompressedQuestion,
-    /// SvcParam keys were not in strictly increasing order, which RFC 9460
-    /// section 2.2 requires.
+    /// SvcParam keys are not strictly increasing as RFC 9460 section 2.2 requires.
     SvcParamsOutOfOrder,
-    /// An `alpn` value carried a zero-length identifier, which makes the
-    /// list's own length ambiguous.
+    /// An `alpn` value carries a zero-length identifier.
     EmptyAlpnIdentifier,
-    /// The output buffer could not hold the message.
+    /// The output buffer cannot hold the message.
     OutputTooSmall,
 }
 
@@ -126,15 +77,10 @@ impl fmt::Display for DnsError {
 
 impl Error for DnsError {}
 
-/// A decoded, normalized domain name.
+/// Normalized domain name in fixed inline storage.
 ///
-/// ASCII-lowercased, because RFC 4343 makes DNS comparison case-insensitive
-/// over ASCII and only ASCII; labels joined by `.`; no trailing dot; the root
-/// is the empty name. Bytes outside ASCII pass through unchanged and compare
-/// bytewise, so internationalized and DNS-SD names are handled without this
-/// module having an opinion about text encoding.
-///
-/// Fixed inline storage, so decoding a query allocates nothing.
+/// ASCII is lowercased per RFC 4343; labels use `.`, the root is empty, and
+/// non-ASCII bytes compare bytewise without text-encoding assumptions.
 #[derive(Clone, Copy)]
 pub struct Name {
     bytes: [u8; MAX_NAME_CHARS],
@@ -142,24 +88,19 @@ pub struct Name {
 }
 
 impl Name {
-    /// The root name, which is what an empty wire name decodes to.
+    /// Root name.
     pub const ROOT: Self = Self {
         bytes: [0; MAX_NAME_CHARS],
         len: 0,
     };
 
-    /// Normalizes a presentation-form name. `None` when it is too long or a
-    /// label carries the separator — the same refusals wire decoding makes,
-    /// so a rule and a query cannot disagree about what a name is.
+    /// Normalizes a presentation-form name, rejecting values wire decoding cannot represent.
     pub fn parse(text: &str) -> Option<Self> {
         let trimmed = text.strip_suffix('.').unwrap_or(text);
         if trimmed.len() > MAX_NAME_CHARS {
             return None;
         }
-        // An empty label would encode as a zero length byte, which is the
-        // wire's name terminator: `a..b` would silently become `a`. Wire
-        // decoding cannot produce one, so refusing it here gives both
-        // constructors the same invariant.
+        // An empty label would be the wire terminator and could collapse `a..b` to `a`.
         if !trimmed.is_empty()
             && trimmed
                 .split('.')
@@ -184,11 +125,7 @@ impl Name {
         self.len == 0
     }
 
-    /// The name and every parent of it, most specific first: `a.b.c` yields
-    /// `a.b.c`, `b.c`, `c`. This is the lookup order host policy uses, so the
-    /// first match is the most specific rule.
-    ///
-    /// O(labels), and a name's length limit bounds labels at 127.
+    /// Yields the name and its parent suffixes, most specific first. O(labels).
     pub fn suffixes(&self) -> impl Iterator<Item = &[u8]> {
         let full = self.as_bytes();
         std::iter::successors(
@@ -202,11 +139,7 @@ impl Name {
         )
     }
 
-    /// Rebuilds a name from bytes that are already normalized.
-    ///
-    /// Only reachable from [`Name::suffixes`], whose output is by construction
-    /// a suffix of an already-normalized name and therefore normalized itself,
-    /// so there is nothing left to check.
+    /// Rebuilds a suffix already normalized by [`Name::suffixes`].
     fn from_normalized(normalized: &[u8]) -> Self {
         let mut bytes = [0; MAX_NAME_CHARS];
         bytes[..normalized.len()].copy_from_slice(normalized);
@@ -216,9 +149,7 @@ impl Name {
         }
     }
 
-    /// Wire length: one length byte per label plus the root's terminating
-    /// zero. The separators become length bytes, so a non-root name costs its
-    /// presentation length plus two.
+    /// Wire length including label prefixes and the root terminator.
     pub fn wire_len(&self) -> usize {
         if self.is_root() {
             1
@@ -227,15 +158,11 @@ impl Name {
         }
     }
 
-    /// Decodes a name at `at`, returning it with the number of bytes it
-    /// occupies *at that position* — following a pointer consumes the two
-    /// pointer bytes and nothing more.
+    /// Decodes a name and returns bytes consumed at its original position.
     fn read(message: &[u8], at: usize) -> Result<(Self, usize), DnsError> {
         let mut bytes = [0; MAX_NAME_CHARS];
         let mut len = 0usize;
         let mut reader = Reader::at(message, at).ok_or(DnsError::Truncated)?;
-        // Set by the first pointer: everything after it is elsewhere in the
-        // message and costs nothing at the original position.
         let mut consumed: Option<usize> = None;
 
         loop {
@@ -265,8 +192,7 @@ impl Name {
                 0xc0 => {
                     let low = reader.u8().ok_or(DnsError::Truncated)?;
                     let target = usize::from(u16::from_be_bytes([length & 0x3f, low]));
-                    // Strictly backwards, so the cursor strictly decreases and
-                    // the chain is finite. This is the whole loop defense.
+                    // Strict decrease bounds pointer traversal without a visited set.
                     if target >= cursor {
                         return Err(DnsError::ForwardPointer);
                     }
@@ -286,19 +212,15 @@ impl Name {
         ))
     }
 
-    /// Writes the wire encoding at `at`, returning the new offset. Never
-    /// compressed: see [`write_response`] for why.
+    /// Writes an uncompressed wire encoding at `at`.
     fn write(&self, out: &mut [u8], at: usize) -> Result<usize, DnsError> {
         let mut writer = Bounded::at(out, at).ok_or(DnsError::OutputTooSmall)?;
         if !self.is_root() {
-            // Each label is its own length-prefixed vector. Both constructors
-            // bound a label at `MAX_LABEL_LEN`, which is what keeps every
-            // length prefix inside its one byte.
             for label in self.as_bytes().split(|byte| *byte == b'.') {
                 writer.vector_u8(label);
             }
         }
-        writer.u8(0); // the root label, which terminates every name
+        writer.u8(0);
         writer.finish().ok_or(DnsError::OutputTooSmall)
     }
 }
@@ -317,9 +239,7 @@ impl std::hash::Hash for Name {
     }
 }
 
-/// RFC 1035 section 5.1 presentation form: printable ASCII verbatim,
-/// everything else escaped as `\DDD`, so a log line is unambiguous and cannot
-/// carry a control sequence.
+/// RFC 1035 section 5.1 presentation form with control bytes escaped as `\DDD`.
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_root() {
@@ -341,19 +261,14 @@ impl fmt::Debug for Name {
     }
 }
 
-/// The record types host policy and steering act on, plus everything else.
-///
-/// `Other` keeps the sum total without pretending the list is closed: a query
-/// for `MX` is forwarded and answered like any other, it simply has no policy
-/// attached. The wire encoding round-trips, which is the law the tests check.
+/// Record types relevant to policy, plus an open `Other` case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordType {
     A,
     Aaaa,
-    /// RFC 9460 HTTPS record: the ALPN and ECH carrier, and therefore the
-    /// record both steering and ECH policy act on.
+    /// RFC 9460 HTTPS record carrying ALPN and ECH parameters.
     Https,
-    /// RFC 9460 SVCB record, the general form of the same shape.
+    /// RFC 9460 SVCB record carrying the same parameter shape.
     Svcb,
     Other(u16),
 }
@@ -379,23 +294,20 @@ impl RecordType {
         }
     }
 
-    /// Whether this record carries SvcParams, and so whether ECH policy has
-    /// anything to act on.
+    /// Whether this record carries SvcParams.
     pub fn carries_svc_params(self) -> bool {
         matches!(self, Self::Https | Self::Svcb)
     }
 }
 
-/// The four header bits Boreas reads or sets. The rest of the flags word is
-/// copied through, because a resolver that reinvents an upstream's header is a
-/// resolver that disagrees with it.
+/// Header flags used by this module.
 const FLAG_RESPONSE: u16 = 0x8000;
 const FLAG_RECURSION_DESIRED: u16 = 0x0100;
 const FLAG_RECURSION_AVAILABLE: u16 = 0x0080;
 const FLAG_TRUNCATED: u16 = 0x0200;
 const RCODE_MASK: u16 = 0x000f;
 
-/// RFC 1035 response codes this module produces.
+/// Response codes produced by this module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rcode {
     NoError,
@@ -431,7 +343,7 @@ pub struct Question {
     pub qclass: u16,
 }
 
-/// One resource record, with its RDATA still borrowed from the message.
+/// Resource record with borrowed RDATA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceRecord<'a> {
     pub name: Name,
@@ -441,10 +353,7 @@ pub struct ResourceRecord<'a> {
     pub rdata: &'a [u8],
 }
 
-/// A parsed DNS message. The header and the question are decoded eagerly
-/// because every caller needs both; the answer section stays borrowed and is
-/// walked lazily, so a message with a hundred answers costs one pass and no
-/// allocation.
+/// Parsed DNS message with borrowed, lazily walked answers.
 #[derive(Clone, Copy, Debug)]
 pub struct Message<'a> {
     bytes: &'a [u8],
@@ -452,9 +361,7 @@ pub struct Message<'a> {
     flags: u16,
     answer_count: u16,
     question: Question,
-    /// The question section exactly as it arrived, copied verbatim into a
-    /// response so a client using 0x20 case randomization still recognizes its
-    /// own query. Safe to copy because a compressed question name is refused.
+    /// Original question bytes, safe to copy because compressed questions are refused.
     question_bytes: &'a [u8],
     answers_at: usize,
 }
@@ -467,18 +374,9 @@ impl<'a> Message<'a> {
         else {
             return Err(DnsError::Truncated);
         };
-        // Advance to the end of the fixed header, over `nscount` and
-        // `arcount`. Both must be present and neither is read: a stub
-        // resolver's query carries no authority or additional section, and
-        // this shell answers from the question alone.
         reader
             .skip(HEADER_BYTES - reader.position())
             .ok_or(DnsError::Truncated)?;
-        // Exactly one, which is what the single `Question` below asserts and
-        // what everything after `answers_at` depends on. A drop rather than the
-        // FORMERR RFC 9619 section 4.3 asks middleboxes for: this shell has no
-        // path that answers an unparseable query, and a stub retries a dropped
-        // query exactly as it does a lost datagram.
         match question_count {
             0 => return Err(DnsError::NoQuestion),
             1 => {}
@@ -488,12 +386,8 @@ impl<'a> Message<'a> {
         let question_at = reader.position();
         let (name, name_len) = Name::read(bytes, question_at)?;
         if name_len != name.wire_len() {
-            // A pointer was followed, so the encoding is shorter than the name
-            // it denotes. See `DnsError::CompressedQuestion`.
             return Err(DnsError::CompressedQuestion);
         }
-        // `Name::read` already proved these bytes are there; skipping them is
-        // how the cursor learns what it read.
         reader.skip(name_len).ok_or(DnsError::Truncated)?;
         let (Some(qtype), Some(qclass)) = (reader.u16(), reader.u16()) else {
             return Err(DnsError::Truncated);
@@ -538,9 +432,7 @@ impl<'a> Message<'a> {
         self.flags & FLAG_RECURSION_DESIRED != 0
     }
 
-    /// The answer section, walked lazily. Each item is fallible because the
-    /// bytes are untrusted; a caller that stops at the first error has still
-    /// consumed every record before it.
+    /// Lazily walks borrowed answer records; each item may fail on malformed bytes.
     pub fn answers(&self) -> Answers<'a> {
         Answers {
             message: self.bytes,
@@ -577,8 +469,6 @@ impl<'a> Answers<'a> {
         else {
             return Err(DnsError::Truncated);
         };
-        // `RDLENGTH` and `RDATA` are one length-prefixed vector, which is what
-        // makes an over-long declared length a refusal rather than a slice.
         let rdata = reader.vector_u16().ok_or(DnsError::Truncated)?;
         self.cursor = reader.position();
 
@@ -592,40 +482,19 @@ impl<'a> Answers<'a> {
     }
 }
 
-/// RFC 9460 section 14.3.2: the `ech` SvcParam key.
+/// RFC 9460 section 14.3.2 `ech` SvcParam key.
 pub const SVCPARAM_ECH: u16 = 5;
-/// RFC 9460 section 14.3.2: the `alpn` SvcParam key, which steering reads to
-/// decide whether a host is offering h3.
+/// RFC 9460 section 14.3.2 `alpn` SvcParam key.
 pub const SVCPARAM_ALPN: u16 = 1;
-/// RFC 9460 section 14.3.2: the `no-default-alpn` SvcParam key.
-///
-/// Section 7.1.1 permits it only alongside `alpn`, so removing one requires
-/// removing the other. Their keys are 1 and 2, SvcParams are in strictly
-/// increasing key order, and no integer lies between them — so whenever both
-/// are present they are adjacent, and the pair is a single contiguous range.
-/// That is what keeps the removal a slice operation.
+/// RFC 9460 section 14.3.2 `no-default-alpn` SvcParam key.
 pub const SVCPARAM_NO_DEFAULT_ALPN: u16 = 2;
 
-/// Whether an ALPN identifier names HTTP/3.
-///
-/// RFC 9114 registers `h3`; the drafts that browsers still accept are `h3-29`
-/// and friends. Matching the prefix covers both without enumerating a moving
-/// list, and the only cost of a false positive is that a host loses an ALPN
-/// advertisement it could have kept.
+/// Whether an ALPN identifier names HTTP/3, including draft `h3-*` identifiers.
 fn is_h3(identifier: &[u8]) -> bool {
     identifier == b"h3" || identifier.starts_with(b"h3-")
 }
 
-/// The contiguous range that must go if an HTTPS or SVCB RDATA advertises
-/// HTTP/3: the `alpn` parameter, plus `no-default-alpn` when it follows.
-///
-/// `None` when the record advertises no ALPN, or advertises one without h3 —
-/// in which case nothing is rewritten, because steering removes an
-/// advertisement rather than editing one. Dropping the parameter leaves the
-/// record's default ALPN, which for an HTTPS record is `http/1.1`; TLS ALPN
-/// still negotiates h2 on the connection that follows, so the browser reaches
-/// h2 and cannot reach h3 from DNS.
-///
+/// Returns the contiguous ALPN removal range for an HTTPS/SVCB record advertising HTTP/3.
 /// O(parameters + ALPN identifiers), allocation-free.
 pub fn h3_alpn_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
     let mut found: Option<Range<usize>> = None;
@@ -633,8 +502,6 @@ pub fn h3_alpn_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
         let param = param?;
         match param.key {
             SVCPARAM_ALPN if alpn_offers_h3(param.value)? => found = Some(param.at),
-            // Only extends a range this record actually produced, so a
-            // `no-default-alpn` on a record keeping its ALPN is left alone.
             SVCPARAM_NO_DEFAULT_ALPN => {
                 if let Some(range) = found.as_mut() {
                     range.end = param.at.end;
@@ -646,10 +513,7 @@ pub fn h3_alpn_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
     Ok(found)
 }
 
-/// The `alpn` value is a sequence of one-octet-length-prefixed identifiers
-/// (RFC 9460 section 7.1). A zero-length identifier is malformed and refused
-/// rather than skipped, because skipping it would make the list's length
-/// ambiguous.
+/// Parses RFC 9460 section 7.1 length-prefixed ALPN identifiers.
 fn alpn_offers_h3(value: &[u8]) -> Result<bool, DnsError> {
     let mut cursor = 0;
     while cursor < value.len() {
@@ -668,8 +532,7 @@ fn alpn_offers_h3(value: &[u8]) -> Result<bool, DnsError> {
     Ok(false)
 }
 
-/// One SvcParam, with the byte range it occupies inside the RDATA. The range
-/// is what makes removal a slice operation rather than a rebuild.
+/// SvcParam and its occupied RDATA range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SvcParam<'a> {
     pub key: u16,
@@ -677,12 +540,9 @@ pub struct SvcParam<'a> {
     pub at: Range<usize>,
 }
 
-/// Walks the SvcParams of an HTTPS or SVCB RDATA.
-///
-/// The TargetName inside SVCB RDATA is uncompressible by RFC 9460 section 2.2,
-/// so this needs no message context and works on the RDATA alone.
+/// Walks SvcParams in HTTPS/SVCB RDATA. RFC 9460 section 2.2 makes TargetName
+/// uncompressible, so RDATA is sufficient input.
 pub fn svc_params(rdata: &[u8]) -> Result<SvcParams<'_>, DnsError> {
-    // SvcPriority, then TargetName, then the params.
     let mut cursor = 2;
     if rdata.len() < cursor {
         return Err(DnsError::Truncated);
@@ -690,7 +550,6 @@ pub fn svc_params(rdata: &[u8]) -> Result<SvcParams<'_>, DnsError> {
     loop {
         let length = usize::from(*rdata.get(cursor).ok_or(DnsError::Truncated)?);
         if length & 0xc0 != 0 {
-            // A pointer or reserved prefix where RFC 9460 forbids one.
             return Err(DnsError::ReservedLabel);
         }
         cursor += 1 + length;
@@ -734,8 +593,6 @@ impl<'a> SvcParams<'a> {
         };
         let value = reader.vector_u16().ok_or(DnsError::Truncated)?;
         let end = reader.position();
-        // RFC 9460 section 2.2 requires strictly increasing keys, which also
-        // makes a duplicated key unrepresentable rather than ambiguous.
         if self.previous.is_some_and(|previous| key <= previous) {
             return Err(DnsError::SvcParamsOutOfOrder);
         }
@@ -749,12 +606,7 @@ impl<'a> SvcParams<'a> {
     }
 }
 
-/// The byte range of the `ech` SvcParam inside an HTTPS or SVCB RDATA, when
-/// the answer publishes one.
-///
-/// Deliberately walks the whole parameter list rather than stopping at the
-/// match: answering from a record whose remaining parameters do not parse
-/// would be validating the part that suits us and trusting the rest.
+/// Returns the `ech` SvcParam range after validating the complete parameter list.
 pub fn ech_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
     let mut found = None;
     for param in svc_params(rdata)? {
@@ -766,55 +618,28 @@ pub fn ech_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
     Ok(found)
 }
 
-/// What the session may do with a host. This is the entire interface between
-/// filtering policy and DNS, and it is deliberately three cases: anything
-/// finer is a property of the rule, not of the resolver.
+/// DNS action for one host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostVerdict {
-    /// Refuse the name. No upstream is consulted, so a blocked host costs no
-    /// query and leaks no name.
+    /// Refuse without consulting upstream.
     Blocked,
-    /// Resolve normally, and leave ECH exactly as the authority published it.
+    /// Resolve without rewriting ECH.
     Allowed,
-    /// Resolve, but this session terminates TLS for the host, so an ECH
-    /// configuration the client could use would encrypt the ClientHello and
-    /// the interception would silently never fire.
+    /// Resolve while stripping ECH for local TLS interception.
     Inspected,
 }
 
-/// The verdict for one name, with the rule that produced it.
+/// Host verdict and matching rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Judgment {
     pub verdict: HostVerdict,
-    /// The suffix of the queried name that matched, or `None` when nothing
-    /// did. This is what makes a verdict explainable: "blocked by
-    /// `doubleclick.net`", not "blocked".
+    /// Matching suffix, if any.
     pub matched: Option<Name>,
 }
 
-/// Host rules, indexed for suffix lookup.
-///
-/// A rule covers a name and everything under it, so the lookup walks the
-/// query's suffixes from most to least specific. Two laws decide the winner:
-///
-/// - **An exception wins outright, at any specificity.** That is Adblock Plus
-///   semantics for network rules, and it is the fail-open direction
-///   [Filtering](../docs/filtering.md) mandates: a rule that says "never touch
-///   this" must not be overridden by a more specific rule that says "block".
-/// - **Otherwise the most specific rule wins, and at equal specificity
-///   blocking beats inspection**, because a host that is refused is never also
-///   intercepted.
-///
-/// O(labels) hash probes per query, at most three per label, and a name's
-/// 253-character limit bounds labels at 127 — typically three to five. The
-/// exception law is what costs the full walk rather than an early exit: a
-/// block found at the first label must still yield to an exception found at
-/// the last. The keys are `HashSet`'s default SipHash with a per-process
-/// random seed, which matters because qnames are attacker-chosen: any
-/// application on the device can ask for any name it likes.
-///
-/// Space is O(distinct rule hosts), which a full filter-list build puts in the
-/// hundreds of thousands; each key is its own name's bytes and nothing else.
+/// Host rules indexed by normalized suffix. Exceptions win; otherwise the
+/// most-specific rule wins, with blocking before inspection at equal specificity.
+/// Lookup is O(labels) expected time and storage is O(distinct rule hosts).
 #[derive(Default)]
 pub struct HostPolicy {
     allowed: HashSet<Box<[u8]>>,
@@ -827,25 +652,22 @@ impl HostPolicy {
         Self::default()
     }
 
-    /// Adds a blocking rule. `false` when the name is not one DNS can carry,
-    /// which is a rejected rule rather than a silently ignored one.
+    /// Adds a blocking rule; returns `false` for an unrepresentable name.
     pub fn block(&mut self, name: &str) -> bool {
         Self::insert(&mut self.blocked, name)
     }
 
-    /// Adds an exception. It beats every blocking and inspection rule that
-    /// matches the same query, however specific they are.
+    /// Adds an exception that overrides matching block and inspection rules.
     pub fn allow(&mut self, name: &str) -> bool {
         Self::insert(&mut self.allowed, name)
     }
 
-    /// Adds an inspection rule; see [`HostVerdict::Inspected`].
+    /// Adds an inspection rule.
     pub fn inspect(&mut self, name: &str) -> bool {
         Self::insert(&mut self.inspected, name)
     }
 
-    /// How many rules of each kind this policy holds. The number an operator
-    /// reads back after a list reload.
+    /// Returns counts by rule kind.
     pub fn len(&self) -> RuleCounts {
         RuleCounts {
             allowed: self.allowed.len(),
@@ -868,8 +690,7 @@ impl HostPolicy {
         }
     }
 
-    /// Adds an already-parsed name, which is how the filter-list compiler
-    /// avoids re-normalizing what it has just parsed.
+    /// Adds an already-normalized name without reparsing it.
     pub(crate) fn insert_name(&mut self, verdict: HostVerdict, name: &Name) {
         let set = match verdict {
             HostVerdict::Allowed => &mut self.allowed,
@@ -882,8 +703,6 @@ impl HostPolicy {
     pub fn judge(&self, name: &Name) -> Judgment {
         let mut decided = None;
         for suffix in name.suffixes() {
-            // The exception law: an allow anywhere in the chain ends the
-            // search, which is why the walk cannot stop at the first block.
             if self.allowed.contains(suffix) {
                 return Judgment {
                     verdict: HostVerdict::Allowed,
@@ -912,7 +731,7 @@ impl HostPolicy {
     }
 }
 
-/// Rules held, by kind.
+/// Rule counts by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuleCounts {
     pub allowed: usize,
@@ -920,37 +739,25 @@ pub struct RuleCounts {
     pub inspected: usize,
 }
 
-/// What must happen to the `ech` SvcParam of this host's answers.
+/// ECH rewrite policy for a host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchPolicy {
-    /// Leave it exactly as published. The default, and the reason there is no
-    /// global ECH switch anywhere in this crate.
+    /// Preserve the published ECH configuration.
     Preserve,
-    /// Remove it from this host's answers, and only this host's.
+    /// Remove ECH from this host's answers.
     Strip,
 }
 
-/// What must happen to the ALPN advertisement of this host's answers.
+/// ALPN rewrite policy for a host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlpnPolicy {
-    /// Leave it exactly as published.
+    /// Preserve the published ALPN.
     Preserve,
-    /// Remove the HTTP/3 advertisement, for this host and only this host.
-    ///
-    /// Browsers race QUIC against TCP and take QUIC if it answers within
-    /// roughly 300 to 500 ms. A locally added root can never validate over
-    /// QUIC, so an inspected host reached over h3 is a host whose interception
-    /// silently never fires — and the failure looks like a filtering bug
-    /// rather than a transport one. Steering acts at discovery, before a
-    /// connection exists, which is why it lives here and not in the datapath.
+    /// Remove HTTP/3 so inspected traffic reaches the TLS interceptor over HTTP/2.
     StripH3,
 }
 
-/// The one place ECH policy is decided.
-///
-/// The law, and the P11 gate: `Strip` if and only if the host is inspected.
-/// An allowed host keeps its ECH configuration, and so does a blocked one —
-/// its answer carries no addresses to connect to anyway.
+/// Strips ECH if and only if the host is inspected.
 pub fn ech_policy(verdict: HostVerdict) -> EchPolicy {
     match verdict {
         HostVerdict::Inspected => EchPolicy::Strip,
@@ -958,8 +765,7 @@ pub fn ech_policy(verdict: HostVerdict) -> EchPolicy {
     }
 }
 
-/// The one place ALPN steering is decided, with the same law: strip if and
-/// only if the host is inspected.
+/// Strips HTTP/3 ALPN if and only if the host is inspected.
 pub fn alpn_policy(verdict: HostVerdict) -> AlpnPolicy {
     match verdict {
         HostVerdict::Inspected => AlpnPolicy::StripH3,
@@ -967,13 +773,7 @@ pub fn alpn_policy(verdict: HostVerdict) -> AlpnPolicy {
     }
 }
 
-/// Every rewrite one host's answers undergo.
-///
-/// Grouped because both are decided from one verdict and applied in one pass
-/// over the answer section, and because a caller holding one of them without
-/// the other would be a caller that could steer without stripping ECH — which
-/// is precisely the half-applied policy that makes an interception fail
-/// silently.
+/// ECH and ALPN rewrites derived from one host verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnswerPolicy {
     pub ech: EchPolicy,
@@ -981,17 +781,13 @@ pub struct AnswerPolicy {
 }
 
 impl AnswerPolicy {
-    /// Whether this host's addresses belong in the transient UDP/443 backstop.
-    ///
-    /// Exactly the hosts whose ALPN was rewritten: DNS steering only stops a
-    /// browser that has no cached Alt-Svc entry, and the backstop is what
-    /// covers the window while a stale one expires.
+    /// Whether resolved addresses require the UDP/443 steering backstop.
     pub fn steers(self) -> bool {
         matches!(self.alpn, AlpnPolicy::StripH3)
     }
 }
 
-/// Derives both rewrites from one verdict.
+/// Derives both response rewrites from one verdict.
 pub fn answer_policy(verdict: HostVerdict) -> AnswerPolicy {
     AnswerPolicy {
         ech: ech_policy(verdict),
@@ -999,13 +795,7 @@ pub fn answer_policy(verdict: HostVerdict) -> AnswerPolicy {
     }
 }
 
-/// What to do with one intercepted query, decided before any upstream is
-/// consulted.
-///
-/// The `Refuse` variant is the larger by the width of a [`Name`], and
-/// deliberately not boxed: refusal is the ad-blocking path, the one taken most
-/// often, and paying an allocation there to shrink a value that lives for the
-/// length of one function call is the wrong trade.
+/// Action for one intercepted query, chosen before upstream access.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryPlan {
@@ -1015,14 +805,10 @@ pub enum QueryPlan {
     Forward { policy: AnswerPolicy },
 }
 
-/// Plans one intercepted query. Total: every name has a verdict, and every
-/// verdict has a plan.
+/// Plans one intercepted query.
 pub fn plan_query(question: &Question, policy: &HostPolicy) -> QueryPlan {
     let judgment = policy.judge(&question.name);
     match judgment.verdict {
-        // `matched` is always `Some` for a non-`Allowed` verdict: only a rule
-        // can produce one. The fallback keeps the function total rather than
-        // asserting that.
         HostVerdict::Blocked => QueryPlan::Refuse {
             rule: judgment.matched.unwrap_or(Name::ROOT),
         },
@@ -1032,8 +818,7 @@ pub fn plan_query(question: &Question, policy: &HostPolicy) -> QueryPlan {
     }
 }
 
-/// The transport an answer crossed. Recorded because the privacy claim differs
-/// per transport: Do53 is readable by anything on the path, the rest are not.
+/// Upstream transport used for resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upstream {
     Do53,
@@ -1053,44 +838,38 @@ impl fmt::Display for Upstream {
     }
 }
 
-/// Where an answer came from.
+/// Answer provenance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provenance {
-    /// Synthesized from policy; nothing left the device.
+    /// Synthesized locally.
     Policy,
-    /// Resolved through an upstream.
+    /// Resolved upstream.
     Upstream(Upstream),
 }
 
-/// What happened to ECH in one response, which is the part of a verdict a
-/// privacy-conscious user most needs explained.
+/// ECH outcome for one response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchOutcome {
-    /// No answer carried an ECH configuration.
+    /// No answer carried ECH.
     Absent,
-    /// Published and preserved, because host policy did not need it gone.
+    /// Published and preserved.
     Preserved,
-    /// Removed from `count` answers for this name only.
+    /// Removed from `count` answers.
     Stripped { count: u16 },
 }
 
-/// What happened to the HTTP/3 advertisement in one response.
+/// HTTP/3 ALPN outcome for one response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlpnOutcome {
-    /// No answer advertised HTTP/3, so there was nothing to steer.
+    /// No answer advertised HTTP/3.
     Absent,
-    /// Advertised and preserved, because the host is not inspected.
+    /// Advertised and preserved.
     Preserved,
-    /// Removed from `count` answers, so the browser's QUIC race cannot win
-    /// for a host whose interception QUIC would silently defeat.
+    /// Removed from `count` answers.
     Steered { count: u16 },
 }
 
-/// Everything needed to explain one verdict after the fact.
-///
-/// One of these per query, and a query is a flow-scale event rather than a
-/// packet-scale one, so it travels whole rather than being folded into a
-/// counter.
+/// Resolution result and policy provenance for one query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resolution {
     pub name: Name,
@@ -1098,20 +877,13 @@ pub struct Resolution {
     pub rcode: Rcode,
     pub answers: u16,
     pub provenance: Provenance,
-    /// The rule that decided the verdict. Absent when no rule matched.
+    /// Matching rule, if any.
     pub rule: Option<Name>,
     pub ech: EchOutcome,
     pub alpn: AlpnOutcome,
 }
 
-/// RDATA being written: the bytes as they arrived, minus up to two disjoint
-/// ranges.
-///
-/// Removal is the only edit any policy in this module performs, and two is the
-/// number of removals any of them performs at once — the ALPN block that
-/// steering drops and the ECH parameter that inspection drops. Three slices
-/// therefore cover the whole domain, and a rewritten answer costs no
-/// allocation and no byte copy that the writer would not have made anyway.
+/// Borrowed RDATA represented as up to three slices after two removals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rdata<'a> {
     parts: [&'a [u8]; 3],
@@ -1124,16 +896,14 @@ impl<'a> Rdata<'a> {
         }
     }
 
-    /// `None` when the range does not lie inside `bytes`.
+    /// Returns `None` when `cut` is outside `bytes`.
     pub fn without(bytes: &'a [u8], cut: Range<usize>) -> Option<Self> {
         Some(Self {
             parts: [bytes.get(..cut.start)?, bytes.get(cut.end..)?, &[]],
         })
     }
 
-    /// Removes two disjoint ranges. `None` unless `first` ends at or before
-    /// `second` begins, so an overlap is unconstructable rather than silently
-    /// producing bytes from neither range.
+    /// Removes two ordered, disjoint ranges.
     pub fn without_both(
         bytes: &'a [u8],
         first: Range<usize>,
@@ -1151,8 +921,7 @@ impl<'a> Rdata<'a> {
         })
     }
 
-    /// Removes `first` and `second` in whichever order they appear, and
-    /// tolerates either being absent.
+    /// Removes present ranges in source order.
     fn without_all(
         bytes: &'a [u8],
         first: Option<Range<usize>>,
@@ -1177,7 +946,7 @@ impl<'a> Rdata<'a> {
     }
 }
 
-/// How a response was rewritten.
+/// Summary of response rewriting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rewritten {
     pub len: usize,
@@ -1186,24 +955,10 @@ pub struct Rewritten {
     pub alpn: AlpnOutcome,
 }
 
-/// Writes the response the client receives, from the client's query and the
-/// upstream's answer.
-///
-/// The transaction id, the question section, and the recursion-desired bit
-/// come from the *query*, never from the upstream: a resolver that echoes an
-/// upstream's id answers a question the client did not ask. The rcode,
-/// truncation bit, and answers come from the upstream.
-///
-/// Names are written uncompressed. The only edit this function makes is
-/// deleting a byte range from one RDATA, and deleting bytes from the middle of
-/// a message invalidates every compression pointer targeting anything after
-/// the deletion. Uncompressed output costs tens of bytes on a response that
-/// crosses a 1420-byte tunnel, and it cannot be wrong.
-///
-/// The authority and additional sections are dropped: the client is a stub
-/// resolver, which needs neither.
-///
-/// O(answers + bytes), one pass, no allocation.
+/// Writes a response using the client's transaction and question and the
+/// upstream's result. Names stay uncompressed because RDATA removal would
+/// invalidate downstream compression pointers; stub clients need no authority
+/// or additional sections.
 pub fn write_response(
     out: &mut [u8],
     query: &Message<'_>,
@@ -1225,8 +980,7 @@ pub fn write_response(
 
     for answer in upstream.answers() {
         let answer = answer?;
-        // Only SVCB-shaped records carry either parameter, so every other
-        // answer crosses verbatim without being parsed a second time.
+        // Only SVCB-shaped records can carry these parameters.
         let (ech_at, h3_at) = if answer.rtype.carries_svc_params() {
             (ech_param(answer.rdata)?, h3_alpn_param(answer.rdata)?)
         } else {
@@ -1245,9 +999,7 @@ pub fn write_response(
         answers += 1;
     }
 
-    // `ancount`, now that the loop knows it. The header is already written, so
-    // this offset is inside the buffer by construction — but the writer is
-    // what says so rather than an index that has to be read against it.
+    // Patch `ancount` after the answer pass.
     let mut ancount = Bounded::at(out, ANCOUNT_AT).ok_or(DnsError::OutputTooSmall)?;
     ancount.u16(answers);
     ancount.finish().ok_or(DnsError::OutputTooSmall)?;
@@ -1267,14 +1019,7 @@ pub fn write_response(
     })
 }
 
-/// The addresses an answer resolves to, appended to `out`.
-///
-/// `A` and `AAAA` RDATA are exactly the address, so this is a filter and a
-/// decode with no parsing left to do. It exists for the steering index: the
-/// transient UDP/443 backstop needs to know which addresses belong to a host
-/// whose ALPN was just rewritten.
-///
-/// O(answers), and allocates only what the sink grows by.
+/// Appends `A` and `AAAA` answer addresses to `out`.
 pub fn answer_addresses(message: &Message<'_>, out: &mut Vec<IpAddr>) -> Result<(), DnsError> {
     for answer in message.answers() {
         let answer = answer?;
@@ -1295,11 +1040,7 @@ pub fn answer_addresses(message: &Message<'_>, out: &mut Vec<IpAddr>) -> Result<
     Ok(())
 }
 
-/// The response a refused name receives: `NXDOMAIN` with no answers.
-///
-/// `NXDOMAIN` rather than a null address, because a client handed `0.0.0.0`
-/// opens a connection that fails on a timeout, while a name error fails
-/// immediately down a path every browser already has.
+/// Writes an `NXDOMAIN` response with no answers.
 pub fn write_refusal(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsError> {
     let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | Rcode::NameError.to_wire();
     if query.recursion_desired() {
@@ -1308,9 +1049,7 @@ pub fn write_refusal(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsEr
     write_header_and_question(out, query, flags)
 }
 
-/// The response an upstream failure receives. Fail visibly rather than
-/// silently: a `SERVFAIL` is retried by the stub resolver, whereas a dropped
-/// query stalls the application until its own timeout.
+/// Writes a visible `SERVFAIL` response for an upstream failure.
 pub fn write_failure(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsError> {
     let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | Rcode::ServerFailure.to_wire();
     if query.recursion_desired() {
@@ -1328,8 +1067,8 @@ fn write_header_and_question(
     writer
         .u16(query.id)
         .u16(flags)
-        .u16(1) // qdcount: exactly one, which `Message::parse` enforced
-        .zeros(6) // ancount, nscount, arcount — the first is patched later
+        .u16(1) // qdcount: `Message::parse` accepts exactly one question
+        .zeros(6) // ancount, nscount, arcount; ancount is patched later
         .bytes(query.question_bytes);
     writer.finish().ok_or(DnsError::OutputTooSmall)
 }
@@ -1347,8 +1086,7 @@ fn write_record(
         .u16(record.rtype.to_wire())
         .u16(record.class)
         .u32(record.ttl)
-        // Not `vector_u16`: the parts are contiguous on the wire but held
-        // apart here, so the length is the sum rather than any one of them.
+        // Parts are separate here but contiguous on the wire.
         .u16(length);
     for part in rdata.parts {
         writer.bytes(part);
@@ -1384,12 +1122,7 @@ mod tests {
         out
     }
 
-    /// RFC 9619 section 4: "A DNS message with OPCODE = 0 MUST NOT include a
-    /// QDCOUNT parameter whose value is greater than 1." The parser reads one
-    /// question and calls everything after it the answer section, so a second
-    /// question used to be decoded as a resource record — the filter then ran
-    /// against whatever that misparse produced rather than against the name the
-    /// client asked for.
+    /// RFC 9619 section 4 requires at most one question for `OPCODE = 0`.
     #[test]
     fn a_query_carries_exactly_one_question_or_none_at_all() {
         let one = query("example.com", RecordType::A, 0x1234);
@@ -1399,8 +1132,7 @@ mod tests {
         none[4..6].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(Message::parse(&none).err(), Some(DnsError::NoQuestion));
 
-        // A second question appended, and QDCOUNT raised to match it: a
-        // well-formed-looking message that no conforming resolver accepts.
+        // A second question is refused even when `QDCOUNT` matches it.
         let mut two = one.clone();
         two[4..6].copy_from_slice(&2u16.to_be_bytes());
         two.extend_from_slice(&wire_name("tracker.example"));
@@ -1427,8 +1159,7 @@ mod tests {
         out
     }
 
-    /// An HTTPS RDATA in ServiceMode, with params in the ascending key order
-    /// RFC 9460 section 2.2 requires.
+    /// Builds HTTPS RDATA with RFC 9460's ascending SvcParam keys.
     fn https_rdata(target: &str, alpn: Option<&[u8]>, ech: Option<&[u8]>) -> Vec<u8> {
         let mut out = 1u16.to_be_bytes().to_vec();
         out.extend_from_slice(&wire_name(target));
@@ -1451,15 +1182,14 @@ mod tests {
         assert_eq!(name.to_string(), "ads.example.com");
         assert_eq!(name, Name::parse("ads.example.com").unwrap());
 
-        // The root is the empty name, and it is not the same as any label.
+        // The root is empty and is not a rule label.
         let root = Name::parse("").expect("the root");
         assert!(root.is_root());
         assert_eq!(root.to_string(), ".");
         assert_eq!(root.wire_len(), 1);
         assert_eq!(name.wire_len(), name.as_bytes().len() + 2);
 
-        // An empty label would encode as the wire's terminator, so `a..b`
-        // must not silently become `a`.
+        // Empty labels would collide with the wire terminator.
         assert_eq!(Name::parse("a..b"), None);
         assert_eq!(Name::parse(&"x".repeat(64)), None);
         assert_eq!(Name::parse(&"a.".repeat(200)), None);
@@ -1475,8 +1205,7 @@ mod tests {
 
     #[test]
     fn compression_terminates_because_pointers_run_backwards() {
-        // A pointer back to the question's name: the ordinary case, and the
-        // one every real response uses.
+        // Backward pointers are the ordinary compressed-name case.
         let mut message = query("example.com", RecordType::A, 1);
         let name_at = HEADER_BYTES as u16;
         message.extend_from_slice(&(0xc000 | name_at).to_be_bytes());
@@ -1484,25 +1213,22 @@ mod tests {
         assert_eq!(name.as_bytes(), b"example.com");
         assert_eq!(consumed, 2, "a pointer costs two bytes where it appears");
 
-        // A pointer to itself is the classic decompression loop. Requiring a
-        // strictly backwards target refuses it without a visited set.
+        // Self-pointers would loop; strict backward targets reject them.
         let at = message.len();
         message.extend_from_slice(&(0xc000 | at as u16).to_be_bytes());
         assert_eq!(Name::read(&message, at), Err(DnsError::ForwardPointer));
 
-        // As is a forward pointer, and a two-pointer cycle, which cannot be
-        // built at all once every hop must decrease.
+        // Forward pointers and cycles are rejected by the same rule.
         let at = message.len();
         message.extend_from_slice(&(0xc000 | (at as u16 + 8)).to_be_bytes());
         assert_eq!(Name::read(&message, at), Err(DnsError::ForwardPointer));
 
-        // Reserved prefixes and truncation are refusals, not panics.
+        // Reserved prefixes and truncation return errors.
         assert_eq!(Name::read(&[0x80], 0), Err(DnsError::ReservedLabel));
         assert_eq!(Name::read(&[0x04, b'a'], 0), Err(DnsError::Truncated));
         assert_eq!(Name::read(&[0xc0], 0), Err(DnsError::Truncated));
 
-        // A label carrying the presentation separator would make suffix
-        // matching ambiguous.
+        // A separator inside a label would make suffix matching ambiguous.
         assert_eq!(
             Name::read(&[0x03, b'a', b'.', b'b', 0x00], 0),
             Err(DnsError::SeparatorInLabel)
@@ -1523,8 +1249,7 @@ mod tests {
 
     #[test]
     fn record_type_round_trips_over_the_whole_wire_domain() {
-        // The law: `from_wire` and `to_wire` are inverse on every u16, so
-        // naming four types cannot lose or alias any of the rest.
+        // `from_wire` and `to_wire` are inverse over all `u16` values.
         for value in 0..=u16::MAX {
             assert_eq!(RecordType::from_wire(value).to_wire(), value);
         }
@@ -1552,13 +1277,12 @@ mod tests {
             )
         };
 
-        // A subdomain inherits its parent's rule, and the parent is named as
-        // the reason, which is what makes the verdict explainable.
+        // A subdomain inherits its parent's rule and provenance.
         assert_eq!(
             judge("static.doubleclick.net"),
             (HostVerdict::Blocked, Some(b"doubleclick.net".to_vec()))
         );
-        // The more specific block wins over the less specific inspection.
+        // A more-specific block wins over inspection.
         assert_eq!(
             judge("img.ads.example.com"),
             (HostVerdict::Blocked, Some(b"ads.example.com".to_vec()))
@@ -1569,14 +1293,13 @@ mod tests {
         );
         assert_eq!(judge("example.org"), (HostVerdict::Allowed, None));
 
-        // A rule matches labels, never substrings: `notexample.com` must not
-        // inherit `example.com`.
+        // Matching is label-based, never substring-based.
         assert_eq!(judge("notexample.com"), (HostVerdict::Allowed, None));
     }
 
     #[test]
     fn ech_is_stripped_for_inspected_hosts_and_for_nothing_else() {
-        // The P11 gate as a law over the whole verdict domain.
+        // The policy law holds over every verdict.
         for verdict in [
             HostVerdict::Allowed,
             HostVerdict::Blocked,
@@ -1616,7 +1339,7 @@ mod tests {
             plan("other.example"),
             Err(answer_policy(HostVerdict::Allowed))
         );
-        // The inspected plan is the one that feeds the steering index.
+        // Inspection enables address steering.
         assert!(answer_policy(HostVerdict::Inspected).steers());
         assert!(!answer_policy(HostVerdict::Allowed).steers());
     }
@@ -1636,12 +1359,11 @@ mod tests {
         assert_eq!(ech_param(&rdata).unwrap(), Some(params[1].at.clone()));
         assert_eq!(&rdata[params[1].at.clone()][4..], ECH_CONFIG);
 
-        // No ech param at all.
+        // No ECH parameter.
         let plain = https_rdata("target.example", Some(b"\x02h2"), None);
         assert_eq!(ech_param(&plain).unwrap(), None);
 
-        // Descending keys break the ordering RFC 9460 requires, which is what
-        // makes a duplicated key unrepresentable rather than ambiguous.
+        // Descending or duplicate keys violate RFC 9460 ordering.
         let mut reversed = 1u16.to_be_bytes().to_vec();
         reversed.extend_from_slice(&wire_name("target.example"));
         for key in [SVCPARAM_ECH, SVCPARAM_ALPN] {
@@ -1653,7 +1375,7 @@ mod tests {
             DnsError::SvcParamsOutOfOrder
         );
 
-        // A compression pointer where RFC 9460 forbids one.
+        // RFC 9460 forbids compression in TargetName.
         let pointered = [0x00, 0x01, 0xc0, 0x0c];
         assert_eq!(svc_params(&pointered).err(), Some(DnsError::ReservedLabel));
     }
@@ -1687,7 +1409,7 @@ mod tests {
         assert_eq!(preserved.answers, 2);
         assert_eq!(preserved.ech, EchOutcome::Preserved);
         let parsed = Message::parse(&out[..preserved.len]).unwrap();
-        // The id and the question come from the client, never the upstream.
+        // Transaction identity and question come from the client.
         assert_eq!(parsed.id(), 0x1234);
         assert_eq!(parsed.question(), client.question());
         assert!(parsed.is_response() && parsed.recursion_desired());
@@ -1710,9 +1432,7 @@ mod tests {
         let after: Vec<ResourceRecord<'_>> = parsed.answers().collect::<Result<_, _>>().unwrap();
         assert_eq!(after.len(), 2, "stripping removes a param, not a record");
 
-        // This answer advertised h3, so an inspected host loses both the ECH
-        // configuration and the ALPN block — two disjoint cuts in one RDATA,
-        // which is the whole reason `Rdata` carries three parts.
+        // Inspection removes both advertised ECH and HTTP/3 parameters.
         assert_eq!(stripped.alpn, AlpnOutcome::Steered { count: 1 });
         assert_eq!(ech_param(after[0].rdata).unwrap(), None);
         assert_eq!(h3_alpn_param(after[0].rdata).unwrap(), None);
@@ -1734,9 +1454,7 @@ mod tests {
 
     #[test]
     fn the_two_cuts_are_independent() {
-        // An inspected host whose answer advertises h2 rather than h3 keeps
-        // its ALPN and loses only its ECH: the policies compose, they do not
-        // imply each other.
+        // Inspection strips ECH but preserves a non-HTTP/3 ALPN.
         let client = query("shop.example", RecordType::Https, 5);
         let client = Message::parse(&client).unwrap();
         let upstream_bytes = response(
@@ -1785,7 +1503,7 @@ mod tests {
             rdata
         };
 
-        // Registered and draft identifiers both count; anything else does not.
+        // Registered and draft HTTP/3 identifiers both count.
         for alpn in [&b"\x02h3"[..], b"\x05h3-29", b"\x02h2\x02h3"] {
             let rdata = with(alpn, false);
             assert!(
@@ -1798,24 +1516,21 @@ mod tests {
             assert_eq!(h3_alpn_param(&rdata).unwrap(), None, "{alpn:?}");
         }
 
-        // RFC 9460 section 7.1.1 permits `no-default-alpn` only alongside
-        // `alpn`, so the removal must take both — and because keys are
-        // strictly increasing with no integer between 1 and 2, the pair is
-        // always one contiguous range.
+        // RFC 9460 section 7.1.1 makes this adjacent to `alpn`.
         let rdata = with(b"\x02h3", true);
         let range = h3_alpn_param(&rdata).unwrap().expect("h3 advertised");
         assert_eq!(range.end, rdata.len(), "the pair reaches the end together");
         let kept = Rdata::without(&rdata, range).unwrap();
         assert_eq!(kept.len(), rdata.len() - (4 + 3) - 4);
 
-        // `no-default-alpn` on a record keeping its ALPN is left alone.
+        // An unrelated `no-default-alpn` is left alone.
         let mut rdata = 1u16.to_be_bytes().to_vec();
         rdata.extend_from_slice(&wire_name("target.example"));
         rdata.extend_from_slice(&SVCPARAM_NO_DEFAULT_ALPN.to_be_bytes());
         rdata.extend_from_slice(&0u16.to_be_bytes());
         assert_eq!(h3_alpn_param(&rdata).unwrap(), None);
 
-        // A zero-length identifier makes the list's own length ambiguous.
+        // Empty identifiers are malformed.
         let rdata = with(b"\x00", false);
         assert_eq!(
             h3_alpn_param(&rdata).unwrap_err(),
@@ -1829,8 +1544,7 @@ mod tests {
         assert_eq!(Rdata::verbatim(bytes).len(), 10);
         assert_eq!(Rdata::without(bytes, 2..4).unwrap().len(), 8);
         assert_eq!(Rdata::without_both(bytes, 1..3, 6..8).unwrap().len(), 6);
-        // Adjacent is disjoint; overlapping is not, and yields no value rather
-        // than bytes drawn from neither range.
+        // Adjacent ranges are valid; overlapping or out-of-bounds ranges fail.
         assert!(Rdata::without_both(bytes, 1..3, 3..5).is_some());
         assert!(Rdata::without_both(bytes, 1..4, 3..5).is_none());
         assert!(Rdata::without_both(bytes, 1..3, 20..30).is_none());

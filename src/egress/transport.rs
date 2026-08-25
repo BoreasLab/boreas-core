@@ -1,41 +1,12 @@
-//! The transports a proxy protocol can speak over, as one composable family.
+//! Composable proxy transports for VLESS.
 //!
-//! VLESS carries no encryption and no framing of its own; it is a header
-//! followed by bytes. Everything that makes a deployment survive a hostile
-//! network — TLS, looking like a WebSocket to a CDN, riding HTTP/2 so a
-//! middlebox sees an ordinary request — lives *under* the protocol rather than
-//! inside it. sing-box calls these V2Ray transports and offers five (`http`,
-//! `ws`, `quic`, `grpc`, `httpupgrade`) beneath an optional TLS layer; this
-//! module is that set.
+//! Each layer obtains a byte stream from the layer below. TLS, WebSocket,
+//! HTTP Upgrade, HTTP/2, gRPC, and QUIC therefore compose as values rather
+//! than optional settings on every protocol.
 //!
-//! **The family is closed under composition, and the types say so.** A
-//! transport is one method — *obtain a byte stream* — so a transport that wraps
-//! another is a transport, and TLS is not a flag on five configurations but a
-//! sixth transport the others are built over:
-//!
-//! ```text
-//! WebSocketTransport::new(ws, TlsTransport::new(tls, DirectSockets))
-//! GrpcTransport::new(grpc, TlsTransport::new(tls, DirectSockets))
-//! ```
-//!
-//! sing-box reaches the same arrangement by threading a `tlsConfig` through
-//! every constructor and branching on it five times. Making the layer a value
-//! rather than a nullable parameter removes those branches and, with them, the
-//! possibility of a transport that forgets to apply the TLS it was handed.
-//!
-//! **Every wire detail here was read from sing-box's `transport/v2ray*`
-//! packages before it was written**, and checked against a running server
-//! afterwards, because these formats are defined by implementation rather than
-//! by specification. Two of them are traps worth naming in advance:
-//!
-//! - **gRPC's length prefix is a protobuf varint, not a QUIC varint.** They are
-//!   different encodings that agree on small values, so [`crate::varint`] would
-//!   appear to work and would corrupt any message of 64 bytes or more. It has
-//!   its own encoder here, and a test asserts the two disagree.
-//! - **Both HTTPUpgrade and WebSocket over-read.** Reading a header from a byte
-//!   stream consumes whatever followed it in the same segment, and what follows
-//!   is payload. Both hand the surplus to [`Prefixed`], which is the same fix
-//!   the SOCKS5 reply reader needed.
+//! Wire details follow sing-box's V2Ray transport implementations. gRPC uses a
+//! protobuf varint, not the QUIC varint, and HTTP handshakes preserve surplus
+//! bytes so payload read with the response is not lost.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -54,37 +25,17 @@ use crate::{
     wire::Writer,
 };
 
-/// How a proxy protocol obtains the byte stream it speaks over.
-///
-/// The one seam that separates *what is said* from *what carries it*. It is
-/// deliberately a single method with no configuration in its signature: a
-/// transport that needed to be told about the protocol above it would not be a
-/// transport, it would be half of one.
+/// Obtains the byte stream used by a proxy protocol.
 pub trait ProxyTransport: Send + Sync {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>>;
 
-    /// The name the layer below is addressed by, for an HTTP-shaped transport
-    /// above it to put in `Host` when the deployment has not overridden it.
-    ///
-    /// **sing-box's rule, and it matters on the wire**: configured host, then
-    /// the TLS server name, then the server's address. A transport that made
-    /// something up instead — `localhost`, say — announces itself to any server
-    /// that logs the field and to any CDN that routes on it.
-    ///
-    /// `None` only for a transport that genuinely cannot know. Every chain
-    /// bottoms out at [`PlainTransport`] or [`TlsTransport`], both of which can.
+    /// Returns the layer's authority for HTTP `Host` fallback.
     fn authority(&self) -> Option<&str> {
         None
     }
 }
 
-/// A boxed chain is itself a transport.
-///
-/// Composition is what this family is built on, but the *shape* of a chain is a
-/// deployment's choice and therefore not known until runtime — the type of
-/// `WebSocketTransport<TlsTransport<DirectSockets>>` cannot be written down by
-/// code that reads a configuration file. This impl is what lets such code
-/// assemble one and hand it over.
+/// A boxed transport preserves dynamic chain composition.
 impl ProxyTransport for Box<dyn ProxyTransport> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         (**self).dial()
@@ -95,15 +46,10 @@ impl ProxyTransport for Box<dyn ProxyTransport> {
     }
 }
 
-/// A plain TCP transport through the tunnel bypass.
-///
-/// Correct for VLESS behind a transport that already provides confidentiality,
-/// and for tests. On its own it is cleartext, which is why the type says
-/// `Plain` rather than something that could be mistaken for secure.
+/// Plain TCP through the tunnel bypass.
 pub struct PlainTransport<B> {
     server: SocketAddr,
-    /// Rendered once, because `authority` hands out a borrow and a
-    /// `SocketAddr` has no `&str` view of its own.
+    /// Stored because `SocketAddr` has no borrowed string view.
     authority: String,
     bypass: B,
 }
@@ -134,24 +80,14 @@ impl<B: TunnelBypass + 'static> ProxyTransport for PlainTransport<B> {
 
 // ---------------------------------------------------------------- TLS
 
-/// TLS over TCP: the layer the other transports are built on.
+/// TLS over TCP.
 pub struct TlsConfig {
     pub server: SocketAddr,
-    /// Presented in SNI and verified against the server's certificate.
+    /// SNI name and certificate verification name.
     pub server_name: String,
-    /// ALPN to offer. The transport above chooses it — `http/1.1` for
-    /// WebSocket and HTTPUpgrade, `h2` for gRPC and HTTP — because offering the
-    /// wrong one is how a server closes the connection at the handshake with no
-    /// explanation.
+    /// ALPN identifiers selected by the transport above.
     pub alpn: Vec<Vec<u8>>,
-    /// Trust anchors to accept *in addition to* the bundled Mozilla set,
-    /// DER-encoded.
-    ///
-    /// Empty in the ordinary case. It exists because a self-hosted server very
-    /// often presents a certificate from a private CA, and the honest answer to
-    /// that is to name the CA — not to offer a "skip verification" switch,
-    /// which is the same feature with no way to tell a configured exception
-    /// from an attack.
+    /// Additional DER-encoded trust anchors.
     pub extra_roots: Vec<Vec<u8>>,
 }
 
@@ -159,26 +95,15 @@ pub struct TlsTransport<B> {
     server: SocketAddr,
     server_name: String,
     originator: Arc<Originator>,
-    /// The ALPN list in wire format, built once because it never varies for a
-    /// configured transport.
+    /// Wire-format ALPN list.
     alpn: Vec<u8>,
     bypass: B,
 }
 
 impl<B: TunnelBypass> TlsTransport<B> {
-    /// **BoringSSL, wearing Chrome's hello.** A VLESS-family transport exists to
-    /// look like a browser reaching a website, so a `rustls` ClientHello on the
-    /// wire is the one thing it must not send. There is no client hello to
-    /// mirror on this leg — nothing local originated it — so the profile is
-    /// [`ClientProfile::chrome`] rather than the empty one, which would leave
-    /// BoringSSL's own defaults and no `X25519MLKEM768`.
-    ///
-    /// Trust anchors are Mozilla's bundle rather than the platform store, for
-    /// the reason the DNS upstreams give: the set this crate verifies against
-    /// should not be one a device owner or an MDM profile can widen.
+    /// Builds a Chrome-shaped TLS client using the bundled trust roots.
     pub fn new(config: TlsConfig, bypass: B) -> Result<Self, EgressError> {
-        // Parsed only to reject a name no handshake could verify. The value is
-        // discarded: BoringSSL takes the name as a string.
+        // Validate the name before handing its string form to BoringSSL.
         rustls::pki_types::ServerName::try_from(config.server_name.as_str())
             .map_err(|_| ProxyError::Address)?;
         let alpn: Vec<&[u8]> = config.alpn.iter().map(Vec::as_slice).collect();
@@ -204,8 +129,7 @@ impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {
         })
     }
 
-    /// The name in SNI, which is what a server expects to see echoed in `Host`
-    /// and what a fronted deployment's CDN routes on.
+    /// Returns the SNI name for HTTP `Host` fallback.
     fn authority(&self) -> Option<&str> {
         Some(&self.server_name)
     }
@@ -213,15 +137,10 @@ impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {
 
 // ------------------------------------------------------- HTTP framing
 
-/// The `Host` and extra headers an HTTP-shaped transport sends.
-///
-/// Shared by WebSocket, HTTPUpgrade, gRPC, and HTTP because all four send an
-/// HTTP request whose headers are how a deployment makes itself look like
-/// whatever the operator wants it to look like.
+/// `Host` override and additional headers for HTTP-shaped transports.
 #[derive(Clone, Default)]
 pub struct HttpHeaders {
-    /// Overrides the `Host` header. A CDN deployment sets this to the fronted
-    /// name while connecting to a different address entirely.
+    /// Optional fronted `Host` name.
     pub host: Option<String>,
     pub extra: Vec<(String, String)>,
 }
@@ -232,9 +151,7 @@ impl HttpHeaders {
     }
 }
 
-/// Normalises a configured path the way sing-box does: a path that does not
-/// begin with `/` gets one, because a server matching on `/x` never matches a
-/// request for `x` and the failure looks like a rejected connection.
+/// Adds the leading slash required by HTTP request paths.
 fn normalise_path(path: &str) -> String {
     if path.starts_with('/') {
         path.to_owned()
@@ -250,17 +167,7 @@ pub struct WebSocketConfig {
     pub headers: HttpHeaders,
 }
 
-/// VLESS over WebSocket: the most deployed transport in the family, because a
-/// WebSocket traverses a CDN and an ordinary TCP connection does not.
-///
-/// **The protocol comes from `tokio-tungstenite`; only the trait adaptation is
-/// written here.** Framing, masking, and the ping/pong and close state machine
-/// are exactly the things a hand-rolled implementation gets subtly wrong, and
-/// that crate is the ecosystem's standard for them. What it does not provide is
-/// an `AsyncRead + AsyncWrite` view, because a WebSocket is a message stream
-/// and not a byte stream; the ~80 lines below are that projection, and writing
-/// them is cheaper than the `futures-io`-to-`tokio-io` compatibility shim the
-/// available adapter crates would need.
+/// VLESS over WebSocket, projected to a byte stream with tungstenite.
 pub struct WebSocketTransport<T> {
     path: String,
     headers: HttpHeaders,
@@ -281,16 +188,13 @@ impl<T: ProxyTransport + 'static> ProxyTransport for WebSocketTransport<T> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let stream = self.inner.dial().await?;
-            // The authority is only ever a name here: the socket is already
-            // connected, so this URI is read for its `Host` header and its path
-            // and never resolved.
+            // The socket is already connected; the URI supplies HTTP fields only.
             let host = self.headers.host_or(self.inner.authority().unwrap_or(""));
             let uri = format!("ws://{host}{}", self.path);
             let mut request = http::Request::builder()
                 .uri(&uri)
                 .header("Host", &host)
-                // tungstenite requires these to be present and correct; it
-                // generates the key and verifies the accept token itself.
+                // tungstenite generates the key and verifies the accept token.
                 .header("Connection", "Upgrade")
                 .header("Upgrade", "websocket")
                 .header("Sec-WebSocket-Version", "13")
@@ -312,24 +216,16 @@ impl<T: ProxyTransport + 'static> ProxyTransport for WebSocketTransport<T> {
         })
     }
 
-    /// Delegated: what a chain is addressed by belongs to whatever is
-    /// underneath it, not to the framing on top.
+    /// Delegates authority to the wrapped transport.
     fn authority(&self) -> Option<&str> {
         self.inner.authority()
     }
 }
 
-/// A WebSocket message stream, projected to a byte stream.
-///
-/// Writes become one binary message each and reads concatenate binary payloads,
-/// which is what sing-box's own conn does. Non-binary data frames are skipped
-/// rather than treated as an error, again matching it: a server or an
-/// intermediary that sends a text frame has not corrupted the tunnel.
+/// Projects WebSocket binary messages onto a byte stream.
 struct WebSocketStream<S> {
     socket: tokio_tungstenite::WebSocketStream<S>,
-    /// The unconsumed tail of a message larger than the last read buffer. The
-    /// same idiom [`crate::bridge`] uses, and for the same reason: losing it
-    /// silently truncates every message that does not fit one read.
+    /// Unconsumed tail of the last binary message.
     pending: bytes::Bytes,
 }
 
@@ -365,18 +261,15 @@ where
             }
             match std::pin::Pin::new(&mut this.socket).poll_next(cx) {
                 Poll::Ready(Some(Ok(Message::Binary(payload)))) => {
-                    // An empty binary message carries nothing; returning here
-                    // would be a spurious end of stream, so loop instead.
+                    // Empty messages do not signal EOF.
                     if payload.is_empty() {
                         continue;
                     }
                     this.pending = payload;
                 }
-                // A close frame, or the stream ending, is end of stream.
+                // Close and stream end both terminate the byte stream.
                 Poll::Ready(Some(Ok(Message::Close(_))) | None) => return Poll::Ready(Ok(())),
-                // Text, ping, pong, and frame-level messages carry no tunnel
-                // payload. `tungstenite` answers pings itself; these are simply
-                // not ours.
+                // Non-binary frames carry no tunnel payload.
                 Poll::Ready(Some(Ok(_))) => continue,
                 Poll::Ready(Some(Err(error))) => {
                     return Poll::Ready(Err(std::io::Error::other(error)));
@@ -424,8 +317,7 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        // `poll_close` sends the close frame, which is the WebSocket spelling
-        // of FIN and what the peer needs to see to finish cleanly.
+        // A close frame is WebSocket's orderly stream shutdown.
         std::pin::Pin::new(&mut self.get_mut().socket)
             .poll_close(cx)
             .map_err(std::io::Error::other)
@@ -439,22 +331,7 @@ pub struct HttpUpgradeConfig {
     pub headers: HttpHeaders,
 }
 
-/// VLESS over an HTTP/1.1 Upgrade, with no framing at all after the handshake.
-///
-/// It exists because WebSocket's per-message header and masking cost real
-/// throughput while the thing that actually gets a connection through a CDN is
-/// the *handshake* looking like a WebSocket's. So this sends exactly that
-/// handshake, takes the `101`, and then speaks raw bytes.
-///
-/// **The reference is sing-box's `v2rayhttpupgrade`, and this matches it byte
-/// for byte** — including the two details a from-scratch implementation gets
-/// wrong. sing-box builds a Go `http.Request` and calls `Write`, so the wire
-/// order is Go's: request line, `Host`, `User-Agent`, then every remaining
-/// header **sorted by canonical name**. And it sends Go's default
-/// `User-Agent`, because it never sets one. Neither is negotiable: a request
-/// whose header order differs from every other client of this protocol is a
-/// request that stands out in exactly the logs this transport exists to blend
-/// into.
+/// VLESS over HTTP/1.1 Upgrade with raw bytes after the handshake.
 pub struct HttpUpgradeTransport<T> {
     path: String,
     headers: HttpHeaders,
@@ -477,22 +354,7 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpUpgradeTransport<T> {
             let mut stream = self.inner.dial().await?;
             let host = self.headers.host_or(self.inner.authority().unwrap_or(""));
             let mut upgrade = Upgrade::new(&self.path, &host, &self.headers);
-            // Whatever followed the `101` is already tunnel payload; the
-            // negotiation reports it and `Prefixed` replays it. Omitting that
-            // truncates the first read of every connection where the server
-            // answers and sends in one segment, which is what sing-box's
-            // `bufio.NewCachedConn` exists to prevent on its side.
-            //
-            // **The mirror image of this is a race in the reference servers,
-            // and it is not ours to fix.** Go's `http.Server` buffers whatever
-            // it read when a handler hijacks the connection and hands it back
-            // in a `bufrw`; both sing-box and Xray-core discard that value, so
-            // payload arriving in the window between their `101` and their
-            // `Hijack` is lost and the flow is reset. Waiting before writing
-            // would narrow that window without closing it, at the cost of a
-            // delay on every connection, so this client does what the reference
-            // clients do and writes immediately. `tests/interop.rs` retries a
-            // flow for this reason and says so.
+            // The handshake may read tunnel payload with the `101` response.
             let ((), surplus) = crate::negotiate(&mut stream, &mut upgrade).await?;
             Ok(Box::new(Prefixed::new(surplus, stream)) as Box<dyn AsyncStream>)
         })
@@ -503,20 +365,12 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpUpgradeTransport<T> {
     }
 }
 
-/// Go's default, which is what sing-box sends because it never sets one. A
-/// deployment that wants a browser's puts it in `headers`.
+/// Go's default user agent used by sing-box when none is configured.
 const GO_USER_AGENT: &str = "Go-http-client/1.1";
 
-/// The HTTP/1.1 Upgrade exchange, as a pure state machine.
-///
-/// No socket, no clock: the request is built once at construction and handed
-/// over on the first advance, and every subsequent one re-reads the same
-/// growing response buffer. That is what lets the whole exchange — including a
-/// server that dribbles its status line one byte at a time — be tested without
-/// a network.
+/// Pure HTTP/1.1 Upgrade negotiation state.
 struct Upgrade {
-    /// Taken on the first advance, which is how "write once per phase" is
-    /// enforced by the type rather than by a flag.
+    /// Request emitted on the first advance.
     request: Option<Vec<u8>>,
 }
 
@@ -531,9 +385,7 @@ impl Upgrade {
 impl crate::Negotiation for Upgrade {
     type Output = ();
 
-    /// O(response head), re-parsed from the start on each offer. The head is
-    /// bounded by the driver, and re-parsing a few hundred bytes a handful of
-    /// times is cheaper than the incremental parser it would take to avoid it.
+    /// Parses the bounded response head on each offer.
     fn advance(
         &mut self,
         input: &[u8],
@@ -549,20 +401,14 @@ impl crate::Negotiation for Upgrade {
             httparse::Status::Partial => return Ok(crate::Decoded::Incomplete),
         };
 
-        // The numeric code, as sing-box checks it. Xray-core compares the whole
-        // status line to `"101 Switching Protocols"`, which breaks against a
-        // server that writes a different reason phrase; matching the stricter
-        // reader would refuse connections the other reference client accepts.
+        // Match the status code, independent of the reason phrase.
         if response.code != Some(101) {
             return Err(ProxyError::Denied(format!(
                 "expected 101, got {}",
                 response.code.unwrap_or(0)
             )));
         }
-        // A `101` without the upgrade headers is a proxy that answered without
-        // switching protocols, and writing tunnel bytes into it would be
-        // writing into an HTTP response body. Both reference clients check
-        // both, case-insensitively on the value.
+        // Require both headers before treating the response as a tunnel.
         let named = |name: &str, want: &str| {
             response.headers.iter().any(|header| {
                 header.name.eq_ignore_ascii_case(name)
@@ -582,16 +428,7 @@ impl crate::Negotiation for Upgrade {
     }
 }
 
-/// Builds the request exactly as Go's `(*http.Request).Write` would.
-///
-/// The ordering is the whole point and it is not this crate's choice: request
-/// line, `Host`, `User-Agent`, then everything else **sorted by canonical
-/// header name**, because that is what `Header.writeSubset` does and therefore
-/// what every server that has ever seen this protocol expects. `Connection` and
-/// `Upgrade` are in that sorted run rather than ahead of it, so a configured
-/// header beginning with `S` lands between them.
-///
-/// O(headers log headers) for the sort, once per dial.
+/// Builds the Go-compatible HTTP Upgrade request and header order.
 fn encode_upgrade_request(path: &str, host: &str, headers: &HttpHeaders) -> Vec<u8> {
     let mut sorted: Vec<(String, &str)> = headers
         .extra
@@ -617,12 +454,7 @@ fn encode_upgrade_request(path: &str, host: &str, headers: &HttpHeaders) -> Vec<
     request.into_bytes()
 }
 
-/// A header name in MIME canonical form: `content-type` becomes `Content-Type`.
-///
-/// Go canonicalises before sorting, so sorting the raw configured spelling
-/// would order `x-foo` after `Upgrade` where Go orders `X-Foo` before it.
-///
-/// O(name length), one allocation.
+/// Converts a header name to MIME canonical form before sorting.
 fn canonical(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut starting = true;
@@ -643,47 +475,36 @@ fn canonical(name: &str) -> String {
 
 // --------------------------------------------------- HTTP/2 and gRPC
 
-/// What an HTTP/2-carried transport puts in its request, and how it frames the
-/// bytes inside the body.
-///
-/// gRPC and `http` differ *only* in these two respects — one path and header
-/// set versus another, length-prefixed messages versus raw bytes — so they are
-/// one implementation parameterised by this rather than two that drift.
+/// Body framing used by HTTP/2 transports.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Framing {
-    /// gRPC: each write becomes one length-delimited message.
+    /// Each write becomes one length-delimited message.
     Grpc,
-    /// `http`: the body is the byte stream, unframed.
+    /// The body is an unframed byte stream.
     Raw,
 }
 
 pub struct GrpcConfig {
-    /// The service name in the request path, which becomes
-    /// `/{service_name}/Tun`.
+    /// Service name in the `/{service_name}/Tun` request path.
     pub service_name: String,
     pub headers: HttpHeaders,
 }
 
 pub struct HttpConfig {
     pub path: String,
-    /// sing-box defaults to `PUT`; a deployment behind a cache that rejects it
-    /// uses `GET` or `POST` instead.
+    /// HTTP method, defaulting to sing-box's `PUT` at configuration time.
     pub method: String,
     pub headers: HttpHeaders,
 }
 
-/// VLESS over gRPC: an HTTP/2 `POST` whose body is a stream of gRPC messages.
-///
-/// It is a *lite* gRPC — the framing and the content type, with no protobuf
-/// schema, no compression, and no trailers logic — which is exactly what
-/// sing-box's `v2raygrpclite` is and what servers in the wild expect.
+/// VLESS over gRPC with a streaming HTTP/2 body.
 pub struct GrpcTransport<T> {
     config: GrpcConfig,
     inner: T,
     connection: Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
 }
 
-/// VLESS over HTTP/2: a streaming request whose body is the tunnel.
+/// VLESS over HTTP/2 with a streaming request body.
 pub struct HttpTransport<T> {
     config: HttpConfig,
     inner: T,
@@ -713,12 +534,8 @@ impl<T: ProxyTransport> HttpTransport<T> {
     }
 }
 
-/// Obtains an HTTP/2 request sender, reusing the live one when there is one.
-///
-/// **One connection, many streams** — which is the entire reason to carry a
-/// proxy over HTTP/2. Holding the lock across the handshake is deliberate, as
-/// it is for Hysteria2: it makes concurrent first flows share a connection
-/// rather than race to build two.
+/// Obtains or reuses an HTTP/2 request sender. The lock covers the handshake so
+/// concurrent first flows share one connection.
 async fn h2_sender<T: ProxyTransport>(
     held: &Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
     inner: &T,
@@ -735,9 +552,7 @@ async fn h2_sender<T: ProxyTransport>(
     let (sender, connection) = h2::client::handshake(stream)
         .await
         .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
-    // The connection future *is* the HTTP/2 driver: nothing moves on any stream
-    // unless it is polled. It ends when the connection does, which is what
-    // makes a detached task the right shape rather than a leak.
+    // HTTP/2 streams progress only while their connection future is polled.
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -749,28 +564,14 @@ async fn h2_sender<T: ProxyTransport>(
     Ok(ready)
 }
 
-/// Opens one HTTP/2 stream and returns it as a byte stream **without waiting
-/// for the response**.
-///
-/// **Waiting here deadlocks, and the reference is built the same way.** The
-/// server does not answer until it has read the proxy header out of the request
-/// body, and the protocol above does not write that header until this returns —
-/// so a `dial` that awaited the response would wait for a message that waits
-/// for it. sing-box resolves this by running its `RoundTrip` on a goroutine and
-/// handing back a connection whose *reads* block until the response arrives;
-/// [`Recv::Pending`] is that same structure as a state rather than a task, and
-/// it also spares the flow a round trip it never needed.
-///
-/// The cost is that a refusal — a bad path, a wrong content type — surfaces on
-/// the first read rather than from `dial`. That is inherent: the server has not
-/// decided yet at the moment `dial` returns.
+/// Opens an HTTP/2 stream without waiting for its response. The server needs
+/// request-body data before replying, so refusal is reported on the first read.
 fn h2_dial(
     mut sender: h2::client::SendRequest<bytes::Bytes>,
     request: http::Request<()>,
     framing: Framing,
 ) -> Result<Box<dyn AsyncStream>, EgressError> {
-    // `end_of_stream: false` is load-bearing: the request body is the tunnel's
-    // uplink and stays open for the life of the flow.
+    // The request body remains open for the tunnel uplink.
     let (response, send) = sender
         .send_request(request, false)
         .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
@@ -784,14 +585,11 @@ fn h2_dial(
     }))
 }
 
-/// The downlink half of an HTTP/2 stream, which does not exist until the server
-/// has answered.
+/// Downlink state for an HTTP/2 stream response.
 enum Recv {
     Pending(h2::client::ResponseFuture),
     Ready(h2::RecvStream),
-    /// The response arrived and was a refusal, or the stream failed. Kept as a
-    /// state so a second read reports end of stream rather than polling a
-    /// future that has already completed.
+    /// Refused or failed; subsequent reads return end of stream.
     Done,
 }
 
@@ -810,9 +608,7 @@ impl<T: ProxyTransport + 'static> ProxyTransport for GrpcTransport<T> {
                     self.config.service_name.trim_matches('/')
                 ))
                 .header("content-type", "application/grpc")
-                // The reference sends gRPC-Go's own user agent, and matching it
-                // is the point: a distinctive one would identify the client to
-                // anyone watching, which is what the transport exists to avoid.
+                // Match gRPC-Go's reference user agent.
                 .header("user-agent", "grpc-go/1.48.0")
                 .header("te", "trailers");
             for (name, value) in &self.config.headers.extra {
@@ -825,8 +621,7 @@ impl<T: ProxyTransport + 'static> ProxyTransport for GrpcTransport<T> {
         })
     }
 
-    /// Delegated: what a chain is addressed by belongs to whatever is
-    /// underneath it, not to the framing on top.
+    /// Delegates authority to the wrapped transport.
     fn authority(&self) -> Option<&str> {
         self.inner.authority()
     }
@@ -855,44 +650,33 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpTransport<T> {
         })
     }
 
-    /// Delegated: what a chain is addressed by belongs to whatever is
-    /// underneath it, not to the framing on top.
+    /// Delegates authority to the wrapped transport.
     fn authority(&self) -> Option<&str> {
         self.inner.authority()
     }
 }
 
-/// One HTTP/2 stream as a byte stream, with or without gRPC framing.
+/// HTTP/2 stream projected to a byte stream, optionally with gRPC framing.
 struct H2Stream {
     send: h2::SendStream<bytes::Bytes>,
     recv: Recv,
     framing: Framing,
     /// Undelivered payload from the last DATA frame.
     pending: bytes::Bytes,
-    /// Bytes still owed to the gRPC message being read. Zero means the next
-    /// bytes are a header.
+    /// Bytes remaining in the current gRPC message; zero means a header follows.
     remaining: usize,
-    /// A gRPC header split across DATA frames. HTTP/2 does not align its frames
-    /// to the framing above it, so a header arriving in two pieces is ordinary
-    /// rather than exceptional, and this is what makes the reader total.
+    /// gRPC header bytes split across HTTP/2 DATA frames.
     head: Vec<u8>,
 }
 
-/// The gRPC message header this transport writes and reads:
+/// gRPC header and payload layout:
 /// `00 | u32be(total) | 0x0A | protobuf-varint(len) | payload`.
-///
-/// The first byte is gRPC's "not compressed" flag and the `u32` is gRPC's own
-/// message length. What follows is a protobuf message with one `bytes` field:
-/// `0x0A` is the tag for field 1, wire type 2.
 const GRPC_HEADER_MIN: usize = 6;
 
-/// Protobuf's varint — LEB128, little-endian groups of seven bits.
+/// Encodes protobuf's little-endian groups-of-seven varint.
 ///
-/// **Not [`crate::varint`].** QUIC's encoding puts its length in the *high*
-/// bits of the first byte and is big-endian; protobuf's puts a continuation
-/// flag in the high bit and is little-endian. They agree on 0..=63 and diverge
-/// immediately after, so using the wrong one produces a transport that works in
-/// testing and corrupts every message of 64 bytes or more.
+/// This differs from [`crate::varint`], whose QUIC encoding uses high-bit length
+/// markers and diverges at 64.
 fn put_protobuf_varint(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);
@@ -901,12 +685,11 @@ fn put_protobuf_varint(mut value: u64, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
-/// The decoding half. `None` for a proper prefix, so a caller reads more.
+/// Decodes a protobuf varint; `None` means the prefix is incomplete or invalid.
 fn get_protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     for (index, &byte) in bytes.iter().enumerate() {
-        // Ten groups of seven bits is the most a `u64` can hold; refusing past
-        // that stops a hostile peer from spinning this forever.
+        // Ten groups hold a `u64`; reject longer prefixes.
         if index >= 10 {
             return None;
         }
@@ -918,33 +701,22 @@ fn get_protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Wraps one payload as a gRPC message. O(payload length).
+/// Wraps one payload as a gRPC message.
 fn encode_grpc_message(payload: &[u8], out: &mut Vec<u8>) {
     let mut length = Vec::with_capacity(10);
     put_protobuf_varint(payload.len() as u64, &mut length);
     Writer::new(out)
         .u8(0) // not compressed
         .u32((1 + length.len() + payload.len()) as u32)
-        .u8(0x0A) // protobuf field 1, wire type 2
+        .u8(0x0A) // field 1, wire type 2
         .bytes(&length)
         .bytes(payload);
 }
 
-/// Reads a gRPC message header, returning the payload length and the header's
-/// own size.
+/// Reads a gRPC header, returning payload length and header size.
 ///
-/// `None` for a proper prefix, which is the whole reason this is separate:
-/// **an HTTP/2 DATA frame boundary falls wherever the peer's window put it**,
-/// so a header routinely arrives in two pieces and a reader that assumed
-/// otherwise would work against every server that happens to send it whole.
-///
-/// This is as far as sans-IO reaches into [`H2Stream`], and the line is not
-/// arbitrary. The framing is a decision about bytes and lifts cleanly; the
-/// capacity a write must reserve is the connection's flow-control window,
-/// which *is* backpressure and cannot be expressed without the connection that
-/// owns it.
-///
-/// O(header length), which the varint's ten-group ceiling bounds.
+/// `None` means the HTTP/2 DATA frame ended inside the header. This is the
+/// sans-IO boundary: framing is byte-local, while capacity belongs to h2.
 fn decode_grpc_header(head: &[u8]) -> Option<(usize, usize)> {
     let (length, used) = get_protobuf_varint(head.get(GRPC_HEADER_MIN..)?)?;
     Some((length as usize, GRPC_HEADER_MIN + used))
@@ -961,7 +733,7 @@ impl AsyncRead for H2Stream {
 
         let this = self.get_mut();
         loop {
-            // Deliver whatever is already decoded before asking for more.
+            // Deliver decoded bytes before polling the connection.
             let deliverable = match this.framing {
                 Framing::Raw => this.pending.len(),
                 Framing::Grpc => this.remaining.min(this.pending.len()),
@@ -974,12 +746,11 @@ impl AsyncRead for H2Stream {
                     this.remaining = this.remaining.saturating_sub(moved);
                     return Poll::Ready(Ok(()));
                 }
-                // A zero-capacity read buffer: nothing to do, and reporting
-                // ready with no bytes is a legal no-op rather than EOF.
+                // A zero-capacity read is a successful no-op, not EOF.
                 return Poll::Ready(Ok(()));
             }
 
-            // A gRPC header may be next, and may be split across frames.
+            // A gRPC header may span DATA frames.
             if this.framing == Framing::Grpc && this.remaining == 0 && !this.pending.is_empty() {
                 this.head.extend_from_slice(&this.pending);
                 this.pending = bytes::Bytes::new();
@@ -994,8 +765,7 @@ impl AsyncRead for H2Stream {
                 continue;
             }
 
-            // The response may not have arrived yet: `dial` deliberately does
-            // not wait for it, so the first read is where it lands.
+            // `dial` does not await the response; the first read does.
             let body = match &mut this.recv {
                 Recv::Ready(body) => body,
                 Recv::Done => return Poll::Ready(Ok(())),
@@ -1021,8 +791,7 @@ impl AsyncRead for H2Stream {
 
             match std::pin::Pin::new(&mut *body).poll_data(cx) {
                 Poll::Ready(Some(Ok(data))) => {
-                    // Releasing capacity is what keeps the peer sending; an
-                    // HTTP/2 receiver that never does stalls after one window.
+                    // Release capacity so the peer can send past one window.
                     let _ = body.flow_control().release_capacity(data.len());
                     if this.framing == Framing::Grpc && this.remaining == 0 {
                         this.head.extend_from_slice(&data);
@@ -1049,9 +818,7 @@ impl AsyncWrite for H2Stream {
         use std::task::Poll;
 
         let this = self.get_mut();
-        // Ask for the whole write, then take what the window grants. Reserving
-        // before framing matters for gRPC: a message may not be split, so it
-        // has to be written whole or not at all.
+        // Reserve before framing so one gRPC message is written whole.
         this.send.reserve_capacity(buf.len());
         let granted = match this.send.poll_capacity(cx) {
             Poll::Ready(Some(Ok(granted))) => granted,
@@ -1078,9 +845,7 @@ impl AsyncWrite for H2Stream {
         Poll::Ready(Ok(moved))
     }
 
-    /// `h2` writes when its connection task runs; there is no buffer here to
-    /// force out, and waiting for the peer to acknowledge is not what flush
-    /// means.
+    /// h2 flushes when its connection task runs; this stream has no flush buffer.
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
@@ -1093,7 +858,7 @@ impl AsyncWrite for H2Stream {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        // An empty DATA frame with END_STREAM is HTTP/2's FIN.
+        // An empty DATA frame with END_STREAM is HTTP/2 FIN.
         this.send
             .send_data(bytes::Bytes::new(), true)
             .map_err(std::io::Error::other)?;
@@ -1109,14 +874,7 @@ pub struct QuicTransportConfig {
     pub idle_timeout: Duration,
 }
 
-/// VLESS over QUIC, which costs almost nothing now that Hysteria2 exists.
-///
-/// sing-box's `quic` transport is a QUIC connection with the `h3` ALPN whose
-/// bidirectional streams carry the payload raw — no HTTP/3, despite the ALPN.
-/// That is precisely the QUIC stream driver minus the authentication request,
-/// so this is that driver with its `http3` step skipped, and every property it
-/// establishes (backpressure from QUIC's own window, one connection per
-/// egress, the driver's lifetime bound to this value) holds unchanged.
+/// VLESS over QUIC streams using the `h3` ALPN without HTTP/3 framing.
 pub struct QuicTransport<B> {
     config: QuicTransportConfig,
     bypass: B,
@@ -1140,9 +898,7 @@ impl<B: TunnelBypass> QuicTransport<B> {
         }
     }
 
-    /// The `quiche::Config` this transport needs, for a caller to set
-    /// certificate verification on — the same division [`crate::MasqueEgress`]
-    /// and Hysteria2 use.
+    /// Builds a QUIC config for the caller to configure certificate verification.
     pub fn quic_config(idle_timeout: Duration) -> Result<quiche::Config, EgressError> {
         client_config(quiche::h3::APPLICATION_PROTOCOL, idle_timeout)
     }
@@ -1185,10 +941,7 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// **The trap this module exists to avoid.** Protobuf and QUIC varints
-    /// agree on every value below 64 and disagree immediately above it, so a
-    /// transport built on the wrong one passes a small-message test and
-    /// corrupts real traffic. This pins that they differ.
+    /// Protobuf and QUIC varints agree below 64 but diverge at 64.
     #[test]
     fn the_protobuf_varint_is_not_the_quic_varint() {
         for value in [0u64, 1, 63] {
@@ -1206,14 +959,13 @@ mod tests {
                 "{value} must not encode identically, or the wrong codec would pass tests"
             );
         }
-        // The exact protobuf encodings, so a rewrite cannot drift.
+        // Pin a multi-byte protobuf encoding.
         let mut out = Vec::new();
         put_protobuf_varint(300, &mut out);
         assert_eq!(out, [0xac, 0x02]);
     }
 
-    /// Round trip and totality: every proper prefix is incomplete, which is
-    /// what lets the reader survive a header split across HTTP/2 frames.
+    /// Round trips values and rejects every incomplete prefix.
     #[test]
     fn protobuf_varints_round_trip_and_every_prefix_is_incomplete() {
         for value in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64] {
@@ -1226,8 +978,7 @@ mod tests {
         }
     }
 
-    /// The gRPC frame, byte for byte, against the reference's own layout:
-    /// `00 | u32be(1 + varint + payload) | 0A | varint(payload) | payload`.
+    /// Matches the reference gRPC frame layout.
     #[test]
     fn a_grpc_message_matches_the_reference_layout() {
         let mut out = Vec::new();
@@ -1243,8 +994,7 @@ mod tests {
             ]
         );
 
-        // A payload past the one-byte varint boundary, where the length prefix
-        // grows and the u32 must grow with it.
+        // Check the multi-byte varint boundary.
         let mut out = Vec::new();
         encode_grpc_message(&vec![0u8; 300], &mut out);
         assert_eq!(out[0], 0);
@@ -1256,8 +1006,7 @@ mod tests {
         assert_eq!(out.len(), 6 + 2 + 300);
     }
 
-    /// A path without a leading slash is a configuration a server never
-    /// matches, so it is normalised rather than passed through.
+    /// Normalizes paths without a leading slash.
     #[test]
     fn a_path_is_given_its_leading_slash() {
         assert_eq!(normalise_path("ws"), "/ws");
@@ -1265,8 +1014,7 @@ mod tests {
         assert_eq!(normalise_path(""), "/");
     }
 
-    /// The `Host` override is what a CDN-fronted deployment depends on, so an
-    /// absent override must fall back rather than send an empty header.
+    /// Prefers the configured `Host` and otherwise uses the fallback.
     #[test]
     fn the_host_header_prefers_the_override() {
         let headers = HttpHeaders {
@@ -1280,11 +1028,7 @@ mod tests {
         );
     }
 
-    /// **The wire order is Go's, not ours, and that is the point.** sing-box
-    /// builds an `http.Request` and calls `Write`, which emits the request
-    /// line, `Host`, `User-Agent`, then every remaining header sorted by
-    /// canonical name. A request in any other order is a request that stands
-    /// out in the one log this transport exists to look ordinary in.
+    /// Matches Go's request-line and canonical header order.
     #[test]
     fn an_upgrade_request_is_byte_identical_to_the_reference_clients() {
         let request = encode_upgrade_request("/tunnel", "cdn.example", &HttpHeaders::default());
@@ -1299,10 +1043,7 @@ mod tests {
         );
     }
 
-    /// Configured headers join the sorted run rather than sitting after it, so
-    /// one beginning with `S` lands *between* `Connection` and `Upgrade` —
-    /// which is exactly where Go puts it and nowhere a hand-rolled builder
-    /// would.
+    /// Sorts configured headers into Go's canonical header run.
     #[test]
     fn configured_headers_are_sorted_in_among_the_upgrade_pair() {
         let headers = HttpHeaders {
@@ -1333,8 +1074,7 @@ mod tests {
         );
     }
 
-    /// A deployment that wants a browser's user agent gets it, and does not get
-    /// two.
+    /// Replaces, rather than duplicates, the default user agent.
     #[test]
     fn a_configured_user_agent_replaces_gos_default_rather_than_joining_it() {
         let headers = HttpHeaders {
@@ -1347,10 +1087,7 @@ mod tests {
         assert!(!request.contains(GO_USER_AGENT));
     }
 
-    /// The `Host` a server sees is the fronted name when one is configured, and
-    /// otherwise whatever the layer below is addressed by. **Never a made-up
-    /// constant**: a request announcing `localhost` to a CDN is a request that
-    /// does not route and a log line that does not blend in.
+    /// Falls back to the wrapped transport's authority.
     #[test]
     fn the_host_falls_back_to_what_the_layer_below_is_addressed_by() {
         let fronted = HttpHeaders {
@@ -1364,9 +1101,7 @@ mod tests {
         );
     }
 
-    /// The exchange, driven a byte at a time. A client that only works when the
-    /// whole response head lands in one read is one that works against a
-    /// loopback test and fails behind a middlebox that splits the segment.
+    /// Completes when the response arrives in arbitrarily sized chunks.
     #[tokio::test]
     async fn the_upgrade_completes_however_the_response_is_split() {
         for chunk in [1usize, 7, 4096] {
@@ -1404,9 +1139,7 @@ mod tests {
         }
     }
 
-    /// A `101` is not enough on its own. Both reference clients check the
-    /// upgrade headers too, because a proxy that answered without switching
-    /// protocols would take tunnel bytes as an HTTP response body.
+    /// Requires upgrade headers in addition to status `101`.
     #[test]
     fn a_response_that_did_not_switch_protocols_is_refused() {
         use crate::Negotiation;
@@ -1427,9 +1160,7 @@ mod tests {
         }
     }
 
-    /// Header values arrive with the space after the colon still attached in
-    /// some servers' spelling; comparing without trimming rejects a perfectly
-    /// ordinary `101`.
+    /// Compares upgrade values case-insensitively after trimming whitespace.
     #[test]
     fn header_values_are_compared_case_insensitively_and_untrimmed() {
         use crate::Negotiation;
@@ -1444,18 +1175,14 @@ mod tests {
         ));
     }
 
-    /// **A DATA frame boundary falls wherever the peer's window put it**, so a
-    /// gRPC header routinely arrives in two pieces. Every proper prefix must
-    /// say "not yet" rather than guess, and the whole must report both the
-    /// payload length and its own size — reporting the header's size wrong by
-    /// one desynchronises every message after it.
+    /// Handles gRPC headers split across HTTP/2 DATA frames.
     #[test]
     fn a_grpc_header_split_anywhere_is_read_once_it_is_whole() {
         for payload in [0usize, 1, 63, 64, 300, 100_000] {
             let mut framed = Vec::new();
             encode_grpc_message(&vec![b'x'; payload], &mut framed);
 
-            // Every proper prefix of the header is incomplete.
+            // Every proper prefix needs more input.
             let (length, header) = decode_grpc_header(&framed).unwrap_or_else(|| {
                 panic!("a whole message of {payload} bytes carries a whole header")
             });
@@ -1474,9 +1201,7 @@ mod tests {
         }
     }
 
-    /// A length field a hostile peer never terminates would otherwise be read
-    /// forever. Ten groups is all a `u64` holds, and past that the frame is
-    /// refused rather than awaited.
+    /// Refuses a varint longer than the ten groups allowed by `u64`.
     #[test]
     fn a_length_field_that_never_ends_is_refused_rather_than_awaited() {
         let mut endless = vec![0u8; GRPC_HEADER_MIN];

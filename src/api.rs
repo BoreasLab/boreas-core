@@ -1,60 +1,19 @@
-//! The interface a host application builds a tunnel through.
+//! Public host-facing construction and lifecycle API.
 //!
-//! Everything else in this crate is machinery. This module is the contract:
-//! what a host must provide, what it may choose, what it gets back, and what it
-//! must keep. Nothing here exposes a type from `quiche`, `rustls`, `boring`,
-//! `hyper`, or `smoltcp`, which is the whole point — those are how Boreas is
-//! built today and a host that named one would be pinned to that choice.
+//! Hosts provide a [`Platform`], construct a checked [`TunnelConfig`], run a
+//! [`Tunnel`], and persist certificate-authority material when interception is
+//! enabled. The API does not expose implementation-crate types.
 //!
-//! # The four things a host does
+//! The public contract is the configuration reachable from [`TunnelConfig`],
+//! [`Platform`], [`Tunnel`], [`Event`], and the error sums. `#[non_exhaustive]`
+//! applies to types hosts eliminate, not structs they construct; adding a
+//! field to a constructed struct remains source-compatible through
+//! [`Default`] where provided.
 //!
-//! 1. **Provide what only a platform can.** A TUN device, and sockets that do
-//!    not re-enter the tunnel. Both are [`Platform`].
-//! 2. **Describe the tunnel.** One [`TunnelConfig`] value, total and checked in
-//!    one place.
-//! 3. **Run it.** [`Tunnel::start`], then read [`Tunnel::next_event`] until it
-//!    stops.
-//! 4. **Keep what cannot be relearned.** Exactly one thing: the certificate
-//!    authority's material. See [`crate::intercept::ca`] for why that is the only one.
-//!
-//! # What is stable and what is not
-//!
-//! **Stable:** the shape of [`TunnelConfig`] and everything reachable from it,
-//! [`Platform`], [`Tunnel`]'s methods, [`Event`], and the error sums. A field
-//! may be added to a struct here; a variant may be added to an enum here; both
-//! are minor changes.
-//!
-//! **`#[non_exhaustive]` is on exactly the types a host *eliminates*** —
-//! [`Event`], [`Counters`], [`ConfigError`], [`StartError`], and the enums it
-//! may match on. It is deliberately *not* on the structs a host *constructs*,
-//! and the difference is not a nuance: on an eliminated type the attribute
-//! costs a caller one `_` arm and buys room to add a variant, while on a
-//! constructed struct it forbids the struct expression outright. Every config
-//! struct here carried it until `boreas-ffi` became the first consumer outside
-//! this crate and could not build one — the interface documented as stable had
-//! never been compiled against from outside, and could not have been.
-//!
-//! What replaces it for those structs is the ordinary Rust convention: build
-//! from [`Default`] where one exists and update the fields you mean, so a field
-//! added later reaches you with a value rather than a compile error.
-//!
-//! **Not stable, and not reachable from here:** every other item this crate
-//! exports. `Datapath`, `Shell`, `Session`, the egress traits, the DNS message
-//! codec, and the rewriting tier are all public because this crate's own tests
-//! and examples drive them directly, and all of them will change. A host that
-//! reaches past this module is choosing to track that.
-//!
-//! # What a host cannot set, and why
-//!
-//! Configuration here is *policy* — what a product or a user decides. It is not
-//! *mechanism*. A host cannot set the TLS or HTTP/2 fingerprint, because
-//! matching a browser exactly is the feature and a knob there is a knob that
-//! breaks it. It cannot set the dial deadlines in [`crate::Wait`], which come
-//! from what mobility measurements say rather than from taste, nor lengthen a
-//! NAT mapping below RFC 4787's floor, nor size the buffer pool's slices. It
-//! *can* set every ceiling that depends on the device it runs on, because a
-//! phone and a desktop differ by an order of magnitude there and only the host
-//! knows which one it is.
+//! Other crate exports are internal implementation surfaces. Hosts configure
+//! policy here; protocol fingerprints, deadlines, NAT floors, and pool slice
+//! sizes remain owned by the implementation, while device-dependent ceilings
+//! remain configurable.
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Instant};
 
@@ -73,38 +32,20 @@ use crate::{
 
 // ---------------------------------------------------------- Platform
 
-/// What only the platform can supply.
+/// Platform-owned device and tunnel-bypass capabilities.
 ///
-/// Two obligations, and each is a thing this crate is structurally unable to
-/// do. It cannot open the TUN, because on Android `VpnService` owns the
-/// descriptor's lifecycle and permissions and on Windows the Wintun session
-/// comes from a signed driver. And it cannot make a socket that leaves by a
-/// route other than the tunnel, because excluding one is `VpnService.protect`
-/// on Android and binding the physical interface's address on Windows.
-///
-/// **The second obligation is the one that is silent when it is skipped.** A
-/// socket that was not excluded still works — until the tunnel comes up, at
-/// which point every packet it sends re-enters the tunnel it was serving. The
-/// symptom is a resolver that hangs and a proxy that never connects, and the
-/// cause is three lines away in a different language. [`TunnelBypass`] exists
-/// to give that obligation a name.
+/// The crate cannot open platform TUN devices or make sockets bypass the
+/// tunnel. A missing bypass is a routing loop once the tunnel is active.
 pub struct Platform<D, B> {
-    /// The client's TUN. Raw IP packets in and out.
+    /// Client TUN carrying raw IP packets.
     pub device: D,
-    /// Sockets excluded from the tunnel: the egress's own, the resolver's, and
-    /// any relay's.
+    /// Sockets excluded from the tunnel for egress, DNS, and relay traffic.
     pub bypass: B,
 }
 
 // ------------------------------------------------------ Configuration
 
-/// One tunnel, described completely.
-///
-/// Five independent choices, which is why this is a product: where traffic
-/// leaves, how names are answered, what is done to what crosses, what the
-/// client's own link looks like, and how much this instance may hold. Nothing
-/// here is optional in the sense of "leave it out and something sensible
-/// happens" except where a `Default` says exactly what that something is.
+/// Complete tunnel configuration.
 pub struct TunnelConfig {
     pub egress: Egress,
     pub resolver: Resolver,
@@ -113,33 +54,17 @@ pub struct TunnelConfig {
     pub ceilings: Ceilings,
 }
 
-/// Where traffic leaves by.
-///
-/// **The variant decides the layer, and the layer decides everything
-/// downstream** — whether flows are terminated locally, whether datagrams need
-/// a relay, whether QUIC survives or is steered to HTTP/2. A host picks a
-/// variant; it never states a layer, because a variant that could disagree with
-/// its own layer is the defect [`crate::Egress`] was built to remove.
+/// Egress choice; the variant determines the accepted layer and flow behavior.
 #[non_exhaustive]
 pub enum Egress {
-    /// Out by the host's own routes, unchanged.
-    ///
-    /// **The ordinary configuration for a content blocker**, and the only one
-    /// in which nothing is proxied: connections are re-originated to the
-    /// address the client asked for, which is what lets filtering happen
-    /// without moving where traffic goes.
+    /// Direct host routing and NAT.
     Direct {
-        /// What the host's own NAT does to a mapping. A phone behind
-        /// carrier-grade NAT and a desktop with a public address are the same
-        /// code and different answers, and only the host can tell which.
+        /// Host NAT behavior, supplied because only the host can observe it.
         nat_behavior: NatBehavior,
     },
-    /// A WireGuard peer, carrying whole IP packets.
+    /// WireGuard peer carrying whole IP packets.
     WireGuard {
-        /// Where the peer is reached. **Not part of [`WireGuardConfig`]**,
-        /// because that value describes the cryptographic peer and this one
-        /// describes a socket: a peer that roams keeps its keys and changes
-        /// its address.
+        /// Peer socket address; cryptographic configuration can remain stable while it roams.
         peer: SocketAddr,
         config: WireGuardConfig,
     },
@@ -152,21 +77,14 @@ pub enum Egress {
     Hysteria2(Hysteria2Config),
 }
 
-/// How a VLESS stream is carried.
-///
-/// VLESS has no framing and no encryption of its own — everything that makes it
-/// survive a hostile network lives underneath it — so the transport is a
-/// separate choice rather than a field on [`VlessConfig`].
+/// VLESS transport. Framing and confidentiality belong to the selected transport.
 #[non_exhaustive]
 pub enum VlessTransport {
-    /// TCP, in the clear. Correct only underneath something that already
-    /// provides confidentiality, and named `Plain` so it cannot be mistaken for
-    /// something that does.
+    /// Clear TCP; use only beneath an already confidential path.
     Plain { server: SocketAddr },
-    /// TLS over TCP, wearing Chrome's hello.
+    /// TLS over TCP with the browser-shaped handshake.
     Tls(crate::TlsConfig),
-    /// A WebSocket over TLS, which is what a CDN-fronted deployment looks like
-    /// to whatever is in the way.
+    /// WebSocket over TLS.
     WebSocket {
         tls: crate::TlsConfig,
         settings: crate::WebSocketConfig,
@@ -176,166 +94,110 @@ pub enum VlessTransport {
         tls: crate::TlsConfig,
         settings: crate::GrpcConfig,
     },
-    /// An HTTP/1.1 Upgrade over TLS, and **raw bytes after it**.
-    ///
-    /// The same handshake a WebSocket performs — which is the part a CDN
-    /// inspects — without the per-message header and masking a WebSocket pays
-    /// for every frame afterwards. Choose it over [`Self::WebSocket`] wherever
-    /// the infrastructure in the way proxies an upgrade transparently, which is
-    /// what it was invented for.
+    /// HTTP/1.1 Upgrade over TLS; raw bytes follow the handshake.
     HttpUpgrade {
         tls: crate::TlsConfig,
         settings: crate::HttpUpgradeConfig,
     },
-    /// An ordinary HTTP/2 request whose body is the byte stream.
+    /// HTTP/2 request whose body carries the byte stream.
     Http {
         tls: crate::TlsConfig,
         settings: crate::HttpConfig,
     },
 }
 
-/// How names are answered.
+/// Name-resolution mode.
 #[non_exhaustive]
 pub enum Resolver {
-    /// The client's own stack resolves; queries cross the tunnel untouched.
-    ///
-    /// **Incompatible with filtering under a packet egress**, and
-    /// [`ConfigError::NothingToFilter`] says so at construction: on the packet
-    /// fast path a flow is selected for inspection because a DNS answer named
-    /// its address, so a tunnel that never sees a question can never select
-    /// one. It would carry traffic and filter nothing while reporting health.
+    /// Client resolution; incompatible with filtering on a packet egress.
     Passthrough,
-    /// Answered here, against the rules in [`Filtering`], forwarding what
-    /// policy allows.
+    /// Local policy evaluation and configured upstream forwarding.
     Local { upstream: Upstream },
 }
 
-/// Where an allowed question goes.
-///
-/// All four verify against the bundled Mozilla anchors rather than the platform
-/// store, deliberately: the set a resolver is trusted against should not be one
-/// a device owner or an MDM profile can widen.
+/// Upstream for allowed DNS questions; encrypted modes use bundled trust anchors.
 #[non_exhaustive]
 pub enum Upstream {
-    /// Cleartext DNS. Readable by anything on the path, and the only one that
-    /// needs no TLS.
+    /// Cleartext DNS.
     Do53 { resolver: SocketAddr },
-    /// DNS over TLS. `server_name` is what the certificate must carry, which is
-    /// not the address it lives at.
+    /// DNS over TLS; `server_name` is checked against the certificate.
     Dot {
         resolver: SocketAddr,
         server_name: String,
     },
     /// DNS over HTTPS.
     Doh { url: String, resolver: SocketAddr },
-    /// DNS over QUIC.
+    /// DNS over QUIC; `server_name` is checked against the certificate.
     Doq {
         resolver: SocketAddr,
         server_name: String,
     },
 }
 
-/// What this tunnel does to what it carries.
-///
-/// **The tiers are a chain, and the nesting is the chain.** Rules over names
-/// are the floor: everything above needs them. Interception is rules plus
-/// terminated TLS, so it cannot be configured without them and it carries the
-/// authority it mints under. Document rewriting is interception plus a body
-/// tier, so it lives inside interception and cannot be reached without it.
-///
-/// Written as three flat fields, "rewrite documents" and "do not intercept"
-/// would be a representable pair with no meaning, and something would have to
-/// notice at runtime. Here there is nothing to notice.
+/// Filtering policy. Optional nesting enforces the rule-to-interception-to-body
+/// tier dependency at construction time.
 pub struct Filtering {
-    /// Filter-list text, in the syntax [`crate::parse_rule`] accepts. The host
-    /// fetches and stores these; this crate compiles them and never keeps them.
-    ///
-    /// Empty means a tunnel that resolves locally and blocks nothing, which is
-    /// a real configuration: it is what encrypted DNS with no filtering is.
+    /// Filter-list text compiled when the tunnel starts or reloads.
     pub lists: Vec<String>,
-    /// Termination, when this tunnel intercepts. `None` stops at the name tier.
+    /// Optional interception tier.
     pub interception: Option<Interception>,
 }
 
-/// Terminating TLS for named hosts, and filtering the requests inside.
+/// Terminating TLS for an explicit host allowlist.
 pub struct Interception {
-    /// The hosts a person chose to intercept. **An allowlist, never a
-    /// pattern**: interception forges a certificate, and the set of hosts that
-    /// happens to should be one a user can read.
+    /// Hostnames to intercept; patterns are not accepted because certificates are forged.
     pub hosts: Vec<String>,
-    /// The authority to mint under, and whether it is new. See [`Trust`].
+    /// Authority material and its trust source.
     pub trust: Trust,
-    /// Body rewriting, when this tunnel rewrites. `None` stops at requests.
+    /// Optional HTML body rewriting tier.
     pub documents: Option<Documents>,
 }
 
-/// Rewriting HTML bodies as they stream past.
+/// Streaming HTML body rewriting configuration.
 pub struct Documents {
-    /// Memory one response may occupy while being rewritten. The ceiling is the
-    /// point: a document is transformed as it arrives rather than buffered
-    /// whole, and this is what makes that a bound rather than an intention.
+    /// Per-response memory budget; bodies are not buffered whole.
     pub budget: StreamBudget,
 }
 
-/// The client's own interface.
+/// Client link parameters.
 pub struct Link {
-    /// The MTU configured on the TUN.
-    ///
-    /// **Set the TUN to this and tell this the same number.** The tunnel is
-    /// narrower than the link by whatever the egress encapsulates, so a packet
-    /// between the two is one the client may legitimately send and the session
-    /// cannot carry — those are answered with an ICMP Packet Too Big, and a
-    /// [`Event::Counted`] whose `paths_reported` stays high is the symptom of
-    /// having told the two different numbers.
+    /// MTU configured on the client TUN; the device must use the same value.
     pub mtu: Mtu,
-    /// Local ports reserved for re-originated connections, and therefore never
-    /// themselves inspected.
+    /// Reserved source ports for re-originated connections.
     pub origination_ports: OriginationPorts,
 }
 
 impl Default for Link {
     fn default() -> Self {
         Self {
-            // The IPv6 minimum, which every path carries and no egress's
-            // overhead can push below the floor.
             mtu: Mtu::new(crate::MIN_IPV6_MTU).expect("the floor is a valid MTU"),
             origination_ports: crate::DEFAULT_ORIGINATION_PORTS,
         }
     }
 }
 
-/// How much one tunnel may hold.
-///
-/// **Every number here is about the device, which is why the host sets them.**
-/// A handset with 2 GB of RAM running a VPN service that Android will kill for
-/// using too much, and a desktop with 32 GB, want different answers, and
-/// nothing in this crate can tell which it is on.
+/// Device-dependent resource ceilings.
 #[derive(Clone, Copy, Debug)]
 pub struct Ceilings {
-    /// Payload buffers, shared by everything: forwarded packets, queued
-    /// datagrams, terminated segments, synthesized replies. `slices x
-    /// slice_size` is the whole memory budget for traffic in flight, and
-    /// exhaustion is a counted drop rather than a wait or an allocation.
+    /// Shared payload buffers; exhaustion is counted rather than allocated.
     pub buffer_slices: NonZeroUsize,
-    /// Datagrams one flow may have queued before further ones are dropped.
+    /// Queued datagrams per flow.
     pub datagrams_per_flow: NonZeroUsize,
-    /// Live terminated connections. Each is a socket in the local stack.
+    /// Live terminated connections.
     pub terminated_connections: NonZeroUsize,
-    /// Datagram associations through a proxy egress, when there is one.
+    /// Datagram associations through a proxy egress.
     pub associations: NonZeroUsize,
-    /// Addresses remembered as belonging to an inspected host.
+    /// Remembered addresses for inspected hosts.
     pub inspected_addresses: NonZeroUsize,
-    /// Fragmented packets held awaiting the rest of themselves.
+    /// Pending fragment reassemblies.
     pub pending_reassemblies: NonZeroUsize,
 }
 
 impl Default for Ceilings {
-    /// Sized for a phone, because that is where this runs and where being wrong
-    /// gets the process killed. A desktop host should raise them.
+    /// Defaults target a memory-constrained mobile host.
     fn default() -> Self {
         let at_least = |count: usize| NonZeroUsize::new(count).expect("a positive constant");
         Self {
-            // 2048 x 2 KiB is about 4 MiB of traffic in flight.
             buffer_slices: at_least(2048),
             datagrams_per_flow: at_least(32),
             terminated_connections: at_least(512),
@@ -346,38 +208,22 @@ impl Default for Ceilings {
     }
 }
 
-/// The size of one pooled buffer.
-///
-/// **Not configurable, and the reason is a correctness argument rather than a
-/// preference.** A slice must hold the largest thing this crate ever forwards —
-/// a full-MTU packet plus the local stack's framing — so a host that set it
-/// small would not save memory, it would turn every large packet into a counted
-/// drop. It is derived from [`Link::mtu`] instead.
+/// Extra capacity required beyond the link MTU for local framing.
 const SLICE_HEADROOM: usize = 128;
 
 // ------------------------------------------------------------ Errors
 
-/// A configuration this crate will not run, and why.
-///
-/// **Every variant is a combination that would run and do nothing**, rather
-/// than one that would crash. Those are the dangerous ones: a tunnel that
-/// carries traffic while filtering none of it reports itself healthy, and the
-/// user discovers it months later.
+/// A configuration this crate refuses to run.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
-    /// Filtering was asked for, names are passed through, and the egress
-    /// carries packets. On the fast path a flow is inspected because a DNS
-    /// answer named its address, so this combination would inspect nothing
-    /// while looking configured. Give it a [`Resolver::Local`].
+    /// Filtering cannot observe names when DNS passes through a packet egress.
     NothingToFilter,
-    /// Interception was asked for with no hosts. Forging certificates for the
-    /// empty set is the DNS tier with extra machinery, so say that instead.
+    /// Interception was requested without hosts.
     NoHostsToIntercept,
-    /// A host in the interception list is not a name. The offending text is
-    /// carried so the host can tell the user which line to fix.
+    /// An interception entry is not a valid hostname; the offending text is retained.
     NotAHost(String),
-    /// The link's MTU cannot absorb the egress's own overhead.
+    /// Link MTU cannot absorb egress overhead.
     LinkTooNarrow,
 }
 
@@ -396,27 +242,21 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Why a tunnel did not start.
+/// Why tunnel startup failed.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum StartError {
-    /// The configuration was refused before anything was built.
+    /// Configuration failed before construction.
     Config(ConfigError),
-    /// The certificate authority could not be opened. A
-    /// [`CaError::Material`] here means stored key material was lost or
-    /// corrupted, and the host's recovery is to generate afresh and ask the
-    /// user to trust the new root.
+    /// Certificate authority opening failed; material errors require regeneration and re-trust.
     Authority(CaError),
-    /// An egress could not be constructed from its configuration.
+    /// Egress construction failed.
     Egress(EgressError),
-    /// The datapath refused the combination it was handed. Distinct from
-    /// [`Self::Config`] because it comes from the layer that owns the
-    /// invariant rather than from this one's restatement of it.
+    /// Datapath construction failed.
     Datapath(DatapathError),
-    /// A socket the tunnel needs could not be opened through the bypass.
+    /// A required bypass socket could not be opened.
     Io(std::io::ErrorKind),
-    /// The local terminator cannot serve every inspected port under the
-    /// [`Ceilings::terminated_connections`] it was given. Raise it.
+    /// Termination limits cannot support the configured inspected ports.
     Termination(crate::TerminationError),
 }
 
@@ -467,33 +307,20 @@ impl From<std::io::Error> for StartError {
 
 // ----------------------------------------------------- The checked plan
 
-/// A configuration that has been checked, with everything the builder needs
-/// derived once.
-///
-/// **The point of parsing into this is that the builder below is total.** Every
-/// question a builder would otherwise ask mid-construction — does this
-/// terminate, does it need a relay, does it need an authority — is answered
-/// here, before a socket exists, so there is no half-built tunnel to unwind.
+/// Checked configuration with construction decisions derived once.
 #[derive(Debug)]
 struct Plan {
     filter: FilterPolicy,
     dns: DnsPolicy,
     accepts: Accepts,
-    /// Flows are terminated locally, so a TCP stack and a session driver are
-    /// needed. True whenever the egress carries flows — there is no packet to
-    /// forward — and whenever anything is intercepted.
+    /// Whether local TCP termination is required.
     terminates: bool,
-    /// Datagrams need an association through the egress rather than a packet
-    /// on the fast path. Exactly when the egress carries flows: a datagram is
-    /// never itself inspected, so interception does not move this.
+    /// Whether datagrams require proxy associations.
     relays: bool,
 }
 
 impl TunnelConfig {
-    /// The one boundary an untrusted configuration crosses to become a running
-    /// tunnel.
-    ///
-    /// O(hosts + lists), dominated by compiling the rules.
+    /// Validates configuration and derives construction decisions. O(hosts + lists).
     fn plan(&self) -> Result<Plan, ConfigError> {
         let accepts = self.egress.accepts();
         let intercepts = self.filtering.interception.is_some();
@@ -517,18 +344,13 @@ impl TunnelConfig {
             FilterPolicy::PassThrough
         };
 
-        // The datapath refuses this combination too, and rightly — but it
-        // refuses it after a pool, an egress, and a device have been built,
-        // and with a name that describes the core rather than the choice a
-        // person made. Saying it here is what makes the message actionable.
+        // Reject configurations that enable inspection without observable DNS.
         if filter == FilterPolicy::InspectHttp
             && dns == DnsPolicy::Forward
             && accepts == Accepts::IpPackets
         {
             return Err(ConfigError::NothingToFilter);
         }
-        // Filtering names without seeing questions is the same emptiness one
-        // tier down, and it is worth the same refusal.
         if dns == DnsPolicy::Forward && !self.filtering.lists.is_empty() {
             return Err(ConfigError::NothingToFilter);
         }
@@ -544,8 +366,7 @@ impl TunnelConfig {
 }
 
 impl Egress {
-    /// The layer this choice implies. Derived rather than configured, which is
-    /// what keeps a variant from disagreeing with its own layer.
+    /// Returns the layer implied by the selected variant.
     fn accepts(&self) -> Accepts {
         match self {
             Self::WireGuard { .. } => Accepts::IpPackets,
@@ -560,111 +381,69 @@ impl Egress {
 
 // ------------------------------------------------------------- Events
 
-/// What a host learns while a tunnel runs.
-///
-/// **Deliberately narrower than the core's own telemetry**, which names DNS
-/// record types, steering reasons, and per-flow endpoints. Those are how Boreas
-/// works today; a host that displayed them would be pinned to that. What is
-/// here is what a user interface can show and an operator can act on.
-///
-/// Counting variants report occurrences *since the previous report*, on a fixed
-/// interval, so an observer sums rather than diffs — and so a flood costs one
-/// message per interval rather than one per packet.
+/// Host-visible tunnel telemetry. Counting variants report occurrences since
+/// the previous report.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// One name was decided.
+    /// A name-resolution decision.
     Resolved {
         name: String,
-        /// Whether the answer was refused rather than forwarded.
+        /// Whether policy refused the name.
         blocked: bool,
-        /// The rule that decided it, when one did.
+        /// Matching rule, if any.
         rule: Option<String>,
     },
-    /// Rules were reloaded, and how many of each are now in force.
+    /// Rule counts after an atomic reload.
     Reloaded {
         allowed: usize,
         blocked: usize,
         inspected: usize,
     },
-    /// Aggregated counters since the previous one of these.
+    /// Aggregated counters since the previous report.
     Counted(Counters),
 }
 
-/// Occurrences since the previous [`Event::Counted`].
-///
-/// **Every field is a thing that went wrong or a thing that was refused.** A
-/// tunnel working normally reports zeroes, so a host can treat any non-zero
-/// field as worth showing without knowing what any of them mean.
+/// Counted drops and failures since the previous [`Event::Counted`].
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
-    /// Datagrams dropped because a queue was full or the buffer budget was
-    /// spent. Ordinary under load; sustained means [`Ceilings`] is too small
-    /// for this device's traffic.
+    /// Datagrams dropped by queue or buffer limits.
     pub datagrams_dropped: u64,
-    /// Packets that did not parse. Sustained means something upstream is
-    /// producing malformed traffic.
+    /// Packets rejected during parsing.
     pub packets_rejected: u64,
-    /// QUIC attempts refused so the browser falls back to HTTP/2, which is what
-    /// makes an inspected host inspectable. Expected to be non-zero whenever
-    /// interception is on, and expected to fall as browsers cache the fallback.
+    /// QUIC attempts steered to HTTP/2 for inspection.
     pub quic_steered: u64,
-    /// Over-sized packets answered with an ICMP Packet Too Big. **A number that
-    /// stays high is a misconfiguration**: the TUN's MTU was set wider than
-    /// [`Link::mtu`] says, so the client keeps sending what the tunnel cannot
-    /// carry.
+    /// Oversized packets answered with ICMP Packet Too Big.
     pub paths_reported: u64,
-    /// Events this tunnel produced and could not deliver, because the host was
-    /// not reading them fast enough. Counted so a gap never reads as quiet.
+    /// Events lost because the host did not consume them fast enough.
     pub events_lost: u64,
-    /// **A defect in Boreas, not a condition of the network.** Every other
-    /// field here is something a peer, a path, or a ceiling caused; this one is
-    /// a task that ended by panicking, which no input is supposed to be able to
-    /// do. One means a connection died for a reason nothing else records.
-    /// Sustained means a subsystem is failing every time it is used. Report it.
+    /// Tasks that ended by panicking; this indicates an internal defect.
     pub tasks_panicked: u64,
 }
 
 // ------------------------------------------------------- Running tunnel
 
-/// A running tunnel.
-///
-/// Dropping this does **not** stop it: the tasks own their own handles and a
-/// dropped `Tunnel` leaves them running until the process ends. Call
-/// [`Self::stop`], which cancels and waits — an ordered shutdown is what
-/// returns every pooled buffer and closes every socket, and a tunnel that
-/// vanished without one would leave the device's routes pointing at nothing.
+/// A running tunnel. Dropping it does not stop its tasks; call [`Self::stop`]
+/// for ordered cancellation and resource cleanup.
 pub struct Tunnel {
     shell: Shell,
-    /// Republishes compiled rules to the resolver without restarting anything.
-    /// A rebuild replaces the whole index at once, so no query is ever decided
-    /// against half a list.
+    /// Publishes complete compiled rule sets atomically.
     policy: watch::Sender<Arc<HostPolicy>>,
-    /// The tasks this tunnel spawned besides the shell's two: the terminator,
-    /// the session driver, the relay.
+    /// Tasks owned by the tunnel.
     tasks: TaskTracker,
     shutdown: CancellationToken,
-    /// Present exactly when this tunnel intercepts, which is exactly when there
-    /// is an authority to keep.
+    /// Authority retained when interception is enabled.
     authority: Option<Arc<CertificateAuthority>>,
 }
 
 impl Tunnel {
-    /// The material a host must store, and the root a user must trust.
-    ///
-    /// `None` when this tunnel does not intercept, which is also when there is
-    /// nothing to store: a host can call this unconditionally and write
-    /// whatever it gets.
+    /// Returns material the host must persist for future interception.
     pub fn authority(&self) -> Option<CaMaterial> {
         self.authority.as_ref().map(|ca| ca.material())
     }
 
-    /// The next thing worth telling a user, or `None` once the tunnel has
-    /// stopped.
-    ///
-    /// Cancel-safe: dropping the future loses nothing, because the event stays
-    /// in the channel until it is taken.
+    /// Returns the next host-visible event, or `None` after shutdown.
     pub async fn next_event(&mut self) -> Option<Event> {
         loop {
             let telemetry = self.shell.next_telemetry().await?;
@@ -674,21 +453,10 @@ impl Tunnel {
         }
     }
 
-    /// Replaces the rules in force, without restarting the tunnel or dropping a
-    /// connection.
-    ///
-    /// **A whole list set, never a delta.** A rebuild compiles a fresh index
-    /// and publishes it in one write, so every query is decided against exactly
-    /// one version — the one current when it was admitted. Applying edits
-    /// incrementally would make "which rules did this query see" a question
-    /// with no answer.
-    ///
-    /// O(total list length). Returns what is now in force.
+    /// Atomically replaces the rules without restarting connections. O(total list length).
     pub fn reload(&self, lists: &[String]) -> Event {
         let policy = compile(lists);
         let counts = policy.len();
-        // The receiver is held by tasks this tunnel owns, so a send fails only
-        // after `stop`, where a reload is a no-op rather than an error.
         let _ = self.policy.send(Arc::new(policy));
         Event::Reloaded {
             allowed: counts.allowed,
@@ -697,11 +465,7 @@ impl Tunnel {
         }
     }
 
-    /// Stops the tunnel and waits for every task it started.
-    ///
-    /// Ordered, and the order is the point: admission closes first, so nothing
-    /// new is accepted while what is in flight finishes. When this returns,
-    /// every socket is closed and every pooled buffer is back.
+    /// Cancels the tunnel and waits for its tasks and resources to close.
     pub async fn stop(self) -> std::io::Result<()> {
         self.shutdown.cancel();
         self.tasks.close();
@@ -710,11 +474,7 @@ impl Tunnel {
     }
 }
 
-/// Compiles filter-list text into the index a query is decided against.
-///
-/// Malformed lines are counted and skipped rather than refused: a list is
-/// fetched from the internet and one bad line in fifty thousand must not cost a
-/// user their whole rule set.
+/// Compiles filter-list text; malformed lines are skipped and counted.
 fn compile(lists: &[String]) -> HostPolicy {
     let mut policy = HostPolicy::new();
     for list in lists {
@@ -723,20 +483,12 @@ fn compile(lists: &[String]) -> HostPolicy {
     policy
 }
 
-/// Narrows the core's telemetry to what a host should see.
-///
-/// `None` for everything that is an implementation detail, which is most of it:
-/// a variant that is not projected is one a host was never told about and
-/// therefore one this crate is free to change.
+/// Projects internal telemetry onto the host-visible event set.
 fn project(telemetry: crate::Telemetry) -> Option<Event> {
     use crate::Telemetry;
     Some(match telemetry {
         Telemetry::Resolved(resolution) => Event::Resolved {
             name: resolution.name.to_string(),
-            // A refusal is answered from policy without anything leaving the
-            // device, which is exactly what `Provenance::Policy` records --
-            // and it is a stronger test than reading the response code, since
-            // a forwarded answer can carry NXDOMAIN for reasons of its own.
             blocked: resolution.provenance == crate::Provenance::Policy,
             rule: resolution.rule.as_ref().map(ToString::to_string),
         },
@@ -769,9 +521,7 @@ fn project(telemetry: crate::Telemetry) -> Option<Event> {
             tasks_panicked: count,
             ..Counters::default()
         }),
-        // Per-flow lifecycle, reassembly, and the internal refusal counters are
-        // this crate's business. A host that needed one of them would be
-        // debugging Boreas rather than running it.
+        // Keep internal lifecycle and refusal telemetry out of the public API.
         Telemetry::Event(_)
         | Telemetry::ReassemblyDiscarded(_)
         | Telemetry::TransmitsDropped(_)
@@ -783,20 +533,13 @@ fn project(telemetry: crate::Telemetry) -> Option<Event> {
 
 // ------------------------------------------------------ Composition
 
-/// The DNS upstreams, as one type.
-///
-/// [`crate::DnsUpstream`] returns `impl Future`, so it is not object-safe and a
-/// runtime-chosen upstream cannot be a `Box<dyn _>`. Dispatching over a closed
-/// sum is the standard answer and the better one here anyway: the set of
-/// transports is fixed by what DNS has, not by what a host might invent.
+/// Closed dispatch over the supported DNS upstream implementations.
 enum AnyUpstream<B> {
     Do53(crate::Do53Upstream<B>),
     Dot(crate::DotUpstream<B>),
     Doh(crate::DohUpstream<B>),
     Doq(crate::DoqUpstream<B>),
-    /// A tunnel that forwards questions never asks one, so this is never
-    /// consulted. It exists because [`Shell`] takes an upstream by value and
-    /// `Option` there would put a branch on a path that has none.
+    /// Placeholder for a tunnel whose DNS questions pass through.
     Unused,
 }
 
@@ -849,24 +592,16 @@ impl Upstream {
                 resolver,
                 &server_name,
                 bypass,
-                // Verification stays at quiche's default, which verifies. The
-                // factory exists so this crate's own tests can point at a
-                // throwaway resolver; a host has no business relaxing it.
                 Box::new(crate::DoqUpstream::<B>::quic_config),
             )),
         })
     }
 }
 
-/// The network socket a packet egress's encapsulated datagrams travel on.
-///
-/// A flow egress has none — its bytes go out through the proxy's own
-/// connections — but [`Shell`] takes one by value, so the absence is a variant
-/// rather than an `Option` the reactor would have to branch on per datagram.
+/// Underlay for packet-egress datagrams.
 enum Underlay {
     Peer(tokio::net::UdpSocket),
-    /// Never ready, never writable. A reactor selecting over it simply never
-    /// wins that arm.
+    /// No underlay exists for a flow egress.
     Absent,
 }
 
@@ -893,16 +628,8 @@ impl crate::AsyncNetwork for Underlay {
 }
 
 impl Tunnel {
-    /// Builds and starts everything, on the current tokio runtime.
-    ///
-    /// **This is the only place the whole thing is assembled**, and that is
-    /// deliberate: a datapath, a reactor, a TCP stack, a session driver, a
-    /// datagram relay, and a resolver are six components joined by nine
-    /// channels whose directions are not guessable, and every host that had to
-    /// wire them itself would wire them slightly differently.
-    ///
-    /// The configuration is checked in full before a socket is opened, so a
-    /// refusal leaves nothing to unwind and nothing half-started.
+    /// Validates, assembles, and starts a tunnel on the current Tokio runtime.
+    /// Configuration is checked before any socket is opened.
     pub async fn start<D, B>(
         config: TunnelConfig,
         platform: Platform<D, B>,
@@ -912,10 +639,6 @@ impl Tunnel {
         B: TunnelBypass + Clone + 'static,
     {
         let plan = config.plan()?;
-        // Destructured once, so every step below moves what it needs instead of
-        // borrowing a whole configuration and cloning out of it. A pre-shared
-        // key that was cloned would outlive the value the host meant to hand
-        // over exactly once.
         let TunnelConfig {
             egress,
             resolver,
@@ -925,9 +648,6 @@ impl Tunnel {
         } = config;
         let Platform { device, bypass } = platform;
 
-        // One budget for everything in flight. The slice holds a full-MTU
-        // packet plus the local stack's framing, which is why it is derived
-        // from the link rather than configured.
         let pool = BufferPool::new(
             NonZeroUsize::new(usize::from(link.mtu.get()) + SLICE_HEADROOM)
                 .expect("an MTU is positive"),
@@ -950,15 +670,12 @@ impl Tunnel {
 
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
-        // One token and one counter for every subsystem this tunnel spawns, so
-        // one cancellation stops them all and one report covers their defects.
         let supervision = crate::Supervision {
             shutdown: shutdown.clone(),
             panics: crate::Panics::new(),
         };
         let (policy_tx, policy_rx) = watch::channel(Arc::new(compile(&filtering.lists)));
 
-        // The terminator and the session driver, when flows are terminated.
         let (termination, authority) = if plan.terminates {
             let (built, authority) = start_termination(
                 filtering,
@@ -974,13 +691,9 @@ impl Tunnel {
             (None, None)
         };
 
-        // The datagram relay, when datagrams travel as associations rather than
-        // as packets.
         let relay = plan.relays.then(|| {
             let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_DEPTH);
             let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_DEPTH);
-            // The relay reports its own refusals on a channel of its own; they
-            // are folded into the same counters everything else is.
             let (counts_tx, _counts_rx) = mpsc::channel(CHANNEL_DEPTH);
             tasks.spawn(crate::run_relay(
                 Arc::clone(&assembly.flows),
@@ -1027,18 +740,10 @@ impl Tunnel {
     }
 }
 
-/// Depth of the channels joining this tunnel's tasks. Bounded is the point; the
-/// exact depth trades burst tolerance against queueing delay, and the shell
-/// uses the same number for the same reason.
+/// Capacity of channels joining tunnel tasks.
 const CHANNEL_DEPTH: usize = 256;
 
-/// Spawns the local TCP stack and the session driver, and opens the authority
-/// if this tunnel intercepts.
-///
-/// Returns the reactor's half of the terminator's channels, and the authority
-/// to keep. The authority is `None` for a tunnel that terminates without
-/// intercepting — a flow egress with no interception still needs a TCP stack,
-/// because there is no packet to forward, but it forges no certificates.
+/// Starts local termination and session handling, opening an authority only for interception.
 fn start_termination(
     filtering: Filtering,
     link: &Link,
@@ -1065,9 +770,6 @@ fn start_termination(
     let (replies_tx, replies_rx) = mpsc::channel(CHANNEL_DEPTH);
     let (accepted_tx, accepted_rx) = mpsc::channel(CHANNEL_DEPTH);
 
-    // The terminator is one long-lived task rather than one per connection, so
-    // it needs the token but not the counter: if *it* panics the tunnel stops
-    // terminating entirely, which the session driver's own silence reports.
     tasks.spawn(supervision.panics.watch(crate::run_terminator(
         stack,
         packets_rx,
@@ -1081,9 +783,6 @@ fn start_termination(
         interception,
     } = filtering;
     let Some(interception) = interception else {
-        // Terminated but not intercepted: the session driver still runs,
-        // because a terminated flow needs re-originating whether or not anyone
-        // reads it, and its allowlist is empty so every host is spliced.
         let sessions = build_sessions(lists, None, ceilings, flows, None)?;
         tasks.spawn(crate::run_sessions(
             accepted_rx,
@@ -1134,10 +833,6 @@ fn build_sessions(
     flows: Arc<dyn StreamEgress>,
     authority: Option<Arc<CertificateAuthority>>,
 ) -> Result<Arc<crate::Sessions>, StartError> {
-    // An authority is needed to build an interceptor at all, so a tunnel that
-    // terminates without intercepting gets a throwaway one whose leaves are
-    // never minted: the allowlist below is empty, so every host is spliced
-    // before a certificate is asked for.
     let authority = match authority {
         Some(authority) => authority,
         None => Arc::new(CertificateAuthority::generate()?),
@@ -1164,18 +859,13 @@ fn build_sessions(
     Ok(Arc::new(sessions))
 }
 
-/// Turns the configuration's ceilings into the core's own limits.
+/// Converts host-facing ceilings into core limits.
 fn limits(link: &Link, ceilings: &Ceilings, plan: &Plan) -> Limits {
     Limits {
         reassembly_timeout: std::time::Duration::from_secs(30),
         max_pending_reassemblies: ceilings.pending_reassemblies,
-        // RFC 4787 REQ-5's floor. Not configurable: a shorter mapping is one a
-        // NAT on the path would outlive, which turns a live flow into a black
-        // hole, and `UdpFlowTable` refuses it anyway.
         flow_idle_timeout: std::time::Duration::from_secs(120),
         datagram_buffer_capacity: ceilings.datagrams_per_flow,
-        // Long enough to outlast a browser's cached Alt-Svc entry for an
-        // origin, which the DNS rewrite alone cannot reach.
         inspection_window: std::time::Duration::from_secs(60),
         max_inspected_addresses: ceilings.inspected_addresses,
         inspected_ports: crate::DEFAULT_INSPECTED_PORTS,
@@ -1183,25 +873,18 @@ fn limits(link: &Link, ceilings: &Ceilings, plan: &Plan) -> Limits {
     }
 }
 
-/// Builds the configured egress, and the network socket a packet egress needs.
+/// Builds the configured egress and its packet underlay, if any.
 async fn build_egress<B: TunnelBypass + Clone + 'static>(
     choice: Egress,
     bypass: &B,
     pool: &Arc<BufferPool>,
 ) -> Result<(crate::Egress, Underlay), StartError> {
-    // Every arm moves its configuration in rather than cloning it: a
-    // configuration is consumed to build a tunnel, and the one thing a host
-    // would notice about a clone here is the copy of its pre-shared key that
-    // stayed alive afterwards.
     Ok(match choice {
         Egress::Direct { nat_behavior } => (
             crate::Egress::Stream(Box::new(DirectEgress::new(bypass.clone(), nat_behavior))),
             Underlay::Absent,
         ),
         Egress::WireGuard { peer, config } => {
-            // The socket the peer is reached on. Through the bypass, because a
-            // tunnel whose own underlay went through itself is the loop this
-            // crate exists on the other side of.
             let socket = bypass.udp(peer).await?;
             (
                 crate::Egress::Packet(Box::new(WireGuardEgress::new(config, Arc::clone(pool)))),
@@ -1304,8 +987,7 @@ mod tests {
         }
     }
 
-    /// A device that never produces a packet and swallows what it is given.
-    /// Enough to start a tunnel, which is what these tests are about.
+    /// Device stub sufficient to start a tunnel without network I/O.
     struct Silent;
 
     impl AsyncDevice for Silent {
@@ -1337,10 +1019,7 @@ mod tests {
         }
     }
 
-    /// **The composition nothing in this repository did before.** A datapath, a
-    /// reactor, a TCP stack, a session driver, a datagram relay, and a resolver
-    /// are six components joined by nine channels; this is the test that says
-    /// they join.
+    /// The complete component assembly starts and stops cleanly.
     #[tokio::test]
     async fn a_filtering_tunnel_over_a_direct_egress_starts_and_stops() {
         let tunnel = Tunnel::start(
@@ -1363,9 +1042,7 @@ mod tests {
         tunnel.stop().await.expect("and it stops in order");
     }
 
-    /// The same tunnel with nothing intercepted: it still terminates, because a
-    /// flow egress has no packet to forward, but it forges nothing and so has
-    /// nothing for the host to store.
+    /// Flow termination without interception does not retain authority material.
     #[tokio::test]
     async fn a_tunnel_that_does_not_intercept_has_nothing_to_keep() {
         let tunnel = Tunnel::start(
@@ -1384,9 +1061,7 @@ mod tests {
         tunnel.stop().await.unwrap();
     }
 
-    /// **The root a user trusted comes back.** This is the whole persistence
-    /// story observed from the outside: a host stores what the first tunnel
-    /// handed it, and the second mints under the same root.
+    /// Persisted authority material is reused after restart.
     #[tokio::test]
     async fn a_restarted_tunnel_keeps_the_root_the_user_trusted() {
         let first = Tunnel::start(
@@ -1427,9 +1102,7 @@ mod tests {
         second.stop().await.unwrap();
     }
 
-    /// **Every refusal here is a configuration that would run and filter
-    /// nothing.** Those are the dangerous ones: the tunnel reports itself
-    /// healthy and the user finds out months later.
+    /// Configurations that cannot apply filtering are refused before startup.
     #[test]
     fn a_configuration_that_would_filter_nothing_is_refused_before_anything_is_built() {
         let cases = [
@@ -1483,9 +1156,7 @@ mod tests {
         }
     }
 
-    /// A host that is not a name is a line in a settings screen the user
-    /// mistyped, so the offending text comes back with the error rather than
-    /// being silently dropped from the list.
+    /// Invalid host input is retained in the configuration error.
     #[test]
     fn an_intercepted_host_that_is_not_a_name_names_itself() {
         let config = config(
@@ -1504,9 +1175,7 @@ mod tests {
         );
     }
 
-    /// The layer follows from the variant and cannot be stated separately,
-    /// which is what stops a configuration from claiming a layer its egress
-    /// does not accept.
+    /// The egress variant determines accepted layer and derived decisions.
     #[test]
     fn the_layer_follows_from_the_egress_and_the_rest_follows_from_the_layer() {
         let packets = config(
