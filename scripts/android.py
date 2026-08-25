@@ -63,11 +63,14 @@ turns testing off and then includes the NDK's own is the one seam available.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import doctest
 import enum
+import io
 import os
 import platform
 import sys
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -274,6 +277,63 @@ def lookup(name: str) -> Abi:
         raise KeyError(f"no such ABI {name!r}; the NDK has {offered}") from None
 
 
+def smoke() -> int:
+    """Run `main` end to end for every ABI against a fabricated NDK.
+
+    **The doctests above cover the table; this covers the half that touches a
+    filesystem and an argument parser.** That half is where a shadowed name or
+    a mistyped key actually lives — and a `--selftest` that proves the pure
+    core while `--env` cannot run at all is a green check reporting nothing.
+
+    Nothing is compiled here. What is asserted is that every ABI produces a
+    complete environment and a wrapper that turns testing off, which is exactly
+    what a CI step consumes.
+    """
+    bin_dir = Path("toolchains/llvm/prebuilt") / HOST_TAGS[platform.system()] / "bin"
+    failures = 0
+
+    with tempfile.TemporaryDirectory() as scratch:
+        ndk = Path(scratch)
+        (ndk / bin_dir).mkdir(parents=True)
+        ndk_toolchain_file(ndk).parent.mkdir(parents=True)
+        ndk_toolchain_file(ndk).touch()
+        (ndk / bin_dir / "llvm-ar").touch()
+        for abi in ABIS.values():
+            for suffix in ("clang", "clang++"):
+                (ndk / bin_dir / f"{abi.clang}{DEFAULT_API}-{suffix}").touch()
+
+        for name, abi in ABIS.items():
+            emitted = io.StringIO()
+            with contextlib.redirect_stdout(emitted):
+                status = main(["--env", name, "--ndk", str(ndk)])
+            printed = dict(
+                line.split("=", 1) for line in emitted.getvalue().splitlines()
+            )
+            expected = {
+                f"CC_{abi.rust.replace('-', '_')}",
+                f"CXX_{abi.rust.replace('-', '_')}",
+                f"AR_{abi.rust.replace('-', '_')}",
+                f"CARGO_TARGET_{abi.rust.replace('-', '_').upper()}_LINKER",
+                "ANDROID_NDK_HOME",
+                f"CMAKE_TOOLCHAIN_FILE_{abi.rust}",
+            }
+            wrapper = Path(printed.get(f"CMAKE_TOOLCHAIN_FILE_{abi.rust}", os.devnull))
+            for complaint, ok in [
+                (f"{name}: --env exited {status}", status == Exit.OK),
+                (f"{name}: emitted {set(printed)}", set(printed) == expected),
+                (f"{name}: no wrapper at {wrapper}", wrapper.is_file()),
+                (
+                    f"{name}: wrapper does not disable testing",
+                    wrapper.is_file() and "BUILD_TESTING OFF" in wrapper.read_text(),
+                ),
+            ]:
+                if not ok:
+                    print(f"android: {complaint}", file=sys.stderr)
+                    failures += 1
+
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     what = parser.add_mutually_exclusive_group(required=True)
@@ -302,11 +362,13 @@ def main(argv: list[str] | None = None) -> int:
         results = doctest.testmod(
             verbose=False, optionflags=doctest.IGNORE_EXCEPTION_DETAIL
         )
+        failures = smoke()
         print(
-            f"android: {results.attempted} doctests, {results.failed} failed",
+            f"android: {results.attempted} doctests, {results.failed} failed; "
+            f"{len(ABIS)} ABIs smoke-tested, {failures} failed",
             file=sys.stderr,
         )
-        return Exit.ERROR if results.failed else Exit.OK
+        return Exit.ERROR if results.failed or failures else Exit.OK
 
     if arguments.abis:
         print("\n".join(ABIS))
@@ -342,8 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     # script nor the file it could not find — and the C++ wrapper is checked
     # alongside the C one precisely because its absence is the failure that
     # otherwise reaches the final link disguised as an architecture mismatch.
-    toolchain = ndk_toolchain_file(root)
-    for required in (clang, Path(f"{clang}++"), toolchain):
+    for required in (clang, Path(f"{clang}++"), ndk_toolchain_file(root)):
         if not required.is_file():
             print(f"missing from the NDK: {required}", file=sys.stderr)
             return Exit.ERROR

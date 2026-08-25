@@ -43,8 +43,10 @@ which is not a distinction anything here draws.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import doctest
 import enum
+import io
 import re
 import subprocess
 import sys
@@ -287,6 +289,65 @@ def released() -> list[Version]:
     ]
 
 
+def smoke() -> int:
+    """Run `main` against this repository, for the same reason `android.py`
+    does: doctests prove the algebra and nothing about the argument parser or
+    the two files it reads.
+
+    The gate is checked from both sides — the crate's own version is accepted,
+    a version that is not it is refused, and a string that is not a release tag
+    is refused before either is consulted.
+    """
+    declared = crate_version(ROOT / "Cargo.toml")
+    wrong = declared.bump_patch()
+    failures = 0
+
+    def gate(tag: str) -> int:
+        """`--check`, with its diagnostics swallowed: three of the five cases
+        below are *expected* refusals, and a passing selftest should be quiet."""
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            return main(["--check", tag])
+
+    for complaint, ok in [
+        (
+            "--next did not produce a pre-release tag",
+            isinstance(parse(next_tag()), PreRelease),
+        ),
+        (f"--check rejected v{declared}", gate(f"v{declared}") == Exit.OK),
+        (
+            f"--check accepted v{wrong}",
+            gate(f"v{wrong}") == Exit.MALFORMED,
+        ),
+        (
+            "--check accepted a pre-release tag",
+            gate(next_tag()) == Exit.MALFORMED,
+        ),
+        (
+            "--check accepted a bare version",
+            gate(str(declared)) == Exit.MALFORMED,
+        ),
+    ]:
+        if not ok:
+            print(f"release: {complaint}", file=sys.stderr)
+            failures += 1
+
+    return failures
+
+
+def next_tag() -> str:
+    """The pre-release tag this commit would be published under."""
+    return str(
+        PreRelease(
+            base(released(), crate_version(ROOT / "Cargo.toml")),
+            datetime.now(timezone.utc),
+            git("rev-parse", f"--short={COMMIT_CHARS}", "HEAD"),
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     what = parser.add_mutually_exclusive_group(required=True)
@@ -299,18 +360,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if arguments.selftest:
         results = doctest.testmod(verbose=False)
+        failures = smoke()
         print(
-            f"release: {results.attempted} doctests, {results.failed} failed",
+            f"release: {results.attempted} doctests, {results.failed} failed; "
+            f"the gate smoke-tested, {failures} failed",
             file=sys.stderr,
         )
-        return Exit.ERROR if results.failed else Exit.OK
+        return Exit.ERROR if results.failed or failures else Exit.OK
 
     manifest = ROOT / "Cargo.toml"
 
     if arguments.next:
-        stamp = datetime.now(timezone.utc)
-        commit = git("rev-parse", f"--short={COMMIT_CHARS}", "HEAD")
-        print(PreRelease(base(released(), crate_version(manifest)), stamp, commit))
+        print(next_tag())
         return Exit.OK
 
     # The gate. A release is the one tag a human types, so it is the one that
