@@ -1,62 +1,13 @@
-//! The originating side of interception: the ClientHello Boreas sends upstream.
+//! Originates upstream TLS with a mirrored ClientHello.
 //!
-//! **rustls is the server and BoringSSL is the client, and the asymmetry is the
-//! design.** Terminating the local browser has no fidelity requirement — the
-//! peer is an application on this device and nothing fingerprints it — so
-//! [`Interceptor`](crate::Interceptor) keeps rustls and its memory safety.
-//! Every leg that *dials out* is fingerprinted by whoever answers, and rustls
-//! has no supported way to shape a ClientHello: extension order, GREASE
-//! placement, and JA3/JA4-matching hellos are long-standing open requests, and
-//! `Acceptor` only lets a caller *read* a peer's. BoringSSL is what Chrome
-//! itself speaks, so matching it is configuration rather than reimplementation.
+//! Local TLS termination uses rustls. Every connection Boreas initiates uses
+//! BoringSSL, which can reproduce the client profile or use
+//! [`ClientProfile::chrome`] when no ClientHello exists to copy.
 //!
-//! **Every dialling leg comes through here**, not only interception: the
-//! VLESS-family transports, whose premise is looking like a browser reaching a
-//! website, and the encrypted DNS upstreams, whose query is the first thing a
-//! connection does. Those two have no client hello to copy, so they wear
-//! [`ClientProfile::chrome`] instead of a mirror.
-//!
-//! **The target is the client on this device, not a canonical Chrome.** Boreas
-//! already holds the real ClientHello — it terminated the connection to read the
-//! SNI — so the cipher list, groups, signature algorithms, GREASE, and
-//! certificate compression are sitting in bytes already parsed. Mirroring them
-//! is self-consistent on any device: Chrome gets Chrome, WebView gets WebView,
-//! and a Firefox that routes through here gets Firefox. A hardcoded Chrome
-//! profile would be exactly right for one client and would manufacture a fresh
-//! mismatch for every other, while needing maintenance against Chrome's
-//! four-week release train.
-//!
-//! It also does something a fixed profile cannot advertise its way out of:
-//! BoringSSL's *default* supported groups are `X25519`, `P-256`, and `P-384`,
-//! so an unmirrored hello cannot carry `X25519MLKEM768` at all — the group
-//! current Chrome always offers, and the one a stale TLS stack is most visibly
-//! missing.
-//!
-//! **What is mirrored, and what is not.** Mirrored: supported groups, signature
-//! algorithms, certificate-compression algorithms, GREASE, and extension
-//! permutation. Not mirrored, because BoringSSL does not expose it: an explicit
-//! extension *order* (only randomised permutation, which is what Chrome does
-//! anyway), and ALPS. The TLS 1.3 cipher suites are fixed in BoringSSL and
-//! already match Chrome's, since Chrome is BoringSSL.
-//!
-//! **ALPN is mirrored, and the origin is what picks from it.** The upstream
-//! handshake offers the client's own list ([`Offer`]) and the client's handshake
-//! is then given exactly the one protocol the origin agreed to, so a crossed
-//! HTTP version stays unrepresentable while an origin that speaks only
-//! HTTP/1.1 is still served. Offering the client's *choice* upstream instead
-//! would send `h2` alone to such an origin and be refused outright — a site
-//! Chrome loads without complaint, lost to a one-entry ALPN list that is also
-//! nothing a browser sends.
-//!
-//! **The HTTP/2 half is here too, and it is not mirrored — it is Chrome's.**
-//! [`H2Profile`] carries the four fields the Akamai fingerprint reads. The
-//! asymmetry with the ClientHello above is forced rather than chosen: a
-//! ClientHello arrives before anything is decrypted, so Boreas holds the
-//! client's own bytes, while an HTTP/2 preface arrives *inside* the connection
-//! this process terminates and is consumed by hyper's server before any of it
-//! could be copied. Reproducing the client's preface would mean reading frames
-//! hyper has already turned into a `Request`. So the upstream preface is a
-//! constant, and [`H2Profile::CHROME`] is what it is set to.
+//! Supported groups, signature algorithms, certificate compression, GREASE,
+//! and ALPN are mirrored where the BoringSSL API permits. HTTP/2 uses the
+//! fixed Chrome profile because the local preface is consumed before it can be
+//! copied.
 
 use std::{
     collections::HashMap,
@@ -77,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::wire::Reader;
 
-/// Handshake extensions this module reads out of a ClientHello.
+/// ClientHello extensions read by this module.
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXTENSION_SIGNATURE_ALGORITHMS: u16 = 0x000d;
@@ -87,39 +38,18 @@ const EXTENSION_ALPN: u16 = 0x0010;
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const NAME_TYPE_HOST: u8 = 0x00;
 
-/// RFC 8879's identifier for Brotli certificate compression. Compared against
-/// codepoints read off the wire, so it is the number rather than boring's
-/// constant, which carries no accessor to compare with.
+/// RFC 8879 Brotli certificate-compression identifier.
 const BROTLI_ALGORITHM: u16 = 2;
 
-/// How many distinct (profile, wire) pairs keep a built connector.
-///
-/// A device runs a handful of TLS clients, so this is generous in practice.
-/// It is a cap rather than an eviction policy because the profile is derived
-/// from bytes a local application chooses: without a bound, an application that
-/// varied its hello per connection would grow this map without limit, and an
-/// LRU would spend more code on that case than it is worth. Overflow clears,
-/// which costs one rebuild per profile and never unbounded memory.
+/// Maximum number of cached (profile, ALPN) connectors.
 const MAX_CACHED_CONNECTORS: usize = 16;
 
-/// Whether a codepoint is one of the GREASE values reserved by RFC 8701.
-///
-/// They are the sixteen values whose bytes are equal and whose low nibbles are
-/// `0xA` — `0x0A0A`, `0x1A1A`, through `0xFAFA`. A client that sends one is
-/// exercising the extension-tolerance mechanism, and a client that sends none
-/// is not; reproducing that is a single bit of the profile.
+/// Whether a codepoint is an RFC 8701 GREASE value.
 const fn is_grease(value: u16) -> bool {
     value >> 8 == value & 0x00ff && value & 0x000f == 0x000a
 }
 
-/// The BoringSSL name for an IANA group codepoint, or `None` for a group this
-/// build cannot express.
-///
-/// A closed table taken from BoringSSL's own `kNamedGroups`, because
-/// `set_curves_list` speaks names rather than codepoints. An unknown codepoint
-/// is dropped rather than refused: a client offering a group this BoringSSL
-/// does not implement still gets a handshake, one group shorter, which is the
-/// same fail-open the rest of interception takes.
+/// Maps an IANA group codepoint to a BoringSSL name.
 const fn group_name(codepoint: u16) -> Option<&'static str> {
     Some(match codepoint {
         23 => "P-256",
@@ -133,46 +63,26 @@ const fn group_name(codepoint: u16) -> Option<&'static str> {
     })
 }
 
-/// What a ClientHello asked for, reduced to what BoringSSL can be told.
-///
-/// [`Default`] is the honest identity: an empty profile applies nothing and
-/// leaves BoringSSL's own defaults in place, which is what a flow whose hello
-/// could not be parsed gets. Every field is therefore "what to override",
-/// never "what the peer must have sent".
+/// ClientHello features that can override BoringSSL defaults.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ClientProfile {
-    /// Supported groups, in the client's order, as BoringSSL names.
+    /// Supported groups in client order.
     groups: Vec<&'static str>,
-    /// Signature algorithms, in the client's order. These are IANA codepoints
-    /// on both sides, so they map through with no table.
+    /// Signature algorithms in client order.
     sigalgs: Vec<u16>,
-    /// Certificate-compression algorithms the client advertised.
+    /// Advertised certificate-compression algorithms.
     compression: Vec<u16>,
-    /// Whether the client sent GREASE values.
+    /// Whether the client advertised GREASE.
     grease: bool,
 }
 
 impl ClientProfile {
-    /// Chrome's own hello, for a leg that has no client to mirror.
-    ///
-    /// **The fallback is a stated profile, not the empty one.** An empty profile
-    /// leaves BoringSSL's defaults — `X25519`, `P-256`, `P-384` — which cannot
-    /// carry `X25519MLKEM768` and so name a TLS stack years older than the
-    /// browser this build otherwise reproduces. Every leg that dials out
-    /// without a ClientHello to copy uses this: the VLESS-family transports,
-    /// whose whole premise is looking like a browser reaching a website, and the
-    /// encrypted DNS upstreams.
-    ///
-    /// Mirroring is still preferred wherever a hello exists, for the reason this
-    /// module opens with: a fixed profile is right for one client and wrong for
-    /// every other, and needs maintaining against a four-week release train.
+    /// Chrome profile for an originating leg with no ClientHello to mirror.
     #[must_use]
     pub fn chrome() -> Self {
         Self {
             groups: vec!["X25519MLKEM768", "X25519", "P-256", "P-384"],
-            // ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, rsa_pkcs1_sha256,
-            // ecdsa_secp384r1_sha384, rsa_pss_rsae_sha384, rsa_pkcs1_sha384,
-            // rsa_pss_rsae_sha512, rsa_pkcs1_sha512.
+            // Chrome's advertised signature-algorithm order.
             sigalgs: vec![
                 0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
             ],
@@ -181,31 +91,26 @@ impl ClientProfile {
         }
     }
 
-    /// Whether this profile overrides anything at all.
+    /// Whether the profile is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 
-    /// The groups this profile will ask for, for tests and diagnostics.
+    /// Supported groups for diagnostics.
     #[must_use]
     pub fn groups(&self) -> &[&'static str] {
         &self.groups
     }
 
-    /// Whether the client advertised Brotli certificate compression, which is
-    /// the only algorithm this build can answer.
+    /// Whether Brotli certificate decompression is enabled.
     #[must_use]
     pub fn compresses_certificates(&self) -> bool {
         self.compression.contains(&BROTLI_ALGORITHM)
     }
 }
 
-/// What one ClientHello revealed: the name a policy needs, and the shape an
-/// upstream handshake should reproduce.
-///
-/// One value from one pass, because the two facts come from the same bytes and
-/// a second traversal could only disagree with the first.
+/// Host, TLS profile, and ALPN extracted from one ClientHello.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hello {
     pub host: Option<crate::DomainName>,
@@ -213,29 +118,12 @@ pub struct Hello {
     pub alpn: Offer,
 }
 
-/// The application protocols a client offered, reduced to the ones Boreas can
-/// terminate and kept in the client's own order.
-///
-/// **This is what lets the origin settle the wire.** The upstream handshake
-/// offers this list verbatim, the origin picks one, and the client's handshake
-/// is then given that one and no other. An origin that speaks only HTTP/1.1 is
-/// therefore served over HTTP/1.1 on both legs, where offering the client's
-/// choice would have offered `h2` alone and been refused.
-///
-/// Empty is a real value meaning *negotiate nothing*: a client that sent no ALPN
-/// extension, or offered only protocols this cannot terminate. RFC 7301 makes
-/// that HTTP/1.1 on both sides, which is what a bare HTTP/1.1 client already
-/// expects.
+/// Client ALPN offer reduced to protocols Boreas can terminate.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Offer(Vec<crate::Wire>);
 
 impl Offer {
-    /// The protocols named in an `application_layer_protocol_negotiation`
-    /// extension body, keeping only what [`Wire`](crate::Wire) admits.
-    ///
-    /// Total on untrusted input: a body this cannot read is an empty offer.
-    /// O(bytes), and the result is bounded by [`Wire::ALL`](crate::Wire::ALL)
-    /// however long the client's list is.
+    /// Reads supported protocols from an ALPN extension body.
     fn read(body: &[u8]) -> Self {
         let Some(list) = Reader::new(body).vector_u16() else {
             return Self::default();
@@ -243,9 +131,7 @@ impl Offer {
         let mut wires = Vec::new();
         let mut reader = Reader::new(list);
         while let Some(name) = reader.vector_u8() {
-            // `h3` and anything else is dropped rather than carried: this leg
-            // is TCP, and a protocol the exchange cannot serve is one the
-            // origin must not be allowed to pick.
+            // This TCP leg cannot carry HTTP/3.
             if let Some(wire) = crate::Wire::from_identifier(name)
                 && !wires.contains(&wire)
             {
@@ -255,13 +141,13 @@ impl Offer {
         Self(wires)
     }
 
-    /// The wires offered, in the client's order.
+    /// Supported protocols in client order.
     #[must_use]
     pub fn wires(&self) -> &[crate::Wire] {
         &self.0
     }
 
-    /// This offer in ALPN wire format, ready for a handshake.
+    /// Encodes the offer for a TLS handshake.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let names: Vec<&[u8]> = self.0.iter().map(|wire| wire.identifier()).collect();
@@ -269,17 +155,7 @@ impl Offer {
     }
 }
 
-/// Reads one handshake record.
-///
-/// Total on untrusted input: every byte sequence is *some* [`Hello`], and the
-/// ones this cannot interpret yield an empty one, which applies no overrides
-/// and names no host. There is deliberately no error case — a parser with one
-/// would force every caller to choose a fallback, and one of them would
-/// eventually choose to intercept.
-///
-/// One forward pass over the record, $O(n)$ in its bytes, bounded by the
-/// 2^14-byte maximum of a TLS record. Allocates only the vectors the profile
-/// keeps, each bounded by the extension that fills it.
+/// Reads a ClientHello record; malformed input yields the empty identity.
 #[must_use]
 pub fn read_hello(record: &[u8]) -> Hello {
     let mut hello = Hello::default();
@@ -287,9 +163,7 @@ pub fn read_hello(record: &[u8]) -> Hello {
     if reader.u8() != Some(HANDSHAKE_CLIENT_HELLO) {
         return hello;
     }
-    // A handshake body longer than this record is a ClientHello fragmented
-    // across records. Legal, vanishingly rare, and not reassembled here: the
-    // result names no host, which splices.
+    // Fragmented ClientHello records are not reassembled.
     let Some(body) = reader
         .u24()
         .and_then(|length| reader.take(usize::try_from(length).ok()?))
@@ -310,9 +184,7 @@ pub fn read_hello(record: &[u8]) -> Hello {
         return hello;
     };
 
-    // Extensions are a sequence rather than a map, so this is a scan — but one
-    // that reads every header once and skips each body by length, so it is
-    // O(bytes) and not O(extensions) times anything.
+    // Extensions are length-delimited and may repeat, so scan them in order.
     let mut reader = Reader::new(extensions);
     while let Some(kind) = reader.u16() {
         let Some(body) = reader.vector_u16() else {
@@ -321,10 +193,7 @@ pub fn read_hello(record: &[u8]) -> Hello {
         hello.profile.grease |= is_grease(kind);
         match kind {
             EXTENSION_SERVER_NAME => hello.host = server_name(body),
-            // A client greases its group and signature lists as well as its
-            // extension types, so the flag reflects any of them — and the
-            // grease values themselves are dropped, because forwarding one as
-            // a preference would name an algorithm that does not exist.
+            // Record GREASE, but do not forward GREASE algorithms.
             EXTENSION_SUPPORTED_GROUPS => {
                 hello.profile.grease |= codepoints(body).any(is_grease);
                 hello.profile.groups = codepoints(body).filter_map(group_name).collect();
@@ -335,8 +204,7 @@ pub fn read_hello(record: &[u8]) -> Hello {
             }
             EXTENSION_ALPN => hello.alpn = Offer::read(body),
             EXTENSION_COMPRESS_CERTIFICATE => {
-                // A one-byte length prefix here, unlike the two-byte vectors
-                // above, so it is read on its own terms.
+                // Certificate compression uses a one-byte vector length.
                 let mut inner = Reader::new(body);
                 if let Some(list) = inner.vector_u8() {
                     hello.profile.compression = u16s(list).collect();
@@ -348,40 +216,25 @@ pub fn read_hello(record: &[u8]) -> Hello {
     hello
 }
 
-/// Every `u16` in `body`, in order, ignoring a trailing odd byte.
-///
-/// **A reader rather than a chunked slice.** Both callers had taken the bytes
-/// out of a [`Reader`] and then re-derived the pairs with `chunks_exact(2)` and
-/// two index expressions — which is [`Reader::u16`] written again, by hand, in
-/// a place where the length is no longer checked by the thing that knows it.
-/// Reading them back through the reader is the same iterator with none of that:
-/// it stops when fewer than two bytes remain, which *is* "skip a trailing odd
-/// byte".
-///
-/// O(bytes), lazily, with no allocation.
+/// Yields complete big-endian `u16` values, ignoring a trailing byte.
 fn u16s(body: &[u8]) -> impl Iterator<Item = u16> + '_ {
     let mut reader = Reader::new(body);
     std::iter::from_fn(move || reader.u16())
 }
 
-/// The u16 codepoints of a two-byte-length-prefixed vector, skipping a
-/// trailing odd byte rather than failing on it.
+/// Reads codepoints from a two-byte-length-prefixed vector.
 fn codepoints(body: &[u8]) -> impl Iterator<Item = u16> + '_ {
     u16s(Reader::new(body).vector_u16().unwrap_or_default())
 }
 
-/// The SNI host from a `server_name` extension body.
+/// Reads the host name from a `server_name` extension.
 fn server_name(body: &[u8]) -> Option<crate::DomainName> {
-    // ServerNameList: a vector of (name_type, opaque name). RFC 6066 allows at
-    // most one entry per type and `host_name` is the only type defined, so the
-    // first match is the answer.
+    // ServerNameList contains typed, length-prefixed names.
     let mut names = Reader::new(body.get(2..)?);
     while let Some(name_type) = names.u8() {
         let name = names.vector_u16()?;
         if name_type == NAME_TYPE_HOST {
-            // The name crosses into the domain through the same smart
-            // constructor every other host does, so an over-long or NUL-bearing
-            // SNI is rejected here rather than downstream.
+            // Reuse the domain constructor for length and character checks.
             return std::str::from_utf8(name)
                 .ok()
                 .and_then(|host| crate::DomainName::new(host).ok());
@@ -390,12 +243,7 @@ fn server_name(body: &[u8]) -> Option<crate::DomainName> {
     None
 }
 
-/// Brotli certificate decompression, RFC 8879.
-///
-/// Advertised only when the mirrored client advertised it, and decompression
-/// only: `CAN_COMPRESS` is false because this side never sends a certificate
-/// chain to the origin. The decoder is the one the HTML tier already carries,
-/// so nothing new enters the artefact.
+/// RFC 8879 Brotli certificate decompressor.
 struct Brotli;
 
 impl CertificateCompressor for Brotli {
@@ -423,19 +271,15 @@ impl CertificateCompressor for Brotli {
     }
 }
 
-/// Matches the HTML tier's decoder window, and is the size RFC 7932 names as
-/// sufficient for any stream a compliant encoder produces.
+/// Decoder buffer size shared with the HTML tier.
 const BROTLI_BUFFER: usize = 64 * 1024;
 
-/// Why an upstream TLS client could not be built.
-///
-/// Configuration failures, decided before a packet moves — distinct from a
-/// handshake that failed, which is evidence [`classify`](crate::classify) reads.
+/// Reason an upstream TLS client could not be built.
 #[derive(Debug)]
 pub enum MirrorError {
-    /// A trust anchor did not parse as a DER certificate.
+    /// A trust anchor was not a DER certificate.
     Anchor,
-    /// BoringSSL refused the configuration.
+    /// BoringSSL rejected the configuration.
     Configuration(ErrorStack),
 }
 
@@ -456,22 +300,16 @@ impl From<ErrorStack> for MirrorError {
     }
 }
 
-/// What identifies a built connector: everything that shapes the hello.
+/// Connector cache key: TLS profile and ALPN.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
     profile: ClientProfile,
     alpn: Vec<u8>,
 }
 
-/// Opens TLS to a remote server, wearing a mirrored ClientHello.
-///
-/// One of these is shared across connections. Building a connector parses the
-/// trust anchors, which is not a per-connection cost, so the built connectors
-/// are memoised on the profile and ALPN that shaped them — the two things that
-/// vary and the only two.
+/// Opens TLS with a mirrored ClientHello and caches connectors by profile.
 pub struct Originator {
-    /// Trust anchors beyond the bundled Mozilla set, DER-encoded. Empty in the
-    /// ordinary case; a self-hosted server behind a private CA is why it exists.
+    /// Additional DER-encoded trust anchors.
     extra: Vec<Vec<u8>>,
     connectors: Mutex<HashMap<Key, Arc<SslConnector>>>,
 }
@@ -485,18 +323,14 @@ impl Originator {
         }
     }
 
-    /// Trusts `extra` in addition to the bundled anchors, DER-encoded.
-    ///
-    /// The honest answer to a private CA is to name it. There is deliberately
-    /// no "skip verification" switch, which is the same feature with no way to
-    /// tell a configured exception from an attack.
+    /// Adds DER-encoded trust anchors to the bundled set.
     #[must_use]
     pub fn with_extra_roots(mut self, extra: &[Vec<u8>]) -> Self {
         self.extra = extra.to_vec();
         self
     }
 
-    /// The connector for one profile and one ALPN offer, built once.
+    /// Returns or builds a connector for one profile and ALPN offer.
     fn connector(
         &self,
         profile: &ClientProfile,
@@ -506,10 +340,7 @@ impl Originator {
             profile: profile.clone(),
             alpn: alpn.to_vec(),
         };
-        // The lock is held across a build on a miss. That is deliberate: the
-        // critical section holds no `.await`, a build is microseconds against a
-        // handshake's milliseconds, and letting two connections race to build
-        // the same connector would spend more.
+        // Serialize cache misses; this section contains no await.
         let mut connectors = crate::locked(&self.connectors);
         if let Some(existing) = connectors.get(&key) {
             return Ok(Arc::clone(existing));
@@ -525,11 +356,7 @@ impl Originator {
     fn build(&self, profile: &ClientProfile, alpn: &[u8]) -> Result<SslConnector, MirrorError> {
         let mut builder = SslConnector::builder(SslMethod::tls())?;
 
-        // The anchors are Mozilla's bundle rather than the platform store, for
-        // the reason the DNS upstreams give: the set this crate verifies
-        // against should not be one a device owner or an MDM profile can widen.
-        // `SslConnector::builder` has already called `set_default_verify_paths`,
-        // so replacing the store outright is what makes that true.
+        // Use the bundled roots plus explicit extras, not the platform store.
         let mut store = X509StoreBuilder::new()?;
         for anchor in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
             store.add_cert(X509::from_der(anchor).map_err(|_| MirrorError::Anchor)?)?;
@@ -543,9 +370,7 @@ impl Originator {
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_alpn_protos(alpn)?;
 
-        // Everything below is the mirror, and every arm is a no-op when the
-        // hello did not say — so an unparsed hello leaves BoringSSL's defaults
-        // exactly as they were.
+        // Empty profile fields leave BoringSSL defaults unchanged.
         if !profile.groups.is_empty() {
             builder.set_curves_list(&profile.groups.join(":"))?;
         }
@@ -562,21 +387,13 @@ impl Originator {
             builder.add_certificate_compression_algorithm(Brotli)?;
         }
         builder.set_grease_enabled(profile.grease);
-        // Chrome permutes its extensions per connection, so a fixed order would
-        // be the anomaly. This reproduces the behaviour rather than a hash.
+        // Chrome permutes extensions per connection.
         builder.set_permute_extensions(true);
 
         Ok(builder.build())
     }
 
-    /// Opens TLS over `stream` to `host`, offering exactly `alpn`.
-    ///
-    /// `alpn` is the wire-format protocol list — each entry a one-byte length
-    /// followed by its name — and it is the caller's decision, never the
-    /// profile's. [`alpn_for`] builds it from a [`Wire`](crate::Wire).
-    ///
-    /// Cancellation-safe in the sense the caller needs: dropping the future
-    /// drops the connection, and no state outside it has been mutated.
+    /// Opens TLS to `host` over `stream` with the supplied wire-format ALPN.
     pub async fn connect<S>(
         &self,
         host: &str,
@@ -593,10 +410,7 @@ impl Originator {
         let configuration = connector
             .configure()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        // **Every TLS handshake this crate originates passes here**, so the
-        // bound is stated once: the upstream leg of an intercepted session, the
-        // TLS under a V2Ray transport, and DoT and DoH alike. A handshake is a
-        // wait on a peer that a vanished mobile path never ends.
+        // Bound every originating TLS handshake.
         crate::within(crate::Wait::TlsHandshake, async {
             tokio_boring::connect(configuration, host, Opaque(stream))
                 .await
@@ -620,39 +434,28 @@ impl std::fmt::Debug for Originator {
     }
 }
 
-/// The SSL library's slot in BoringSSL's packed error codes. The reason
-/// numbers below are that library's own numbering and other libraries reuse
-/// those integers for unrelated things, so the library is checked before a
-/// reason is believed.
+/// BoringSSL's SSL library identifier in packed error codes.
 const SSL_LIBRARY: boring::error::ErrLib = boring::error::ErrLib(16);
 
-/// BoringSSL's reason code for a chain this side would not verify.
+/// BoringSSL reason for certificate verification failure.
 const REASON_CERTIFICATE_VERIFY_FAILED: i32 = 125;
-/// ...for finding no application protocol in common.
+/// BoringSSL reason for no common application protocol.
 const REASON_NO_APPLICATION_PROTOCOL: i32 = 307;
-/// A received alert is reported as this offset plus the alert's own
-/// description byte, which is what makes one subtraction enough to recover it.
+/// Offset used to encode a received TLS alert description.
 const REASON_ALERT_OFFSET: i32 = 1000;
 
-/// What a failed handshake proved, in the terms demotion reads.
-///
-/// A closed sum, and the three arms are separate because their remedies are:
-/// an alert is the peer refusing *us*, [`Self::Untrusted`] is this side
-/// refusing *the peer*, and [`Self::NoProtocol`] is neither party being at
-/// fault. Flattening them to a message would leave
-/// [`classify`](crate::classify) nothing to read and silently disable half of
-/// the demotion lattice.
+/// Handshake evidence consumed by demotion policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The peer sent a fatal alert carrying this description byte.
+    /// Peer sent a fatal alert.
     Alert(u8),
-    /// This side rejected the server's certificate chain.
+    /// Local verification rejected the server certificate.
     Untrusted,
-    /// No application protocol in common.
+    /// No common application protocol.
     NoProtocol,
 }
 
-/// A TLS handshake failure, keeping BoringSSL's verdict rather than its prose.
+/// TLS handshake failure with the classified refusal.
 #[derive(Debug)]
 pub struct HandshakeFailure {
     pub refusal: Option<Refusal>,
@@ -660,8 +463,7 @@ pub struct HandshakeFailure {
 }
 
 impl HandshakeFailure {
-    /// Builds one directly, which is how a test synthesizes the evidence a
-    /// real handshake would have produced without standing up a hostile server.
+    /// Constructs synthetic handshake evidence for tests.
     #[must_use]
     pub fn new(refusal: Option<Refusal>, detail: impl Into<String>) -> Self {
         Self {
@@ -679,12 +481,7 @@ impl std::fmt::Display for HandshakeFailure {
 
 impl std::error::Error for HandshakeFailure {}
 
-/// Turns a failed handshake into an [`io::Error`] that still carries the
-/// verdict.
-///
-/// A transport-level failure keeps its own [`io::ErrorKind`], because a reset
-/// or a timeout proves nothing about whether interception works and must not
-/// demote a host.
+/// Converts a handshake failure while preserving transport errors and refusal evidence.
 fn handshake_error<S: std::fmt::Debug>(error: tokio_boring::HandshakeError<S>) -> io::Error {
     if let Some(io) = error.as_io_error() {
         return io::Error::new(io.kind(), io.to_string());
@@ -695,20 +492,14 @@ fn handshake_error<S: std::fmt::Debug>(error: tokio_boring::HandshakeError<S>) -
     })
 }
 
-/// Reads the first reason in BoringSSL's error stack this module understands.
-///
-/// The stack is ordered innermost-first, so the first recognised entry is the
-/// one that actually stopped the handshake; entries this does not recognise are
-/// skipped rather than treated as evidence.
+/// Classifies the first recognized BoringSSL stack reason.
 fn refusal<S: std::fmt::Debug>(error: &tokio_boring::HandshakeError<S>) -> Option<Refusal> {
     let source = std::error::Error::source(error)?;
     let stack = source.downcast_ref::<boring::ssl::Error>()?.ssl_error()?;
     stack
         .errors()
         .iter()
-        // The reason codes below are the SSL library's own numbering, and other
-        // libraries in the stack reuse those integers for unrelated things — so
-        // the library is checked before the reason is believed.
+        // Reason values are meaningful only with the matching library id.
         .filter(|entry| entry.library_reason(SSL_LIBRARY).is_some())
         .find_map(|entry| {
             Some(match entry.library_reason(SSL_LIBRARY)? {
@@ -722,14 +513,7 @@ fn refusal<S: std::fmt::Debug>(error: &tokio_boring::HandshakeError<S>) -> Optio
         })
 }
 
-/// A stream wearing a [`Debug`] it does not have.
-///
-/// `tokio-boring` exposes the BoringSSL error stack only through
-/// [`std::error::Error::source`], which its `HandshakeError` implements just
-/// for a `Debug` stream. The streams here are trait objects and are not
-/// `Debug`, so rather than push that bound onto every caller — and onto the
-/// egress trait — the requirement is satisfied locally by a wrapper that
-/// prints nothing about the connection it carries.
+/// Adds a private `Debug` implementation around a non-debug stream.
 pub struct Opaque<S>(S);
 
 impl<S> std::fmt::Debug for Opaque<S> {
@@ -772,9 +556,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Opaque<S> {
     }
 }
 
-/// The wire-format encoding of an ALPN protocol list: each name prefixed by its
-/// one-byte length. A name longer than 255 bytes cannot be encoded and is
-/// dropped, which is not reachable from any caller here.
+/// Encodes ALPN names as one-byte-length-prefixed entries.
 #[must_use]
 pub fn alpn_list(protocols: &[&[u8]]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(protocols.iter().map(|protocol| protocol.len() + 1).sum());
@@ -790,68 +572,36 @@ pub fn alpn_list(protocols: &[&[u8]]) -> Vec<u8> {
 
 // ------------------------------------------------------- HTTP/2 preface
 
-/// HTTP/2's own initial connection window (RFC 9113 §6.9.2). Every endpoint
-/// starts here, so the WINDOW_UPDATE a fingerprint reads is the target less
-/// this.
+/// HTTP/2 initial connection window from RFC 9113 section 6.9.2.
 const SPEC_WINDOW_SIZE: u32 = 65_535;
 
-/// The pseudo-header order every browser sends, and the Akamai fingerprint's
-/// fourth field.
-///
-/// A constant rather than a setting because nothing in this process decides it:
-/// h2 hard-codes the order, and `vendor/patches/h2.patch` is what makes this
-/// string true. `exchange::tests` asserts it against the wire.
+/// Pseudo-header order used by the Chrome HTTP/2 profile.
 const PSEUDO_HEADER_ORDER: &str = "m,a,s,p";
 
-/// `SETTINGS_ENABLE_PUSH`. hyper disables push unconditionally and so does
-/// Chrome, so there is no knob here and no disagreement to model.
+/// `SETTINGS_ENABLE_PUSH`, disabled by hyper and Chrome.
 const ENABLE_PUSH: u32 = 0;
 
-/// The HTTP/2 connection preface a client is fingerprinted by.
+/// HTTP/2 settings and connection window for a fingerprinted client.
 ///
-/// **A value, so the fingerprint is a test rather than a habit.** The Akamai
-/// fingerprint reads four fields — SETTINGS, the connection WINDOW_UPDATE,
-/// PRIORITY, and pseudo-header order. The first two are this struct, the third
-/// is `0` for any client that sends no PRIORITY frame, and the fourth is
-/// [`PSEUDO_HEADER_ORDER`]. [`Self::akamai`] renders all four, which is what
-/// lets a test compare one string against Chrome's published one instead of
-/// trusting six loose constants to stay in agreement.
-///
-/// **An `Option` field models presence, not a default.** Chrome sends no
-/// `MAX_CONCURRENT_STREAMS` and no `MAX_FRAME_SIZE`, and *sending* either is as
-/// distinguishing as sending a wrong value — so `None` means the setting is
-/// absent from the frame. The two non-`Option` fields are the ones hyper always
-/// emits and offers no way to suppress.
+/// `None` means the setting is absent from the frame, not defaulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct H2Profile {
-    /// `SETTINGS_HEADER_TABLE_SIZE` (1): the HPACK dynamic table this endpoint
-    /// will maintain, which bounds what the *peer's* encoder may use. `None`
-    /// leaves HPACK's own 4096.
+    /// `SETTINGS_HEADER_TABLE_SIZE` (1).
     pub header_table_size: Option<u32>,
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` (3).
     pub max_concurrent_streams: Option<u32>,
-    /// `SETTINGS_INITIAL_WINDOW_SIZE` (4): the per-stream receive window.
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` (4).
     pub initial_window_size: u32,
-    /// `SETTINGS_MAX_FRAME_SIZE` (5). `None` is what Chrome does, and costs
-    /// nothing: the value it would carry is the protocol default anyway.
+    /// `SETTINGS_MAX_FRAME_SIZE` (5).
     pub max_frame_size: Option<u32>,
-    /// `SETTINGS_MAX_HEADER_LIST_SIZE` (6): the largest *uncompressed* header
-    /// block this endpoint accepts. Not a dictionary, despite living next to
-    /// one.
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE` (6).
     pub max_header_list_size: u32,
-    /// The connection-level receive window, which a client raises with a
-    /// WINDOW_UPDATE on stream 0 straight after its SETTINGS. Not a setting;
-    /// see [`Self::window_increment`].
+    /// Connection-level receive window advertised by `WINDOW_UPDATE`.
     pub connection_window_size: u32,
 }
 
 impl H2Profile {
-    /// Chrome's preface, unchanged from Chrome 124 through at least 147.
-    ///
-    /// The windows are Chromium's `kSpdyStreamMaxRecvWindowSize` and
-    /// `kSpdySessionMaxRecvWindowSize`; `1` and `6` are `kSpdyMaxHeaderTableSize`
-    /// and `kSpdyMaxHeaderListSize`. `3` and `5` are absent because
-    /// `AddDefaultHttp2Settings` never sets them.
+    /// Chrome's HTTP/2 preface profile.
     pub const CHROME: Self = Self {
         header_table_size: Some(64 * 1024),
         max_concurrent_streams: None,
@@ -861,15 +611,13 @@ impl H2Profile {
         connection_window_size: 15 * 1024 * 1024,
     };
 
-    /// The WINDOW_UPDATE increment this profile sends on stream 0.
+    /// WINDOW_UPDATE increment sent on stream 0.
     #[must_use]
     pub const fn window_increment(&self) -> u32 {
         self.connection_window_size.saturating_sub(SPEC_WINDOW_SIZE)
     }
 
-    /// The SETTINGS this profile puts on the wire, paired with their
-    /// identifiers and in ascending order — which is the order h2 encodes them
-    /// and therefore the order a fingerprint reads them.
+    /// Settings in wire order.
     const fn settings(&self) -> [(u16, Option<u32>); 6] {
         [
             (1, self.header_table_size),
@@ -881,8 +629,7 @@ impl H2Profile {
         ]
     }
 
-    /// This preface in the Akamai fingerprint's notation:
-    /// `SETTINGS|WINDOW_UPDATE|PRIORITY|PSEUDO_HEADER_ORDER`.
+    /// Renders the Akamai fingerprint notation.
     #[must_use]
     pub fn akamai(&self) -> String {
         let settings = self
@@ -891,15 +638,14 @@ impl H2Profile {
             .filter_map(|(id, value)| Some(format!("{id}:{}", value?)))
             .collect::<Vec<_>>()
             .join(";");
-        // PRIORITY is `0`: no client here sends a PRIORITY frame, and neither
-        // does Chrome since it moved to RFC 9218 priority signalling.
+        // No PRIORITY frame is sent.
         format!(
             "{settings}|{}|0|{PSEUDO_HEADER_ORDER}",
             self.window_increment()
         )
     }
 
-    /// Configures a hyper HTTP/2 client to open connections with this preface.
+    /// Applies this profile to a hyper HTTP/2 client.
     pub fn apply<'a, E: Clone>(&self, builder: &'a mut H2Builder<E>) -> &'a mut H2Builder<E> {
         builder
             .header_table_size(self.header_table_size)
@@ -915,9 +661,7 @@ impl H2Profile {
 mod tests {
     use super::*;
 
-    /// Chrome's published fingerprint, verbatim. Six constants can each look
-    /// plausible alone; this is the one assertion that fails by naming which
-    /// field moved.
+    /// Matches Chrome's published fingerprint.
     #[test]
     fn the_chrome_profile_renders_chromes_published_fingerprint() {
         assert_eq!(
@@ -926,8 +670,7 @@ mod tests {
         );
     }
 
-    /// A `None` setting is absent from the frame rather than sent with a
-    /// default, because sending it at all is what a fingerprint sees.
+    /// Omits absent settings instead of sending defaults.
     #[test]
     fn an_absent_setting_is_omitted_rather_than_defaulted() {
         let profile = H2Profile {
@@ -943,8 +686,7 @@ mod tests {
         );
     }
 
-    /// GREASE is the sixteen values RFC 8701 reserves, and nothing else. A
-    /// looser test would let an ordinary extension set the flag.
+    /// Recognizes exactly the sixteen RFC 8701 GREASE values.
     #[test]
     fn grease_is_exactly_the_reserved_values() {
         for nibble in 0..16u16 {
@@ -955,9 +697,7 @@ mod tests {
         }
     }
 
-    /// The whole point of the mirror: a hello that offers MLKEM produces a
-    /// profile that asks for it. BoringSSL's default group list does not
-    /// include it, so without this the upstream hello could not carry it.
+    /// Mirrors a client group that BoringSSL does not enable by default.
     #[test]
     fn a_profile_carries_the_groups_the_client_offered() {
         let profile = profile_from(&[extension(
@@ -967,9 +707,7 @@ mod tests {
         assert_eq!(profile.groups(), ["X25519MLKEM768", "X25519", "P-256"]);
     }
 
-    /// A group this BoringSSL cannot name is dropped rather than refused, so
-    /// an unfamiliar client still gets a handshake — the same fail-open the
-    /// rest of interception takes.
+    /// Drops an unknown group without rejecting the handshake.
     #[test]
     fn an_unknown_group_is_dropped_not_fatal() {
         let profile = profile_from(&[extension(
@@ -979,9 +717,7 @@ mod tests {
         assert_eq!(profile.groups(), ["X25519"]);
     }
 
-    /// GREASE codepoints are not signature algorithms, and forwarding one as a
-    /// verification preference would ask BoringSSL to accept a nonexistent
-    /// algorithm.
+    /// Removes GREASE codepoints from signature preferences.
     #[test]
     fn grease_is_stripped_from_signature_algorithms() {
         let profile = profile_from(&[extension(
@@ -992,8 +728,7 @@ mod tests {
         assert!(profile.grease, "the hello still counts as GREASE-bearing");
     }
 
-    /// Bytes that are not a ClientHello yield the identity profile, which
-    /// overrides nothing. That is what makes an unparsed hello safe.
+    /// Malformed input yields the empty, non-overriding profile.
     #[test]
     fn an_unreadable_hello_overrides_nothing() {
         for bytes in [b"".as_slice(), b"\x01", b"\x16\x03\x01", b"not tls at all"] {
@@ -1001,9 +736,7 @@ mod tests {
         }
     }
 
-    /// The stated profile a leg with nothing to mirror wears. Asserted against
-    /// the group that actually distinguishes it: an empty profile leaves
-    /// BoringSSL's defaults, which cannot express `X25519MLKEM768` at all.
+    /// The fallback profile includes the modern hybrid group.
     #[test]
     fn the_chrome_profile_offers_the_group_the_default_one_cannot() {
         let chrome = ClientProfile::chrome();
@@ -1013,8 +746,7 @@ mod tests {
         assert!(chrome.grease);
     }
 
-    /// The client's list, in the client's order, so the origin makes the same
-    /// choice it would have made for the client itself.
+    /// Preserves the client's supported ALPN order.
     #[test]
     fn an_offer_carries_the_clients_own_list_in_order() {
         let hello = read_hello(&client_hello(&[extension(
@@ -1025,8 +757,7 @@ mod tests {
         assert_eq!(hello.alpn.encode(), b"\x02h2\x08http/1.1");
     }
 
-    /// `h3` rides QUIC, and this leg is TCP. Carrying it would let an origin
-    /// select a protocol the exchange cannot serve.
+    /// Drops protocols this TCP leg cannot terminate.
     #[test]
     fn a_protocol_this_cannot_terminate_is_dropped() {
         let hello = read_hello(&client_hello(&[extension(
@@ -1036,8 +767,7 @@ mod tests {
         assert_eq!(hello.alpn.wires(), [crate::Wire::Http1]);
     }
 
-    /// No ALPN is an empty offer, which negotiates nothing on either leg —
-    /// RFC 7301's reading, and what a bare HTTP/1.1 client expects.
+    /// Treats an absent ALPN extension as an empty offer.
     #[test]
     fn a_hello_without_alpn_offers_nothing() {
         let hello = read_hello(&client_hello(&[]));
@@ -1045,7 +775,7 @@ mod tests {
         assert!(hello.alpn.encode().is_empty());
     }
 
-    /// A length-prefixed sequence of ALPN names, itself length-prefixed.
+    /// Builds a length-prefixed ALPN list.
     fn names(protocols: &[&[u8]]) -> Vec<u8> {
         let body = alpn_list(protocols);
         let mut out = u16::try_from(body.len()).unwrap().to_be_bytes().to_vec();
@@ -1057,7 +787,7 @@ mod tests {
         read_hello(&client_hello(extensions)).profile
     }
 
-    /// A two-byte-length-prefixed vector of codepoints.
+    /// Builds a two-byte-length-prefixed codepoint vector.
     fn vector_u16(values: &[u16]) -> Vec<u8> {
         let body: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
         let mut out = u16::try_from(body.len()).unwrap().to_be_bytes().to_vec();
@@ -1072,7 +802,7 @@ mod tests {
         out
     }
 
-    /// A ClientHello handshake message carrying `extensions`.
+    /// Builds a ClientHello carrying `extensions`.
     fn client_hello(extensions: &[Vec<u8>]) -> Vec<u8> {
         let joined: Vec<u8> = extensions.concat();
         let mut body = vec![0x03, 0x03];

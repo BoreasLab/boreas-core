@@ -1,34 +1,12 @@
-//! Shadowsocks 2022 Edition (SIP022) as a stream egress.
+//! Shadowsocks 2022 Edition (SIP022) stream and datagram egress.
 //!
-//! The 2022 edition rather than the older AEAD construction, and the choice is
-//! a security one rather than a preference. SIP004 derived its key with
-//! `EVP_BytesToKey`, carried no timestamp, and offered no replay defence; the
-//! 2022 edition takes a full-entropy pre-shared key, derives a per-session
-//! subkey with BLAKE3, stamps every stream with a time, and echoes the
-//! request's salt in the response so a client can tell its own session from a
-//! replayed one. Shipping the older construction would be shipping a protocol
-//! whose own specification calls it obsolete.
+//! SIP022 uses full-entropy keys, BLAKE3 session derivation, timestamp checks,
+//! and replay protection. AEAD operations use the crate's existing providers;
+//! counters remain paired with their keys so nonces cannot repeat.
 //!
-//! **The AEAD comes from `ring`, which is already the crate's one provider.**
-//! WireGuard, the DNS upstreams, and interception all use it, so the three
-//! cipher suites here add no second crypto stack. BLAKE3 is a new dependency
-//! and an unavoidable one: it *is* the key-derivation function the protocol
-//! names, and no substitute is wire-compatible.
-//!
-//! **Nonces are a counter this code owns, so `ring`'s safe API is the wrong
-//! one.** SIP022 fixes the nonce as a 12-byte little-endian counter starting at
-//! zero and incremented after every operation, separately per direction. That
-//! is exactly what `LessSafeKey` exists for, and [`Session`] is the type that
-//! keeps the counter and the key together so no call site can pair a key with
-//! the wrong number.
-//!
-//! **Wire compatibility against a reference server is unverified.** The tests
-//! below drive this implementation against itself, which proves the framing is
-//! self-consistent and that every guard fires, but a misreading of the
-//! specification would satisfy both halves equally. Verifying against
-//! `shadowsocks-rust` or a deployed server is recorded in
-//! [Verification](../docs/verification.md) and is not something this
-//! environment can perform.
+//! Stream and packet formats are separate SIP022 constructions. Local tests
+//! cover field-level framing; interoperability remains tracked in
+//! [Verification](../docs/verification.md).
 
 use std::{
     sync::Arc,
@@ -48,29 +26,23 @@ use crate::{
     wire::{Reader, Writer},
 };
 
-/// The BLAKE3 derive-key context, fixed by SIP022. It is part of the wire
-/// format: a different string yields a different subkey and no interoperation.
+/// SIP022's fixed BLAKE3 derive-key context.
 const SUBKEY_CONTEXT: &str = "shadowsocks 2022 session subkey";
 
-/// Bytes an AEAD tag adds to every sealed chunk.
+/// AEAD tag size.
 const TAG: usize = 16;
 
-/// The largest payload one chunk carries, from SIP022. The two-byte length
-/// field bounds it, and it is what sizes the read buffer.
+/// Maximum plaintext chunk size from the two-byte length field.
 const MAX_CHUNK: usize = 0xffff;
 
-/// How far a peer's timestamp may differ from ours before the stream is refused.
-/// SIP022 fixes 30 seconds; a wider window would widen the replay opportunity
-/// it exists to close.
+/// SIP022 timestamp tolerance.
 const CLOCK_SKEW_SECONDS: u64 = 30;
 
-/// Stream types, SIP022 §"TCP". A client never writes 1 and never accepts 0,
-/// which is what stops a reflected request from being read as a response.
+/// SIP022 stream message types.
 const TYPE_REQUEST: u8 = 0;
 const TYPE_RESPONSE: u8 = 1;
 
-/// The cipher suites SIP022 defines. Closed: each names its key and salt
-/// length, so a configuration cannot pair a 16-byte key with a 32-byte salt.
+/// SIP022 cipher suites and their key lengths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Aes128Gcm,
@@ -79,8 +51,7 @@ pub enum Method {
 }
 
 impl Method {
-    /// SIP022 ties the salt length to the key length, so one function answers
-    /// both and they cannot drift.
+    /// Returns the method key length.
     pub fn key_len(self) -> usize {
         match self {
             Self::Aes128Gcm => 16,
@@ -100,8 +71,7 @@ impl Method {
         }
     }
 
-    /// The identifier this method is configured by, matching the names the
-    /// wider Shadowsocks ecosystem uses.
+    /// Returns the configured method name.
     pub fn name(self) -> &'static str {
         match self {
             Self::Aes128Gcm => "2022-blake3-aes-128-gcm",
@@ -111,11 +81,7 @@ impl Method {
     }
 }
 
-/// A pre-shared key whose length matches its method.
-///
-/// Refined because SIP022 forbids deriving a key from a passphrase: the key is
-/// full-entropy material of an exact length, and admitting a short one would
-/// silently weaken every session built from it.
+/// A SIP022 pre-shared key with method-specific length.
 #[derive(Clone, Debug)]
 pub struct PreSharedKey {
     bytes: Vec<u8>,
@@ -124,7 +90,7 @@ pub struct PreSharedKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyError {
-    /// The key is not the length the method requires.
+    /// The key length does not match the method.
     Length { expected: usize, found: usize },
 }
 
@@ -140,13 +106,7 @@ impl PreSharedKey {
         Ok(Self { bytes, method })
     }
 
-    /// The session subkey for one salt: `BLAKE3::derive_key(context, psk ||
-    /// salt)`, truncated to the method's key length.
-    ///
-    /// O(key + salt) — a single BLAKE3 compression over 32 to 64 bytes.
-    /// The key material itself. Crate-private: the one legitimate reader is
-    /// the packet cipher, whose AES methods key their separate-header block on
-    /// the pre-shared key directly rather than on anything derived.
+    /// Returns the raw pre-shared key for packet-header encryption.
     fn raw(&self) -> &[u8] {
         &self.bytes
     }
@@ -160,16 +120,10 @@ impl PreSharedKey {
     }
 }
 
-/// One direction of one session: a key and the counter that must never repeat
-/// against it.
-///
-/// The two live together because a nonce reused with a key destroys AEAD
-/// security entirely, and keeping them in separate variables is how that
-/// happens. Every seal and open goes through here.
+/// One session direction with its AEAD key and nonce counter.
 struct Session {
     key: LessSafeKey,
-    /// The 12-byte little-endian nonce, as a counter. A `u64` covers it: the
-    /// top four bytes stay zero, and 2^64 chunks is unreachable on any stream.
+    /// Little-endian nonce counter stored in the low eight bytes.
     counter: u64,
 }
 
@@ -182,7 +136,7 @@ impl Session {
         })
     }
 
-    /// The next nonce, consuming it so the same value cannot be produced twice.
+    /// Consumes and returns the next nonce.
     fn next_nonce(&mut self) -> Nonce {
         let mut bytes = [0u8; 12];
         bytes[..8].copy_from_slice(&self.counter.to_le_bytes());
@@ -190,7 +144,7 @@ impl Session {
         Nonce::assume_unique_for_key(bytes)
     }
 
-    /// Seals in place, appending the tag. SIP022 uses no associated data.
+    /// Seals in place with an empty associated-data value.
     fn seal(&mut self, buf: &mut Vec<u8>) -> Result<(), ProxyError> {
         let nonce = self.next_nonce();
         self.key
@@ -199,9 +153,7 @@ impl Session {
         Ok(())
     }
 
-    /// Opens in place, returning the plaintext. A failure here is an
-    /// authentication failure and is fatal to the stream: there is no way to
-    /// resynchronise a counter-based AEAD after one.
+    /// Opens in place; authentication failure makes the stream unusable.
     fn open<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a [u8], ProxyError> {
         let nonce = self.next_nonce();
         let plain = self
@@ -212,10 +164,7 @@ impl Session {
     }
 }
 
-/// Seconds since the Unix epoch, as SIP022 stamps them.
-///
-/// The clock is an effect, so it enters the pure header codec as an argument
-/// and is read only here, at the one boundary that performs it.
+/// Current Unix time in seconds for SIP022 timestamps.
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -223,12 +172,7 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// Rejects a peer whose clock is too far from ours.
-///
-/// This is the replay window: a server keeps recently seen salts for a bounded
-/// time, and that bound is only meaningful if a stamp far outside it is
-/// refused. Symmetric in both directions, because a replayed *response* is as
-/// harmful as a replayed request.
+/// Rejects timestamps outside the SIP022 replay window.
 fn check_timestamp(theirs: u64, ours: u64) -> Result<(), ProxyError> {
     let skew = ours.abs_diff(theirs);
     if skew > CLOCK_SKEW_SECONDS {
@@ -237,19 +181,10 @@ fn check_timestamp(theirs: u64, ours: u64) -> Result<(), ProxyError> {
     Ok(())
 }
 
-/// The largest padding SIP022 permits in a request header.
+/// Maximum SIP022 request padding.
 const MAX_PADDING: usize = 900;
 
-/// Builds the variable-length request header: target, padding, then whatever
-/// payload rides along with it.
-///
-/// **A request must carry padding or an initial payload, and may not be empty
-/// of both.** SIP022 requires it and a reference server rejects the violation
-/// outright with "missing payload or padding": with neither, the header's
-/// encrypted length would leak the address length exactly, which is what the
-/// padding is there to blur. The caller supplies the padding bytes rather than
-/// this function generating them, so the encoder stays pure and the randomness
-/// stays at the one boundary that performs effects.
+/// Builds the variable request body from target, padding, and initial payload.
 fn encode_request_body(target: &Target, padding: &[u8], initial: &[u8]) -> Vec<u8> {
     debug_assert!(
         !padding.is_empty() || !initial.is_empty(),
@@ -262,8 +197,7 @@ fn encode_request_body(target: &Target, padding: &[u8], initial: &[u8]) -> Vec<u
     body
 }
 
-/// The fixed-length request header: type, timestamp, and the length of the
-/// variable-length header that follows it.
+/// Builds the fixed request header.
 fn encode_request_fixed(now: u64, body_len: u16) -> Vec<u8> {
     let mut header = Vec::with_capacity(11);
     Writer::new(&mut header)
@@ -273,16 +207,9 @@ fn encode_request_fixed(now: u64, body_len: u16) -> Vec<u8> {
     header
 }
 
-/// Reads the fixed-length response header, checking everything it asserts:
-/// that it is a response, that its clock agrees with ours, and that it echoes
-/// the salt of *our* request rather than some other session's.
-///
-/// The salt echo is what makes a replayed response detectable, so verifying it
-/// is not optional politeness — it is the property the field exists for.
+/// Validates a fixed response header and returns its payload length.
 fn decode_response_fixed(plain: &[u8], request_salt: &[u8], now: u64) -> Result<u16, ProxyError> {
-    // An exact length, not a minimum: this header is opened from a block whose
-    // size the state machine already chose, so a different size is a framing
-    // error rather than a short read.
+    // The state machine selected the exact ciphertext size.
     if plain.len() != 1 + 8 + request_salt.len() + 2 {
         return Err(ProxyError::Header);
     }
@@ -301,90 +228,54 @@ fn decode_response_fixed(plain: &[u8], request_salt: &[u8], now: u64) -> Result<
 pub struct ShadowsocksConfig {
     pub server: std::net::SocketAddr,
     pub key: PreSharedKey,
-    /// The proxy's RFC 4787 mapping behavior, configuration for the same
-    /// reason SOCKS5's and MASQUE's are: it belongs to the server.
+    /// Proxy mapping behavior from RFC 4787.
     pub nat_behavior: NatBehavior,
 }
 
-// -------------------------------------------------------- SIP022 UDP
+// SIP022 UDP packet egress.
 
-/// **SIP022's packet format is a second construction, not a variation of the
-/// stream one.** A stream is salt-then-chunks under one derived key with a
-/// counter nonce; a packet stands alone, so it carries its own key material and
-/// its own nonce, and the two AES methods and the ChaCha method do that
-/// *differently*. Modelling them as one format with flags is how a client ends
-/// up deriving a subkey for a method that has none.
-///
-/// The AES methods put an 8-byte session ID and an 8-byte packet ID in a
-/// 16-byte *separate header*, encrypt it as a single AES-ECB block under the
-/// pre-shared key itself, and derive the body's subkey from the session ID. The
-/// ChaCha method has no separate header at all: a random 24-byte XChaCha20
-/// nonce goes in front, the body is keyed by the pre-shared key directly, and
-/// the session and packet IDs move *inside* the encrypted body.
-///
-/// Both come from BoringSSL, which is already linked for every hello this crate
-/// sends: `ring` exposes neither a raw AES block nor XChaCha20-Poly1305, and
-/// neither is a thing to hand-roll.
+/// SIP022 packet ciphers. AES uses a separate encrypted identity header;
+/// ChaCha carries identity inside the encrypted body.
 enum PacketCipher {
-    /// The AES methods. `header` is keyed by the pre-shared key and used one
-    /// block at a time with padding off, which is the only correct way to use
-    /// ECB and is why it appears nowhere else.
+    /// AES packet format with an encrypted separate header.
     Separate {
         key: PreSharedKey,
         header: boring::symm::Cipher,
     },
-    /// `2022-blake3-chacha20-poly1305`. One context for the association's life,
-    /// because the key never changes: it is the pre-shared key.
+    /// XChaCha packet format keyed by the association PSK.
     Merged { key: boring::aead::AeadCtx },
 }
 
-/// Bytes of the AES methods' separate header.
+/// AES separate-header size.
 const SEPARATE_HEADER: usize = 16;
 
-/// The AEAD nonce is a window over the plaintext separate header rather than a
-/// field of its own: the last four bytes of the session ID followed by the
-/// whole packet ID. Uniqueness therefore comes from the packet counter, which
-/// is what makes the counter's discipline load-bearing.
+/// AEAD nonce range within the AES identity header.
 const NONCE_WINDOW: std::ops::Range<usize> = 4..SEPARATE_HEADER;
 
-/// XChaCha20-Poly1305's nonce, written in the clear ahead of the body.
+/// Cleartext XChaCha nonce size.
 const MERGED_NONCE: usize = 24;
 
-/// Packet types, the packet-format counterparts of [`TYPE_REQUEST`] and
-/// [`TYPE_RESPONSE`]. Separate constants because they are a separate namespace
-/// in the specification, even though they happen to agree.
+/// SIP022 packet message types.
 const PACKET_TO_SERVER: u8 = 0;
 const PACKET_TO_CLIENT: u8 = 1;
 
-/// The largest UDP payload a datagram can carry, which sizes the receive buffer
-/// exactly: nothing larger can arrive, so a payload this cannot hold does not
-/// exist.
+/// Maximum UDP payload representable by the datagram length field.
 const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
 
-/// The largest client datagram this egress will carry, and therefore what the
-/// planner budgets QUIC against.
-///
-/// It is the IPv6 minimum path less the worst case this format adds: the
-/// separate header or nonce, the tag, the fixed message header, and the largest
-/// address SIP022 can express. Deliberately the *worst* case rather than the
-/// one a given target happens to cost, because the number is a promise made
-/// once per session and a flow must not discover mid-transfer that its
-/// destination's name was long.
+/// Maximum client datagram after worst-case SIP022 framing.
 const MAX_PROXIED_DATAGRAM: u16 = {
-    // nonce or separate header, tag, type, timestamp, padding length
+    // Worst-case outer framing: nonce or header, tag, type, timestamp, padding.
     let framing = MERGED_NONCE + TAG + 1 + 8 + 2;
-    // domain form: type byte, length octet, 255 bytes of name, port
+    // Longest encoded domain address.
     let address = 1 + 1 + 255 + 2;
     (crate::MIN_IPV6_MTU as usize - 48 - framing - address) as u16
 };
 
-/// One packet's plaintext, after whichever framing its method used has been
-/// removed. Both constructions produce exactly this, which is what lets
-/// everything above them be written once.
+/// Packet plaintext shared by both cipher constructions.
 struct Opened {
     session: [u8; 8],
     packet_id: u64,
-    /// The message proper, starting at its type byte.
+    /// Message beginning at its type byte.
     message: Vec<u8>,
 }
 
@@ -410,9 +301,6 @@ impl PacketCipher {
     }
 
     /// Seals one packet for the server.
-    ///
-    /// O(message length), with one allocation for the datagram the caller is
-    /// about to hand to the socket.
     fn seal(
         &self,
         session: [u8; 8],
@@ -437,7 +325,7 @@ impl PacketCipher {
                 let mut out = vec![0u8; MERGED_NONCE];
                 random(&mut out)?;
                 let nonce: [u8; MERGED_NONCE] = out[..].try_into().expect("just sized");
-                // The identity is inside the body here, not ahead of it.
+                // Merged format keeps identity inside the encrypted body.
                 out.extend_from_slice(&identity);
                 out.extend_from_slice(message);
                 let tag = Self::finish(key, &nonce, &mut out, MERGED_NONCE)?;
@@ -447,11 +335,7 @@ impl PacketCipher {
         }
     }
 
-    /// Opens one packet from the server.
-    ///
-    /// Nothing here trusts anything: the identity is read, the body is
-    /// authenticated under a key derived from it, and only then does a caller
-    /// see a byte of it. A forged identity yields a key that opens nothing.
+    /// Opens and authenticates one server packet.
     fn open(&self, datagram: &[u8]) -> Result<Opened, EgressError> {
         let (identity, key, nonce, body) = match self {
             Self::Separate { .. } => {
@@ -480,9 +364,7 @@ impl PacketCipher {
         Ok(Self::identify(&identity, message))
     }
 
-    /// Splits a `SEPARATE_HEADER`-sized identity into its session and packet
-    /// id. Every caller has already sized `identity`, so a short one is a
-    /// defect here rather than something a peer can send.
+    /// Splits a validated identity into session and packet id.
     fn identify(identity: &[u8], message: Vec<u8>) -> Opened {
         let mut reader = Reader::new(identity);
         let (Some(session), Some(packet_id)) = (reader.array::<8>(), reader.u64()) else {
@@ -495,9 +377,7 @@ impl PacketCipher {
         }
     }
 
-    /// Seals `out[at..]` in place and returns the tag to append. Split out
-    /// because both constructions seal the same way once they have agreed on a
-    /// key and a nonce, and only the framing around it differs.
+    /// Seals `out[at..]` and returns its tag.
     fn finish(
         key: &boring::aead::AeadCtx,
         nonce: &[u8],
@@ -522,9 +402,7 @@ impl PacketCipher {
         Ok(body)
     }
 
-    /// The AEAD context for one AES-method session. The subkey is derived from
-    /// the session ID exactly as the stream side derives its own from the salt,
-    /// which is why one `subkey` serves both.
+    /// Builds the AES packet AEAD context for a session.
     fn aead(&self, session: &[u8]) -> Result<boring::aead::AeadCtx, EgressError> {
         let Self::Separate { key, .. } = self else {
             return Err(ProxyError::Crypto.into());
@@ -537,9 +415,7 @@ impl PacketCipher {
             .map_err(|_| ProxyError::Crypto.into())
     }
 
-    /// One ECB block, padding off. `Crypter` rather than `symm::encrypt`
-    /// because the latter pads to a second block, and a 32-byte separate header
-    /// is not a separate header.
+    /// Encrypts or decrypts one unpadded AES identity block.
     fn block(&self, mode: boring::symm::Mode, input: &[u8]) -> Result<Vec<u8>, EgressError> {
         let Self::Separate { key, header } = self else {
             return Err(ProxyError::Crypto.into());
@@ -559,7 +435,7 @@ impl PacketCipher {
     }
 }
 
-/// Fills `bytes` from the system CSPRNG and nowhere else.
+/// Fills `bytes` from the system CSPRNG.
 fn random(bytes: &mut [u8]) -> Result<(), EgressError> {
     ring::rand::SystemRandom::new()
         .fill(bytes)
@@ -567,17 +443,7 @@ fn random(bytes: &mut [u8]) -> Result<(), EgressError> {
     Ok(())
 }
 
-/// Builds one client-to-server message: type, timestamp, padding, target
-/// address, payload.
-///
-/// **Padding is a policy, and this one is the reference implementations'.**
-/// Both `shadowsocks-go` and `sing-shadowsocks` pad only queries to port 53,
-/// where a datagram's length otherwise leaks which name was asked for; padding
-/// everything would cost bandwidth on a phone for no distinguishability that
-/// TLS has not already provided. The length is `1 + rand % 900`, matching their
-/// `MaxPaddingLength`.
-///
-/// O(payload length), one allocation.
+/// Builds a client-to-server packet message.
 fn encode_packet_request(
     target: &Target,
     now: u64,
@@ -605,21 +471,13 @@ fn padding_for(target: &Target) -> Result<Vec<u8>, EgressError> {
     Ok(pad)
 }
 
-/// Reads one server-to-client message, returning where the reply came from and
-/// where its payload starts.
-///
-/// Three checks, all of them MUST-level in SIP022 and each closing a different
-/// hole: the type byte stops a reflected request from being read as a response,
-/// the clock bounds the replay window to 30 seconds, and the echoed client
-/// session ID stops another client's reply being delivered to this one.
-///
-/// O(address length). Total on untrusted input.
+/// Validates a server-to-client message and returns source and payload offset.
 fn decode_packet_response(
     message: &[u8],
     client_session: &[u8; 8],
     now: u64,
 ) -> Result<(Target, usize), EgressError> {
-    // type(1) + timestamp(8) + client session(8) + padding
+    // Type, timestamp, echoed client session, and padding length.
     let mut reader = Reader::new(message);
     let (Some(PACKET_TO_CLIENT), Some(stamp), Some(session)) =
         (reader.u8(), reader.u64(), reader.array::<8>())
@@ -640,40 +498,23 @@ fn decode_packet_response(
     }
 }
 
-/// A sliding window over one server session's packet IDs, in WireGuard's shape:
-/// the highest identifier seen and a bitmap of the 64 below it.
-///
-/// SIP022 requires one — a relay whose replies can be replayed is a relay whose
-/// client can be made to re-process an old answer — and points at WireGuard's
-/// as a usable implementation. Sixty-four is ample for a UDP association: a
-/// reply reordered by more than that many packets is one the transport above
-/// has already given up on.
-///
-/// O(1) per packet, and no allocation ever.
+/// WireGuard-shaped replay window for server packet IDs.
 #[derive(Default)]
 struct Window {
-    /// `None` until the first packet, because **SIP022 starts a packet counter
-    /// at zero**: a bare `u64` high-water mark would make the very first
-    /// legitimate packet indistinguishable from a replay of itself.
+    /// No high-water mark exists until the first packet.
     highest: Option<u64>,
     below: u64,
 }
 
 impl Window {
-    /// Whether `id` is fresh, recording it when it is.
-    ///
-    /// **Called only after the packet has authenticated**, which is SIP022's
-    /// own rule: advancing on an unauthenticated identifier would let anyone
-    /// who can guess a session ID push the window past every real packet.
+    /// Admits and records a fresh packet ID.
     fn admit(&mut self, id: u64) -> bool {
         let Some(highest) = self.highest else {
             self.highest = Some(id);
             return true;
         };
         let Some(behind) = highest.checked_sub(id) else {
-            // Ahead of everything seen: shift the bitmap by the gap, then mark
-            // the old high-water mark as seen. A gap of 64 or more leaves
-            // nothing of the old window inside the new one, so it starts empty.
+            // Shift the bitmap and retain the old high-water mark when in range.
             let gap = id - highest;
             self.below = if gap < 64 {
                 (self.below << gap) | (1 << (gap - 1))
@@ -695,18 +536,12 @@ impl Window {
     }
 }
 
-/// One SIP022 datagram association: a socket to the server, the session this
-/// client speaks under, and the counter that must never repeat against it.
-///
-/// The counter and the key live together for the reason the stream side's do:
-/// the AEAD nonce is a window over the packet identifier, so a repeated
-/// identifier is a repeated nonce, which is total loss of confidentiality.
+/// SIP022 datagram association with its session and packet counter.
 struct PacketRelay {
     socket: tokio::net::UdpSocket,
     cipher: PacketCipher,
     session: [u8; 8],
-    /// SIP022 starts at zero and adds one per packet sent. Atomic because the
-    /// sink is shared by every flow in the mapping and `send_to` takes `&self`.
+    /// Atomic packet counter shared by all mapped flows.
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -726,23 +561,17 @@ impl DatagramSink for PacketRelay {
     }
 }
 
-/// The receiving half, and the state that makes a reply believable.
+/// Receiving half with authenticated-session state.
 struct PacketSource {
     relay: Arc<PacketRelay>,
-    /// **Two server sessions, not one.** SIP022 requires a client to survive a
-    /// server restart, which changes the server's session ID mid-association;
-    /// it permits keeping exactly the current one and one predecessor, which is
-    /// what this is. A third would be a cache with an eviction policy for a set
-    /// that never exceeds two.
+    /// Current and immediately previous server sessions.
     sessions: [Option<([u8; 8], Window)>; 2],
-    /// One receive buffer for the association's life, sized so that nothing a
-    /// UDP datagram can carry is ever truncated.
+    /// Receive buffer large enough for any UDP datagram.
     framed: Vec<u8>,
 }
 
 impl PacketSource {
-    /// The window for `session`, admitting it as the current one if it is new
-    /// and retiring whatever was oldest.
+    /// Returns the replay window for `session`, rotating old sessions if new.
     fn window(&mut self, session: [u8; 8]) -> &mut Window {
         if let Some(at) = self
             .sessions
@@ -765,9 +594,7 @@ impl DatagramSource for PacketSource {
         Box::pin(async move {
             loop {
                 let read = self.relay.socket.recv(&mut self.framed).await?;
-                // **A bad packet is skipped, never fatal.** Anything can send to
-                // a UDP socket, so a datagram that will not open is noise on a
-                // public port rather than a failure of this association.
+                // Unauthenticated UDP input is noise, not association failure.
                 let Ok(opened) = self.relay.cipher.open(&self.framed[..read]) else {
                     continue;
                 };
@@ -776,8 +603,7 @@ impl DatagramSource for PacketSource {
                 else {
                     continue;
                 };
-                // Only now, with the packet authenticated and its header
-                // validated, may the window move.
+                // Advance replay state only after authentication and validation.
                 if !self.window(opened.session).admit(opened.packet_id) {
                     continue;
                 }
@@ -794,7 +620,7 @@ impl DatagramSource for PacketSource {
     }
 }
 
-/// A Shadowsocks 2022 server as a stream egress.
+/// Shadowsocks 2022 stream and datagram egress.
 pub struct ShadowsocksEgress<B> {
     config: ShadowsocksConfig,
     bypass: B,
@@ -809,17 +635,9 @@ impl<B: TunnelBypass> ShadowsocksEgress<B> {
 impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // **Native, and the packet format is why.** SIP022 carries one
-            // client datagram as one server datagram with its own address
-            // inside, so a boundary crosses intact and one association serves
-            // every peer -- which is what makes QUIC survive this egress rather
-            // than be steered off it.
+            // SIP022 preserves one client datagram per server datagram.
             datagram_fidelity: DatagramFidelity::Native,
-            // A datagram is re-originated by the server, so the client's own
-            // packet size stops existing at the proxy and there is no
-            // per-packet header for the *client's* path to charge for. What the
-            // framing costs is charged in `max_datagram_size` instead, which is
-            // the budget that actually binds.
+            // Framing is included in the maximum datagram budget.
             overhead_bytes: 0,
             max_datagram_size: Some(MAX_PROXIED_DATAGRAM),
             preserves_ecn: false,
@@ -827,21 +645,12 @@ impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
         }
     }
 
-    /// Opens the datagram half: one socket to the server, one client session,
-    /// and the counter that must never repeat against it.
-    ///
-    /// **No handshake, which is the point of the format.** Unlike SOCKS5's UDP
-    /// ASSOCIATE there is no control connection whose lifetime bounds this one
-    /// and no relay address to be told; the first packet establishes the
-    /// session by carrying its identifier, so an association costs one socket
-    /// and one round of randomness.
+    /// Opens the datagram association without a control handshake.
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
             let socket = self.bypass.udp(self.config.server).await?;
             let mut session = [0u8; 8];
-            // SIP022: "the server session ID MUST be randomly generated", and
-            // the client's likewise -- it is the salt every packet key on this
-            // association is derived from.
+            // SIP022 requires a random client session ID.
             random(&mut session)?;
             let relay = Arc::new(PacketRelay {
                 socket,
@@ -869,18 +678,13 @@ impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
             let mut stream =
                 crate::within(crate::Wait::TcpConnect, self.bypass.tcp(self.config.server)).await?;
 
-            // A fresh random salt per session: it is the only input that makes
-            // two sessions under one pre-shared key different, so it comes from
-            // the system CSPRNG and nowhere else.
+            // A fresh CSPRNG salt separates sessions under one PSK.
             let random = ring::rand::SystemRandom::new();
             let mut salt = vec![0u8; method.salt_len()];
             random.fill(&mut salt).map_err(|_| ProxyError::Crypto)?;
             let mut writer = Session::new(method, &self.config.key.subkey(&salt))?;
 
-            // No initial payload here — `connect` returns before the caller
-            // has written anything — so padding is mandatory rather than
-            // optional, and its length is randomised so the header's size
-            // carries no information about the address inside it.
+            // No initial payload means request padding is mandatory.
             let mut length_pick = [0u8; 2];
             random
                 .fill(&mut length_pick)
@@ -917,33 +721,23 @@ impl<B: TunnelBypass + 'static> StreamEgress for ShadowsocksEgress<B> {
     }
 }
 
-/// What the reader is waiting for. See [`StreamCodec::needed`] for why this is
-/// a state and not a length.
+/// Stream reader state; each next length depends on the prior decrypted stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadState {
-    /// The server's salt, in the clear, which keys the response direction.
+    /// Server salt that keys the response direction.
     Salt,
-    /// The sealed fixed-length response header.
+    /// Sealed response header.
     FixedHeader,
-    /// A sealed length chunk: two bytes plus a tag.
+    /// Sealed payload-length chunk.
     Length,
-    /// A sealed payload chunk of this many plaintext bytes.
+    /// Sealed payload chunk of this plaintext length.
     Payload(usize),
 }
 
-/// A Shadowsocks session's framing, as a pure codec.
-///
-/// **Everything below reads from a slice and writes to a sink.** The framing
-/// logic was already almost pure — it read only from a buffer the poll loop
-/// filled — and lifting the last of it out removed two defects with the loop it
-/// replaced. One was a busy spin: the old writer looped on `Poll::Pending`
-/// rather than yielding, because a sealed frame whose nonce is already spent
-/// cannot be dropped and re-made, so it had nowhere to put one. [`Framed`] has
-/// somewhere, and parks instead of burning a core until the socket drains.
+/// Pure Shadowsocks stream framing codec.
 struct StreamCodec {
     writer: Session,
-    /// Built lazily: the response direction is keyed by a salt the server sends
-    /// with its first byte, which may be long after connect returned.
+    /// Built from the server salt on the first response.
     reader: Option<Session>,
     method: Method,
     key: PreSharedKey,
@@ -952,10 +746,7 @@ struct StreamCodec {
 }
 
 impl StreamCodec {
-    /// How many ciphertext bytes the current state needs before it can act.
-    ///
-    /// **A state rather than a length guess**, because each stage's size is
-    /// known only once the previous one has been decrypted.
+    /// Ciphertext bytes required by the current state.
     fn needed(&self) -> usize {
         match self.state {
             ReadState::Salt => self.method.salt_len(),
@@ -967,8 +758,7 @@ impl StreamCodec {
 }
 
 impl Codec for StreamCodec {
-    /// O(chunk), with one copy of the sealed block because opening is in place
-    /// and the input is borrowed.
+    /// Decodes one complete ciphertext stage.
     fn decode<'a>(&mut self, input: &'a [u8], out: &mut Vec<u8>) -> Result<Decode<'a>, ProxyError> {
         let needed = self.needed();
         let Some((block, rest)) = input.split_at_checked(needed) else {
@@ -1001,12 +791,7 @@ impl Codec for StreamCodec {
         Ok(Decode::Framed { rest })
     }
 
-    /// Seals one chunk: a length under the writer's nonce, then the payload
-    /// under the next.
-    ///
-    /// O(payload). The two seals must reach the peer in this order and without
-    /// anything between them, which is why the whole frame goes into one sink
-    /// and [`Framed`] writes it whole.
+    /// Seals one length stage followed by one payload stage.
     fn encode(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ProxyError> {
         let mut length = Vec::with_capacity(2);
         Writer::new(&mut length).u16(payload.len() as u16);
@@ -1017,8 +802,7 @@ impl Codec for StreamCodec {
         Ok(())
     }
 
-    /// The two-byte length field's ceiling. A caller writing more is split by
-    /// the adapter rather than discovering the limit here.
+    /// Maximum payload length of one framed chunk.
     fn max_payload(&self) -> usize {
         MAX_CHUNK
     }
@@ -1044,7 +828,7 @@ mod tests {
             }
         );
         assert!(PreSharedKey::new(Method::Aes128Gcm, vec![0u8; 16]).is_ok());
-        // The salt length follows the key length, so the two cannot disagree.
+        // Both lengths derive from the method definition.
         for method in [
             Method::Aes128Gcm,
             Method::Aes256Gcm,
@@ -1062,15 +846,14 @@ mod tests {
         assert_ne!(first, second, "a new salt is a new session key");
         assert_eq!(first, psk.subkey(&[1u8; 32]), "derivation is a function");
         assert_eq!(first.len(), 32);
-        // A 128-bit method truncates the same 256-bit derivation.
+        // BLAKE3 always derives 256 bits before method-specific truncation.
         assert_eq!(key(Method::Aes128Gcm).subkey(&[1u8; 16]).len(), 16);
     }
 
     #[test]
     fn the_nonce_counter_never_repeats_and_advances_little_endian() {
         let mut session = Session::new(Method::Aes256Gcm, &[3u8; 32]).unwrap();
-        // Sealing the same plaintext twice must not produce the same bytes:
-        // that is the property the counter exists to guarantee.
+        // Identical plaintexts require distinct ciphertexts under fresh nonces.
         let mut first = b"identical".to_vec();
         let mut second = b"identical".to_vec();
         session.seal(&mut first).unwrap();
@@ -1087,8 +870,7 @@ mod tests {
         writer.seal(&mut chunk).unwrap();
         assert_eq!(reader.open(&mut chunk.clone()).unwrap(), b"payload");
 
-        // A reader whose counter has run ahead cannot open it, which is what
-        // makes a dropped or reordered chunk fatal rather than silently wrong.
+        // Counter drift makes the next chunk fail authentication.
         let mut ahead = Session::new(Method::ChaCha20Poly1305, &[9u8; 32]).unwrap();
         ahead.next_nonce();
         assert!(ahead.open(&mut chunk).is_err());
@@ -1106,19 +888,18 @@ mod tests {
             header
         };
 
-        // The good case, and the length it reports.
+        // A matching type, timestamp, salt, and length is accepted.
         let good = build(TYPE_RESPONSE, now, &salt, 1234);
         assert_eq!(decode_response_fixed(&good, &salt, now).unwrap(), 1234);
 
-        // A response carrying somebody else's salt is a replay of another
-        // session, and is the case this field exists to catch.
+        // The echoed salt binds the response to this request.
         let other = build(TYPE_RESPONSE, now, &[6u8; 32], 1);
         assert!(matches!(
             decode_response_fixed(&other, &salt, now),
             Err(ProxyError::SaltMismatch)
         ));
 
-        // A stale stamp is refused in both directions of skew.
+        // The replay window is symmetric around the local clock.
         for stamp in [now - CLOCK_SKEW_SECONDS - 1, now + CLOCK_SKEW_SECONDS + 1] {
             let stale = build(TYPE_RESPONSE, stamp, &salt, 1);
             assert!(matches!(
@@ -1126,18 +907,18 @@ mod tests {
                 Err(ProxyError::Stale { .. })
             ));
         }
-        // Exactly at the boundary is still admitted.
+        // The configured boundary is inclusive.
         let edge = build(TYPE_RESPONSE, now + CLOCK_SKEW_SECONDS, &salt, 1);
         assert_eq!(decode_response_fixed(&edge, &salt, now).unwrap(), 1);
 
-        // Our own request reflected back is not a response.
+        // A reflected request has the wrong message type.
         let reflected = build(TYPE_REQUEST, now, &salt, 1);
         assert!(matches!(
             decode_response_fixed(&reflected, &salt, now),
             Err(ProxyError::Header)
         ));
 
-        // A truncated header is refused rather than indexed into.
+        // Truncation produces a header error.
         assert!(matches!(
             decode_response_fixed(&good[..10], &salt, now),
             Err(ProxyError::Header)
@@ -1147,9 +928,9 @@ mod tests {
     #[test]
     fn a_request_body_carries_the_target_and_an_explicit_padding_length() {
         let target = Target::Ip("192.0.2.1:443".parse().unwrap());
-        // With an initial payload, no padding is required.
+        // Initial data satisfies SIP022's non-empty request requirement.
         let body = encode_request_body(&target, &[], b"GET /");
-        // ATYP + 4 address + 2 port + 2 padding length + payload.
+        // IPv4 address plus padding length and payload.
         assert_eq!(body.len(), 1 + 4 + 2 + 2 + 5);
         assert_eq!(
             &body[7..9],
@@ -1158,9 +939,7 @@ mod tests {
         );
         assert_eq!(&body[9..], b"GET /");
 
-        // With no payload, padding carries SIP022's requirement instead, and
-        // its length is declared where the reader expects it. A request with
-        // neither is what the reference server rejects outright.
+        // Without initial data, the declared padding carries that requirement.
         let padded = encode_request_body(&target, &[0xab; 16], &[]);
         assert_eq!(&padded[7..9], &16u16.to_be_bytes());
         assert_eq!(padded.len(), 1 + 4 + 2 + 2 + 16);
@@ -1174,11 +953,7 @@ mod tests {
         );
     }
 
-    /// **A server written from the specification, not from the encoder above.**
-    /// Round-tripping a codec against itself proves only that it is
-    /// self-consistent; the thing that matters is agreeing with a peer, so this
-    /// reads the bytes the way SIP022's field tables say to and answers the
-    /// same way.
+    /// Decodes a request and builds a field-table-compatible server reply.
     fn spec_server_reply(
         key: &PreSharedKey,
         datagram: &[u8],
@@ -1199,7 +974,7 @@ mod tests {
             Method::ChaCha20Poly1305 => Algorithm::xchacha20_poly1305(),
         };
 
-        // --- read what the client sent
+        // Decode the client packet independently of the production decoder.
         let (identity, body, nonce) = if aes {
             let block = match key.method {
                 Method::Aes128Gcm => Cipher::aes_128_ecb(),
@@ -1223,7 +998,7 @@ mod tests {
         let mut opened = body.clone();
         let tag = opened.split_off(opened.len() - 16);
         ctx.open_in_place(&nonce, &mut opened, &tag, &[]).unwrap();
-        // For the merged form the identity is the first 16 bytes of the body.
+        // Merged packets place the identity at the start of the plaintext body.
         let (client_session, message) = if aes {
             (identity[..8].to_vec(), opened.as_slice())
         } else {
@@ -1241,12 +1016,12 @@ mod tests {
         };
         let sent = message[11 + pad + consumed..].to_vec();
 
-        // --- answer the way the field table says to
+        // Encode the server response from the SIP022 field order.
         let mut reply = Vec::new();
-        reply.push(1u8); // type: server to client
+        reply.push(1u8); // Server-to-client message type.
         reply.extend_from_slice(&now_seconds().to_be_bytes());
         reply.extend_from_slice(&client_session);
-        reply.extend_from_slice(&0u16.to_be_bytes()); // no padding
+        reply.extend_from_slice(&0u16.to_be_bytes()); // No response padding.
         encode_address(from, &mut reply);
         reply.extend_from_slice(payload);
 
@@ -1279,10 +1054,8 @@ mod tests {
         (out, target, sent)
     }
 
-    /// Every method's packet format, against a server that reads the
-    /// specification rather than this file. **The two AES methods and the
-    /// ChaCha one are different constructions**, so a test that only covered
-    /// one would leave the other's framing entirely unexercised.
+    /// Checks all three SIP022 packet constructions against an independent
+    /// field-table server.
     #[test]
     fn a_packet_round_trips_against_a_server_built_from_the_field_tables() {
         for method in [
@@ -1321,10 +1094,7 @@ mod tests {
         }
     }
 
-    /// The three MUST-level checks, each closing a different hole. A reflected
-    /// request read as a response would deliver a client its own bytes; a stale
-    /// timestamp is the replay window SIP022 bounds at 30 seconds; and a reply
-    /// echoing another client's session is another client's traffic.
+    /// Checks message direction, timestamp freshness, and session binding.
     #[test]
     fn a_reply_must_be_a_reply_recent_and_addressed_to_this_client() {
         let session = [9u8; 8];
@@ -1364,10 +1134,7 @@ mod tests {
         );
     }
 
-    /// SIP022 requires a sliding window because a relay whose replies can be
-    /// replayed is a relay whose client can be made to re-process an old
-    /// answer. Reordering inside the window is ordinary on any path and must
-    /// still be accepted.
+    /// Accepts bounded reordering while rejecting repeated or expired IDs.
     #[test]
     fn the_replay_window_admits_reordering_and_refuses_repetition() {
         let mut window = Window::default();
@@ -1379,8 +1146,7 @@ mod tests {
         assert!(window.admit(4));
         assert!(!window.admit(5));
 
-        // Far ahead resets the bitmap; everything under the new floor is gone
-        // rather than admitted, which is the conservative half of the trade.
+        // A large jump retires IDs below the new window.
         assert!(window.admit(1_000));
         assert!(
             !window.admit(4),
@@ -1389,9 +1155,7 @@ mod tests {
         assert!(window.admit(999), "and just inside it is still accepted");
     }
 
-    /// The nonce is a window over the packet identifier, so a repeated
-    /// identifier is a repeated nonce — which against one key is total loss of
-    /// confidentiality, not a degraded mode.
+    /// Packet IDs must produce distinct AES nonce windows.
     #[test]
     fn the_packet_counter_never_repeats_a_nonce() {
         let psk = key(Method::Aes256Gcm);
@@ -1414,9 +1178,7 @@ mod tests {
         }
     }
 
-    /// A datagram that will not open is noise, not a failure: anything on the
-    /// internet can send to a UDP socket, so an association that died on the
-    /// first stray packet would not survive a public port for a minute.
+    /// Invalid UDP input is discarded without killing the association.
     #[test]
     fn a_packet_that_will_not_open_is_refused_rather_than_believed() {
         let psk = key(Method::Aes128Gcm);
@@ -1439,8 +1201,7 @@ mod tests {
         assert!(cipher.open(&[]).is_err(), "and nothing at all");
     }
 
-    /// Padding exists to stop a datagram's length naming which host was looked
-    /// up, so it applies where that leak is — plain DNS — and nowhere else.
+    /// DNS queries receive random padding; other destinations do not.
     #[test]
     fn only_a_query_to_the_resolver_is_padded() {
         let dns = Target::Ip("198.51.100.7:53".parse().unwrap());
@@ -1461,9 +1222,7 @@ mod tests {
         );
     }
 
-    /// The response fixed header a server writes, built here from SIP022's
-    /// field table rather than from this file's decoder — so the tests below
-    /// check agreement with the specification and not with themselves.
+    /// Builds the response fixed header in SIP022 field order.
     fn server_fixed_header(now: u64, request_salt: &[u8], length: u16) -> Vec<u8> {
         let mut header = Vec::with_capacity(11 + request_salt.len());
         header.push(TYPE_RESPONSE);
@@ -1473,13 +1232,12 @@ mod tests {
         header
     }
 
-    /// A codec pair keyed the way a real session is, so the two directions can
-    /// be run against each other without a server.
+    /// Builds client and server codec state for one stream session.
     fn paired(method: Method) -> (StreamCodec, Session, Vec<u8>, PreSharedKey) {
         let psk = key(method);
         let request_salt = vec![7u8; method.salt_len()];
         let response_salt = vec![9u8; method.salt_len()];
-        // What the client holds.
+        // Client request direction.
         let client = StreamCodec {
             writer: Session::new(method, &psk.subkey(&request_salt)).unwrap(),
             reader: None,
@@ -1488,21 +1246,17 @@ mod tests {
             request_salt: request_salt.clone(),
             state: ReadState::Salt,
         };
-        // What a server would seal responses with.
+        // Server response direction.
         let server = Session::new(method, &psk.subkey(&response_salt)).unwrap();
         (client, server, response_salt, psk)
     }
 
-    /// **Every read boundary, without a socket.** The framing is four states
-    /// whose sizes are each known only after the previous one decrypts, so a
-    /// decoder that assumed a whole stage arrives at once would pass a loopback
-    /// test and stall on a real path.
+    /// Decodes each framing state across one-byte input boundaries.
     #[test]
     fn the_stream_framing_decodes_one_byte_at_a_time() {
         let (mut codec, mut server, response_salt, _psk) = paired(Method::Aes256Gcm);
 
-        // A server's first bytes: its salt, the sealed fixed header naming the
-        // first chunk's length, then that chunk.
+        // Server salt, fixed length header, and first payload chunk.
         let payload = b"hello from the far side";
         let mut wire = response_salt.clone();
         let mut fixed =
@@ -1513,7 +1267,7 @@ mod tests {
         server.seal(&mut sealed).unwrap();
         wire.extend_from_slice(&sealed);
 
-        // Offer a growing prefix, one byte at a time, exactly as `Framed` does.
+        // Feed growing prefixes as the transport would.
         let mut out = Vec::new();
         let mut at = 0usize;
         for taken in 0..=wire.len() {
@@ -1532,9 +1286,7 @@ mod tests {
         assert_eq!(out, payload, "every stage crossed a byte at a time");
     }
 
-    /// A sealed chunk whose tag does not verify ends the stream. Framing is not
-    /// something a peer recovers from mid-connection: a chunk that will not
-    /// open means the two sides no longer agree where the next one begins.
+    /// A failed chunk authentication rejects the stream framing.
     #[test]
     fn a_chunk_that_will_not_open_is_refused() {
         let (mut codec, mut server, response_salt, _psk) = paired(Method::Aes128Gcm);
@@ -1545,7 +1297,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut at = 0usize;
-        // The salt, then the header.
+        // Consume the server salt and fixed header.
         for _ in 0..2 {
             let offered = &wire[at..];
             let Decode::Framed { rest } = codec.decode(offered, &mut out).unwrap() else {
@@ -1553,7 +1305,7 @@ mod tests {
             };
             at += offered.len() - rest.len();
         }
-        // A payload chunk of the right length whose contents are noise.
+        // Correct length, invalid authentication.
         let noise = vec![0u8; 4 + TAG];
         assert!(matches!(
             codec.decode(&noise, &mut out),
@@ -1561,8 +1313,7 @@ mod tests {
         ));
     }
 
-    /// The two-byte length field is the ceiling, and the adapter splits rather
-    /// than letting a caller discover it mid-encode.
+    /// The adapter owns splitting at the two-byte length ceiling.
     #[test]
     fn a_payload_past_the_length_field_is_the_adapters_problem_not_the_codecs() {
         let (codec, _server, _salt, _psk) = paired(Method::Aes256Gcm);
@@ -1570,10 +1321,7 @@ mod tests {
         assert_eq!(MAX_CHUNK, 0xffff, "what two bytes can express");
     }
 
-    /// **The spin this port removed.** The old writer looped on `Poll::Pending`
-    /// because a sealed frame's nonce is already spent and it had nowhere to
-    /// park one; against a peer that stops reading it burned a core. `Framed`
-    /// holds the frame and yields, so a full pipe costs nothing.
+    /// A blocked peer parks the already-sealed frame instead of spinning.
     #[tokio::test]
     async fn a_peer_that_stops_reading_parks_the_writer_rather_than_spinning() {
         let (peer, ours) = tokio::io::duplex(64);
@@ -1581,7 +1329,7 @@ mod tests {
         codec.state = ReadState::Salt;
         let mut framed = Framed::new(ours, codec);
 
-        // Far more than the pipe holds, and nobody is draining it.
+        // Exceed the duplex capacity while the peer remains unread.
         let payload = vec![b'x'; 8192];
         let stalled = tokio::time::timeout(
             std::time::Duration::from_millis(200),

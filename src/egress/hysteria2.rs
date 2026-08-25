@@ -1,33 +1,12 @@
-//! Hysteria2 as a stream egress.
+//! Hysteria2 stream egress over one authenticated QUIC connection.
 //!
-//! One QUIC connection to the server, authenticated once, carrying every flow
-//! as a bidirectional stream. That shape is what makes it worth having: on a
-//! lossy long-RTT path a proxy that multiplexes over QUIC does not head-of-line
-//! block one flow behind another's retransmit, which every TCP-carried protocol
-//! in this crate does.
+//! No RFC defines its wire format, so layouts and limits follow
+//! [sing-quic](https://github.com/SagerNet/sing-quic)'s `hysteria2` package and
+//! are checked by `tests/interop.rs`.
 //!
-//! **There is no specification, so the reference implementation is the
-//! specification.** Hysteria2 is defined by its implementation rather than by
-//! an RFC, so every constant and every field order here was read out of
-//! [sing-quic](https://github.com/SagerNet/sing-quic)'s `hysteria2` package
-//! before it was written, and then checked against a running server by
-//! `tests/interop.rs`. A protocol with no written-down wire format is one where
-//! self-testing proves the least.
-//!
-//! **Authentication is an ordinary HTTP/3 request, and then HTTP/3 is done.**
-//! The client `POST`s to `https://hysteria/auth` with the password in a header
-//! and expects status **233**, which is not an HTTP status code — it is a
-//! sentinel chosen so that anything scanning the endpoint, including a browser,
-//! gets a response indistinguishable from a plain web server's. After that the
-//! connection carries raw streams; see [`crate::egress::quic`] for why the HTTP/3 layer
-//! must be dropped before the first one is opened.
-//!
-//! **Padding is mandatory on both messages**, which is a lesson this crate has
-//! already paid for once: Shadowsocks 2022 rejected our sessions because a
-//! header with neither payload nor padding leaks its length exactly. Hysteria2
-//! pads for the same reason, and the sizes here are the reference's own ranges
-//! rather than invented ones, because a *different* padding distribution is
-//! itself a fingerprint.
+//! Authentication is one HTTP/3 request with status `233`; subsequent streams
+//! use Hysteria2 frames after the HTTP/3 layer is dropped. Both request types
+//! use the reference padding ranges to avoid a distinctive wire shape.
 
 use std::{net::SocketAddr, ops::Range, sync::Arc, time::Duration};
 
@@ -43,53 +22,39 @@ use crate::{
     wire::{Reader, Writer, varint_len},
 };
 
-/// The `:authority` and `:path` the authentication request carries. Fixed
-/// strings, not a real host: the request never leaves the QUIC connection it is
-/// sent on, so the authority names the protocol rather than a name to resolve.
+/// Fixed pseudo-headers for the in-connection authentication request.
 const AUTH_AUTHORITY: &str = "hysteria";
 const AUTH_PATH: &str = "/auth";
 
-/// Header names, lowercase because HTTP/3 requires it.
+/// Lowercase HTTP/3 header names.
 const HEADER_AUTH: &[u8] = b"hysteria-auth";
 const HEADER_CC_RX: &[u8] = b"hysteria-cc-rx";
 const HEADER_PADDING: &[u8] = b"hysteria-padding";
-/// Whether the server will carry datagrams. Read and reported rather than
-/// acted on, because this egress does not implement Hysteria2's UDP yet.
+/// Whether the server accepts Hysteria2 datagrams.
 const HEADER_UDP: &str = "hysteria-udp";
 
-/// Authentication succeeded. Deliberately not a real HTTP status: a probe that
-/// is not a Hysteria2 client sees an ordinary rejection instead.
+/// Hysteria2's nonstandard authentication success status.
 const STATUS_AUTH_OK: u16 = 233;
 
-/// The frame type that opens a TCP proxy stream.
+/// Frame type for opening a TCP proxy stream.
 const FRAME_TCP_REQUEST: u64 = 0x401;
 
-/// Ceilings from the reference, which exist so a hostile server cannot make a
-/// client allocate without bound. They are checked here for the same reason:
-/// a length is a promise from an untrusted peer.
+/// Reference limits for lengths received from the server.
 const MAX_ADDRESS_LEN: u64 = 2048;
 const MAX_MESSAGE_LEN: u64 = 2048;
 const MAX_PADDING_LEN: u64 = 4096;
 
-/// Padding sizes, half-open exactly as the reference writes them. Matching the
-/// distribution matters as much as padding at all: a client whose padding is
-/// uniformly the wrong width is more identifiable than one that does not pad.
+/// Reference padding ranges, expressed as half-open intervals.
 const AUTH_PADDING: Range<usize> = 256..2048;
 const REQUEST_PADDING: Range<usize> = 64..512;
 
-/// The alphabet the reference pads with. ASCII alphanumerics, so the padding
-/// looks like the header values around it rather than like a block of entropy.
+/// Reference padding alphabet.
 const PADDING_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-/// How long a connection may sit idle before QUIC closes it. The reference uses
-/// 30 seconds with a 10-second keepalive; this is the same ceiling, and the
-/// driver's timer handles the rest.
+/// Reference idle timeout; QUIC driving owns the timer.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Random padding of a length drawn from `range`.
-///
-/// Both the length and the contents are random, and both come from the same
-/// CSPRNG the rest of the crate uses. O(range.end).
+/// Generates reference-shaped random padding. O(range.end).
 fn padding(range: Range<usize>) -> Result<Vec<u8>, ProxyError> {
     let random = ring::rand::SystemRandom::new();
     let mut choice = [0u8; 2];
@@ -100,25 +65,14 @@ fn padding(range: Range<usize>) -> Result<Vec<u8>, ProxyError> {
     let mut bytes = vec![0u8; length];
     random.fill(&mut bytes).map_err(|_| ProxyError::Crypto)?;
     for byte in &mut bytes {
-        // Modulo bias over a 62-symbol alphabet is irrelevant here: the padding
-        // conveys nothing, and only its length is observable on the wire.
+        // Padding is opaque; only its length is protocol-visible.
         *byte = PADDING_ALPHABET[usize::from(*byte) % PADDING_ALPHABET.len()];
     }
     Ok(bytes)
 }
 
-/// Writes the frame that opens a proxy stream.
-///
-/// `varint(0x401) || varint(len) || address || varint(len) || padding`, where
-/// the address is the target's text form — `host:port`, with an IPv6 literal
-/// bracketed. Hysteria2 sends a *string* rather than a typed address, which is
-/// why this shares nothing with SOCKS5's or VLESS's encoders.
-///
-/// Padding is a parameter rather than generated here so the encoder stays pure
-/// and its output is a function of its inputs, which is what lets a test assert
-/// the layout byte for byte.
-///
-/// O(address length + padding length).
+/// Writes `varint(type) || varint(address) || address || varint(padding) || padding`.
+/// The address is the target's textual `host:port` form.
 pub fn encode_tcp_request(target: &Target, padding: &[u8], out: &mut Vec<u8>) {
     let address = target.to_string();
     Writer::new(out)
@@ -127,27 +81,16 @@ pub fn encode_tcp_request(target: &Target, padding: &[u8], out: &mut Vec<u8>) {
         .vector_varint(padding);
 }
 
-/// What the server answered when asked to open a stream.
+/// Server result for a stream-open request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TcpResponse {
-    /// Status zero. The stream carries payload from here.
+    /// Status zero; the stream carries payload.
     Accepted,
-    /// Any non-zero status, carrying the server's explanation — capped at the
-    /// protocol's 2048-byte ceiling by the decoder.
-    ///
-    /// A sum rather than `{ ok: bool, message: String }`, because that pair
-    /// admitted an acceptance carrying a refusal reason and a refusal
-    /// explaining nothing. Only one of the two fields was ever meaningful at a
-    /// time, and which one is exactly what `status` decides.
+    /// Nonzero status and the server's bounded explanation.
     Refused(String),
 }
 
-/// Reads the response frame: `status || vstring(message) || vbytes(padding)`.
-///
-/// [`Decoded::Incomplete`] for every proper prefix, so a caller can read and
-/// retry; the `consumed` count is what lets it keep the payload that followed.
-///
-/// O(message length + padding length), and it allocates only for the message.
+/// Reads `status || vstring(message) || vbytes(padding)` and preserves surplus.
 pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyError> {
     let mut reader = Reader::new(bytes);
     let Some(status) = reader.u8() else {
@@ -171,14 +114,12 @@ pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyEr
     if reader.skip(padding_len as usize).is_none() {
         return Ok(Decoded::Incomplete);
     }
-    // A message that is not UTF-8 is a malformed frame rather than a lossy
-    // one: it is the server's own diagnostic text, and mangling it would put
-    // replacement characters into an operator's logs.
+    // Refuse malformed diagnostic text rather than logging replacement bytes.
     let message = std::str::from_utf8(message)
         .map_err(|_| ProxyError::Header)?
         .to_owned();
     Ok(Decoded::Complete {
-        // The reference treats every non-zero status as a refusal.
+        // Any nonzero status is a refusal.
         value: match status {
             0 => TcpResponse::Accepted,
             _ => TcpResponse::Refused(message),
@@ -189,38 +130,22 @@ pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyEr
 
 /// Static configuration for one Hysteria2 server.
 pub struct Hysteria2Config {
-    /// The server's UDP endpoint.
+    /// Server UDP endpoint.
     pub server: SocketAddr,
-    /// The name presented in SNI and verified against the server's certificate.
+    /// SNI name and certificate verification name.
     pub server_name: String,
-    /// The shared password, sent verbatim in the authentication header.
+    /// Password sent in the authentication header.
     pub password: String,
-    /// What RFC 4787 mapping behavior the server's own egress provides.
-    ///
-    /// Configuration for the same reason MASQUE's and SOCKS5's are: the mapping
-    /// belongs to the server and is unobservable from here, so the planner is
-    /// entitled to a measured claim rather than an optimistic constant.
+    /// RFC 4787 mapping behavior provided by the server.
     pub nat_behavior: NatBehavior,
 }
 
-/// Builds the `quiche::Config` for one connection.
-///
-/// A factory rather than a value because `quiche::Config` is neither `Clone`
-/// nor reusable across connections, and this egress redials when its connection
-/// dies. Certificate verification is set here, by the caller, for the same
-/// reason it is for MASQUE: a test server and a production one differ there and
-/// nowhere else.
+/// Factory for a fresh `quiche::Config` per connection.
 pub type QuicConfigFactory = Box<dyn Fn() -> Result<quiche::Config, EgressError> + Send + Sync>;
 
-/// Opening one proxied TCP stream: the request frame out, the response frame
-/// back.
-///
-/// A single exchange, so the machine has one conditional and no offset —
-/// contrast [`crate::Negotiation`]'s multi-phase users, which have to remember
-/// where earlier phases reached.
+/// Sends one stream-open frame and reads its response.
 struct OpenStream {
-    /// Taken on the first advance, which is how "write once" is enforced by the
-    /// type rather than by a flag.
+    /// Consumed by the first call to `advance`.
     request: Option<Vec<u8>>,
 }
 
@@ -237,7 +162,6 @@ impl OpenStream {
 impl crate::Negotiation for OpenStream {
     type Output = ();
 
-    /// O(response length), which the frame's own varints bound.
     fn advance(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Decoded<()>, ProxyError> {
         if let Some(request) = self.request.take() {
             out.extend_from_slice(&request);
@@ -255,9 +179,9 @@ impl crate::Negotiation for OpenStream {
     }
 }
 
-// ------------------------------------------------------- UDP over QUIC
+// UDP over QUIC.
 
-/// A `UDPMessage`, which is what one QUIC DATAGRAM carries.
+/// One Hysteria2 UDP message carried by one QUIC DATAGRAM.
 ///
 /// ```text
 /// [uint32] Session ID
@@ -269,13 +193,8 @@ impl crate::Negotiation for OpenStream {
 /// [bytes]  Payload
 /// ```
 ///
-/// **The address is a string, not a structure.** Hysteria2 writes `host:port`
-/// as text and lets the server resolve it, which is why a name survives the
-/// crossing intact rather than being resolved on this side — the same property
-/// [`Target`] exists to protect everywhere else in this crate.
-///
-/// There is no frame-type varint and no authentication of its own: this rides
-/// inside QUIC, which provides both.
+/// The address remains textual and is resolved by the server. QUIC supplies
+/// framing and authentication, so this message has no additional type field.
 struct UdpMessage<'a> {
     session: u32,
     packet: u16,
@@ -285,17 +204,14 @@ struct UdpMessage<'a> {
     payload: &'a [u8],
 }
 
-/// Header bytes before the address: session, packet, fragment, count.
+/// Fixed header bytes before the address.
 const UDP_FIXED: usize = 4 + 2 + 1 + 1;
 
-/// The reference's `MaxDatagramFrameSize`. A message larger than this must be
-/// fragmented or dropped, never truncated.
+/// Reference `MaxDatagramFrameSize`.
 const MAX_DATAGRAM_FRAME: usize = 1200;
 
 impl UdpMessage<'_> {
-    /// Bytes this message's header costs, which is what fragmentation has to
-    /// subtract from the frame budget. The address is repeated in *every*
-    /// fragment, so this is per fragment rather than per message.
+    /// Per-fragment overhead, including the repeated address.
     fn header_len(address: &str) -> usize {
         UDP_FIXED + varint_len(address.len() as u64) + address.len()
     }
@@ -310,8 +226,7 @@ impl UdpMessage<'_> {
             .bytes(self.payload);
     }
 
-    /// Total on untrusted input: every short buffer, over-long length, and
-    /// non-UTF-8 address is `None` rather than a panic or a partial read.
+    /// Parses a complete, bounded message from untrusted input.
     fn read(bytes: &[u8]) -> Option<UdpMessage<'_>> {
         let mut reader = Reader::new(bytes);
         let session = reader.u32()?;
@@ -324,8 +239,7 @@ impl UdpMessage<'_> {
         }
         let address = reader.take(length as usize)?;
         let payload = reader.rest();
-        // The reference requires at least one payload byte, so a zero-length
-        // one is not representable and is refused rather than delivered empty.
+        // Empty payloads are not valid Hysteria2 messages.
         if payload.is_empty() {
             return None;
         }
@@ -340,15 +254,7 @@ impl UdpMessage<'_> {
     }
 }
 
-/// Splits one datagram into as many messages as the frame budget needs.
-///
-/// **Every fragment repeats the whole header, address included**, which is what
-/// makes the budget per fragment rather than amortised, and is what the
-/// reference does. `FragCount` is 1 for the ordinary case, where the spec says
-/// the packet and fragment identifiers are irrelevant.
-///
-/// O(payload length). Returns `None` for a payload that cannot be fragmented
-/// into at most 255 pieces, which is a datagram no path would carry anyway.
+/// Splits a datagram into bounded messages with the full header on each one.
 fn fragment(session: u32, packet: u16, address: &str, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
     let budget = MAX_DATAGRAM_FRAME.checked_sub(UdpMessage::header_len(address))?;
     if budget == 0 {
@@ -378,36 +284,19 @@ fn fragment(session: u32, packet: u16, address: &str, payload: &[u8]) -> Option<
     )
 }
 
-/// Reassembles one session's fragmented messages.
-///
-/// **One packet at a time, deliberately.** The reference discards everything it
-/// holds the moment a different packet identifier arrives, and so does this: a
-/// datagram transport that buffered several partial packets would be a memory
-/// pool an attacker fills by sending first fragments, and the spec's own rule —
-/// lose one fragment, discard the packet — means nothing held is worth much.
+/// Reassembles one packet at a time; a new packet replaces partial state.
 #[derive(Default)]
 struct Defragmenter {
     packet: u16,
     fragments: u8,
-    /// Fragments in index order, `None` where one has not arrived.
+    /// Fragments in index order.
     held: Vec<Option<Vec<u8>>>,
 }
 
 impl Defragmenter {
-    /// Returns the whole payload once every fragment of one packet is in hand.
-    ///
-    /// O(1) amortised per fragment, plus one copy of the payload when it
-    /// completes.
+    /// Returns a payload only after every fragment has arrived.
     fn push(&mut self, message: &UdpMessage<'_>) -> Option<Vec<u8>> {
-        // **`<= 1`, not `== 1`, and that is a decision rather than an
-        // accident.** The specification says "For packets that are not
-        // fragmented, the Fragment Count MUST be set to 1" and is silent on
-        // zero, so a zero is a value no conforming sender emits. Both
-        // references fill the silence the same way — apernet/hysteria's
-        // `Defragger::Feed` and sing-quic's `udpDefragger::feed` each open with
-        // `FragCount <= 1`, returning the message whole — and this rides an
-        // authenticated connection, where refusing a datagram two reference
-        // implementations deliver buys nothing.
+        // Both reference implementations treat zero like an unfragmented packet.
         if message.fragments <= 1 {
             return Some(message.payload.to_vec());
         }
@@ -425,30 +314,22 @@ impl Defragmenter {
         }
         let whole = self.held.iter().flatten().flatten().copied().collect();
         self.held.clear();
-        // A completed packet leaves nothing behind, so the next first fragment
-        // starts from empty rather than from a stale count.
+        // Completed packets leave no stale fragment state.
         self.fragments = 0;
         Some(whole)
     }
 }
 
-/// A Hysteria2 server as a stream egress.
+/// Hysteria2 stream and datagram egress.
 pub struct Hysteria2Egress<B> {
     config: Hysteria2Config,
     bypass: B,
     quic: QuicConfigFactory,
-    /// The shared connection every flow rides on. An async mutex because
-    /// establishing one awaits, and because two flows arriving together must
-    /// produce *one* connection rather than two — the second waits and finds
-    /// the first's.
+    /// Shared authenticated connection.
     connection: Mutex<Option<QuicConnection>>,
-    /// The datagram hub for the live connection, or `None` when the server
-    /// answered `Hysteria-UDP: false`. Replaced whenever a connection is, since
-    /// a session identifier means nothing on a different connection.
+    /// Datagram routes for the current connection, if supported.
     datagrams: Mutex<Option<Arc<Sessions>>>,
-    /// Cancels the driver task. Held here so the connection's lifetime is the
-    /// egress's: dropping the egress ends the task rather than leaving it
-    /// holding a socket nobody can reach.
+    /// Cancels the connection driver on drop.
     shutdown: CancellationToken,
 }
 
@@ -470,18 +351,12 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
         }
     }
 
-    /// A `quiche::Config` with Hysteria2's ALPN and the idle timeout the
-    /// reference uses, ready for a caller to set verification on.
+    /// Builds a config with Hysteria2's ALPN and idle timeout.
     pub fn quic_config() -> Result<quiche::Config, EgressError> {
         client_config(quiche::h3::APPLICATION_PROTOCOL, IDLE_TIMEOUT)
     }
 
-    /// The live connection, dialling and authenticating one if there is none.
-    ///
-    /// Holding the lock across the handshake is deliberate: it is what makes
-    /// concurrent first flows share a connection instead of racing to build
-    /// two, and a second connection would mean a second authentication and a
-    /// second socket for no gain.
+    /// Returns the live connection, authenticating one if necessary.
     async fn connection(&self) -> Result<QuicConnection, EgressError> {
         let mut held = self.connection.lock().await;
         if let Some(connection) = held.as_ref()
@@ -507,10 +382,7 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
                 quiche::h3::Header::new(b":authority", AUTH_AUTHORITY.as_bytes()),
                 quiche::h3::Header::new(b":path", AUTH_PATH.as_bytes()),
                 quiche::h3::Header::new(HEADER_AUTH, self.config.password.as_bytes()),
-                // Zero means "I do not know my own receive bandwidth, use
-                // congestion control". Honest: this client runs `quiche`'s
-                // CUBIC rather than Hysteria's Brutal, which is a sender-side
-                // rate the server would otherwise trust us to have measured.
+                // Zero selects congestion control instead of a claimed receive rate.
                 quiche::h3::Header::new(HEADER_CC_RX, b"0"),
                 quiche::h3::Header::new(HEADER_PADDING, &pad),
             ])
@@ -519,18 +391,13 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
         if response.status != STATUS_AUTH_OK {
             return Err(ProxyError::AuthFailed.into());
         }
-        // **The server declares UDP support unilaterally and the client must
-        // obey it.** The request says nothing about datagrams; the response
-        // says whether any will be carried, and a server that said no "SHOULD
-        // silently discard" what a client sends anyway -- so sending would look
-        // exactly like a working relay that drops everything.
+        // Datagram support is a server-declared capability.
         let carries_datagrams = response
             .header(HEADER_UDP)
             .is_some_and(|value| matches!(value, "true" | "1" | "t" | "T" | "TRUE" | "True"));
 
         let connection = handshake.drive(self.shutdown.clone());
-        // One hub per connection, started before any session can register, so
-        // a session opened immediately after this cannot miss its own replies.
+        // Start routing before allowing sessions to register.
         let hub = if carries_datagrams {
             let hub = Sessions::new();
             hub.serve(&connection, self.shutdown.clone()).await;
@@ -543,28 +410,20 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
         Ok(connection)
     }
 
-    /// The response header a server declares datagram support in.
+    /// Response header reporting datagram support.
     pub fn udp_header() -> &'static str {
         HEADER_UDP
     }
 }
 
-/// One session's inbound queue: a reassembled datagram and where it came from.
+/// One session's bounded inbound route.
 type Route = mpsc::Sender<(Vec<u8>, Target)>;
 
-/// The datagram side of one authenticated connection.
-///
-/// **One QUIC connection carries every session, so someone has to
-/// demultiplex.** Hysteria2 gives each association a 32-bit session identifier
-/// and the server echoes it on every reply, so the routing key is in the
-/// message — but only one reader may take the connection's datagram stream, so
-/// that reader is here and it fans out.
+/// Demultiplexes one connection's datagrams by session identifier.
 struct Sessions {
-    /// Where a session's reassembled datagrams go, by session identifier.
+    /// Routes keyed by session identifier.
     routes: std::sync::Mutex<std::collections::HashMap<u32, Route>>,
-    /// **The client picks these, and the reference starts at 1.** Zero is
-    /// avoided for the same reason the reference avoids it as a packet
-    /// identifier: it reads as "unset" in a capture.
+    /// Next session identifier; reference implementations start at one.
     next: std::sync::atomic::AtomicU32,
 }
 
@@ -576,18 +435,14 @@ impl Sessions {
         })
     }
 
-    /// Starts the one task that reads the connection's datagrams and routes
-    /// them. Returns `false` when something already claimed the stream, which
-    /// means a hub is already running for this connection.
+    /// Starts the single datagram reader and router.
     async fn serve(self: &Arc<Self>, connection: &QuicConnection, shutdown: CancellationToken) {
         let Some(mut inbound) = connection.receive_datagrams().await else {
             return;
         };
         let hub = Arc::clone(self);
         tokio::spawn(async move {
-            // Reassembly is per session, and the map is owned by this task
-            // alone -- so a session's partial packet cannot be observed or
-            // filled in by any other.
+            // Each session's reassembly state belongs to this reader task.
             let mut partial: std::collections::HashMap<u32, Defragmenter> =
                 std::collections::HashMap::new();
             loop {
@@ -598,40 +453,31 @@ impl Sessions {
                         None => break,
                     },
                 };
-                // A malformed datagram is noise, not a failure: it rides an
-                // authenticated connection, but a server that speaks a dialect
-                // this client does not is not a reason to drop every session.
+                // Ignore malformed messages without killing other sessions.
                 let Some(message) = UdpMessage::read(&datagram) else {
                     continue;
                 };
                 let Some(route) = crate::locked(&hub.routes).get(&message.session).cloned() else {
-                    // A session that has gone away. Its reassembly state goes
-                    // with it, or a server that kept sending would keep a
-                    // buffer alive for a mapping nobody holds.
+                    // Drop state for a session that has closed.
                     partial.remove(&message.session);
                     continue;
                 };
                 let Ok(from) = message.address.parse::<SocketAddr>().map(Target::Ip) else {
-                    // The reply names where it came from; a name here gives no
-                    // address to write into the synthesized packet's source,
-                    // and a client discards a reply from an address it did not
-                    // dial.
+                    // Replies must identify a concrete source address.
                     continue;
                 };
                 let Some(whole) = partial.entry(message.session).or_default().push(&message) else {
                     continue;
                 };
                 if route.try_send((whole, from)).is_err() {
-                    // The mapping is gone or is not keeping up. Either way this
-                    // is a dropped datagram, which is what a dropped datagram
-                    // is.
+                    // A full or closed route drops the datagram.
                     continue;
                 }
             }
         });
     }
 
-    /// Registers a session and returns its identifier and inbound queue.
+    /// Registers a session and returns its identifier and route.
     fn open(&self) -> (u32, mpsc::Receiver<(Vec<u8>, Target)>) {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(SESSION_DEPTH);
@@ -644,26 +490,19 @@ impl Sessions {
     }
 }
 
-/// Datagrams held for one session that is not being drained. Bounded and lossy
-/// for the reason every datagram queue here is.
+/// Capacity of each bounded, lossy session route.
 const SESSION_DEPTH: usize = 64;
 
-/// The sending half of one Hysteria2 association.
+/// Sending half of one Hysteria2 datagram association.
 struct UdpSession {
     connection: QuicConnection,
     hub: Arc<Sessions>,
     id: u32,
-    /// Identifies the fragments of one datagram. The reference draws a fresh
-    /// one per fragmented packet and leaves it at zero otherwise, which is
-    /// exactly what the spec means by "irrelevant" when the count is 1.
+    /// Packet identifier for the next datagram.
     next_packet: std::sync::atomic::AtomicU32,
 }
 
 impl Drop for UdpSession {
-    /// **The protocol has no way to close a session, so this is the only
-    /// signal.** The server releases its port on its own idle timer; what this
-    /// releases is the routing entry, without which the hub would keep a
-    /// channel alive for a mapping nobody holds.
     fn drop(&mut self) {
         self.hub.close(self.id);
     }
@@ -693,11 +532,10 @@ impl DatagramSink for UdpSession {
     }
 }
 
-/// The receiving half: one session's queue, filled by the hub.
+/// Receiving half of one Hysteria2 datagram association.
 struct UdpReplies {
     inbound: mpsc::Receiver<(Vec<u8>, Target)>,
-    /// Held so the routing entry outlives this half too. Without it a caller
-    /// that dropped the sink and kept the source would stop receiving.
+    /// Keeps the route registered while this receiver exists.
     _session: Arc<UdpSession>,
 }
 
@@ -722,18 +560,8 @@ impl DatagramSource for UdpReplies {
 impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // **Native: a client datagram is one QUIC DATAGRAM, unreliable and
-            // unordered exactly as it was.** Fragmentation is the one caveat
-            // and it does not change the claim -- a packet that needs it is
-            // reassembled whole or discarded whole, never delivered in pieces.
-            //
-            // A server that answered `Hysteria-UDP: false` is a separate
-            // matter: `associate` refuses, and the flow fails rather than
-            // silently disappearing into a relay that discards it.
+            // Each datagram uses QUIC DATAGRAM; fragments are reassembled before delivery.
             datagram_fidelity: DatagramFidelity::Native,
-            // A terminated path re-originates the byte stream, so the client's
-            // packet size stops existing and there is no per-packet header to
-            // charge for.
             overhead_bytes: 0,
             max_datagram_size: None,
             preserves_ecn: false,
@@ -741,21 +569,12 @@ impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
         }
     }
 
-    /// Opens a datagram association: one session identifier on the connection
-    /// every other flow already shares.
-    ///
-    /// **No handshake and no control stream.** Hysteria2 has neither for UDP --
-    /// the first datagram establishes the session by carrying its identifier,
-    /// and there is no way to close one, so the server releases its port on its
-    /// own idle timer. What this allocates is a routing entry, and dropping the
-    /// association is what frees it.
+    /// Opens a session on the shared connection; the first datagram establishes it.
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
             let connection = self.connection().await?;
             let Some(hub) = self.datagrams.lock().await.clone() else {
-                // The server said it carries none. Refusing is the honest
-                // answer: sending anyway would look exactly like a relay that
-                // works and drops everything.
+                // Do not emulate unsupported datagrams with silent loss.
                 return Err(EgressError::DatagramsUnsupported);
             };
             let (id, inbound) = hub.open();
@@ -786,15 +605,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
             let connection = self.connection().await?;
             let mut stream = connection.open_bidi().await?;
 
-            // **The response is awaited here rather than lazily**, which costs
-            // one round trip before `connect` returns and buys an honest error:
-            // a refusal becomes a failed dial, as it does for SOCKS5, instead
-            // of surfacing later as an unexplained read error on a stream the
-            // caller has already committed to.
             let mut open = OpenStream::new(target, padding(REQUEST_PADDING)?);
-            // Anything past the response frame is the target's first payload,
-            // which coalesces into the same stream write for every server-first
-            // protocol. Replaying it is what keeps a banner from vanishing.
             let ((), surplus) = crate::negotiate(&mut stream, &mut open).await?;
             Ok(Box::new(Prefixed::new(surplus, stream)) as Box<dyn AsyncStream>)
         })
@@ -806,9 +617,7 @@ mod tests {
     use super::*;
     use crate::DomainName;
 
-    /// The request layout, byte for byte, against a hand-written expectation.
-    /// Padding is passed in rather than generated so this is a total function
-    /// of its inputs and the assertion can be exact.
+    /// Pins the stream-open wire layout.
     #[test]
     fn a_tcp_request_is_the_frame_type_then_two_length_prefixed_fields() {
         let target = Target::Domain {
@@ -820,7 +629,6 @@ mod tests {
         assert_eq!(
             out,
             [
-                // 0x401 needs the two-byte varint form: 0x40 | 0x04, 0x01.
                 &[0x44, 0x01][..],
                 &[15][..],
                 b"example.com:443",
@@ -831,9 +639,7 @@ mod tests {
         );
     }
 
-    /// An IPv6 target must be bracketed, because the address form is a *string*
-    /// and `::1:443` would otherwise be ambiguous with the address itself. This
-    /// is `SocketAddr`'s own `Display`, and the test pins that it stays so.
+    /// Textual IPv6 targets remain bracketed.
     #[test]
     fn an_ipv6_target_is_bracketed_in_the_address_string() {
         let target = Target::Ip("[::1]:8080".parse().unwrap());
@@ -845,13 +651,9 @@ mod tests {
         );
     }
 
-    /// The law every streaming decoder in this crate obeys: no proper prefix
-    /// decodes, the whole message does, and `consumed` is exact so the caller
-    /// can keep what followed.
+    /// Incomplete prefixes stay incomplete and surplus is preserved.
     #[test]
     fn every_proper_prefix_of_a_response_is_incomplete() {
-        // Written as the specification lays the frame out, one literal byte
-        // per varint, so this checks the decoder rather than our encoder.
         let mut frame = vec![0u8, 0x02];
         frame.extend_from_slice(b"ok");
         frame.push(0x04);
@@ -872,8 +674,6 @@ mod tests {
             })
         );
 
-        // The payload that follows must be reported as surplus rather than
-        // swallowed, which is the whole point of `consumed`.
         let mut with_payload = frame.clone();
         with_payload.extend_from_slice(b"SSH-2.0-OpenSSH");
         assert_eq!(
@@ -885,8 +685,7 @@ mod tests {
         );
     }
 
-    /// A refusal carries the server's reason, and a non-zero status is what
-    /// makes it a refusal.
+    /// Nonzero status preserves the server's refusal reason.
     #[test]
     fn a_non_zero_status_is_a_refusal_carrying_its_message() {
         let mut frame = vec![1u8, 0x07];
@@ -898,9 +697,7 @@ mod tests {
         assert_eq!(value, TcpResponse::Refused("refused".to_owned()));
     }
 
-    /// Lengths are a promise from an untrusted peer, so a server claiming a
-    /// message larger than the protocol's ceiling is rejected rather than
-    /// allocated for.
+    /// Peer lengths above the protocol ceilings are rejected.
     #[test]
     fn a_length_beyond_the_protocol_ceiling_is_refused_not_allocated() {
         let mut frame = vec![0u8];
@@ -912,9 +709,7 @@ mod tests {
         assert_eq!(decode_tcp_response(&frame), Err(ProxyError::Header));
     }
 
-    /// Padding must land inside the reference's range and use its alphabet: a
-    /// client that pads differently is distinguishable from one that does not
-    /// pad, which defeats the point.
+    /// Padding uses the reference range and alphabet.
     #[test]
     fn padding_stays_inside_the_reference_range_and_alphabet() {
         for _ in 0..64 {
@@ -928,10 +723,7 @@ mod tests {
         }
     }
 
-    /// The field table from the protocol specification, read back by hand
-    /// rather than through this file's own decoder. Round-tripping a codec
-    /// against itself proves only self-consistency; the offsets are the thing
-    /// a peer agrees with.
+    /// Pins the UDP field order independently of the decoder.
     #[test]
     fn a_udp_message_lays_its_fields_out_where_the_specification_says() {
         let mut out = Vec::new();
@@ -949,7 +741,6 @@ mod tests {
         assert_eq!(&out[4..6], &[5, 6], "packet, uint16 big endian");
         assert_eq!(out[6], 2, "fragment index");
         assert_eq!(out[7], 5, "fragment count");
-        // "example.com:443" is 15 bytes, which a one-byte QUIC varint holds.
         assert_eq!(out[8], 15, "address length, QUIC varint");
         assert_eq!(&out[9..24], b"example.com:443");
         assert_eq!(&out[24..], b"body");
@@ -963,8 +754,7 @@ mod tests {
         assert_eq!(read.payload, b"body");
     }
 
-    /// A message is bytes from a server, so every truncation and every
-    /// impossible length is `None` rather than a panic or a partial read.
+    /// Truncated, empty-address, and non-UTF-8 messages are rejected.
     #[test]
     fn a_malformed_message_is_refused_rather_than_partially_believed() {
         let mut whole = Vec::new();
@@ -998,9 +788,7 @@ mod tests {
         assert!(UdpMessage::read(&not_utf8).is_none(), "the address is text");
     }
 
-    /// **Every fragment repeats the whole header, address included**, so the
-    /// budget is per fragment. Getting that wrong by one varint byte makes the
-    /// last fragment exceed the frame and the server drop the packet.
+    /// Every fragment fits the frame and repeats the address.
     #[test]
     fn every_fragment_fits_the_frame_and_carries_the_address_again() {
         let address = "a-rather-long-name.example.com:443";
@@ -1026,8 +814,7 @@ mod tests {
         assert_eq!(rebuilt, payload);
     }
 
-    /// The ordinary case is one message with a count of 1, where the
-    /// specification says the packet and fragment identifiers are irrelevant.
+    /// A fitting datagram uses one message.
     #[test]
     fn a_datagram_that_fits_is_not_fragmented() {
         let fragments = fragment(1, 0, "198.51.100.7:53", b"query").expect("it fits");
@@ -1035,9 +822,7 @@ mod tests {
         assert_eq!(UdpMessage::read(&fragments[0]).unwrap().fragments, 1);
     }
 
-    /// Reassembly in order, out of order, and not at all. **Losing one fragment
-    /// discards the packet** — the specification requires it, and a transport
-    /// that delivered a hole would be worse than one that delivered nothing.
+    /// Reassembly accepts any order and requires every fragment.
     #[test]
     fn reassembly_needs_every_fragment_and_tolerates_their_order() {
         let address = "198.51.100.7:53";
@@ -1045,7 +830,6 @@ mod tests {
         let fragments = fragment(1, 4, address, &payload).unwrap();
         let read = |bytes: &Vec<u8>| -> Vec<u8> { bytes.clone() };
 
-        // In order.
         let mut forward = Defragmenter::default();
         let mut whole = None;
         for bytes in &fragments {
@@ -1053,7 +837,6 @@ mod tests {
         }
         assert_eq!(whole.as_deref(), Some(payload.as_slice()));
 
-        // Reversed, which a lossy path produces routinely.
         let mut backward = Defragmenter::default();
         let mut whole = None;
         for bytes in fragments.iter().rev().map(read).collect::<Vec<_>>() {
@@ -1061,7 +844,6 @@ mod tests {
         }
         assert_eq!(whole.as_deref(), Some(payload.as_slice()));
 
-        // One missing: nothing is ever produced.
         let mut lossy = Defragmenter::default();
         for bytes in fragments.iter().skip(1) {
             assert!(
@@ -1071,9 +853,7 @@ mod tests {
         }
     }
 
-    /// A new packet identifier discards whatever was held. Buffering several
-    /// partial packets would be a pool an attacker fills with first fragments,
-    /// and the specification's own rule means nothing held is worth much.
+    /// A new packet identifier replaces the partial packet.
     #[test]
     fn a_new_packet_discards_the_partial_one_before_it() {
         let address = "198.51.100.7:53";
@@ -1082,7 +862,6 @@ mod tests {
 
         let mut defrag = Defragmenter::default();
         assert!(defrag.push(&UdpMessage::read(&first[0]).unwrap()).is_none());
-        // Everything from the second packet, which must complete on its own.
         let mut whole = None;
         for bytes in &second {
             whole = defrag.push(&UdpMessage::read(bytes).unwrap());
@@ -1094,11 +873,7 @@ mod tests {
         );
     }
 
-    /// A response frame as the protocol specification lays it out:
-    /// `status || vstring(message) || vbytes(padding)`. Built here rather than
-    /// with a shipped encoder, because this crate is a client and never writes
-    /// one — so the tests below check the decoder against the specification
-    /// instead of against its own inverse.
+    /// Builds a response frame for decoder tests.
     fn encode_tcp_response(ok: bool, message: &str, padding: &[u8], out: &mut Vec<u8>) {
         Writer::new(out)
             .u8(if ok { 0 } else { 1 })
@@ -1106,9 +881,7 @@ mod tests {
             .vector_varint(padding);
     }
 
-    /// The exchange, driven without a QUIC connection anywhere. Before the port
-    /// this needed a live server: the request and the response read were
-    /// sequenced inside `connect`, so there was nothing to hand bytes to.
+    /// Drives the stream-open negotiation without QUIC.
     #[test]
     fn opening_a_stream_writes_the_request_then_reads_its_response() {
         use crate::Negotiation;
@@ -1127,16 +900,12 @@ mod tests {
         encode_tcp_request(&target, b"pad", &mut expected);
         assert_eq!(request, expected);
 
-        // A second offer must not write the request again; a server reading two
-        // would take the first bytes of the second as payload.
         let mut again = Vec::new();
         open.advance(&[], &mut again).unwrap();
         assert!(again.is_empty());
     }
 
-    /// **Every read boundary.** A response frame is a status byte and two
-    /// length-prefixed strings, so a machine that assumed it arrives whole
-    /// would work against loopback and stall behind a middlebox.
+    /// The response decoder handles every input split and preserves surplus.
     #[test]
     fn the_response_is_read_however_the_bytes_are_split() {
         use crate::Negotiation;
@@ -1158,8 +927,7 @@ mod tests {
         );
     }
 
-    /// A refusal is a failed dial rather than a stream that fails later, which
-    /// is the whole reason the response is awaited at connect.
+    /// A refusal is reported during stream opening.
     #[test]
     fn a_refused_stream_fails_the_dial_and_says_why() {
         use crate::Negotiation;
