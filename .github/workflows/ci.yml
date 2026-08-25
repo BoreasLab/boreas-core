@@ -40,12 +40,6 @@ jobs:
       # re-materialised, fails here rather than riding into a commit.
       - run: uv run scripts/vendor.py --check
       - run: uv run scripts/vendor.py --selftest
-      # The two tables the release pipeline is built on. Their doctests *are*
-      # the laws — that a pre-release sorts below the release it heads toward,
-      # and that `armeabi-v7a` is one letter different in Rust and in the NDK —
-      # so they run here rather than only when a release is being cut.
-      - run: uv run scripts/release.py --selftest
-      - run: uv run scripts/android.py --selftest
       - run: uvx ruff@0.16.1 check scripts/
       - run: uvx ruff@0.16.1 format --check scripts/
 
@@ -131,56 +125,52 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    env:
+    strategy:
       # One ABI here, all four in the release workflow: this job exists to
       # catch a C dependency that will not cross-compile, and the first target
-      # to do that catches it.
-      ABI: arm64-v8a
+      # to do that catches it. A matrix of one, so the steps are the same steps.
+      matrix:
+        abi: [arm64-v8a]
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: dtolnay/rust-toolchain@stable
 
+      # `xtask` owns the mapping from the name Gradle uses to the target Rust
+      # uses to the triple the NDK's compiler is named after — three names that
+      # do not all agree, in three different types so they cannot be confused.
       - name: Resolve the target
         id: target
-        run: echo "rust=$(uv run scripts/android.py --target "$ABI")" >> "$GITHUB_OUTPUT"
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          target=$(cargo xtask android-target "$ABI")
+          echo "rust=$target" >> "$GITHUB_OUTPUT"
+          rustup target add "$target"
 
-      # **Before `rust-cache`, and that ordering is the whole point.** The cache
-      # action's key includes every env var whose name starts with `CC`, `CXX`,
-      # `CFLAGS`, or `CMAKE`, but it reads them when it runs — so setting the
-      # toolchain afterwards leaves the compilers out of the key entirely. That
-      # is how a `target/` built with one toolchain gets restored over another:
-      # `boring-sys` re-extracts BoringSSL, cmake-rs reuses the old build tree,
-      # and CMake reports `Check for working C compiler: /usr/bin/cc - skipped`
-      # because the answer was already in the restored `CMakeCache.txt`. A
-      # toolchain file is only honoured on a build tree's *first* configure, so
-      # the NDK's never applies, `CMAKE_CROSSCOMPILING` stays false, and
-      # Google Benchmark tries to *run* its feature probes on an ARM64 binary.
+      # **Before `rust-cache`, and that ordering is load-bearing.** The cache
+      # key includes every env var named `CC*`, `CXX*`, `CFLAGS*`, or `CMAKE*`,
+      # but it reads them when it runs — so setting the toolchain afterwards
+      # leaves the compilers out of the key entirely.
       #
-      # `scripts/android.py` owns the three names this needs — Gradle's,
-      # Rust's, and the NDK compiler's — because they do not all agree.
+      # This also writes the CMake wrapper that turns `BUILD_TESTING` off; see
+      # `Ndk::cmake_wrapper` for why BoringSSL's test tree cannot cross-compile.
       - name: Point the C toolchain at the NDK
-        run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
+        env:
+          ABI: ${{ matrix.abi }}
+        run: cargo xtask android-env "$ABI" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ steps.target.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.abi }}
 
       # **A CMake build tree cannot be restored across a toolchain change, and
-      # the cache key cannot be used to prevent it.** `rust-cache` falls back
-      # to a prefix-matched older entry when the exact key misses, so changing
-      # the compilers changes the key and restores the stale tree anyway.
-      #
-      # Two things go stale in there and both are fatal. A toolchain file is
-      # only honoured on a tree's *first* configure, so a restored cache keeps
-      # whatever compiler it was born with. And Google Benchmark writes
-      # `HAVE_STD_REGEX=FALSE` with `CACHE BOOL "" FORCE` when its probe fails,
-      # then short-circuits on `if(DEFINED ...)` ever after — so one bad
-      # configure poisons every later one in that tree, including correct ones,
-      # and the only cure is deleting the directory.
-      #
-      # The cost is a BoringSSL rebuild per run. That is the honest price of
-      # not being able to cache this soundly.
+      # the cache key cannot prevent it**: `rust-cache` falls back to a
+      # prefix-matched older entry when the exact key misses. Two things go
+      # stale in there and both are fatal — the compiler identity, because a
+      # toolchain file is only honoured on a tree's first configure, and
+      # Benchmark's `HAVE_STD_REGEX=FALSE`, which it writes with `FORCE` and
+      # short-circuits on ever after.
       - name: Discard any restored BoringSSL build tree
         run: rm -rf target/*/*/build/boring-sys-* target/*/build/boring-sys-*
 

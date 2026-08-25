@@ -22,7 +22,12 @@ edition = "2024"
 # versions and the same `[patch.crates-io]` entries below. A second workspace
 # would duplicate both and let them drift.
 [workspace]
-members = ["ffi"]
+members = ["ffi", "xtask"]
+# `xtask` is the build pipeline — the Android ABI table and the release tag
+# algebra — and it is a member so `cargo test --workspace` runs its tests and
+# `cargo clippy --workspace` lints it. It is *not* a default member: `cargo
+# build` at the root builds what ships, and a CI tool is not that.
+default-members = [".", "ffi"]
 # `fuzz/` stays out. It is its own workspace on purpose — a nightly toolchain,
 # sanitiser instrumentation, and `libfuzzer-sys`, none of which belong in the
 # graph an ordinary `cargo build` resolves. Naming it here is what keeps

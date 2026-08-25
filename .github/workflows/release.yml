@@ -2,12 +2,12 @@ name: Release
 
 # Two triggers, two kinds of tag, one pipeline.
 #
-# A push to `main` cuts a **pre-release**: `scripts/release.py --next` names it
+# A push to `main` cuts a **pre-release**: `cargo xtask resolve` names it
 # after the patch that has not happened yet, stamped with the time and the
 # commit, and GitHub marks it pre-release so it never becomes "Latest".
 #
 # A `v*` tag pushed by hand cuts a **release**. That is the only thing a human
-# does here, and `scripts/release.py --check` refuses one that disagrees with
+# does here, and `cargo xtask resolve` refuses one that disagrees with
 # `Cargo.toml` — a shipped artefact whose version does not match the crate it
 # was built from is discovered by a downstream consumer, months later, as a
 # mystery.
@@ -53,31 +53,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: dtolnay/rust-toolchain@stable
 
+      # **No branch here, and that is the point.** `xtask resolve` reads the
+      # event from `GITHUB_REF_TYPE`, which GitHub already sets, and returns one
+      # of two variants; a release event with no tag is not a state it can be
+      # asked about. It refuses a tag that disagrees with `Cargo.toml`, because
+      # a published artefact whose version does not match the crate it was built
+      # from is found by a downstream consumer, months later, as a mystery.
       - name: Decide the tag
         id: name
-        env:
-          # The ref crosses as data rather than being spliced into the script.
-          REF_NAME: ${{ github.ref_name }}
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: |
-          set -euo pipefail
-          if [ "$IS_TAG" = "true" ]; then
-            version=$(uv run scripts/release.py --check "$REF_NAME")
-            tag="$REF_NAME"
-            prerelease=false
-          else
-            tag=$(uv run scripts/release.py --next)
-            version="${tag#v}"
-            prerelease=true
-          fi
-          {
-            echo "tag=$tag"
-            echo "version=$version"
-            echo "prerelease=$prerelease"
-          } >> "$GITHUB_OUTPUT"
-          echo "publishing $tag (prerelease=$prerelease)"
+        run: cargo xtask resolve | tee -a "$GITHUB_OUTPUT"
 
   # The gate, on every release including pre-releases. `ci.yml` runs on the same
   # push, but the two are independent workflows: without this, a red `main`
@@ -101,10 +87,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # One shared object per ABI. `scripts/android.py` owns the mapping from the
-  # name Gradle uses to the target Rust uses to the triple the NDK's compiler
-  # is named after — three names that do not all agree, which is why they are
-  # in a table with doctests rather than derived in YAML.
+  # One shared object per ABI. `xtask` owns the three names each ABI has —
+  # Gradle's, Rust's, and the NDK compiler's — in three distinct types, so
+  # using one where another belongs does not compile.
   android:
     name: android ${{ matrix.abi }}
     needs: [plan, gate]
@@ -121,56 +106,44 @@ jobs:
         abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: dtolnay/rust-toolchain@stable
 
+      # `xtask` owns the mapping from the name Gradle uses to the target Rust
+      # uses to the triple the NDK's compiler is named after — three names that
+      # do not all agree, in three different types so they cannot be confused.
       - name: Resolve the target
         id: target
         env:
           ABI: ${{ matrix.abi }}
         run: |
           set -euo pipefail
-          echo "rust=$(uv run scripts/android.py --target "$ABI")" >> "$GITHUB_OUTPUT"
+          target=$(cargo xtask android-target "$ABI")
+          echo "rust=$target" >> "$GITHUB_OUTPUT"
+          rustup target add "$target"
 
-      # **Before `rust-cache`, and that ordering is the whole point.** The cache
-      # action's key includes every env var whose name starts with `CC`, `CXX`,
-      # `CFLAGS`, or `CMAKE`, but it reads them when it runs — so setting the
-      # toolchain afterwards leaves the compilers out of the key entirely. That
-      # is how a `target/` built with one toolchain gets restored over another:
-      # `boring-sys` re-extracts BoringSSL, cmake-rs reuses the old build tree,
-      # and CMake reports `Check for working C compiler: /usr/bin/cc - skipped`
-      # because the answer was already in the restored `CMakeCache.txt`. A
-      # toolchain file is only honoured on a build tree's *first* configure, so
-      # the NDK's never applies, `CMAKE_CROSSCOMPILING` stays false, and
-      # Google Benchmark tries to *run* its feature probes on an ARM64 binary.
+      # **Before `rust-cache`, and that ordering is load-bearing.** The cache
+      # key includes every env var named `CC*`, `CXX*`, `CFLAGS*`, or `CMAKE*`,
+      # but it reads them when it runs — so setting the toolchain afterwards
+      # leaves the compilers out of the key entirely.
       #
-      # It also fails loudly if the compiler is not where the NDK says it is.
+      # This also writes the CMake wrapper that turns `BUILD_TESTING` off; see
+      # `Ndk::cmake_wrapper` for why BoringSSL's test tree cannot cross-compile.
       - name: Point the C toolchain at the NDK
         env:
           ABI: ${{ matrix.abi }}
-        run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
+        run: cargo xtask android-env "$ABI" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ steps.target.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.abi }}
 
       # **A CMake build tree cannot be restored across a toolchain change, and
-      # the cache key cannot be used to prevent it.** `rust-cache` falls back
-      # to a prefix-matched older entry when the exact key misses, so changing
-      # the compilers changes the key and restores the stale tree anyway.
-      #
-      # Two things go stale in there and both are fatal. A toolchain file is
-      # only honoured on a tree's *first* configure, so a restored cache keeps
-      # whatever compiler it was born with. And Google Benchmark writes
-      # `HAVE_STD_REGEX=FALSE` with `CACHE BOOL "" FORCE` when its probe fails,
-      # then short-circuits on `if(DEFINED ...)` ever after — so one bad
-      # configure poisons every later one in that tree, including correct ones,
-      # and the only cure is deleting the directory.
-      #
-      # The cost is a BoringSSL rebuild per run. That is the honest price of
-      # not being able to cache this soundly.
+      # the cache key cannot prevent it**: `rust-cache` falls back to a
+      # prefix-matched older entry when the exact key misses. Two things go
+      # stale in there and both are fatal — the compiler identity, because a
+      # toolchain file is only honoured on a tree's first configure, and
+      # Benchmark's `HAVE_STD_REGEX=FALSE`, which it writes with `FORCE` and
+      # short-circuits on ever after.
       - name: Discard any restored BoringSSL build tree
         run: rm -rf target/*/*/build/boring-sys-* target/*/build/boring-sys-*
 

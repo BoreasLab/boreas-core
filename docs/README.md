@@ -73,4 +73,5 @@ has to read `src/` or `ffi/src/` to make progress has found a defect in
 | `src/host/shell.rs` | tokio runtime shell, fused device/egress/network reactor, bounded channels, deadline timer | [Architecture](architecture.md) |
 | `src/host/platform.rs` | Android VpnService and Windows Wintun byte shims | [Platforms](platforms.md) |
 | `ffi/` | the C boundary and Android's JNI bypass: status codes, handle lifecycle, callback vtables, panic containment | [Platforms](platforms.md) |
+| `xtask/` | the build pipeline: the Android ABI table and the release tag algebra, as types | [Architecture](architecture.md) |
 | `vendor/` | crates patched in tree, generated from `vendor/patches/` by `scripts/vendor.py` | [vendor/README.md](../vendor/README.md) |

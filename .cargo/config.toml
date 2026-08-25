@@ -1,0 +1,5 @@
+[alias]
+# The build pipeline. `cargo xtask abis | android-target | android-env | resolve`.
+# `--locked`, because a CI tool that quietly resolves a different dependency
+# graph than the one committed is a CI tool reporting on something else.
+xtask = "run --package xtask --locked --"

@@ -142,14 +142,29 @@ somebody else's repository — the workflow runs its own gate for that reason
 rather than trusting `ci.yml` to have finished first.
 
 A **release** is the one thing a human does: push a `vMAJOR.MINOR.PATCH` tag.
-`scripts/release.py --check` refuses a tag that disagrees with `Cargo.toml`, so
-bump the crate version in the same commit you intend to tag.
+`cargo xtask resolve` refuses a tag that disagrees with `Cargo.toml`, so bump
+the crate version in the same commit you intend to tag.
 
-The two tables the pipeline stands on are `scripts/release.py` (the tag algebra
-— a pre-release sorts below the release it heads toward, and later builds sort
-later) and `scripts/android.py` (Gradle's ABI name, Rust's target, and the NDK's
-compiler triple, which do not all agree). Their doctests *are* those laws and
-run in the `check` job. Change either table only with its selftest.
+**The pipeline is `xtask/`, in Rust, and it is a workspace member so
+`cargo test --workspace` and `cargo clippy --workspace` already cover it.** It
+was Python until the shell shipped two bugs a type checker would have refused —
+`CC` named without `CXX`, and a local shadowing the function below it — so the
+rule now is that a pipeline decision is a type, not a string:
+
+- `xtask::release` is the tag algebra. `Version`'s field order *is* SemVer
+  precedence, so `Ord` is derived rather than written; `Stamp` renders
+  fixed-width so lexical order is chronological; `Sha` renders with a `g` so it
+  is never an all-digit identifier, which SemVer ranks below every alphanumeric
+  one. `Event` and `Publish` are sums, so "a release with no tag" cannot be
+  written down and the workflow needs no branch.
+- `xtask::android` is the ABI table. Gradle's name, Rust's target, and the NDK's
+  compiler triple are three *different types*, because they are not the same
+  string for `armeabi-v7a` and passing one for another used to link. `Ndk` and
+  `Compiler` have no constructor that does not check the files exist, so an
+  environment naming `CC` without `CXX` is unrepresentable rather than caught.
+
+Change either only with its tests. `scripts/` keeps what genuinely suits a
+script — `vendor.py`, `doclinks.py`, `reference.sh` — and those stay Python.
 
 `api/artifacts.md` is what downstream reads. A change to what is published, how
 it is laid out, or how it is verified is a change to that page first.

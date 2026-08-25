@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+description = "The build pipeline: the Android ABI table and the release tag algebra, typed."
+publish = false
+
+# **Both already appear in `Cargo.lock`**, so this crate adds nothing to the
+# audited dependency set — `cargo deny` sees the same graph it saw before.
+# `clap` would have been a third and is deliberately absent: four subcommands
+# with one argument each is a `match` on `args()`, and a dependency added for
+# argument parsing in a tool that never ships is the kind this repository's
+# dependency rule exists to refuse.
+#
+# `time` is used without its `formatting` feature. The two renderings here are
+# fixed-width `write!` calls over the date components, which is both fewer
+# features and the thing the ordering law actually depends on.
+[dependencies]
+thiserror = "2.0.20"
+time = "0.3.55"
