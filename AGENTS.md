@@ -87,6 +87,51 @@ the product contract. Do not infer implemented status from visionary scope.
   framing and leave them. `decode_grpc_header` is where that line was drawn and
   says why.
 
+## Comments
+
+**A comment earns its place only by saying something the code cannot say about
+itself.** Code already states what it does. Four things it cannot state, and
+they are the only reasons to write one:
+
+1. Why this, and not the obvious alternative a reader would otherwise try.
+2. An invariant the types do not enforce.
+3. What breaks if you change this.
+4. A reference out: an RFC, a CVE, a vendor bug, a path.
+
+Everything else restates the code. Do not write it, and delete it when you find
+it: no comment that narrates the line below it, no `///` that spells out the
+signature, no history of what the file used to be. Git holds the history, and a
+file that carries its own changelog grows one forever.
+
+**Write plain technical English, not essay prose.** This guide is written in a
+register that suits a guide: an aphorism, a contrast, a claim landed on a short
+sentence. **Comments do not get that register**, and imitating it here is the
+most common way this rule is broken. No "X is the Y of Z", no "the real question
+is", no "that is not decoration", no fact trailed by a participial flourish
+("..., reflecting the design's commitment to ..."). Name the mechanism and stop.
+Prefer a colon or a full stop to a dash, and keep at most one dash in a block.
+
+**Economy, not telegraphese.** Cut "in order to", "it is important to note
+that", "has the ability to", stacked hedges, and any sentence announcing the one
+after it. Keep articles and whole sentences: a comment is prose a human reads,
+and `// Ring full. Drop packet.` is not an improvement on the sentence it
+replaced.
+
+**Never delete, and edit only with the change it describes:**
+
+- Every `// SAFETY:` block. They are the soundness argument for an `unsafe`,
+  not commentary on it.
+- The justification on an `#[allow]` or `#[expect]`.
+- `TODO`, `FIXME`, `HACK`, and anything carrying an issue ID.
+- Anything inside a `///` doctest fence. Those compile and run as tests.
+- The text inside an intra-doc link's brackets. `[`Type`]` resolves to a path
+  and a wrong one is a build warning. Deleting the whole sentence is fine.
+- The three comments this guide delegates to rather than repeating:
+  `src/wire.rs`'s module header on why no crate and no SIMD path,
+  `decode_grpc_header`'s note in `src/egress/transport.rs` on where sans-io
+  stops, and the RFC-diagram notes beside the fixed offsets in
+  `src/l3/packet.rs`. Deleting one leaves this file pointing at nothing.
+
 ## Change Process
 
 1. Read the owning subsystem document and direct callers.
