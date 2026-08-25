@@ -131,20 +131,30 @@ jobs:
           set -euo pipefail
           echo "rust=$(uv run scripts/android.py --target "$ABI")" >> "$GITHUB_OUTPUT"
 
+      # **Before `rust-cache`, and that ordering is the whole point.** The cache
+      # action's key includes every env var whose name starts with `CC`, `CXX`,
+      # `CFLAGS`, or `CMAKE`, but it reads them when it runs — so setting the
+      # toolchain afterwards leaves the compilers out of the key entirely. That
+      # is how a `target/` built with one toolchain gets restored over another:
+      # `boring-sys` re-extracts BoringSSL, cmake-rs reuses the old build tree,
+      # and CMake reports `Check for working C compiler: /usr/bin/cc - skipped`
+      # because the answer was already in the restored `CMakeCache.txt`. A
+      # toolchain file is only honoured on a build tree's *first* configure, so
+      # the NDK's never applies, `CMAKE_CROSSCOMPILING` stays false, and
+      # Google Benchmark tries to *run* its feature probes on an ARM64 binary.
+      #
+      # It also fails loudly if the compiler is not where the NDK says it is.
+      - name: Point the C toolchain at the NDK
+        env:
+          ABI: ${{ matrix.abi }}
+        run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ steps.target.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.abi }}
-
-      # The runner image ships an NDK. This points `cc` and the linker at its
-      # clang instead of the host's, and fails loudly if the compiler is not
-      # where the NDK says it is.
-      - name: Point the C toolchain at the NDK
-        env:
-          ABI: ${{ matrix.abi }}
-        run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
 
       - name: Build
         env:

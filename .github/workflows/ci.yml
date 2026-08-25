@@ -144,17 +144,27 @@ jobs:
         id: target
         run: echo "rust=$(uv run scripts/android.py --target "$ABI")" >> "$GITHUB_OUTPUT"
 
+      # **Before `rust-cache`, and that ordering is the whole point.** The cache
+      # action's key includes every env var whose name starts with `CC`, `CXX`,
+      # `CFLAGS`, or `CMAKE`, but it reads them when it runs — so setting the
+      # toolchain afterwards leaves the compilers out of the key entirely. That
+      # is how a `target/` built with one toolchain gets restored over another:
+      # `boring-sys` re-extracts BoringSSL, cmake-rs reuses the old build tree,
+      # and CMake reports `Check for working C compiler: /usr/bin/cc - skipped`
+      # because the answer was already in the restored `CMakeCache.txt`. A
+      # toolchain file is only honoured on a build tree's *first* configure, so
+      # the NDK's never applies, `CMAKE_CROSSCOMPILING` stays false, and
+      # Google Benchmark tries to *run* its feature probes on an ARM64 binary.
+      #
+      # `scripts/android.py` owns the three names this needs — Gradle's,
+      # Rust's, and the NDK compiler's — because they do not all agree.
+      - name: Point the C toolchain at the NDK
+        run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ steps.target.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
-
-      # The runner image ships an NDK. `scripts/android.py` owns the three
-      # names this needs — Gradle's, Rust's, and the NDK compiler's — because
-      # they do not all agree and deriving one from another is correct for
-      # three ABIs out of four.
-      - name: Point the C toolchain at the NDK
-        run: uv run scripts/android.py --env "$ABI" >> "$GITHUB_ENV"
 
       # **`build`, not `check`.** This job ran `cargo check` for its whole life
       # and never linked anything, which is exactly how a `libcrypto.a` full of
