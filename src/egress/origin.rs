@@ -1,34 +1,12 @@
-//! Re-origination through a packet egress: the edge that makes filtering and a
-//! packet tunnel compose.
+//! Re-origination through packet egress for intercepted flows.
 //!
-//! **This is the composition the product is named for, and it was the one edge
-//! missing from the graph.** Inspecting a flow means terminating it here, and a
-//! terminated flow has to be *re-originated* to the real server. A stream
-//! egress answers that directly — "open a byte stream to this target" is what
-//! SOCKS5 does. A packet egress could not: WireGuard and MASQUE accept IP
-//! packets, and there is no `connect` on them to call. So a session that
-//! selected a packet tunnel and enabled inspection had a terminator with
-//! nowhere to send what it terminated.
+//! A terminated flow returns to the origin through the host TCP stack. Those
+//! packets enter Boreas's TUN and use the packet egress, so no second TCP stack
+//! or TCP-over-TCP layer is needed.
 //!
-//! The resolution is that a packet egress *does* carry a byte stream — the same
-//! way it carries everything else, as IP packets. The host's own TCP stack
-//! produces those packets, and the datapath already forwards them: a socket
-//! this process opens without excluding it from the tunnel emits packets into
-//! Boreas's own TUN, which classifies them, plans them onto the packet fast
-//! path, and hands them to the egress. There is no TCP-over-TCP — the
-//! re-originated connection is carried as IP inside the tunnel's own
-//! encapsulation, which is exactly what
-//! [Architecture](../docs/architecture.md) means by local termination — and no
-//! second TCP implementation to maintain.
-//!
-//! **One invariant makes it work, and it is structural rather than
-//! remembered.** A re-originated connection is TCP to the very address and port
-//! that made the original flow a candidate for inspection, so without a rule it
-//! would be selected for inspection too, terminated again, and re-originated
-//! again: an infinite regress that consumes the socket ceiling in one page
-//! load. The rule is a reserved range of local source ports:
-//! [`OriginationPorts`] is *the* value, held by both halves, so the dialer
-//! cannot bind a port the classifier does not exclude.
+//! Re-originated connections target the same address and port that made the
+//! original flow eligible for inspection. [`OriginationPorts`] gives the
+//! dialer and classifier one shared range, preventing recursive interception.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -40,14 +18,11 @@ use crate::{
     StreamEgress, Target,
 };
 
-/// The local source ports a re-originated connection may bind.
+/// Local source ports available to re-originated connections.
 ///
-/// **One value, read by two halves that must agree.** The dialer binds inside
-/// it and the classifier excludes it from inspection; if the two disagreed, a
-/// re-originated connection would be terminated and re-originated forever. It
-/// is a refined type rather than a pair of numbers because "start below end"
-/// and "not the ephemeral range the rest of the system uses" are invariants
-/// worth establishing once.
+/// The dialer binds inside this range and the classifier excludes it from
+/// inspection. The constructor establishes the range ordering and nonzero
+/// source-port invariant once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OriginationPorts {
     start: u16,
@@ -56,9 +31,9 @@ pub struct OriginationPorts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortRangeError {
-    /// The range is empty, so no connection could ever be re-originated.
+    /// The range is empty.
     Empty,
-    /// The range includes port 0, which names no port.
+    /// The range includes port 0.
     IncludesZero,
 }
 
@@ -73,16 +48,14 @@ impl std::fmt::Display for PortRangeError {
 
 impl std::error::Error for PortRangeError {}
 
-/// The default range: a thousand ports well above the ephemeral range Linux and
-/// Windows allocate from by default, so a re-originated connection and an
-/// ordinary one never contend for the same port.
+/// Default range above the usual Linux and Windows ephemeral range.
 pub const DEFAULT_ORIGINATION_PORTS: OriginationPorts = OriginationPorts {
     start: 45_000,
     end: 46_000,
 };
 
 impl OriginationPorts {
-    /// `end` is exclusive.
+    /// Constructs a range with exclusive `end`.
     pub fn new(start: u16, end: u16) -> Result<Self, PortRangeError> {
         if start == 0 {
             return Err(PortRangeError::IncludesZero);
@@ -93,30 +66,21 @@ impl OriginationPorts {
         Ok(Self { start, end })
     }
 
-    /// Whether `port` belongs to this range. O(1), and the hot-path caller is
-    /// the datapath's per-packet inspection verdict.
+    /// Returns whether `port` belongs to this range.
     pub fn contains(self, port: u16) -> bool {
         (self.start..self.end).contains(&port)
     }
 
-    /// How many connections may be re-originated at once. Also the ceiling the
-    /// socket budget should be set against: a terminator admitting more
-    /// connections than there are ports here would refuse the surplus at dial
-    /// time instead of at accept time, which is the worse place to find out.
+    /// Returns the number of simultaneous leases this range permits.
     pub fn capacity(self) -> usize {
         usize::from(self.end - self.start)
     }
 }
 
-/// Which local ports are currently bound.
+/// Available local ports.
 ///
-/// A free list rather than a bitmap or a scan: taking and returning are both
-/// O(1), and the list is exactly [`OriginationPorts::capacity`] entries, which
-/// is a thousand `u16`s — two kilobytes for the whole allocator.
-///
-/// **A port is returned by `Drop`.** There is no release call to forget, so a
-/// connection that ends in any way — closed, reset, cancelled, panicked past —
-/// gives its port back.
+/// A free list makes allocation and return constant time. `Drop` returns every
+/// lease, including one released by close, reset, cancellation, or unwind.
 struct Ports {
     free: Mutex<Vec<u16>>,
 }
@@ -124,8 +88,7 @@ struct Ports {
 impl Ports {
     fn new(range: OriginationPorts) -> Self {
         Self {
-            // Reversed so the first `pop` hands out the lowest port, which
-            // makes a packet capture read in the order connections were made.
+            // Pop the lowest port first for predictable packet captures.
             free: Mutex::new((range.start..range.end).rev().collect()),
         }
     }
@@ -139,7 +102,7 @@ impl Ports {
     }
 }
 
-/// One bound port, held for the life of the connection that uses it.
+/// One bound port held for the connection lifetime.
 struct PortLease {
     port: u16,
     ports: Arc<Ports>,
@@ -151,11 +114,9 @@ impl Drop for PortLease {
     }
 }
 
-/// A byte stream whose port is released when it is dropped.
+/// Byte stream that releases its port when dropped.
 ///
-/// The lease is a field rather than a separate registration, so the port's
-/// lifetime *is* the stream's and nothing has to be told when the connection
-/// ends.
+/// The field makes the lease lifetime equal to the stream lifetime.
 struct Originated<S> {
     stream: S,
     _lease: PortLease,
@@ -195,16 +156,10 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Originated<S> {
     }
 }
 
-/// A [`StreamEgress`] whose connections travel *through* Boreas's own tunnel.
+/// [`StreamEgress`] whose connections travel through Boreas's tunnel.
 ///
-/// The exact dual of [`TunnelBypass`](crate::TunnelBypass), and named for the
-/// contrast: a DNS upstream's socket must be excluded from the tunnel, because
-/// a resolver reached through the tunnel that is resolving for it is a loop; a
-/// re-originated connection must *not* be excluded, because the tunnel is where
-/// it is supposed to go.
-///
-/// It carries no datagrams, and says so: the UDP half of a packet-egress
-/// session is the packet fast path, which needs no association at all.
+/// Unlike [`TunnelBypass`](crate::TunnelBypass), this dialer must remain in the
+/// tunnel. It carries no datagrams; packet egress handles the UDP fast path.
 pub struct TunnelledDialer {
     ports: Arc<Ports>,
     range: OriginationPorts,
@@ -218,27 +173,22 @@ impl TunnelledDialer {
         }
     }
 
-    /// The ports this dialer binds, which the datapath must exclude from
-    /// inspection. Reading it from here rather than configuring it twice is
-    /// what keeps the two in step.
+    /// Returns the ports the datapath must exclude from inspection.
     pub fn ports(&self) -> OriginationPorts {
         self.range
     }
 }
 
 impl StreamEgress for TunnelledDialer {
-    /// **Zero overhead, and that is not a claim about the tunnel.** Whatever
-    /// the packet egress charges is charged on the packets this connection
-    /// produces, by the plan those packets are forwarded under — so counting it
-    /// again here would count it twice.
+    /// Reports no stream-level overhead because the packet plan accounts for
+    /// the packets this connection produces.
     fn properties(&self) -> PathProperties {
         PathProperties {
             datagram_fidelity: DatagramFidelity::None,
             overhead_bytes: 0,
             max_datagram_size: None,
             preserves_ecn: false,
-            // One host stack behind one tunnel address: there is no mapping to
-            // vary, which is the same thing WireGuard's own claim says.
+            // One host stack uses one tunnel address, so no mapping varies.
             nat_behavior: NatBehavior::EndpointIndependent,
         }
     }
@@ -249,8 +199,7 @@ impl StreamEgress for TunnelledDialer {
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
             let address = resolve(target).await?;
-            // The lease is taken before the socket, so a dialer at its ceiling
-            // refuses without having opened anything.
+            // Refuse at the port ceiling before opening a socket.
             let lease = self
                 .ports
                 .take()
@@ -259,14 +208,12 @@ impl StreamEgress for TunnelledDialer {
                 SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
                 SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
             };
-            // A connection that has just closed leaves its port in TIME-WAIT,
-            // and a reserved range is small enough that refusing to reuse one
-            // would exhaust it under ordinary browsing.
+            // Allow reuse while a recently closed connection is in TIME-WAIT;
+            // the reserved range is small under ordinary browsing.
             socket.set_reuseaddr(true)?;
             socket.bind(local_for(address, lease.port))?;
             let stream = crate::within(crate::Wait::TcpConnect, socket.connect(address)).await?;
-            // Nagle would hold a short request waiting for bytes that are not
-            // coming, which on a proxied exchange is pure added latency.
+            // Avoid delaying short requests for bytes that will not arrive.
             stream.set_nodelay(true)?;
             Ok(Box::new(Originated {
                 stream,
@@ -276,7 +223,7 @@ impl StreamEgress for TunnelledDialer {
     }
 }
 
-/// The unspecified address of `address`'s family, on `port`.
+/// Returns the unspecified local address for `address`'s family and `port`.
 fn local_for(address: SocketAddr, port: u16) -> SocketAddr {
     match address {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
@@ -284,14 +231,10 @@ fn local_for(address: SocketAddr, port: u16) -> SocketAddr {
     }
 }
 
-/// Turns a target into an address to dial.
+/// Resolves a target into an address to dial.
 ///
-/// **A name is resolved here and nowhere else in this crate**, and the
-/// resolution goes through the tunnel like everything else this dialer does:
-/// the host stack's resolver sends its query into Boreas's own TUN, where the
-/// session's DNS policy answers it. So the name is resolved in the same view
-/// the client saw, which is the property [`Target`] exists to protect on a
-/// proxy egress and which a packet tunnel gets for free.
+/// Name resolution occurs through the tunnel, so the host stack sees the same
+/// DNS policy and view as the client.
 pub(crate) async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> {
     match target {
         Target::Ip(address) => Ok(*address),
@@ -302,14 +245,11 @@ pub(crate) async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> 
     }
 }
 
-/// A packet egress that carries nothing.
+/// Packet egress placeholder for a flow-only session.
 ///
-/// **What a flow-egress session's raw IP packets have nowhere to go into.**
-/// Under [`Accepts::Flows`](crate::Accepts) every TCP flow is terminated and
-/// every datagram goes to the relay, so the only thing that reaches a packet
-/// egress is ICMP — and a proxy has no way to carry it. Naming that as an
-/// implementation, rather than making the reactor's egress an `Option`, keeps
-/// the refusal counted on the same telemetry every other egress refusal is.
+/// Flow egress carries TCP and UDP associations directly, so no raw packet
+/// operation is available here. Keeping a concrete implementation preserves
+/// uniform reactor errors and telemetry.
 pub struct NoPacketEgress;
 
 impl crate::PacketEgress for NoPacketEgress {
@@ -344,53 +284,32 @@ impl crate::PacketEgress for NoPacketEgress {
     }
 
     fn tick_interval(&self) -> std::time::Duration {
-        // Nothing to drive, so the reactor's other deadlines govern. An hour is
-        // "effectively never" without needing an `Option` in the trait.
+        // Nothing needs driving; let other reactor deadlines govern.
         std::time::Duration::from_secs(3600)
     }
 
     fn max_network_datagram(&self) -> usize {
-        // Nothing arrives here, so the receive buffer need only be well formed.
+        // No datagram arrives here; one byte is enough for a valid buffer.
         1
     }
 }
 
-/// Both effects one session runs on, derived from one configured egress.
-///
-/// **A product, not a sum, and that is the whole point.** A session needs a
-/// packet effect *and* a flow effect: the packet effect carries the fast path,
-/// and the flow effect carries what interception re-originates. Before this
-/// type there was only a way to state one of them, so "filtering plus a packet
-/// tunnel" — the composition the product is named for — could not be assembled
-/// at all: the terminator had somewhere to send a connection only when the
-/// egress happened to be a proxy.
+/// The packet and flow effects derived from one configured egress.
 pub struct Assembly {
-    /// Drives the reactor. Whole IP packets in, encapsulated datagrams out.
+    /// Drives the reactor with whole IP packets and emits encapsulated datagrams.
     pub packets: Box<dyn crate::PacketEgress>,
-    /// Serves the terminator: intercepted and spliced connections both leave
-    /// by here, because interception changes what Boreas can *read*, never
-    /// where traffic exits.
+    /// Carries intercepted and spliced connections to their egress.
     pub flows: Arc<dyn StreamEgress>,
-    /// The ports the flow effect binds locally, which the datapath must
-    /// exclude from inspection. `None` when the flow effect is a proxy, which
-    /// re-originates nothing on this device.
+    /// Local ports the datapath excludes from inspection, or `None` for a proxy
+    /// flow effect that re-originates nothing locally.
     pub origination_ports: Option<OriginationPorts>,
 }
 
-/// Assembles one configured egress into the two effects a session runs on.
+/// Splits one configured egress into the packet and flow effects.
 ///
-/// Total on the [`Egress`] sum, and the elimination is where the two shapes
-/// differ:
-///
-/// - [`Egress::Stream`] *is* a flow effect, and has no packets to carry, so it
-///   is paired with [`NoPacketEgress`];
-/// - [`Egress::Packet`] drives the reactor, and its flow effect is a
-///   [`TunnelledDialer`] whose connections that same tunnel then forwards.
-///
-/// Deriving the origination range here rather than configuring it twice is what
-/// keeps the range the dialer binds and the range the classifier excludes from
-/// drifting apart — which they must not, or a re-originated connection would be
-/// terminated and re-originated forever.
+/// Stream egress pairs with [`NoPacketEgress`]. Packet egress drives the reactor
+/// and uses a [`TunnelledDialer`] for re-originated flows. The shared range
+/// keeps dialing and inspection exclusion aligned.
 pub fn assemble(egress: Egress, range: OriginationPorts) -> Assembly {
     match egress {
         Egress::Stream(flows) => Assembly {
@@ -433,11 +352,7 @@ mod tests {
         assert!(!range.contains(44_999));
     }
 
-    /// **The invariant the whole module rests on.** A re-originated connection
-    /// binds inside the range the classifier excludes; if it could bind outside
-    /// it, that connection would be selected for inspection, terminated, and
-    /// re-originated again — a regress that spends the socket ceiling on one
-    /// page load.
+    /// Re-originated connections bind inside the classifier's excluded range.
     #[tokio::test]
     async fn every_re_originated_connection_binds_inside_the_excluded_range() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -469,8 +384,7 @@ mod tests {
             held.push(stream);
         }
 
-        // The range is the ceiling: a connection past it is refused rather than
-        // binding a port the classifier would then inspect.
+        // The range is the ceiling; excess connections are refused.
         assert!(
             matches!(
                 dialer.connect(&Target::Ip(origin)).await,
@@ -479,14 +393,13 @@ mod tests {
             "the ceiling must refuse rather than escape the range"
         );
 
-        // A port is returned by `Drop`, so closing one connection admits the
-        // next without any release call to forget.
+        // Dropping a stream returns its port and admits the next connection.
         held.pop();
         assert!(dialer.connect(&Target::Ip(origin)).await.is_ok());
     }
 
-    /// The algebra: both egress variants assemble into both effects, and only
-    /// the packet one needs ports excluded from inspection.
+    /// Both egress variants produce both effects; only packet egress needs
+    /// excluded origination ports.
     #[test]
     fn every_egress_variant_assembles_into_both_effects() {
         struct NoStreams;
