@@ -1,29 +1,15 @@
-//! Interoperability against a reference implementation.
+//! Interoperability tests against an independent reference implementation.
 //!
-//! Every other test in this crate drives Boreas against a peer Boreas also
-//! wrote. That proves self-consistency and nothing about the wire: a misreading
-//! of a specification satisfies both halves of a self-test equally. For a
-//! protocol whose entire value is that somebody else's server accepts it, that
-//! is not a gate — it is a rehearsal.
+//! A self-test can validate two matching mistakes. These tests run Boreas
+//! against [sing-box](https://github.com/SagerNet/sing-box), so a successful
+//! round trip crosses both Boreas's encoder and a foreign decoder.
 //!
-//! So these tests run against [sing-box](https://github.com/SagerNet/sing-box),
-//! which is an independent implementation of every proxy protocol in P17. A
-//! byte that survives a round trip here survived Boreas's encoder *and* a
-//! foreign decoder, which is the property the phase actually needs.
-//!
-//! **Opt-in locally, mandatory in CI, and the difference is a variable.** The
-//! binary is a development tool rather than a dependency: never linked, never
-//! distributed, run out of process. So a contributor without one gets an
-//! announced skip and a green suite — which was also, for a while, exactly what
-//! CI got. A suite that exists because self-consistency proves nothing is worth
-//! very little when it can quietly prove nothing itself.
-//!
-//! `BOREAS_INTEROP=required` closes that: a missing or unusable binary becomes
-//! a failure rather than a skip. `scripts/reference.sh` fetches the pinned
-//! version and verifies its digest, and is the same script CI runs.
+//! The reference binary is an out-of-process development tool, not a linked or
+//! distributed dependency. Local runs may announce a skip when it is absent;
+//! CI sets `BOREAS_INTEROP=required`, which turns absence into failure.
+//! `scripts/reference.sh` fetches the pinned binary and verifies its digest.
 //!
 //! ```sh
-//! # What a contributor runs, and what CI runs.
 //! BOREAS_INTEROP=required BOREAS_SINGBOX=$(scripts/reference.sh) \
 //!     cargo test --test interop
 //! ```
@@ -46,23 +32,16 @@ use boreas_core::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Whether a missing reference binary is a skip or a failure.
-///
-/// **The hole this closes.** `BOREAS_SINGBOX` unset meant "skip and pass",
-/// which is right on a contributor's laptop and catastrophic in CI: the one
-/// suite that checks these protocols against a foreign decoder reported green
-/// for every run in which it did nothing. A skip is only ever an ergonomic
-/// concession, so it now has to be asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Demand {
-    /// A contributor without the binary. Announce and pass.
+    /// Announce the missing binary and pass.
     Optional,
-    /// `BOREAS_INTEROP=required`. A missing or unusable binary fails the test,
-    /// which is what makes CI's green mean something.
+    /// Require a usable binary, as CI does.
     Required,
 }
 
 impl Demand {
-    /// Read once, from the environment, at every test's first line.
+    /// Reads the mode from the environment.
     fn current() -> Self {
         match std::env::var("BOREAS_INTEROP").as_deref() {
             Ok("required") => Self::Required,
@@ -71,12 +50,7 @@ impl Demand {
     }
 }
 
-/// The reference binary, or the reason there is none.
-///
-/// `Err(Demand)` is the whole decision: `Optional` announces and returns,
-/// `Required` panics. Every test eliminates it the same way, through
-/// [`reference_or_skip`], so a new test cannot accidentally reintroduce an
-/// unconditional skip.
+/// The reference binary, or the requested skip/failure mode.
 fn reference_binary() -> Result<PathBuf, Demand> {
     let demand = Demand::current();
     let Some(raw) = std::env::var_os("BOREAS_SINGBOX") else {
@@ -86,7 +60,7 @@ fn reference_binary() -> Result<PathBuf, Demand> {
     path.is_file().then_some(path).ok_or(demand)
 }
 
-/// The binary, or `None` after announcing a permitted skip.
+/// Returns the binary, or announces a permitted skip and returns `None`.
 ///
 /// # Panics
 ///
@@ -101,8 +75,7 @@ fn reference_or_skip(test: &str) -> Option<PathBuf> {
              skipping it silently is what it exists to prevent."
         ),
         Err(Demand::Optional) => {
-            // Announced so a green run without the reference is never mistaken
-            // for a verified one.
+            // Make an optional skip visible in test output.
             eprintln!(
                 "SKIPPED {test}: set BOREAS_SINGBOX to a sing-box binary to verify \
                  wire compatibility against the reference implementation"
@@ -112,31 +85,23 @@ fn reference_or_skip(test: &str) -> Option<PathBuf> {
     }
 }
 
-/// A running reference server. Killed on drop, so a failing assertion cannot
-/// leave a proxy listening.
+/// Running reference server, terminated on drop.
 struct Reference {
     child: Child,
     _dir: TempDir,
 }
 
-/// A private CA, and a leaf it signed for the reference server to present.
+/// Private CA and leaf certificate for the reference server.
 ///
-/// **A CA and a leaf rather than one self-signed certificate**, because the two
-/// TLS stacks disagree about the shortcut: `boring` beneath `quiche` will accept
-/// a self-signed end-entity certificate as its own trust anchor, and `rustls`
-/// will not, since such a certificate is not a CA. Generating a real one-link
-/// chain is what makes the same fixture work for both.
-///
-/// **Verification stays on.** Turning it off would make every test below pass
-/// against a server presenting anything at all, and for transports whose whole
-/// job is to carry a protocol inside TLS that would quietly remove the property
-/// under test.
+/// The separate CA and leaf form a chain accepted by both the `boring` and
+/// `rustls` clients. Verification remains enabled so the TLS transport is part
+/// of the interoperability check.
 struct Certificate {
-    /// The CA, DER-encoded, for this client to trust.
+    /// DER-encoded CA trusted by the client.
     authority: Vec<u8>,
-    /// The CA as a PEM file, because `quiche` loads anchors only from disk.
+    /// CA PEM file for `quiche`'s file-based trust loader.
     authority_path: PathBuf,
-    /// The leaf and its key, for the reference server to present.
+    /// Leaf certificate and private-key files for the server.
     certificate: PathBuf,
     key: PathBuf,
     _dir: TempDir,
@@ -184,7 +149,7 @@ impl Certificate {
         }
     }
 
-    /// A TLS transport that trusts this CA and offers `alpn`.
+    /// Builds a TLS transport that trusts this CA and offers `alpn`.
     fn tls_transport(
         &self,
         server: SocketAddr,
@@ -205,8 +170,7 @@ impl Certificate {
     }
 }
 
-/// Wraps DER as PEM. Written out rather than enabling `rcgen`'s `pem` feature,
-/// which would pull a base64 crate in for four lines of work.
+/// Wraps DER as PEM without enabling `rcgen`'s additional feature.
 fn pem(label: &str, der: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::new();
@@ -239,8 +203,7 @@ impl Drop for Reference {
 }
 
 impl Reference {
-    /// Writes `config` to a scratch directory and starts the binary on it,
-    /// waiting until every port in `ports` accepts a connection.
+    /// Starts the reference binary with `config` and waits for TCP readiness.
     fn start(binary: &PathBuf, config: &str, ports: &[u16]) -> Self {
         let dir = TempDir::new();
         let path = dir.path().join("config.json");
@@ -276,19 +239,10 @@ impl Reference {
     }
 }
 
-/// Hands out a port no other test in this process will be given.
+/// Returns a process-unique port that is free for both TCP and UDP.
 ///
-/// **Binding port 0 and releasing it is not enough**, and this file is where
-/// that stops being theoretical: the tests run concurrently, and two that ask
-/// the kernel for a free port in the same instant are told the same one, then
-/// both hand it to a reference server. One binds, the other is refused, and the
-/// failure surfaces later as a connection reset in whichever test lost — which
-/// looks like a protocol bug and is not one.
-///
-/// So the port comes from a per-process counter, which makes a collision within
-/// the process impossible rather than unlikely, and the bind is kept only as a
-/// check that nothing *outside* the process holds it. Both stacks are probed
-/// because QUIC listens on UDP and everything else on TCP.
+/// A per-process counter prevents concurrent tests from selecting the same
+/// port. Binding both protocols checks for conflicts outside the process.
 fn free_port() -> u16 {
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -296,8 +250,7 @@ fn free_port() -> u16 {
     const COUNT: u32 = 40_000;
     static NEXT: AtomicU32 = AtomicU32::new(0);
 
-    // Offsetting by the process id keeps two concurrent test *binaries* from
-    // marching through the same range in lockstep.
+    // Offset separate test binaries into different parts of the range.
     let start = std::process::id() % COUNT;
     loop {
         let step = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -310,7 +263,7 @@ fn free_port() -> u16 {
     }
 }
 
-/// A scratch directory that removes itself.
+/// Scratch directory removed on drop.
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -335,8 +288,7 @@ impl Drop for TempDir {
     }
 }
 
-/// An echo server for the proxy to reach, so a round trip proves the whole
-/// path rather than only the handshake.
+/// Echo server used to verify a complete proxy round trip.
 async fn start_echo() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -360,8 +312,7 @@ async fn start_echo() -> SocketAddr {
     address
 }
 
-/// The pre-shared key material both sides use. Fixed rather than random so a
-/// failure is reproducible; sliced to whatever length the method requires.
+/// Reproducible pre-shared key material, sliced to each method's length.
 const PSK: [u8; 32] = [7u8; 32];
 
 fn psk_base64(len: usize) -> String {
@@ -383,13 +334,9 @@ fn psk_base64(len: usize) -> String {
     encoded
 }
 
-/// The gate the Shadowsocks module's own tests could not provide: a foreign
-/// server decrypting what this client encrypted.
-///
-/// Everything self-testing left open rides on this — the BLAKE3 subkey
-/// derivation and its context string, the nonce counter's little-endian order,
-/// the fixed and variable header layouts, the chunk framing, and the response
-/// salt echo. Any one of them wrong and sing-box rejects the session.
+/// Verifies that a foreign server decrypts and echoes Shadowsocks 2022 traffic.
+/// This covers subkey derivation, nonce order, header layouts, chunk framing,
+/// and response-salt handling beyond self-tests.
 #[tokio::test]
 async fn shadowsocks_2022_interoperates_with_the_reference_server() {
     let Some(binary) =
@@ -398,9 +345,7 @@ async fn shadowsocks_2022_interoperates_with_the_reference_server() {
         return;
     };
 
-    // Every method, because they differ in key length and cipher: a
-    // derivation truncated for the 128-bit suite, or the wrong `ring`
-    // algorithm selected, would show on one of these and not the others.
+    // Cover each key length and cipher implementation.
     for method in [
         Method::Aes128Gcm,
         Method::Aes256Gcm,
@@ -454,10 +399,7 @@ async fn shadowsocks_2022_interoperates_with_the_reference_server() {
     }
 }
 
-/// SOCKS5 against the same reference. Its own tests already check it against an
-/// independently written RFC 1928 proxy, so this is corroboration rather than
-/// the first evidence — but the proxy in those tests is still one this
-/// repository wrote, and sing-box is not.
+/// Verifies SOCKS5 against the independent reference server.
 #[tokio::test]
 async fn socks5_interoperates_with_the_reference_server() {
     let Some(binary) = reference_or_skip("socks5_interoperates_with_the_reference_server") else {
@@ -501,13 +443,8 @@ async fn socks5_interoperates_with_the_reference_server() {
     assert_eq!(&buf, b"socks interop");
 }
 
-/// VLESS against the reference. This is the protocol whose address encoding
-/// most invites a silent error — the port precedes the address and two of the
-/// three family bytes disagree with SOCKS5 — so a foreign server reading the
-/// destination back is exactly the check that matters.
-///
-/// A domain target rather than an address, because the domain form is the one
-/// that would be misread as IPv6 if the family bytes were taken from RFC 1928.
+/// Verifies VLESS address encoding against the reference server.
+/// A domain target exercises the family byte that differs from SOCKS5.
 #[tokio::test]
 async fn vless_interoperates_with_the_reference_server() {
     let Some(binary) = reference_or_skip("vless_interoperates_with_the_reference_server") else {
@@ -552,18 +489,11 @@ async fn vless_interoperates_with_the_reference_server() {
     assert_eq!(&buf, b"vless interop");
 }
 
-/// Hysteria2 against the reference, which is the first test in this file that
-/// exercises a QUIC connection of our own driving rather than a TCP socket.
+/// Verifies Hysteria2 over a real QUIC connection.
 ///
-/// Everything the protocol newly depends on rides on this: the QUIC handshake,
-/// the HTTP/3 authentication exchange and its status 233, the decision to drop
-/// the HTTP/3 layer before opening a proxy stream, the driver's stream pump in
-/// both directions, and the request and response frame codecs. A mistake in any
-/// of them is a server that refuses or a stream that never delivers.
-///
-/// **Two flows, deliberately.** They must share one QUIC connection and land on
-/// *different* stream ids; a driver that reused an id or opened a second
-/// connection would still pass a single-flow test.
+/// The exchange covers QUIC, HTTP/3 status 233, stream setup, bidirectional
+/// pumping, and request/response framing. Two flows must share one connection
+/// and use different stream IDs.
 #[tokio::test]
 async fn hysteria2_interoperates_with_the_reference_server() {
     let Some(binary) = reference_or_skip("hysteria2_interoperates_with_the_reference_server")
@@ -595,9 +525,7 @@ async fn hysteria2_interoperates_with_the_reference_server() {
         cert = certificate.certificate.display(),
         key = certificate.key.display(),
     );
-    // No TCP port to probe: Hysteria2 listens on UDP, and there is no
-    // connectionless equivalent of a completed handshake. Readiness is
-    // established by the client's own retry loop below.
+    // UDP has no TCP readiness probe; the dial retry establishes readiness.
     let _reference = Reference::start(&binary, &config, &[]);
 
     let egress = Hysteria2Egress::new(
@@ -631,8 +559,7 @@ async fn hysteria2_interoperates_with_the_reference_server() {
         .expect("the response arrives");
     assert_eq!(&buf, b"hysteria interop");
 
-    // A second flow over the same connection. It exercises the stream id
-    // allocator and proves the authentication is not repeated per flow.
+    // A second flow checks stream allocation and one-time authentication.
     let mut second = egress
         .connect(&Target::Ip(echo))
         .await
@@ -646,8 +573,7 @@ async fn hysteria2_interoperates_with_the_reference_server() {
         .expect("the response arrives");
     assert_eq!(&buf, b"second");
 
-    // The first stream must still work after the second opened, which is what
-    // separates a multiplexed connection from a serially reused one.
+    // The first stream remains live, proving multiplexing rather than reuse.
     first.write_all(b"again").await.unwrap();
     first.flush().await.unwrap();
     let mut buf = [0u8; 5];
@@ -658,12 +584,9 @@ async fn hysteria2_interoperates_with_the_reference_server() {
     assert_eq!(&buf, b"again");
 }
 
-/// Dials until the reference's UDP listener is up.
-///
-/// A QUIC client cannot tell "not listening yet" from "packet lost" — that is
-/// what makes UDP readiness unprobeable — so the retry is the readiness check.
-/// The timeout is short so a genuinely dead server fails fast rather than
-/// sitting through the handshake's own deadline.
+/// Dials until the reference's UDP listener responds.
+/// UDP gives no separate readiness signal, so bounded retries serve as the
+/// probe and fail faster than the handshake deadline.
 async fn dial_with_retries(
     egress: &impl StreamEgress,
     target: &Target,
@@ -681,22 +604,15 @@ async fn dial_with_retries(
 
 // ------------------------------------------------- VLESS transports
 //
-// VLESS carries no framing of its own, so what these check is the *transport*
-// underneath it: the WebSocket handshake and its binary framing, the HTTP
-// Upgrade exchange, gRPC's length-delimited messages over HTTP/2, a raw HTTP/2
-// body, and a QUIC bidirectional stream. Each runs against a sing-box `vless`
-// inbound configured with the matching `transport`, so a byte that returns
-// crossed both this crate's encoder and a foreign decoder.
+// VLESS supplies no transport framing. These tests cover WebSocket, HTTP
+// Upgrade, gRPC over HTTP/2, an HTTP/2 body, and a QUIC bidirectional stream
+// against matching sing-box inbounds.
 
 const TRANSPORT_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
-/// Runs one VLESS flow over `transport` against a sing-box inbound configured
-/// with `transport_json`, and asserts a payload round-trips.
-///
-/// `tls_json` is the inbound's `tls` object, or empty for a cleartext
-/// transport. The two must agree — a client offering TLS to a plaintext
-/// listener fails at the handshake with nothing useful to read — which is why
-/// they are chosen together at each call site rather than defaulted here.
+/// Runs one VLESS flow against a sing-box inbound and checks a payload round trip.
+/// `transport_json` selects the inbound transport; nonempty `tls_json` enables
+/// the matching TLS server configuration.
 async fn vless_transport_round_trip(
     name: &str,
     transport_json: &str,
@@ -732,8 +648,7 @@ async fn vless_transport_round_trip(
   "outbounds": [{{"type": "direct"}}]
 }}"#
     );
-    // QUIC listens on UDP, where there is no connection to probe for; the
-    // others are TCP and can be waited on directly.
+    // Only TCP transports provide a readiness connection.
     let tcp_ports: &[u16] = if transport_json.contains("\"quic\"") {
         &[]
     } else {
@@ -750,22 +665,13 @@ async fn vless_transport_round_trip(
         build(server, &certificate),
     );
 
-    // **20 000 bytes, not a greeting.** A short payload would pass under a gRPC
-    // framing that used the wrong varint, because protobuf and QUIC varints
-    // agree below 64; at this length they encode 20 000 in three bytes and four
-    // respectively, so the reference stops being able to parse us. It also
-    // carries every transport past one read, one WebSocket message, and one
-    // HTTP/2 frame. It stays under HTTP/2's 65 535-byte initial window so that
-    // writing before reading cannot deadlock against the echo path.
+    // This size distinguishes protobuf and QUIC varints, crosses one read and
+    // one frame/message, and remains below HTTP/2's initial window.
     let payload: Vec<u8> = name.bytes().cycle().take(20_000).collect();
 
-    // **The whole flow is retried, and the reason is the reference, not this
-    // client.** sing-box's HTTPUpgrade server hijacks the connection from Go's
-    // `http.Server` and discards the buffer Go hands back, so payload that
-    // arrives in the window between its `101` and its `Hijack` is dropped and
-    // the flow is reset. Measured at roughly one run in eight under the load of
-    // this file's ten concurrent servers. A genuine protocol error fails every
-    // attempt, so this costs nothing but tolerance for someone else's race.
+    // Retry the whole flow for a known sing-box HTTPUpgrade handoff race: bytes
+    // arriving between `101` and Go's `Hijack` can be discarded. A real protocol
+    // error still fails every attempt.
     let mut last = String::new();
     for attempt in 0..4 {
         match transport_round_trip(&egress, echo, &payload).await {
@@ -779,8 +685,8 @@ async fn vless_transport_round_trip(
     panic!("{name}: every attempt failed, last: {last}");
 }
 
-/// One dial, write, and read-back. `Err` carries what went wrong, so a caller
-/// that retries can still report the last failure rather than a bare timeout.
+/// Dials once, writes the payload, and verifies the read-back.
+/// Errors retain enough context for a retry caller to report the last failure.
 async fn transport_round_trip(
     egress: &impl StreamEgress,
     echo: SocketAddr,
@@ -831,10 +737,7 @@ async fn vless_over_websocket_interoperates_with_the_reference_server() {
     .await;
 }
 
-/// WebSocket *over TLS*, which is the configuration actually deployed: it
-/// exercises `TlsTransport` composing under another transport, and with it the
-/// ALPN choice, since a server offered the wrong protocol closes at the
-/// handshake.
+/// Verifies the deployed WebSocket-over-TLS composition and ALPN selection.
 #[tokio::test]
 async fn vless_over_websocket_tls_interoperates_with_the_reference_server() {
     vless_transport_round_trip(

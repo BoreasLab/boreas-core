@@ -1,13 +1,10 @@
-//! Assembles policy, protocol recognition, interception, and splicing for one
-//! terminated connection.
+//! Session assembly for protocol recognition, interception, and splicing.
 //!
-//! The client name is learned from the first bytes: TLS SNI or cleartext HTTP
-//! `Host`. Recognition is fail-open; only a named, allowlisted host can reach
-//! interception, and every other outcome is spliced with a reason.
+//! TLS SNI or cleartext HTTP `Host` names the client. Only a named allowlisted
+//! host is intercepted; every other result is spliced with a reason.
 //!
-//! The origin selects the ALPN before the local client is terminated. Both legs
-//! therefore use one negotiated wire version, while version crossings remain
-//! counted as an acceptance check.
+//! The origin selects ALPN before local termination, keeping both legs on one
+//! wire version. Version crossings remain an acceptance check.
 
 use std::{
     sync::Arc,
@@ -32,26 +29,26 @@ const RECORD_HANDSHAKE: u8 = 0x16;
 /// TLS record-layer major version.
 const RECORD_MAJOR: u8 = 0x03;
 
-/// Maximum bytes examined for one TLS record.
+/// Maximum bytes inspected for one TLS record.
 const MAX_RECORD: usize = (1 << 14) + 5;
 
-/// Maximum cleartext request headers examined before splicing.
+/// Maximum cleartext request headers inspected before splicing.
 const MAX_REQUEST_HEADERS: usize = 64;
 
-/// Result of recognizing the client's first bytes.
+/// Recognition result for the client's first bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Introduction {
-    /// More bytes are required.
+    /// More bytes are needed.
     Incomplete,
-    /// TLS metadata extracted from one complete handshake record.
+    /// TLS metadata from one complete handshake record.
     Tls(Hello),
-    /// Complete cleartext HTTP/1.x request head and optional host.
+    /// Complete cleartext HTTP/1.x head and optional host.
     Http { host: Option<DomainName> },
-    /// Input is neither recognized TLS nor HTTP.
+    /// Input is neither TLS nor HTTP.
     Plain,
 }
 
-/// Origin connection mode after a host is known.
+/// Origin connection mode once a host is known.
 enum Approach {
     Tls {
         profile: crate::ClientProfile,
@@ -60,9 +57,9 @@ enum Approach {
     Cleartext,
 }
 
-/// Recognizes TLS or cleartext HTTP without consuming the input.
+/// Recognizes TLS or cleartext HTTP without consuming `bytes`.
 pub fn introduce(bytes: &[u8]) -> Introduction {
-    // TLS record header: content type, legacy version, and payload length.
+    // Read the TLS record type, legacy version, and payload length.
     let mut reader = Reader::new(bytes);
     let Some(&[content, major, _minor]) = reader.array::<3>() else {
         return Introduction::Incomplete;
@@ -76,7 +73,7 @@ pub fn introduce(bytes: &[u8]) -> Introduction {
     Introduction::Tls(crate::read_hello(record))
 }
 
-/// Parses a complete cleartext HTTP/1.x request head for its host.
+/// Parses a complete cleartext HTTP/1.x request head and extracts its host.
 fn request_head(bytes: &[u8]) -> Introduction {
     let mut fields = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
     let mut request = httparse::Request::new(&mut fields);
@@ -89,7 +86,7 @@ fn request_head(bytes: &[u8]) -> Introduction {
     }
 }
 
-/// Extracts and validates the host portion of a `Host` authority.
+/// Validates and extracts the host portion of a `Host` authority.
 fn host_field(fields: &[httparse::Header<'_>]) -> Option<DomainName> {
     let value = fields
         .iter()
@@ -99,20 +96,20 @@ fn host_field(fields: &[httparse::Header<'_>]) -> Option<DomainName> {
     DomainName::new(authority.host()).ok()
 }
 
-/// Reason a connection was spliced.
+/// Reason a connection was passed through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpliceReason {
-    /// The host is not allowlisted.
+    /// The host is not on the allowlist.
     NotAllowlisted,
-    /// No usable host name was present.
+    /// No usable host name was found.
     Unnamed,
-    /// Input was not TLS.
+    /// Input was not recognized as TLS.
     NotTls,
-    /// Recognition did not complete before the deadline or bound.
+    /// Recognition exceeded its time or size bound.
     Undecided,
-    /// Interception was previously demoted for this host.
+    /// This host was previously demoted.
     Demoted(Demotion),
-    /// The current origin handshake failed before local termination.
+    /// The origin handshake failed before local termination.
     OriginHandshake,
 }
 
@@ -157,27 +154,27 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-/// Limits for protocol recognition before policy applies.
+/// Bounds for protocol recognition before policy applies.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionLimits {
-    /// Maximum time to wait for a conclusive introduction.
+    /// Maximum wait for a conclusive introduction.
     pub peek_timeout: Duration,
 }
 
 impl Default for SessionLimits {
     fn default() -> Self {
         Self {
-            // Bound silent connections without penalizing slow first packets.
+            // Bound silent connections while allowing slow first packets.
             peek_timeout: Duration::from_secs(5),
         }
     }
 }
 
-/// Immutable and shared state for all sessions.
+/// Shared immutable state for all sessions.
 pub struct Sessions {
     pub interceptor: Arc<Interceptor>,
     pub policy: Arc<InterceptPolicy>,
-    /// Egress for both spliced and intercepted flows.
+    /// Egress for spliced and intercepted flows.
     pub egress: Arc<dyn StreamEgress>,
     pub filter: Arc<dyn RequestFilter>,
     pub crossings: Arc<VersionCrossings>,
@@ -187,7 +184,7 @@ pub struct Sessions {
     /// Source for optional HTML element-hiding rules.
     cosmetic: Arc<dyn CosmeticSource>,
     budget: StreamBudget,
-    /// BoringSSL origin connector, shared to cache profiles and trust anchors.
+    /// BoringSSL origin connector, shared for profile and trust-anchor caches.
     originator: Arc<Originator>,
 }
 
@@ -213,13 +210,13 @@ impl Sessions {
         })
     }
 
-    /// Adds trust roots for private or test upstream origins.
+    /// Adds trust roots for private or test origins.
     pub fn with_upstream_roots(mut self, extra_roots: &[Vec<u8>]) -> Result<Self, EgressError> {
         self.originator = Arc::new(Originator::new().with_extra_roots(extra_roots));
         Ok(self)
     }
 
-    /// Configures cosmetic rules and the stream rewrite budget.
+    /// Configures cosmetic rules and the per-stream rewrite budget.
     #[must_use]
     pub fn with_cosmetic_rules(
         mut self,
@@ -244,7 +241,7 @@ impl Sessions {
     }
 }
 
-/// Serves one terminated connection and returns its handling result.
+/// Serves one terminated connection and reports how it was handled.
 pub async fn serve_session(
     stream: crate::TerminatedStream,
     server: std::net::SocketAddr,
@@ -280,14 +277,14 @@ pub async fn serve_session(
         )
         .await;
     }
-    // Policy selects candidates; standing records whether interception works.
+    // Policy selects candidates; standing records whether interception is allowed.
     let tier = match sessions
         .demotions
         .standing(host.as_str(), Instant::now())
         .permits()
     {
         Ok(tier) => tier,
-        // A recorded demotion is the only standing that forbids interception.
+        // A recorded demotion is the only standing that blocks interception.
         Err(cause) => {
             return splice(
                 sessions,
@@ -304,17 +301,17 @@ pub async fn serve_session(
         host: host.clone(),
         port,
     };
-    // Bound the complete proxy dial, including an egress that accepts but stalls.
+    // Bound the full proxy dial, including an egress that accepts then stalls.
     let transport = crate::within(crate::Wait::ProxyDial, sessions.egress.connect(&target))
         .await
         .map_err(SessionError::Upstream)?;
 
-    // Both modes produce two streams and one wire version.
+    // Both modes produce two streams on one wire version.
     let (client, upstream, wire) = match approach {
-        // The origin selects ALPN before the forged leaf is sent. This keeps
-        // both legs on one version and leaves origin failure spliceable.
+        // Select ALPN at the origin before sending the forged leaf. Origin
+        // failure can then still fall back to a splice.
         Approach::Tls { profile, alpn } => {
-            // Mirror the client's profile on the origin-facing handshake.
+            // Mirror the client profile on the origin-facing handshake.
             let upstream = match sessions
                 .originator
                 .connect(host.as_str(), &profile, &alpn.encode(), transport)
@@ -351,7 +348,7 @@ pub async fn serve_session(
             };
             (Either::Left(client), Either::Left(upstream), wire)
         }
-        // Cleartext has no handshake and only the HTTP/1.x wire.
+        // Cleartext has no handshake and uses HTTP/1.x.
         Approach::Cleartext => (
             Either::Right(Prefixed::new(peeked, stream)),
             Either::Right(transport),
@@ -359,7 +356,7 @@ pub async fn serve_session(
         ),
     };
 
-    // Exchange termination is normal session completion.
+    // Reaching exchange completion is a normal session result.
     let failures = Arc::new(RewriteFailures::new());
     let _ = run_exchange(
         host.as_str(),
@@ -371,7 +368,7 @@ pub async fn serve_session(
         sessions.rewriting(tier, &failures),
     )
     .await;
-    // Record rewrite exhaustion only after the exchange ends.
+    // Record rewrite exhaustion after the exchange ends.
     if failures.count() > 0 {
         sessions
             .demotions
@@ -380,13 +377,10 @@ pub async fn serve_session(
     Ok(Handling::Intercepted { host, wire, tier })
 }
 
-/// Records what a failed handshake proved, if it proved anything.
+/// Records a demotion when a failed handshake proves a repeatable cause.
 ///
-/// A conclusive failure is not an error of the session. The connection is lost
-/// either way; what distinguishes the two outcomes is whether the next
-/// connection to this host will repeat it, and a recorded demotion is exactly
-/// the promise that it will not. Everything else — a reset, a timeout, a peer
-/// that vanished — proves nothing and stays an error.
+/// The current connection is lost in either case. Only a classified failure
+/// predicts the next connection; resets, timeouts, and vanished peers do not.
 fn learn(
     sessions: &Sessions,
     host: &DomainName,
@@ -408,9 +402,9 @@ fn learn(
     }
 }
 
-/// Reads until introduction, timeout, EOF, or the record bound is conclusive.
+/// Reads until introduction, timeout, EOF, or the record bound decides.
 ///
-/// Returns the peeked bytes so splicing and TLS termination can replay them.
+/// Returns the bytes needed to replay the stream for splicing or termination.
 async fn peek(
     mut stream: crate::TerminatedStream,
     timeout: Duration,
@@ -422,14 +416,14 @@ async fn peek(
     loop {
         match introduce(&buf) {
             Introduction::Incomplete if buf.len() < MAX_RECORD => {}
-            // The bound prevents unbounded waiting on incomplete input.
+            // The bound prevents indefinite waiting for incomplete input.
             Introduction::Incomplete => return (Introduction::Incomplete, buf, stream),
             conclusive => return (conclusive, buf, stream),
         }
         let read = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Ok(Ok(0)) | Err(_) => return (introduce(&buf), buf, stream),
             Ok(Ok(read)) => read,
-            // The caller handles the dead connection during splice.
+            // Splicing handles the dead connection.
             Ok(Err(_)) => return (introduce(&buf), buf, stream),
         };
         buf.extend_from_slice(&chunk[..read]);
@@ -438,8 +432,8 @@ async fn peek(
 
 /// Passes a connection through to the original socket address.
 ///
-/// Splicing must preserve the client's DNS choice, so the original address is
-/// used instead of resolving the parsed host again.
+/// The original address preserves the client's DNS choice; resolving the host
+/// again could select a different destination.
 async fn splice(
     sessions: Arc<Sessions>,
     server: std::net::SocketAddr,
@@ -461,8 +455,8 @@ async fn splice(
 
 /// Serves accepted connections until cancellation and joins every child.
 ///
-/// Admission is already bounded by the terminator's socket limit. Tracking and
-/// cancelling children also closes their TLS and egress resources on shutdown.
+/// The terminator bounds admission; tracking children closes their TLS and
+/// egress resources during shutdown.
 pub async fn run_sessions(
     mut accepted: mpsc::Receiver<Accepted>,
     sessions: Arc<Sessions>,
@@ -481,7 +475,7 @@ pub async fn run_sessions(
         let server = std::net::SocketAddr::new(terminated.server.address, terminated.server.port);
         let sessions = Arc::clone(&sessions);
         let shutdown = shutdown.clone();
-        // Contain one connection's panic and record it through supervision.
+        // Contain and record a panic from one connection.
         tracker.spawn(panics.watch(async move {
             tokio::select! {
                 () = shutdown.cancelled() => {}
@@ -490,7 +484,7 @@ pub async fn run_sessions(
         }));
     }
 
-    // Close admission before cancellation and wait for all children.
+    // Stop admission, cancel children, and wait for them all.
     tracker.close();
     shutdown.cancel();
     tracker.wait().await;
@@ -500,7 +494,7 @@ pub async fn run_sessions(
 mod tests {
     use super::*;
 
-    /// TLS ClientHello fields used by introduction tests.
+    /// TLS ClientHello constants used by introduction tests.
     const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
     const EXTENSION_SERVER_NAME: u16 = 0x0000;
     const NAME_TYPE_HOST: u8 = 0x00;
@@ -519,7 +513,7 @@ mod tests {
             extensions.extend_from_slice(&(list.len() as u16).to_be_bytes());
             extensions.extend_from_slice(&list);
         }
-        // Keep a non-SNI extension ahead of the lookup path.
+        // Put a non-SNI extension before the server-name extension.
         extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
 
         let mut body = Vec::new();
@@ -554,7 +548,7 @@ mod tests {
         );
     }
 
-    /// A partial ClientHello remains undecided.
+    /// A partial ClientHello remains incomplete.
     #[test]
     fn every_proper_prefix_of_a_client_hello_is_incomplete() {
         let hello = client_hello(Some("example.com"));
@@ -589,7 +583,7 @@ mod tests {
             introduce(b"GET / HTTP/1.1\r\n\r\n"),
             Introduction::Http { host: None }
         );
-        // Authority parsing preserves bracketed IPv6 host syntax.
+        // Authority parsing retains bracketed IPv6 host syntax.
         for (head, expected) in [
             ("Host: 203.0.113.4", "203.0.113.4"),
             ("Host: [::1]:80", "[::1]"),
@@ -601,7 +595,7 @@ mod tests {
                 }
             );
         }
-        // An incomplete head cannot yet decide that no host exists.
+        // An incomplete head cannot yet establish that no host exists.
         assert_eq!(
             introduce(b"GET / HTTP/1.1\r\nHost: exa"),
             Introduction::Incomplete
@@ -615,14 +609,14 @@ mod tests {
             introduce(b"SSH-2.0-OpenSSH_9.6 Ubuntu\r\n"),
             Introduction::Plain
         );
-        // A TLS-like byte with a non-TLS record version is plain input.
+        // A TLS-like type with a non-TLS version is plain input.
         assert_eq!(
             introduce(&[0x16, 0x00, 0x01, 0x00, 0x05]),
             Introduction::Plain
         );
     }
 
-    /// Corrupted input remains total and bounded.
+    /// Corrupted input remains within the recognition result sum.
     #[test]
     fn no_mutation_of_a_client_hello_escapes_the_sum() {
         let hello = client_hello(Some("example.com"));
@@ -630,11 +624,11 @@ mod tests {
             for patch in [0x00u8, 0x01, 0x7f, 0xff] {
                 let mut corrupted = hello.clone();
                 corrupted[index] = patch;
-                // Every byte mutation must remain in the result sum.
+                // Every mutation must remain representable by the result sum.
                 let _ = introduce(&corrupted);
             }
         }
-        // A declared record larger than the buffer remains incomplete.
+        // A record larger than the available bytes remains incomplete.
         assert_eq!(
             introduce(&[RECORD_HANDSHAKE, RECORD_MAJOR, 0x01, 0xff, 0xff, 0x01]),
             Introduction::Incomplete
@@ -680,9 +674,8 @@ mod end_to_end {
     const ALLOWED: &str = "allowed.example";
     const OTHER: &str = "other.example";
 
-    /// A CA and a leaf for `host`, as DER. The origin presents the leaf; the
-    /// session's upstream leg is told to trust the CA, exactly as a deployment
-    /// behind a private CA would be.
+    /// Returns a DER CA and a leaf for `host`; the origin presents the leaf and
+    /// the session trusts the CA on its upstream leg.
     fn origin_certificate(
         host: &str,
     ) -> (
@@ -693,12 +686,9 @@ mod end_to_end {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        // A distinct subject, because rcgen gives every certificate the same
-        // default one — which would make the leaf's issuer equal to its own
-        // subject and so indistinguishable from a self-signed certificate. The
-        // old rustls upstream matched anchors by signature and did not care;
-        // BoringSSL reports it as `DEPTH_ZERO_SELF_SIGNED_CERT`, and is right
-        // to, so the fixture is what changes.
+        // Give the CA a distinct subject. rcgen otherwise gives both
+        // certificates the same default subject, while BoringSSL correctly
+        // reports that chain as `DEPTH_ZERO_SELF_SIGNED_CERT`.
         ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "boreas test origin ca");
@@ -718,7 +708,7 @@ mod end_to_end {
         )
     }
 
-    /// A real TLS origin answering `200 origin` to anything, on a real socket.
+    /// Real TLS origin returning `200 origin` on a real socket.
     async fn start_tls_origin(host: &str) -> (SocketAddr, Vec<u8>) {
         let (authority, chain, key) = origin_certificate(host);
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -755,10 +745,7 @@ mod end_to_end {
         (address, authority)
     }
 
-    /// An origin that records the first bytes it is sent and echoes them, for
-    /// proving a splice is byte-exact.
-    /// An origin with no TLS at all, which is what a site that never got a
-    /// certificate looks like. Answers every request with its own path.
+    /// Real cleartext origin returning each request path.
     async fn start_cleartext_origin() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -809,11 +796,10 @@ mod end_to_end {
         (address, seen)
     }
 
-    /// An egress that dials one fixed address whatever it is asked for.
+    /// Egress fixture that dials one fixed address for every target.
     ///
-    /// It stands in for a configured proxy without needing one: what these
-    /// tests exercise is the *assembly*, and a real egress is already verified
-    /// against a reference server elsewhere.
+    /// It exercises session assembly without requiring a configured proxy; real
+    /// egress implementations are tested against a reference server elsewhere.
     struct ToOrigin(SocketAddr);
 
     impl StreamEgress for ToOrigin {
@@ -861,11 +847,9 @@ mod end_to_end {
         )
     }
 
-    /// **The P14 through-line, in one test.** A real `rustls` client that trusts
-    /// only the Boreas root speaks TLS to a connection this module classified
-    /// from its SNI alone; the forged leaf validates, the request crosses an
-    /// upstream TLS connection to a real origin, and the origin's body comes
-    /// back. Nothing here is a stub except the egress's choice of address.
+    /// A trusting client is intercepted end to end: SNI recognition, forged
+    /// leaf validation, upstream TLS, and the origin response all use real
+    /// connections. Only the egress address is fixed by the fixture.
     #[tokio::test]
     async fn an_allowlisted_host_is_intercepted_end_to_end() {
         let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
@@ -876,8 +860,7 @@ mod end_to_end {
         let (client_side, terminated) = bridge::duplex();
         let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
 
-        // A client that trusts the Boreas root and nothing else, so a leaf this
-        // process did not forge would fail here.
+        // Trust only the Boreas root; an unforgeable leaf would fail here.
         let mut roots = rustls::RootCertStore::empty();
         roots.add(root).unwrap();
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -887,10 +870,8 @@ mod end_to_end {
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-        // **Chrome's own list, against an origin that speaks only http/1.1.**
-        // The origin picks, so this is served over http/1.1 on both legs. Were
-        // the client's preference what settled it, the upstream leg would offer
-        // `h2` alone and the origin would refuse it outright.
+        // Offer Chrome's order to an origin that speaks only HTTP/1.1. The
+        // origin chooses, so both legs use HTTP/1.1.
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
@@ -945,10 +926,8 @@ mod end_to_end {
         );
     }
 
-    /// A host that is not on the allowlist must reach the origin *unaltered*,
-    /// ClientHello included. This is the fail-open default, and the assertion is
-    /// on the bytes rather than on the decision, because a splice that rewrote
-    /// anything would still report itself as a splice.
+    /// An unlisted host reaches the origin byte-for-byte, including ClientHello.
+    /// Assert the bytes because a rewriting splice could still report Spliced.
     #[tokio::test]
     async fn an_unlisted_host_is_spliced_byte_for_byte() {
         let (origin, seen) = start_recording_origin().await;
@@ -991,10 +970,8 @@ mod end_to_end {
         );
     }
 
-    /// **A site with no HTTPS is still filtered.** Port 80 is inspected for the
-    /// redirects that lead to 443, but a host that never got a certificate
-    /// serves its content there, and it used to pass through untouched for want
-    /// of an SNI to read. `Host` is what names it, and neither leg handshakes.
+    /// A cleartext site is still intercepted through `Host`; neither leg has a
+    /// TLS handshake, so the connection remains HTTP/1.1.
     #[tokio::test]
     async fn a_cleartext_host_is_intercepted_through_its_host_header() {
         let origin = start_cleartext_origin().await;
@@ -1039,25 +1016,17 @@ mod end_to_end {
         );
     }
 
-    /// **The P15 through-line.** A client that does not trust the Boreas root —
-    /// a pinned app, or any client the user did not install the root into —
-    /// rejects the forged leaf. That connection is lost and cannot be
-    /// otherwise: the leaf has been sent by the time the alert arrives, which
-    /// is the one failure the upstream-first order does not recover. What P15
-    /// buys is the next connection, which
-    /// [`a_demoted_host_splices_the_next_connection_byte_for_byte`] covers.
-    ///
-    /// The origin here is a real TLS server because the upstream handshake now
-    /// runs first: reaching the client's leg at all means the origin's leg
-    /// already succeeded.
+    /// A client that rejects the Boreas root loses this connection after the
+    /// forged leaf is sent. The classified failure demotes the next connection
+    /// to a byte-exact splice; the origin is real because its handshake runs
+    /// first.
     #[tokio::test]
     async fn a_client_that_refuses_the_forged_leaf_demotes_the_host() {
         let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
         let sessions = sessions_for(authority, &[ALLOWED], origin, &[origin_ca]);
 
-        // A client trusting only an unrelated root, which is what a pinned
-        // client looks like from here.
+        // Trust only an unrelated root, as a pinned client would.
         let (unrelated, ..) = origin_certificate("elsewhere.example");
         let mut roots = rustls::RootCertStore::empty();
         roots
@@ -1105,11 +1074,8 @@ mod end_to_end {
         );
     }
 
-    /// **What the demotion buys, which is the gate P15 measures.** An
-    /// allowlisted host whose standing has fallen to splice passes through
-    /// untouched, so the client speaks to the origin itself and the pin it was
-    /// protecting is never challenged again. Asserted on the bytes that reach
-    /// the origin rather than on the decision.
+    /// A demoted allowlisted host is spliced byte-for-byte, so the client speaks
+    /// directly to the origin and its pin is not challenged again.
     #[tokio::test]
     async fn a_demoted_host_splices_the_next_connection_byte_for_byte() {
         let (origin, seen) = start_recording_origin().await;
@@ -1152,9 +1118,8 @@ mod end_to_end {
         );
     }
 
-    /// Transport trouble must not demote, or a bad minute of network would
-    /// disable filtering for half a day. A client that opens a TLS record and
-    /// vanishes is exactly that case.
+    /// Transport trouble does not demote a host. A client that starts TLS and
+    /// vanishes provides no repeatable certificate evidence.
     #[tokio::test]
     async fn a_client_that_vanishes_mid_handshake_proves_nothing() {
         let (origin, _) = start_recording_origin().await;
@@ -1184,9 +1149,7 @@ mod end_to_end {
         );
     }
 
-    /// A cleartext request naming no host is spliced, and says why: `Host` is
-    /// what the allowlist reads on this path, and a head without one is the
-    /// same non-decision a hello without an SNI is.
+    /// A cleartext request without `Host` is spliced as an unnamed connection.
     #[tokio::test]
     async fn cleartext_without_a_host_is_spliced_with_its_reason() {
         let (origin, seen) = start_recording_origin().await;
