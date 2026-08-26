@@ -1,5 +1,5 @@
-//! Path MTU handling: TCP MSS clamping on SYN, and authentication of inbound
-//! ICMP Packet Too Big messages against known flows.
+//! Path MTU decisions: clamp TCP SYN MSS and authenticate inbound ICMP Packet
+//! Too Big messages against known flows.
 
 use crate::{
     IngressPacket, InternalEndpoint, MIN_QUIC_MTU, Mtu, Transport, UdpFlowTable,
@@ -11,10 +11,9 @@ pub struct PathUpdate {
     pub next_hop_mtu: u16,
 }
 
-/// A PTB is actionable only when it quotes a packet from a known flow and does
-/// not try to push the path below RFC 9000's floor. Forged sub-1200 messages
-/// (CVE-2024-53259) can otherwise disable QUIC with a single unauthenticated
-/// packet, so an unmatched or below-floor message changes nothing.
+/// Accepts a PTB only when its quote identifies a known flow and its MTU meets
+/// the minimum usable QUIC datagram size. Other messages leave path state
+/// unchanged.
 pub fn validate_ptb<V>(
     quoted: &IngressPacket,
     offered_mtu: u16,
@@ -39,10 +38,10 @@ pub fn validate_ptb<V>(
         })
 }
 
-/// Rewrites the MSS option of a SYN packet toward the tunnel's real budget.
-/// Returns whether a clamp was applied; absence of a clampable MSS is not an
-/// error. The TCP checksum is recomputed in full: two changed bytes do not
-/// justify maintaining the incremental-adjustment path.
+/// Clamps a TCP SYN's MSS to the tunnel's packet budget.
+///
+/// Returns `true` only when a valid MSS option was changed. Recomputing the
+/// complete TCP checksum keeps the write independent of its old checksum.
 pub fn clamp_mss(packet: &mut [u8], inner_mtu: Mtu) -> bool {
     match packet.first().map(|version| version >> 4) {
         Some(4) => clamp_ipv4(packet, inner_mtu.get().saturating_sub(40)),
@@ -108,40 +107,35 @@ fn clamp_ipv6(packet: &mut [u8], clamp: u16) -> bool {
     true
 }
 
-/// TCP option kinds this module names. The remaining kinds are skipped by
-/// length, which is what the option list's TLV framing is for.
+/// TCP option kinds inspected by this module. Other kinds are skipped using
+/// their length fields.
 const OPTION_END: u8 = 0;
 const OPTION_NOOP: u8 = 1;
 const OPTION_MSS: u8 = 2;
 /// `SYN` in the TCP flags byte.
 const FLAG_SYN: u8 = 0x02;
 
-/// One length-checked TCP option. Constructing this value *is* the proof that
-/// `value` lies inside the segment's declared header: the parser below is the
-/// only constructor, and it yields nothing it could not slice. Consumers
-/// therefore index `value` freely.
+/// A TCP option whose payload is inside the segment's declared header.
+/// Construction is private to the bounded option parser.
 struct TcpOption<'a> {
     kind: u8,
-    /// Offset of `value` within the segment that produced it.
+    /// Offset of the payload within the source segment.
     at: usize,
-    /// The option's payload, with its kind and length bytes removed.
+    /// Payload after the kind and length bytes.
     value: &'a [u8],
 }
 
-/// Parses the TCP option region as a total iterator of length-checked records.
+/// Parses TCP options as a total iterator of bounded records.
 ///
-/// This is the trust boundary for the option list: the bytes are attacker-
-/// chosen, so every read is bounded by the data-offset field, which is itself
-/// bounded by the slice. A record that does not fit ends the iteration instead
-/// of panicking, and single-byte options (`END`, `NOOP`) are consumed here so
-/// no consumer has to know they exist.
+/// The option bytes are attacker-controlled. Every read is bounded by the
+/// declared data offset and the available slice. A record that does not fit
+/// ends iteration, while single-byte options are consumed here.
 ///
-/// O(header length), which the 4-bit data offset caps at 60 bytes. Every step
-/// advances `at` by at least one, so the iterator always terminates.
+/// The four-bit data offset caps the work at a 60-byte TCP header, and every
+/// successful step advances the reader.
 fn tcp_options(segment: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
     let header_len = usize::from(segment.get(12).copied().unwrap_or(0) >> 4) * 4;
-    // An inverted or over-long range yields `None`, so a nonsense data offset
-    // simply produces an empty option list.
+    // Invalid data offsets produce no option bytes.
     let options = segment.get(20..header_len).unwrap_or_default();
 
     let mut reader = Reader::new(options);
@@ -151,11 +145,8 @@ fn tcp_options(segment: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
                 OPTION_END => return None,
                 OPTION_NOOP => {}
                 kind => {
-                    // The declared length counts the kind and length bytes
-                    // themselves, so the payload is two shorter — and a
-                    // declared length below two is refused by the subtraction
-                    // rather than by a check of its own. That it is at least
-                    // two on success is what guarantees progress.
+                    // The option length includes its two-byte header. Refusing
+                    // lengths below two also guarantees progress.
                     let length = usize::from(reader.u8()?).checked_sub(2)?;
                     let at = 20 + reader.position();
                     return Some(TcpOption {
@@ -169,17 +160,17 @@ fn tcp_options(segment: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
     })
 }
 
-/// Offset, within `segment`, of the MSS value a SYN advertises above `clamp`.
-/// `None` when the segment is not a SYN, carries no MSS option, carries a
-/// truncated one, or already sits at or below the clamp.
+/// Finds an MSS value above `clamp` in a SYN segment.
+///
+/// Returns `None` for non-SYN segments, missing or truncated options, and MSS
+/// values that already fit the clamp.
 fn mss_above(segment: &[u8], clamp: u16) -> Option<usize> {
     if segment.get(13).is_none_or(|flags| flags & FLAG_SYN == 0) {
         return None;
     }
 
     let mss = tcp_options(segment).find(|option| option.kind == OPTION_MSS)?;
-    // RFC 9293: the MSS option's value is exactly two bytes. A shorter one is
-    // malformed, and the reader refuses it rather than reading past it.
+    // RFC 9293 fixes the MSS value at two bytes; a shorter value is malformed.
     let advertised = Reader::new(mss.value).u16()?;
     (advertised > clamp).then_some(mss.at)
 }
