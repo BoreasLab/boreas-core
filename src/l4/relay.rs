@@ -1,29 +1,23 @@
-//! The L4 datagram relay: what carries UDP when the egress accepts flows
-//! rather than packets.
+//! L4 datagram relay for flow-oriented egresses.
 //!
-//! A packet egress carries a UDP datagram as what it already is — an IP packet
-//! on the fast path — and this module never runs. A *stream* egress cannot:
-//! SOCKS5, Shadowsocks, and VLESS all relay datagrams through an association
-//! that must be opened, framed, and kept alive. The datapath queues the client's
-//! datagrams and their targets ([`Outbound`]); this drives them through that
-//! association and synthesizes the replies back.
+//! Packet egresses carry UDP as IP packets on the fast path, so this module does
+//! not run for them. Flow egresses such as SOCKS5, Shadowsocks, and VLESS use
+//! an opened and framed association instead. The datapath supplies queued
+//! client datagrams and targets ([`Outbound`]); this module forwards them and
+//! synthesizes replies.
 //!
-//! **One association per client mapping is the NAT model.** A shared association
-//! cannot attribute replies when two clients contact the same peer; keying by
-//! client endpoint makes RFC 4787 endpoint independence structural.
+//! **One association serves one client mapping.** A shared association could
+//! not attribute replies when clients contact the same peer; keying by client
+//! endpoint makes RFC 4787 endpoint independence structural.
 //!
-//! **The receive half is owned, the send half is shared, and the types say
-//! so.** [`DatagramSource`] takes `&mut self`, so exactly one task reads each
-//! association and there is no race for an arriving datagram; [`DatagramSink`]
-//! is `Sync` and shared, so anything holding the association may send. That
-//! split is why an association can be driven by a single `select!` without a
-//! lock.
+//! **Receive ownership and send sharing are explicit in the types.**
+//! [`DatagramSource`] takes `&mut self`, so one task reads each association;
+//! [`DatagramSink`] is shared, so association holders may send. A single
+//! `select!` can drive both directions without a lock.
 //!
-//! **Everything is bounded.** Associations are capped, each one's outbound
-//! queue is bounded, payload bytes are on the shared [`BufferPool`] budget, and
-//! an idle association is closed on the same timeout the flow table uses. A
-//! refusal at any of those is a counted drop, never a wait — which is the
-//! discipline UDP already has and every consumer of it already recovers from.
+//! **Every resource is bounded.** Association count, per-association queues,
+//! payload storage, and idle lifetime all have limits. Refusals become counted
+//! drops rather than waits.
 
 use std::{
     collections::HashMap,
@@ -38,20 +32,16 @@ use crate::{
     Association, BufferPool, EgressError, InternalEndpoint, Outbound, StreamEgress, Target,
 };
 
-/// Depth of one association's outbound queue, in datagrams. The fairness bound
-/// beyond the datapath's own per-flow queue; a full one is a drop.
+/// Outbound datagrams retained by one association.
 const ASSOCIATION_DEPTH: usize = 32;
 
-/// What one relay may hold.
+/// Resource limits for one relay.
 #[derive(Clone, Copy, Debug)]
 pub struct RelayLimits {
-    /// Live associations. A bound on state fed by network input: one client
-    /// opening ports in a loop must not open proxy state in a loop.
+    /// Maximum live associations created from client input.
     pub max_associations: std::num::NonZeroUsize,
-    /// How long an association survives with no datagram in either direction.
-    /// Matches the flow table's own idle timeout, so a mapping and the
-    /// association serving it expire together rather than one outliving the
-    /// other.
+    /// Maximum idle interval in either direction. It matches the flow table so
+    /// the mapping and its association expire together.
     pub idle_timeout: Duration,
 }
 
@@ -59,53 +49,42 @@ impl Default for RelayLimits {
     fn default() -> Self {
         Self {
             max_associations: std::num::NonZeroUsize::new(512).expect("512 is not zero"),
-            // RFC 4787 REQ-5's floor, which is also the flow table's.
+            // RFC 4787 REQ-5's minimum, also used by the flow table.
             idle_timeout: Duration::from_secs(120),
         }
     }
 }
 
-/// One datagram coming back from the egress, addressed to the client whose
-/// mapping it belongs to.
+/// One datagram returned for a client mapping.
 #[derive(Debug)]
 pub struct Inbound {
     pub client: InternalEndpoint,
-    /// The peer it came from, which becomes the synthesized packet's source: a
-    /// client that sent to one address and heard from another discards the
-    /// reply.
+    /// The peer address used as the synthesized packet's source.
     pub peer: InternalEndpoint,
     pub payload: crate::Pooled,
 }
 
-/// The relay's two channels, from the reactor's side. Present only for a
-/// session whose egress accepts flows; a packet egress carries datagrams as
-/// packets and needs none of this.
+/// Channels between the reactor and a flow-oriented relay.
 pub struct Relay {
-    /// Client datagrams the datapath drained, offered without waiting: a full
-    /// queue is a counted drop, exactly as a full per-flow queue is.
+    /// Client datagrams offered without waiting; a full queue is a counted drop.
     pub outbound: mpsc::Sender<Outbound>,
-    /// Replies, to be synthesized back into IP packets.
+    /// Replies to synthesize into IP packets.
     pub inbound: mpsc::Receiver<Inbound>,
 }
 
-/// Why a datagram did not cross. Counted rather than logged per occurrence,
-/// because under a flood each of these is per packet.
+/// Per-datagram and per-association relay outcomes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RelayCounts {
-    /// Clients refused at the association ceiling.
+    /// Client mappings refused at the association ceiling.
     pub associations_refused: u64,
-    /// Datagrams a full association queue, an exhausted budget, or a failed
-    /// send could not carry.
+    /// Datagrams rejected by a full queue, exhausted budget, or failed send.
     pub datagrams_dropped: u64,
-    /// Associations that could not be opened at all: the proxy refused, or the
-    /// egress carries no datagrams.
+    /// Associations refused by the proxy or unsupported by the egress.
     pub associations_failed: u64,
 }
 
 impl RelayCounts {
-    /// The monoid a caller folds reports with: the identity is
-    /// [`Default`](Self::default) and the operation is field-wise addition, so
-    /// summing a stream of reports is a fold rather than a diff.
+    /// Adds another report field by field for aggregate accounting.
     pub fn add(&mut self, other: Self) {
         self.associations_refused += other.associations_refused;
         self.datagrams_dropped += other.datagrams_dropped;
@@ -113,10 +92,10 @@ impl RelayCounts {
     }
 }
 
-/// Drives every client mapping's association until cancelled.
+/// Drives client associations until cancellation.
 ///
-/// Time is O(1) per datagram — a hash probe and a channel offer — and space is
-/// O(live associations) plus the shared budget the payloads sit on.
+/// Each datagram performs one hash lookup and one bounded channel offer; state
+/// is proportional to live associations and the shared payload budget.
 pub async fn run_relay(
     egress: Arc<dyn StreamEgress>,
     pool: Arc<BufferPool>,
@@ -141,9 +120,8 @@ pub async fn run_relay(
             },
         };
 
-        // A closed sender is an association whose task has ended — an idle
-        // timeout, or a proxy that went away. Reaping it here rather than on a
-        // sweep is what keeps the map's size a function of live mappings.
+        // Reap associations whose tasks ended before checking the admission
+        // limit, keeping the map proportional to live mappings.
         if live
             .get(&datagram.client)
             .is_some_and(mpsc::Sender::is_closed)
@@ -181,14 +159,12 @@ pub async fn run_relay(
                 live.entry(client).or_insert(sender)
             }
         };
-        // Never awaited: a slow association must not stall the reactor's drain,
-        // and a dropped datagram is what a UDP source already handles.
+        // Do not await a slow association; UDP handles a dropped datagram.
         if sender.try_send(datagram).is_err() {
             pending.datagrams_dropped += 1;
         }
 
-        // Folded and reported on a clock, so the counter stream stays O(time)
-        // rather than O(datagrams).
+        // Report aggregates periodically instead of once per datagram.
         if reported.elapsed() >= Duration::from_millis(500) {
             let _ = counts.try_send(std::mem::take(&mut pending));
             reported = Instant::now();
@@ -196,15 +172,13 @@ pub async fn run_relay(
     }
 
     let _ = counts.try_send(pending);
-    // Admission closes, every association observes the token, and the wait is
-    // the proof that no proxy socket outlives this call.
+    // Stop admission, cancel associations, and wait for every proxy task.
     tracker.close();
     shutdown.cancel();
     tracker.wait().await;
 }
 
-/// Serves one client mapping: open the association, then move datagrams in both
-/// directions until it goes idle or is cancelled.
+/// Opens one client association and moves datagrams until idle or cancelled.
 async fn serve_association(
     egress: &dyn StreamEgress,
     pool: &Arc<BufferPool>,
@@ -218,17 +192,14 @@ async fn serve_association(
     let Ok(Association { sink, mut source }) =
         crate::within(crate::Wait::ProxyDial, egress.associate()).await
     else {
-        // The egress said so in its path properties, or the proxy refused.
-        // Either way there is nothing to serve and the queued datagrams are
-        // dropped with the receiver.
+        // The egress cannot provide an association or the proxy refused it; the
+        // receiver drop releases all queued datagrams.
         counts.associations_failed += 1;
         counts.datagrams_dropped += outbound.len() as u64;
         return counts;
     };
 
-    // One receive buffer for the association's life, sized to the largest
-    // payload a UDP datagram can carry, so a reply costs no allocation and a
-    // payload this cannot hold does not exist.
+    // Reuse one maximum-sized receive buffer for the association's lifetime.
     let mut buf = vec![0u8; usize::from(u16::MAX)];
 
     loop {
@@ -241,22 +212,17 @@ async fn serve_association(
                         counts.datagrams_dropped += 1;
                     }
                 }
-                // The relay dropped this association's sender: the mapping is
-                // gone, so the association goes with it.
+                // The mapping is gone, so its association ends with the sender.
                 None => break,
             },
 
-            // **Cancel safety.** Losing this arm to the outbound one drops the
-            // future mid-read. An implementation that had already taken a
-            // datagram off its socket would lose it, which is why
-            // `DatagramSource` is documented as readiness-driven and why the
-            // buffer is owned by the source rather than by the future.
+            // The source owns its receive buffer and is readiness-driven, so
+            // cancelling this future cannot discard a datagram already read.
             received = source.recv_from(&mut buf) => match received {
                 Ok((len, from)) => {
                     let Target::Ip(peer) = from else {
-                        // A relay that named a peer by domain gives no address
-                        // to write into the reply's source, and a client
-                        // discards a reply from an address it did not dial.
+                        // A domain-only peer cannot provide the source address
+                        // required by the synthesized client packet.
                         counts.datagrams_dropped += 1;
                         continue;
                     };
@@ -273,15 +239,13 @@ async fn serve_association(
                         counts.datagrams_dropped += 1;
                     }
                 }
-                // An oversized datagram is the relay's fault, not this flow's:
-                // count it and keep the association.
+                // An oversized datagram is a relay error; keep the association.
                 Err(EgressError::DatagramTooLarge { .. }) => counts.datagrams_dropped += 1,
                 Err(_) => break,
             },
 
-            // Idleness is measured by the absence of both arms, which is what
-            // this timer is: it fires only when neither has for the whole
-            // window, because any arm that wins restarts the `select!`.
+            // The timer restarts whenever send or receive wins, so it measures
+            // inactivity in both directions.
             () = tokio::time::sleep(idle_timeout) => break,
         }
     }
@@ -321,9 +285,7 @@ mod tests {
         SocketAddr::from(([198, 51, 100, 2], 53))
     }
 
-    /// An association that records what it was sent and echoes each payload
-    /// back from the target it was addressed to — the smallest thing that is
-    /// still a real relay in both directions.
+    /// An association that records sends and echoes payloads from their target.
     #[derive(Default)]
     struct Echo {
         sent: Mutex<Vec<(SocketAddr, Vec<u8>)>>,
@@ -407,7 +369,7 @@ mod tests {
         }
     }
 
-    /// Client datagram reaches its target and the reply returns to its mapping.
+    /// Client datagrams reach their targets and replies return to their mapping.
     #[tokio::test]
     async fn a_client_datagram_crosses_the_association_and_its_reply_returns() {
         let echo = Arc::new(Echo::default());
@@ -457,7 +419,7 @@ mod tests {
             .unwrap();
     }
 
-    /// One association per client mapping prevents replies crossing clients.
+    /// Separate associations prevent replies crossing client mappings.
     #[tokio::test]
     async fn each_client_mapping_gets_its_own_association() {
         let echo = Arc::new(Echo::default());
@@ -512,8 +474,7 @@ mod tests {
             .unwrap();
     }
 
-    /// The association ceiling bounds network-fed state; excess ports become
-    /// counted drops, not proxy sockets.
+    /// The association ceiling turns excess client mappings into counted drops.
     #[tokio::test]
     async fn the_association_ceiling_refuses_rather_than_grows() {
         let echo = Arc::new(Echo::default());
@@ -546,8 +507,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Drain queued datagrams before reporting; cancellation would race the
-        // admission decisions under test.
+        // Let admission finish before cancellation so all decisions are counted.
         drop(out_tx);
         tokio::time::timeout(Duration::from_secs(5), relay)
             .await
@@ -564,9 +524,7 @@ mod tests {
         );
     }
 
-    /// An egress that accepts the connection and then says nothing — the shape
-    /// a path takes when the handset walked out of Wi-Fi range mid-dial. No RST
-    /// arrives, no ICMP, no FIN; the association simply never opens.
+    /// An egress that never completes association establishment.
     struct NeverAnswers;
 
     impl StreamEgress for NeverAnswers {
@@ -592,11 +550,8 @@ mod tests {
         }
     }
 
-    /// **Nothing but a deadline ends a connection whose path stopped
-    /// existing.** Without one, this association holds a task, a queue, and
-    /// every pooled payload queued behind it for as long as the process runs —
-    /// and a client that roams does this several times an hour, so the leak is
-    /// ordinary rather than adversarial.
+    /// A stalled association must end at the proxy dial deadline so its task,
+    /// queue, and pooled payloads do not remain live indefinitely.
     #[tokio::test(start_paused = true)]
     async fn an_egress_that_never_answers_gives_the_association_up() {
         let pool = pool();
@@ -624,8 +579,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Well past the dial budget and far short of forever, which is what the
-        // absence of a bound would have cost.
+        // The association must fail within a finite multiple of the dial budget.
         let counts = tokio::time::timeout(crate::Wait::ProxyDial.budget() * 2, count_rx.recv())
             .await
             .expect("the association gives up on its own")

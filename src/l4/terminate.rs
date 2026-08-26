@@ -1,31 +1,19 @@
-//! The reactor bridge: it drives [`LocalStack`] as a task and turns each
-//! terminated TCP connection into an ordinary `AsyncRead + AsyncWrite` stream
-//! the interception layer can serve.
+//! Reactor bridge for [`LocalStack`] and terminated TCP streams.
 //!
-//! **This is a second task, and the split is load-bearing** — the same argument
-//! that separates the resolver from the reactor. A terminated connection is
-//! served by `hyper`, which awaits, so running it inside the reactor would put
-//! an HTTP round trip in front of every packet. The reactor forwards the
-//! packets a flow plan routed to termination and drains the replies; everything
-//! between those two points happens here.
+//! **The bridge runs as a separate task.** `hyper` awaits while serving a
+//! terminated connection, so running it in the reactor would delay packet
+//! handling. The reactor supplies packets and drains replies; this task owns
+//! the work between those points.
 //!
-//! **Backpressure is TCP's own window, not a drop.** A datagram may be dropped
-//! under load — a stub resolver retries — but a byte stream may not: a dropped
-//! byte is a corrupted response. So the pump only moves bytes out of a socket
-//! when the consuming channel has already reserved capacity. When it has not,
-//! bytes stay in `smoltcp`'s receive buffer, the advertised window shrinks, and
-//! the peer stops sending. The bound is enforced by refusing to read, which is
-//! exactly the mechanism TCP provides for it. The channels and the stream that
-//! rides on them are [`crate::bridge`]'s, shared with the QUIC driver, which
-//! needs the same hand-off for a different state machine.
+//! **Backpressure is TCP flow control, not loss.** The pump reads from a socket
+//! only after reserving channel capacity. Without capacity, bytes remain in
+//! `smoltcp`'s receive buffer and the advertised window closes. The channels
+//! and stream come from [`crate::bridge`], shared with the QUIC driver.
 //!
-//! **The pump is a sweep, and its cost is bounded by the socket ceiling.** One
-//! pass costs O(live connections) channel probes, and
-//! [`TerminationLimits::max_sockets`](crate::TerminationLimits) is what bounds
-//! that count — the same admission rule that bounds the socket set itself. A
-//! ready-list would make it O(ready), which is worth doing only once a
-//! measurement shows the sweep on the profile; at the tens-to-hundreds of
-//! connections the ceiling admits, the probe is cheaper than the bookkeeping.
+//! **The pump is a bounded sweep.** One pass probes each live connection, and
+//! [`TerminationLimits::max_sockets`](crate::TerminationLimits) bounds that
+//! work. A ready list is a measurement-driven optimization, not a second
+//! ownership model.
 
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
@@ -41,37 +29,31 @@ use crate::{
     bridge::{CHUNK, Plumbing, pair},
 };
 
-/// One accepted connection: what it is, and the stream that serves it.
+/// One accepted connection and its serving stream.
 ///
-/// The endpoints travel with the stream because the layer above needs both —
-/// the server address names the host whose certificate must be forged, and the
-/// client address identifies the flow.
+/// The server address identifies the certificate host and the client address
+/// identifies the flow.
 #[derive(Debug)]
 pub struct Accepted {
     pub terminated: Terminated,
     pub stream: TerminatedStream,
 }
 
-/// A terminated TCP connection, as an ordinary async byte stream.
+/// A terminated TCP connection exposed as an async byte stream.
 ///
-/// Half-close is exposed: closing the write half sends FIN; an exhausted read
-/// half observes the peer's FIN.
+/// Closing the write half sends FIN; an exhausted read half observes peer FIN.
 ///
-/// The name is the local one for [`crate::BridgedStream`]: the QUIC driver
-/// hands back the same type for the same reasons, and only the pump behind it
-/// differs.
+/// This aliases [`crate::BridgedStream`], also used by the QUIC driver.
 pub type TerminatedStream = crate::BridgedStream;
 
-/// Drives the terminator until cancelled.
+/// Drives the local TCP terminator until cancellation.
 ///
-/// `packets` carries the client packets the datapath routed to termination;
-/// `replies` carries the segments this stack produced back to the reactor,
-/// which owns the device. `accepted` publishes each new connection.
+/// `packets` carries client packets routed to termination, `replies` carries
+/// generated segments to the device-owning reactor, and `accepted` publishes
+/// new connections.
 ///
-/// Awaiting on `replies` is safe and deliberate: the reactor only ever
-/// `try_send`s into `packets`, so there is no cycle in which both tasks wait on
-/// each other, and a reply is a byte-stream segment that must not be dropped
-/// the way a datagram may be.
+/// Awaiting `replies` cannot deadlock with the reactor: it only `try_send`s into
+/// `packets`, and TCP segments must not be dropped like datagrams.
 pub async fn run_terminator(
     mut stack: LocalStack,
     mut packets: mpsc::Receiver<Pooled>,
@@ -84,9 +66,8 @@ pub async fn run_terminator(
     let mut buf = vec![0u8; CHUNK];
 
     loop {
-        // One timer, armed against the stack's own next deadline — a
-        // retransmit, a delayed ACK, a TIME-WAIT expiry — exactly as the
-        // reactor arms one against the datapath's.
+        // Arm one timer for the stack's next retransmit, delayed ACK, or
+        // TIME-WAIT deadline.
         let deadline = stack
             .poll_at(Instant::now())
             .map(TokioInstant::from_std)
@@ -95,9 +76,7 @@ pub async fn run_terminator(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             packet = packets.recv() => match packet {
-                // Moved into the stack's inbound queue rather than copied out
-                // of it: the buffer is already on the shared budget, and it is
-                // released when `smoltcp` has consumed the packet.
+                // Move the shared-budget buffer into the stack until consumed.
                 Some(packet) => stack.push(packet),
                 None => break,
             },
@@ -108,13 +87,12 @@ pub async fn run_terminator(
         service(&mut stack, &mut conns, &wake, &mut buf, &replies, &accepted).await;
     }
 
-    // Everything already decided still belongs on the wire: one last pass so a
-    // FIN or a final segment is not stranded by cancellation.
+    // Flush decisions already made so cancellation cannot strand a FIN or final
+    // segment.
     service(&mut stack, &mut conns, &wake, &mut buf, &replies, &accepted).await;
 }
 
-/// One servicing pass: advance the state machines, publish new connections,
-/// pump every live one, then drain what that produced.
+/// Advances the stack, publishes connections, pumps streams, and drains output.
 async fn service(
     stack: &mut LocalStack,
     conns: &mut HashMap<StreamId, Plumbing>,
@@ -127,8 +105,7 @@ async fn service(
 
     while let Some(terminated) = stack.poll_accept() {
         let (stream, plumbing) = pair(Arc::clone(wake));
-        // A consumer that cannot take the connection is one that has gone away;
-        // aborting is the honest answer, because nothing will ever serve it.
+        // No consumer remains to serve this connection.
         if accepted
             .send(Accepted { terminated, stream })
             .await
@@ -144,13 +121,12 @@ async fn service(
         pump(stack, id, plumbing, buf);
     }
 
-    // Pumping fed the send buffers; polling again turns those bytes into
-    // segments in this same pass rather than one wakeup later.
+    // Poll again so pumped bytes become segments in this pass.
     stack.poll(Instant::now());
 
     while let Some(packet) = stack.poll_transmit() {
         if replies.send(packet).await.is_err() {
-            return; // the reactor is gone; nothing left to serve
+            return; // the reactor is gone.
         }
     }
 
@@ -159,13 +135,11 @@ async fn service(
     }
 }
 
-/// Moves bytes in both directions for one connection, without ever dropping a
-/// byte: each direction stops at the first sign of a full destination and
-/// resumes on the next sweep.
+/// Moves bytes in both directions without loss. Each direction stops when its
+/// destination is full and resumes on the next sweep.
 fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut [u8]) {
-    // Client to task. A permit is taken *before* the socket is read, so bytes
-    // leave the receive buffer only when there is somewhere to put them; when
-    // there is not, the window closes and the peer stops sending.
+    // Reserve capacity before reading so the TCP receive window closes when
+    // the task cannot accept more bytes.
     let mut peer_finished = false;
     while let Some(sender) = plumbing.to_task.as_ref() {
         let Ok(permit) = sender.try_reserve() else {
@@ -182,9 +156,8 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
         }
     }
     if peer_finished {
-        // The peer's FIN: dropping the sender is what gives the task its end of
-        // stream. Done outside the loop because the reserved permit borrows the
-        // very field being cleared.
+        // Drop the sender outside the loop because the reserved permit borrows
+        // the field being cleared.
         plumbing.to_task = None;
     }
 
@@ -195,8 +168,7 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
             None => match plumbing.from_task.try_recv() {
                 Ok(chunk) => chunk,
                 Err(mpsc::error::TryRecvError::Empty) => break,
-                // The task finished and everything it wrote is already in the
-                // send buffer, so the connection's write half closes now.
+                // Queued task bytes have drained, so close the connection now.
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     if !plumbing.finished {
                         plumbing.finished = true;
@@ -208,8 +180,7 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
         };
         match stack.send(id, &chunk) {
             Ok(written) if written < chunk.len() => {
-                // A partial write is the send buffer filling up. Keep the tail
-                // exactly, and resume from it next sweep.
+                // Preserve the unsent tail for the next sweep.
                 plumbing.pending_out = Some(chunk.slice(written..));
                 break;
             }
@@ -228,10 +199,8 @@ mod tests {
 
     use crate::{BufferPool, Mtu, TerminationLimits};
 
-    /// Drives the terminator against the deterministic smoltcp client the
-    /// `stream` module already uses for its loopback tests, over real channels
-    /// and a real tokio runtime. The wire is in memory; everything else —
-    /// the task split, the pump, the backpressure — is production code.
+    /// Drives the terminator against the deterministic `smoltcp` client using
+    /// real channels and a Tokio runtime; only the wire is in memory.
     struct Rig {
         packets: mpsc::Sender<Pooled>,
         replies: mpsc::Receiver<Pooled>,
@@ -243,8 +212,7 @@ mod tests {
 
     impl Rig {
         fn start(ports: &[u16]) -> Self {
-            // One budget for the whole rig, exactly as production shares one
-            // between the datapath and the terminator.
+            // Share one payload budget, as production does.
             let pool = BufferPool::new(
                 NonZeroUsize::new(2048).unwrap(),
                 NonZeroUsize::new(256).unwrap(),
@@ -287,8 +255,7 @@ mod tests {
             self.packets.send(pooled).await.expect("terminator lives");
         }
 
-        /// Collects the segments the terminator produced, waiting briefly for
-        /// the task to make progress.
+        /// Collects segments produced while the task makes progress.
         async fn drain(&mut self) -> Vec<Vec<u8>> {
             let mut out = Vec::new();
             while let Ok(Some(packet)) =
@@ -315,8 +282,7 @@ mod tests {
             443,
         );
 
-        // Complete the handshake by relaying between the client stack and the
-        // terminator task until the connection is published.
+        // Relay packets until the handshake publishes the connection.
         let mut accepted = None;
         for _ in 0..12 {
             for packet in client.take_outbound() {
@@ -335,8 +301,7 @@ mod tests {
         assert_eq!(accepted.terminated.server.port, 443);
         assert_eq!(accepted.terminated.client.port, 49152);
 
-        // An echo task serves the stream exactly as the interception layer
-        // would: it reads bytes and writes them back.
+        // Serve the stream as the interception layer would, by echoing bytes.
         let mut stream = accepted.stream;
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
