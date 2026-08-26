@@ -1,66 +1,33 @@
-//! Every wait this crate performs on a network peer, named and bounded.
+//! Named, bounded waits for network operations.
 //!
-//! **The clients this serves move.** A handset walks out of Wi-Fi range and
-//! onto cellular, and the path it was using does not close — it stops
-//! existing. Nothing arrives to say so: no RST, no ICMP, no FIN. The peer is
-//! still holding its half, and this side is still holding a task, a socket, and
-//! whatever buffer the connection had reserved. A deadline is the only thing
-//! that ever ends such a connection, which is why an unbounded wait here is not
-//! a latency question but a leak.
+//! A mobile path can disappear without RST, ICMP, or FIN. A deadline is what
+//! releases the task, socket, and buffers left waiting on that path.
 //!
-//! **The values are aggressive on purpose, and that is a deliberate departure
-//! from what browsers ship.** Chromium's own transport connect job allows four
-//! minutes (`TcpConnectJob::ConnectionTimeout`) and its TLS handshake thirty
-//! seconds (`kSSLHandshakeTimeout`); those are anti-hang backstops layered under
-//! a 300 ms fallback timer, and they are survivable in a browser because a
-//! person can close the tab. Nothing closes a tab here. The numbers below come
-//! instead from the proxies that live under the same constraint — HAProxy's and
-//! Envoy's 5 s connect defaults — and from the measurement that governs mobile:
-//! 74% of carrier NATs expire idle state within a minute, with a cellular
-//! median mapping lifetime of 65 s (Richter et al., IMC'16), so a path that has
-//! not answered in seconds is gone rather than slow.
+//! The budgets are shorter than browser defaults because this service has no
+//! tab to close a stalled operation. They bound proxy connection, TLS, and
+//! client-handshake work on mobile paths.
 //!
-//! Idle timeouts are *not* here, and the omission is the point. RFC 4787 REQ-5
-//! binds a mapping to at least two minutes and [`crate::UdpFlowTable`] refuses
-//! anything shorter, so those bounds belong to the state that expires rather
-//! than to a wait that never returns.
+//! UDP idle timeouts belong to [`crate::UdpFlowTable`], which enforces RFC 4787
+//! REQ-5's two-minute minimum. They are state-expiry rules, not operation waits.
 
 use std::{io, time::Duration};
 
-/// Wait kind selects its budget; the error carries the name for diagnostics.
+/// Operation kind with a fixed timeout budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// One TCP connect. Covers a single SYN retransmission (Linux's first RTO
-    /// is 1 s, its second 3 s) with slack; past that the SYN is not being
-    /// answered rather than being answered slowly. HAProxy's `timeout connect`
-    /// and Envoy's cluster `connect_timeout` both default here, and HAProxy's
-    /// manual asks for "slightly above multiples of 3 seconds" for exactly this
-    /// reason.
+    /// One TCP connection attempt.
     TcpConnect,
-    /// One TLS handshake over a connection that is already up. Chromium allows
-    /// 30 s and arms the timer only when the handshake starts rather than
-    /// sharing a budget with the connect beneath it; this keeps that structure
-    /// and tightens the number, because a handshake still unfinished after ten
-    /// seconds on a mobile path is one whose path went away mid-flight.
+    /// One TLS handshake over an established connection.
     TlsHandshake,
-    /// A whole dial through an egress: the connect, the TLS under it, the
-    /// transport's own upgrade, and the proxy protocol's negotiation. The
-    /// backstop for the sum, and the only bound that catches a proxy which
-    /// accepts the connection and then never speaks — the shape a stalled
-    /// cellular path takes most often, because the SYN got through before the
-    /// handover and nothing after it did.
+    /// A complete egress dial, including connection, TLS, upgrade, and proxy
+    /// negotiation.
     ProxyDial,
-    /// One client's TLS handshake against this proxy's own listener. Envoy
-    /// leaves the equivalent (`transport_socket_connect_timeout`) unset by
-    /// default and documents that unset means unlimited, which is a slowloris
-    /// surface; naming it here means it cannot be left unset.
+    /// One client's TLS handshake with this proxy's listener.
     ClientHandshake,
 }
 
 impl Wait {
-    /// The budget, in the same shape [`crate::Demotion::ttl`] uses: a `match`
-    /// in a `const fn`, so the table is one expression and a new variant
-    /// without a number does not compile.
+    /// Returns the fixed budget for this operation kind.
     pub const fn budget(self) -> Duration {
         Duration::from_secs(match self {
             Self::TcpConnect => 5,
@@ -69,7 +36,7 @@ impl Wait {
         })
     }
 
-    /// What an expiry looks like to a caller.
+    /// Converts expiry into the error type used by callers.
     fn expired(self) -> io::Error {
         io::Error::new(io::ErrorKind::TimedOut, self.describe())
     }
@@ -84,17 +51,11 @@ impl Wait {
     }
 }
 
-/// Runs `work` under `wait`'s budget.
+/// Runs `work` under the timeout selected by `wait`.
 ///
-/// Expiry arrives as an `io::Error` of kind `TimedOut` rather than as a new
-/// error type, because every seam this wraps already carries one: `E: From<
-/// io::Error>` is satisfied by `io::Error` itself and by [`crate::EgressError`],
-/// so a bound can be added to a dial path without threading a conversion
-/// through it. The alternative — an `Expired` of its own — would be a second
-/// `?` at every call site to say something the existing kind already says.
-///
-/// Cancellation-safe exactly as far as `work` is: the timer holds no state, so
-/// dropping this drops `work` and nothing else.
+/// Expiry is reported as an `io::Error` of kind `TimedOut`, which existing
+/// callers already convert through `From<io::Error>`. Dropping the wrapper
+/// cancels `work` and retains no timer state.
 pub async fn within<T, E, F>(wait: Wait, work: F) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
@@ -110,9 +71,7 @@ where
 mod tests {
     use super::*;
 
-    /// The budgets nest: a dial contains a connect and a handshake, so a total
-    /// smaller than its parts would make the outer bound the only one that ever
-    /// fires and the inner names meaningless.
+    /// A complete dial budget must cover its connection and handshake parts.
     #[test]
     fn a_whole_dial_allows_at_least_its_parts() {
         assert!(
@@ -120,10 +79,8 @@ mod tests {
         );
     }
 
-    /// Aggressive is the point, but a budget under a second would fail a
-    /// handshake on any path with a real round trip. RFC 9002's `kInitialRtt`
-    /// is 333 ms and a cold PTO about three times that, so a second is the
-    /// floor at which a first attempt is even possible.
+    /// Every budget is long enough for at least one round trip and bounded by
+    /// the service's 30-second upper limit.
     #[test]
     fn no_budget_is_shorter_than_one_round_trips_worth_of_retries() {
         for wait in [
