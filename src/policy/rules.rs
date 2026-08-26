@@ -1,38 +1,23 @@
-//! The rule engine: Adblock Plus syntax in, decisions out.
+//! Rule evaluation for URL requests and host-scoped cosmetic resources.
 //!
-//! [Filtering](../docs/filtering.md) draws the boundary this module implements:
-//! *`adblock` decides and `lol_html` transforms.* Brave's engine is the one
-//! shipping in a browser against the same subscriptions Boreas targets, and the
-//! two faculties [`crate::Deferred`] counts as missing at the name tier are
-//! exactly what it supplies — full URL matching with request context, and
-//! hostname-scoped cosmetic rules. Neither is a parser worth writing twice, and
-//! a second implementation of Adblock syntax would differ from the reference in
-//! ways no test here would find.
+//! [Filtering](../docs/filtering.md) assigns URL decisions to `adblock` and
+//! HTML transformation to `lol_html`. The browser engine supplies the URL and
+//! request-context matching plus host-scoped cosmetic lookup that this crate
+//! cannot reproduce safely with a second syntax implementation.
 //!
-//! **The engine answers two questions and this module asks both.** A request
-//! becomes a [`FilterVerdict`], which is the URL tier P13 deferred to; a host
-//! becomes a compiled [`HidingRules`], which is what the HTML tier removes and
-//! injects with. One index, loaded once, serving both.
+//! **The engine answers two questions.** Requests become [`FilterVerdict`]s for
+//! the URL tier P13 deferred to; hosts become compiled [`HidingRules`] for the
+//! HTML tier. One loaded index serves both.
 //!
-//! **Request context is read from the client, not guessed.** `$third-party`,
-//! `$script`, and `$image` decide most of a real list, and a proxy that guesses
-//! them wrong either breaks a site or fails to block anything. Boreas
-//! terminates TLS, so it sees what a browser actually sends: `Sec-Fetch-Dest`
-//! names the resource kind the fetch was made for, and `Referer` names the
-//! document it was made from. Where a client sends neither, the request is
-//! typed [`Other`](adblock::request::RequestType::Other) and treated as
-//! first-party — the reading that blocks least, which is the direction every
-//! uncertainty in this crate resolves toward.
+//! **Request context comes from client headers.** `Sec-Fetch-Dest` identifies
+//! the resource kind and `Referer` identifies the initiating document. When
+//! neither is usable, the request is typed as [`Other`](adblock::request::RequestType::Other)
+//! and treated as first-party, which is the fail-open interpretation.
 //!
-//! **Generic cosmetic rules are not served, and that is the engine's design
-//! rather than a shortcut here.** `url_cosmetic_resources` deliberately returns
-//! only the host-specific set; the generic set is far too large to ship per
-//! page and is indexed by class and id token, to be queried with the tokens a
-//! document actually contains. A browser collects those from the DOM. A
-//! streaming rewriter could collect them as it walks the document and inject a
-//! second stylesheet before `</body>` — CSS does not care where the rule was
-//! declared — which is a real follow-up rather than an impossibility, and is
-//! recorded as one.
+//! **Generic cosmetic rules are not served.** `url_cosmetic_resources` returns
+//! only host-specific rules; generic rules require DOM class and id tokens that
+//! a streaming rewriter does not currently collect. The follow-up is recorded
+//! rather than hidden behind a partial implementation.
 
 use std::{
     collections::HashMap,
@@ -48,17 +33,12 @@ use hyper::{Request, Uri, body::Incoming, header};
 
 use crate::{CosmeticSource, FilterVerdict, HidingRules, RequestFilter};
 
-/// The compiled rule index, serving the URL tier and the HTML tier from one
-/// copy of the lists.
+/// A compiled index shared by the URL and HTML tiers.
 pub struct RuleEngine {
     engine: Engine,
-    /// Compiled hiding rules per host.
-    ///
-    /// Memoized because `url_cosmetic_resources` walks the hostname's suffixes
-    /// and unions several rule sets, and compiling the result parses a selector
-    /// list and hashes a stylesheet — all of which is a function of the host
-    /// alone and so needs doing once, not once per document. Bounded by the
-    /// interception allowlist, since no other host reaches a rewriter.
+    /// Memoized host-scoped hiding rules. Lookup walks hostname suffixes and
+    /// compiles a selector stylesheet, so the result is a function of the host
+    /// and is reused for later documents.
     cosmetic: RwLock<HashMap<String, Option<Arc<HidingRules>>>>,
 }
 
@@ -69,15 +49,9 @@ impl std::fmt::Debug for RuleEngine {
 }
 
 impl RuleEngine {
-    /// Compiles subscriptions into one index.
-    ///
-    /// Rules the engine cannot parse are ignored rather than fatal, which is
-    /// what a browser does with the same lists: a subscription that gains a
-    /// syntax this build predates must not take the rest of the list with it.
-    ///
-    /// O(bytes of the lists). An EasyList-scale build is a sub-second operation
-    /// that belongs off the datapath; the result is swapped in whole, never
-    /// edited in place.
+    /// Compiles subscriptions into one index. Syntax the engine does not
+    /// understand is ignored, matching browser behavior and keeping one newer
+    /// rule from invalidating the rest of a list.
     #[must_use]
     pub fn from_lists(lists: impl IntoIterator<Item = String>) -> Self {
         let mut set = FilterSet::new(false);
@@ -94,15 +68,14 @@ impl RuleEngine {
         }
     }
 
-    /// An index with no rules: allows every request and hides nothing.
+    /// Returns an index that allows every request and hides nothing.
     #[must_use]
     pub fn empty() -> Self {
         Self::from_lists(std::iter::empty())
     }
 }
 
-/// Authority comes from the SNI-validated host, not the request; scheme is
-/// always `https` because Boreas terminates TLS only.
+/// Builds the absolute URL from the validated host and request target.
 fn absolute(host: &str, uri: &Uri) -> String {
     if uri.scheme().is_some() {
         return uri.to_string();
@@ -111,10 +84,9 @@ fn absolute(host: &str, uri: &Uri) -> String {
     format!("https://{host}{path}")
 }
 
-/// The resource kind the fetch was made for, in the engine's vocabulary.
-///
-/// Read unforgeable `Sec-Fetch-Dest` first; fall back to the leading `Accept`
-/// type for clients without it.
+/// Maps client request headers to the engine's resource vocabulary.
+/// `Sec-Fetch-Dest` is authoritative; `Accept` is the fallback for older
+/// clients.
 fn destination<B>(request: &Request<B>) -> &'static str {
     if let Some(dest) = request
         .headers()
@@ -152,27 +124,15 @@ fn destination<B>(request: &Request<B>) -> &'static str {
 }
 
 impl RuleEngine {
-    /// The URL tier's verdict.
+    /// Evaluates one request against the compiled URL rules.
     ///
-    /// **Every uncertainty resolves to allow.** A URL the engine will not parse,
-    /// a request with no usable context — each of them forwards, because a
-    /// blocked subresource is a broken page and an unblocked one is only an
-    /// advertisement. The engine's own `should_block` already folds exceptions
-    /// and `$important` in the order the syntax defines, so this adds no
-    /// precedence of its own.
-    ///
-    /// O(1) expected against the compiled index, which is a token-bucketed
-    /// match rather than a scan over rules.
-    ///
-    /// Generic over the body because it reads only the head — saying so in the
-    /// type is both honest and what lets this be exercised without standing up
-    /// a connection to manufacture a [`hyper::body::Incoming`].
+    /// Unparseable URLs and missing context allow the request. The engine owns
+    /// exception and `$important` precedence; this adapter adds none.
     #[must_use]
     pub fn verdict<B>(&self, host: &str, request: &Request<B>) -> FilterVerdict {
         let url = absolute(host, request.uri());
-        // The document the fetch was made from decides `$third-party`. A
-        // browser sends at least the origin cross-site by default; with no
-        // referrer the request is treated as first-party, which blocks least.
+        // The referring document supplies `$third-party` context. No usable
+        // referrer is treated as first-party to keep the decision fail-open.
         let source = request
             .headers()
             .get(header::REFERER)
@@ -202,11 +162,8 @@ impl RequestFilter for RuleEngine {
 
 impl CosmeticSource for RuleEngine {
     fn rules(&self, host: &str) -> Option<Arc<HidingRules>> {
-        // **The hit path allocates nothing.** Every host reaching here came
-        // through `DomainName`, which lower-cases at construction, so the
-        // borrowed name is already the memo's key; the owned copy is built only
-        // for a caller that has not normalized, and only once more on a miss
-        // that has to insert.
+        // Normalized hosts hit the memo without allocating. Unnormalized input
+        // is lower-cased only for the fallback lookup or insertion.
         if let Some(cached) = self
             .cosmetic
             .read()
@@ -224,8 +181,8 @@ impl CosmeticSource for RuleEngine {
         {
             return cached.clone();
         }
-        // The engine takes a URL rather than a hostname, and cosmetic rules are
-        // scoped by hostname alone, so the document root stands for the page.
+        // The document root supplies the URL while the engine scopes resources
+        // by hostname.
         let resources = self
             .engine
             .url_cosmetic_resources(&format!("https://{host}/"));
@@ -258,9 +215,7 @@ example.com#@#.ad-banner
         RuleEngine::from_lists([LIST.to_owned()])
     }
 
-    /// A request head. `Incoming` has no public constructor and the filter
-    /// never reads a body, which is exactly what [`RuleEngine::verdict`] being
-    /// generic over it says.
+    /// Builds a request head; verdict evaluation never reads its body.
     fn request(url: &str, headers: &[(&str, &str)]) -> Request<()> {
         let mut builder = Request::builder().uri(url);
         for (name, value) in headers {
@@ -282,12 +237,11 @@ example.com#@#.ad-banner
         );
     }
 
-    /// The faculty the name tier could not have: the same host is blocked or
-    /// allowed depending on the document that asked for it.
+    /// The same host changes verdict with the requesting document.
     #[test]
     fn request_context_decides_a_third_party_rule() {
         let engine = engine();
-        // Fetched from another site: third party, and blocked.
+        // Fetched from another site: third party, so blocked.
         assert_eq!(
             engine.verdict(
                 "tracker.example",
@@ -295,7 +249,7 @@ example.com#@#.ad-banner
             ),
             FilterVerdict::Block
         );
-        // Fetched from itself: first party, and the rule does not apply.
+        // Fetched from itself: first party, so the rule does not apply.
         assert_eq!(
             engine.verdict(
                 "tracker.example",
@@ -305,8 +259,7 @@ example.com#@#.ad-banner
         );
     }
 
-    /// `Sec-Fetch-Dest` is what makes `$script` mean anything, and it is read
-    /// rather than inferred from the path.
+    /// `$script` follows `Sec-Fetch-Dest`, not the URL suffix.
     #[test]
     fn the_resource_kind_comes_from_the_client_not_from_the_url() {
         let engine = engine();
@@ -322,7 +275,7 @@ example.com#@#.ad-banner
             FilterVerdict::Block
         );
 
-        // The identical URL fetched as a document is not what the rule names.
+        // The same URL as a document is not what the rule names.
         let as_document = request(
             "/analytics.js",
             &[
@@ -335,7 +288,7 @@ example.com#@#.ad-banner
             FilterVerdict::Allow
         );
 
-        // And an exception scoped to one document wins over the block.
+        // An exception scoped to one document wins over the block.
         let excepted = request(
             "/analytics.js",
             &[
@@ -369,8 +322,8 @@ example.com#@#.ad-banner
                 "{dest}"
             );
         }
-        // Older clients, read from `Accept` only when the authoritative header
-        // is absent.
+        // Older clients use `Accept` only when the authoritative header is
+        // absent.
         assert_eq!(
             destination(&request("/x", &[("accept", "text/html,*/*;q=0.8")])),
             "document"
@@ -382,8 +335,7 @@ example.com#@#.ad-banner
         assert_eq!(destination(&request("/x", &[])), "other");
     }
 
-    /// Cosmetic rules arrive host-scoped and exception-resolved, and the
-    /// stylesheet the HTML tier injects is built from exactly that set.
+    /// Cosmetic lookup returns host-scoped rules with exceptions applied.
     #[test]
     fn cosmetic_rules_reach_the_html_tier_with_exceptions_already_applied() {
         let engine = engine();
@@ -395,15 +347,12 @@ example.com#@#.ad-banner
             "an excepted selector must not be hidden"
         );
 
-        // Subdomains inherit, and unrelated hosts get nothing.
+        // Subdomains inherit; unrelated hosts get nothing.
         assert!(engine.rules("www.example.com").is_some());
         assert!(engine.rules("other.example").is_none());
     }
 
-    /// The memo must be transparent: asking twice is the same answer and the
-    /// same allocation, or the stylesheet's hash could differ between two
-    /// responses on one connection and the second would be blocked by the CSP
-    /// the first widened.
+    /// Repeated lookup returns the same compiled rule set, including misses.
     #[test]
     fn the_cosmetic_memo_returns_one_compiled_rule_set() {
         let engine = engine();
