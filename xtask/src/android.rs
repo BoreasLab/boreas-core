@@ -1,8 +1,7 @@
-//! The Android cross-build, as types.
+//! Typed Android cross-build configuration.
 //!
-//! Four bugs reached CI from the shell script this replaces, and each one was a
-//! value of the wrong kind flowing somewhere that accepted it. What follows is
-//! organised around making each of them fail to compile.
+//! The former shell pipeline allowed four mismatched values to reach CI. These
+//! types make each mismatch fail at construction or compilation.
 //!
 //! | What went wrong | What forbids it here |
 //! | --- | --- |
@@ -11,35 +10,29 @@
 //! | An environment variable pointing at a file that is not there | [`Ndk::open`] and [`Ndk::compiler`] are the only ways in, and both check |
 //! | A local shadowing the function it then tried to call | a `PathBuf` is not callable |
 //!
-//! The last one is the cheapest and the most embarrassing: a Python local named
-//! `toolchain` shadowed a function named `toolchain`, and the first thing CI did
-//! was `TypeError: 'PosixPath' object is not callable`. It is here only as a
-//! reminder of what a type checker is for.
+//! The shadowing failure was a Python `TypeError` before any build work began.
+//! A typed pipeline makes that class of mistake unrepresentable.
 
 use std::{
     fmt,
     path::{Path, PathBuf},
 };
 
-/// What Gradle, the Play Store, and `src/main/jniLibs/<abi>/` call an
-/// architecture.
+/// Architecture name used by Gradle and `src/main/jniLibs/<abi>/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GradleAbi(&'static str);
 
-/// What `cargo --target` takes, and what names the directory under `target/`.
+/// Architecture name accepted by `cargo --target` and used under `target/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RustTarget(&'static str);
 
-/// What the NDK names its compiler wrappers after.
+/// Triple used in NDK compiler wrapper names.
 ///
-/// **Separate from [`RustTarget`] because the two are independently defined,
-/// not because they currently differ.** They agree on every ABI shipped today,
-/// and that is a coincidence of which three those are: `armeabi-v7a` was
-/// `armv7-linux-androideabi` to Rust and `armv7a-linux-androideabi` to the NDK
-/// — one letter, in the one position where a wrong guess is a missing file at
-/// link time. It was dropped for reach, not for that; nothing stops the next
-/// ABI diverging the same way, and `the_two_triples_are_not_one_type` keeps the
-/// case on file.
+/// This stays separate from [`RustTarget`] because the names are independently
+/// defined. They currently match for shipped ABIs, but `armeabi-v7a` previously
+/// used `armv7-linux-androideabi` for Rust and
+/// `armv7a-linux-androideabi` for the NDK. The test
+/// `the_two_triples_are_not_one_type` preserves that distinction.
 ///
 /// > **Note:** For 32-bit ARM, the compiler is prefixed with
 /// > `armv7a-linux-androideabi`, but the binutils tools are prefixed with
@@ -49,8 +42,8 @@ pub struct RustTarget(&'static str);
 /// > systems](https://developer.android.com/ndk/guides/other_build_systems),
 /// > accessed 2026-08-24
 ///
-/// The binutils half of that note is why the archiver is `llvm-ar`: the unified
-/// tool takes no triple, so the second naming split has nowhere to go wrong.
+/// The unified `llvm-ar` takes no triple, so binutils naming does not enter the
+/// archiver configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NdkTriple(&'static str);
 
@@ -72,7 +65,7 @@ macro_rules! name_newtype {
 }
 name_newtype!(GradleAbi, RustTarget, NdkTriple);
 
-/// One architecture, under all three of its names.
+/// One architecture represented by all three naming systems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Abi {
     pub gradle: GradleAbi,
@@ -80,18 +73,10 @@ pub struct Abi {
     pub ndk: NdkTriple,
 }
 
-/// The ABIs this project ships, and the only values of [`Abi`] that exist: the
-/// fields are public but the type is only ever read from here, so a value of
-/// this type is the proof that the NDK has a toolchain for it.
+/// ABIs shipped by this project.
 ///
-/// **`armeabi-v7a` is deliberately absent.** Google requires 64-bit for each
-/// 32-bit architecture shipped and nothing in the other direction — "for each
-/// native 32-bit architecture you support you must include the corresponding
-/// 64-bit architecture" — so omitting it is compliant. It is also where the
-/// platform is going: 16 KB pages, mandatory for API 35 and above, exist only
-/// on arm64, so a 32-bit ARM device cannot run a current Android at all. What
-/// remains is a shrinking tail of Android Go class handsets, which is not the
-/// hardware that terminates TLS and rewrites HTML under a memory budget.
+/// `armeabi-v7a` is absent: the release requires a corresponding 64-bit ABI for
+/// each shipped 32-bit ABI, and current 16 KB page support is arm64-only.
 pub const ABIS: [Abi; 3] = [
     Abi {
         gradle: GradleAbi("arm64-v8a"),
@@ -111,28 +96,25 @@ pub const ABIS: [Abi; 3] = [
 ];
 
 impl Abi {
-    /// The ABI a caller named, or nothing.
+    /// Resolves a Gradle ABI name to a shipped ABI.
     ///
-    /// The one boundary an untrusted string crosses. Everything downstream
-    /// takes an `Abi`, so no other function has to consider a name the NDK does
-    /// not have.
+    /// This is the boundary for untrusted names; downstream code receives only
+    /// an ABI from the table.
     #[must_use]
     pub fn find(name: &str) -> Option<&'static Self> {
         ABIS.iter().find(|abi| abi.gradle.as_str() == name)
     }
 
-    /// `CC_x86_64_linux_android`, and the other lower-cased spellings the `cc`
-    /// crate reads.
+    /// Returns the lower-case target spelling used in compiler variable names.
     fn env_suffix(self) -> String {
         self.rust.as_str().replace('-', "_")
     }
 }
 
-/// The minimum Android API the shipped library is built against.
+/// Minimum Android API for the shipped library.
 ///
-/// 26 is the floor `VpnService.Builder.setMetered` needs. A level the NDK ships
-/// no wrapper for is not refused here — it is refused by [`Ndk::compiler`],
-/// which looks for the file.
+/// API 26 is required by `VpnService.Builder.setMetered`; compiler availability
+/// for a selected level is checked by [`Ndk::compiler`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiLevel(u32);
 
@@ -146,9 +128,9 @@ impl fmt::Display for ApiLevel {
     }
 }
 
-/// The three host directories the NDK ships prebuilt toolchains for. A closed
-/// set, so a host outside it is a refusal at the one place that names them
-/// rather than a path that does not exist four steps later.
+/// Host directories supported by the NDK's prebuilt toolchains.
+///
+/// A closed set rejects unsupported hosts before path construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostTag {
     Linux,
@@ -185,11 +167,10 @@ pub enum NdkError {
     NoCompiler(PathBuf, ApiLevel),
 }
 
-/// An NDK installation whose CMake toolchain file is present.
+/// NDK installation with a present CMake toolchain file.
 ///
-/// **The constructor is the check.** A value of this type cannot name a
-/// directory that is not an NDK, so nothing downstream re-tests it and no
-/// environment variable can be emitted pointing at one.
+/// Construction validates the installation, so downstream environment values
+/// cannot name an unchecked root.
 #[derive(Debug, Clone)]
 pub struct Ndk {
     root: PathBuf,
@@ -207,7 +188,7 @@ impl Ndk {
         }
     }
 
-    /// The NDK's own CMake toolchain file, which the wrapper below includes.
+    /// Returns the NDK-owned CMake toolchain file included by the wrapper.
     #[must_use]
     pub fn toolchain_file(&self) -> PathBuf {
         self.root.join("build/cmake/android.toolchain.cmake")
@@ -225,13 +206,10 @@ impl Ndk {
             .join("bin")
     }
 
-    /// The compilers for one ABI, if the NDK actually has them.
+    /// Returns the complete compiler toolset for one ABI, if present.
     ///
-    /// Both wrappers are required. That is the whole point: BoringSSL's
-    /// `crypto/` is 329 C++ files and no C files, and a build that named `CC`
-    /// alone let CMake resolve C++ to the host's compiler and produced a
-    /// `libcrypto.a` full of x86-64 objects — which nothing noticed until the
-    /// final link, and `cargo check` never links.
+    /// Both C and C++ wrappers are required. Naming only `CC` can make CMake
+    /// compile BoringSSL C++ sources with the host compiler.
     pub fn compiler(&self, abi: &Abi, api: ApiLevel) -> Result<Compiler, NdkError> {
         let bin = self.bin();
         let triple = abi.ndk.as_str();
@@ -246,23 +224,11 @@ impl Ndk {
         Ok(Compiler { cc, cxx, ar })
     }
 
-    /// A CMake toolchain file that turns testing off and then defers to the
-    /// NDK's own.
+    /// Returns a wrapper that disables tests before including the NDK toolchain.
     ///
-    /// **`BUILD_TESTING` is what this exists for.** It defaults on, so CMake
-    /// descends into googletest and Google Benchmark in order to build neither
-    /// — `boring-sys` asks only for the `crypto` and `ssl` targets. Benchmark
-    /// then probes for a regex backend, writes the answer with
-    /// `CACHE BOOL "" FORCE`, and returns early on `if(DEFINED ...)` ever
-    /// after; `boring-sys` runs CMake once per target, and the second pass
-    /// re-runs those probes over a cache its own `-DCMAKE_C_COMPILER` just
-    /// invalidated, where they fail. A build that never configures Benchmark
-    /// cannot fail in Benchmark.
-    ///
-    /// Setting `CMAKE_TOOLCHAIN_FILE` is the only seam: `boring-sys` skips its
-    /// whole CMake configuration on seeing one. `FORCE`, because a toolchain
-    /// file is re-read for every `try_compile` and Benchmark writes its own
-    /// answers with `FORCE` too.
+    /// `boring-sys` needs only `crypto` and `ssl`; disabling `BUILD_TESTING`
+    /// avoids configuring their unrelated test and benchmark targets. Forced
+    /// cache entries keep the values stable across repeated CMake probes.
     #[must_use]
     pub fn cmake_wrapper(&self, abi: &Abi, api: ApiLevel) -> String {
         let toolchain = self.toolchain_file();
@@ -278,12 +244,11 @@ impl Ndk {
     }
 }
 
-/// The compilers for one ABI, all of which exist.
+/// Existing compiler paths for one ABI.
 ///
-/// There is no constructor but [`Ndk::compiler`], so a `Compiler` in hand is
-/// the proof that a C++ compiler was found — and [`BuildEnvironment`] takes one
-/// rather than a pair of paths, so an environment naming `CC` without `CXX` is
-/// not a bug to be caught but a value that cannot be built.
+/// [`Ndk::compiler`] is the only constructor, so a `Compiler` proves that all
+/// required tools exist. [`BuildEnvironment`] receives it as one value rather
+/// than independent `CC` and `CXX` paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compiler {
     cc: PathBuf,
@@ -291,11 +256,10 @@ pub struct Compiler {
     ar: PathBuf,
 }
 
-/// Everything a cross build for one ABI needs, and nothing else.
+/// Inputs required for one ABI cross-build.
 ///
-/// [`Self::assignments`] returns a fixed-size array, so the number of variables
-/// is part of the signature: adding or dropping one is a type error at every
-/// call site rather than a line quietly missing from `$GITHUB_ENV`.
+/// [`Self::assignments`] returns a fixed-size array, so its variable count is
+/// checked at every call site.
 #[derive(Debug, Clone)]
 pub struct BuildEnvironment {
     abi: &'static Abi,
@@ -315,10 +279,9 @@ impl BuildEnvironment {
         }
     }
 
-    /// The `key=value` lines a CI step appends to `$GITHUB_ENV`.
+    /// Returns the `key=value` lines appended to `$GITHUB_ENV`.
     ///
-    /// The compiler is also the linker: the NDK's wrapper is what knows the
-    /// sysroot and the runtime, and invoking a bare `ld` misses both.
+    /// The NDK compiler wrapper also links, supplying its sysroot and runtime.
     #[must_use]
     pub fn assignments(&self) -> [(String, String); 6] {
         let lower = self.abi.env_suffix();
@@ -332,13 +295,9 @@ impl BuildEnvironment {
                 format!("CARGO_TARGET_{upper}_LINKER"),
                 path(&self.compiler.cc),
             ),
-            // `boring-sys` reads this to locate the NDK's CMake toolchain file.
-            // Naming it explicitly is what stops a runner with more than one
-            // NDK installed from handing BoringSSL a different installation
-            // than the compilers above came from.
+            // `boring-sys` uses this to select the same NDK as the compilers.
             ("ANDROID_NDK_HOME".to_owned(), path(&self.ndk_root)),
-            // Target-scoped, which is the form both `boring-sys` and `cmake-rs`
-            // read. See `Ndk::cmake_wrapper` for what it buys.
+            // Target-scoped form consumed by `boring-sys` and `cmake-rs`.
             (
                 format!("CMAKE_TOOLCHAIN_FILE_{}", self.abi.rust),
                 path(&self.wrapper),
@@ -355,15 +314,10 @@ mod tests {
         Abi::find(name).expect("a name from the table")
     }
 
-    /// **Why [`RustTarget`] and [`NdkTriple`] stay two types now that no shipped
-    /// ABI distinguishes them.**
+    /// Keeps [`RustTarget`] and [`NdkTriple`] distinct despite current matches.
     ///
-    /// Every row below agrees, and a maintainer reading only the table would be
-    /// right to ask why one string needs two names for it. This is the answer,
-    /// kept as a fixture rather than as a comment: `armeabi-v7a`, which this
-    /// project shipped until it was dropped for reach, disagreed. Merging the
-    /// types would compile today and silently mis-name a compiler the day
-    /// anything like it is added back.
+    /// The former `armeabi-v7a` row used different Rust and NDK triples. Merging
+    /// the types would make a future mismatch compile and mis-name a compiler.
     #[test]
     fn the_two_triples_are_not_one_type() {
         assert!(
@@ -372,10 +326,8 @@ mod tests {
              leaving this test asserting the opposite of the table"
         );
 
-        // The case on file. One letter, and the NDK's own documentation is why:
-        // "For 32-bit ARM, the compiler is prefixed with
-        // `armv7a-linux-androideabi`, but the binutils tools are prefixed with
-        // `arm-linux-androideabi`."
+        // Former 32-bit ARM naming differed by one character between compiler
+        // and Rust triples.
         let armv7 = Abi {
             gradle: GradleAbi("armeabi-v7a"),
             rust: RustTarget("armv7-linux-androideabi"),
@@ -385,7 +337,7 @@ mod tests {
         assert!(Abi::find("armeabi-v7a").is_none(), "dropped, not hidden");
     }
 
-    /// The table is the domain: a name outside it has no `Abi` to become.
+    /// The table is the complete ABI domain.
     #[test]
     fn only_the_shipped_abis_exist() {
         assert_eq!(ABIS.len(), 3);
@@ -421,8 +373,7 @@ mod tests {
         }
     }
 
-    /// Every ABI, end to end: the environment names six variables, every tool
-    /// lives under the one NDK, and the wrapper turns testing off.
+    /// Every ABI yields six variables, NDK-local tools, and a test-free wrapper.
     #[test]
     fn every_abi_yields_a_complete_environment_from_one_ndk() {
         let root = fake_ndk("complete", &[Half::C, Half::Cxx]);
@@ -446,8 +397,7 @@ mod tests {
                 ]
             );
 
-            // One NDK, every tool. A build that mixes a cross compiler with a
-            // host one produces objects that only disagree at the final link.
+            // Every tool must come from the same NDK as the selected ABI.
             for (key, value) in env.assignments() {
                 if key.starts_with("CC_") || key.starts_with("CXX_") || key.starts_with("AR_") {
                     assert!(
@@ -465,10 +415,7 @@ mod tests {
         }
     }
 
-    /// The wrapper names the *Gradle* ABI, which is what the NDK's own
-    /// toolchain file expects — not the Rust target and not the compiler
-    /// triple. `arm64-v8a` proves it: its Gradle name shares no substring with
-    /// `aarch64-linux-android`.
+    /// The wrapper passes the Gradle ABI to the NDK, not either compiler triple.
     #[test]
     fn the_wrapper_names_the_gradle_abi() {
         let root = fake_ndk("wrapper", &[Half::C, Half::Cxx]);
@@ -493,9 +440,9 @@ mod tests {
         path
     }
 
-    /// An NDK with the right shape and empty files where the tools go. Nothing
-    /// here compiles anything; what is under test is which paths are looked
-    /// for and what is emitted, which is where every shipped bug lived.
+    /// NDK-shaped fixture with empty tool files.
+    ///
+    /// The test checks path validation and emitted configuration, not compilation.
     fn fake_ndk(label: &str, halves: &[Half]) -> PathBuf {
         let root = tempdir(label);
         let toolchain = root.join("build/cmake/android.toolchain.cmake");
