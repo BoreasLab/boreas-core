@@ -7,25 +7,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// One-second buckets, 512 of them: RFC 4787 REQ-5 sets a 120-second floor and
-/// recommends 300, so the wheel covers the legal idle-timeout range with
-/// headroom. Deadlines past the horizon land in `overflow`, scanned once per
-/// expiry pass and re-bucketed lazily. Memory is O(flows + buckets), never
-/// O(packets): a refresh mutates only the flow's deadline; the wheel slot
-/// inserted at last touch is a hint that expiry re-validates.
+/// A 512-second timer wheel for RFC 4787's two-minute minimum idle timeout.
+/// Deadlines beyond the horizon stay in `overflow` until they enter range.
+/// Refreshes change only the flow deadline, so index memory depends on flows,
+/// not packets.
 const WHEEL_BUCKETS: usize = 512;
 
 struct TimerWheel<T> {
-    /// Absolute-second keyed: bucket `s % 512` holds entries whose deadline is
-    /// in second `s`. A full rotation apart, entries share a bucket, so every
-    /// surfaced entry is re-checked against its real deadline and re-inserted
-    /// when it has not arrived yet.
+    /// Bucket `s % 512` holds entries whose deadline is in second `s`. Entries
+    /// a full rotation apart collide, so expiry rechecks each real deadline.
     buckets: [Vec<(u64, T)>; WHEEL_BUCKETS],
     overflow: Vec<(u64, T)>,
-    /// Seconds since the wheel's epoch. The epoch is fixed at construction;
-    /// `Instant` subtraction does the rest.
+    /// Seconds since the fixed construction epoch.
     epoch: Instant,
-    /// Highest bucket-second drained so far.
+    /// Highest bucket second already drained.
     drained: u64,
 }
 
@@ -46,12 +41,10 @@ impl<T: Copy> TimerWheel<T> {
             .min(u64::MAX - 1)
     }
 
-    /// Files `entry` under its deadline's second, never before `drained`.
+    /// Places `entry` in its deadline bucket, never before `drained`.
     ///
-    /// The clamp is the invariant `next_due` rests on: **every live entry's
-    /// second is at least `drained`.** A deadline landing in an already-drained
-    /// second is due now by definition, and the caller re-checks the real
-    /// deadline regardless, so clamping loses nothing.
+    /// Entries in an already-drained second are due by definition. Expiry
+    /// still checks the exact deadline, so this clamp cannot evict early.
     fn insert(&mut self, deadline: Instant, entry: T) {
         let second = self.second(deadline).max(self.drained);
         if second >= self.drained + WHEEL_BUCKETS as u64 {
@@ -61,10 +54,9 @@ impl<T: Copy> TimerWheel<T> {
         }
     }
 
-    /// Surfaces every entry whose deadline second is at or before `now`'s.
-    /// Entries a full rotation early are re-inserted rather than surfaced, so
-    /// the caller only sees slots whose deadline may have arrived; the caller
-    /// still checks each entry's true deadline.
+    /// Surfaces entries whose deadline second has arrived by `now`.
+    /// Rotation collisions are reinserted, and callers still check exact
+    /// deadlines before eviction.
     fn take_due(&mut self, now: Instant, surfaced: &mut Vec<T>) {
         let horizon = self.second(now);
 
@@ -88,8 +80,8 @@ impl<T: Copy> TimerWheel<T> {
                 if second <= horizon {
                     surfaced.push(entry);
                 } else {
-                    // A rotation-collision entry: its second is in the future.
-                    // Re-insert at its own bucket; it survives until drained.
+                    // A colliding entry is still in the future; keep it in its
+                    // own bucket until that second is drained.
                     self.buckets[(second % WHEEL_BUCKETS as u64) as usize].push((second, entry));
                 }
             }
@@ -97,18 +89,12 @@ impl<T: Copy> TimerWheel<T> {
         }
     }
 
-    /// A lower bound on the earliest second that may contain a live entry.
+    /// Returns a lower bound for the earliest live deadline second.
     ///
-    /// Because `insert` clamps every entry to `drained` or later, the first
-    /// occupied bucket at offset `i` from `drained` proves no entry exists in
-    /// `[drained, drained + i)`, and every entry in a later bucket or in
-    /// `overflow` is later still. So `drained + i` is a sound lower bound even
-    /// when a rotation collision puts a much later entry in that bucket, and
-    /// it is exact whenever no collision is present.
-    ///
-    /// O(WHEEL_BUCKETS) worst case, O(1) when the next bucket is occupied, and
-    /// **independent of the number of entries** — which is what makes it safe
-    /// to call once per reactor iteration at the 10,000-flow target.
+    /// Occupied buckets before the result are absent, while later buckets and
+    /// `overflow` cannot contain an earlier entry. The bound can be early due
+    /// to collisions but never late, and its scan cost is independent of flow
+    /// count.
     fn next_due(&self) -> Option<u64> {
         let horizon = self.drained + WHEEL_BUCKETS as u64;
         (self.drained..horizon)
@@ -166,7 +152,7 @@ impl<T> DatagramBuffer<T> {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             capacity,
-            // Idle flows pay nothing; the queue allocates on first datagram.
+                    // Idle flows pay nothing; the queue allocates on first datagram.
             datagrams: VecDeque::new(),
             dropped: 0,
         }
@@ -215,8 +201,7 @@ pub struct UdpFlowTable<V> {
 }
 
 impl<V> UdpFlowTable<V> {
-    /// `epoch` anchors the timer wheel; pass the first `now` the table sees,
-    /// or `Instant::now()` when no better anchor exists.
+    /// Constructs a flow table whose timer wheel uses `epoch` as its origin.
     pub fn new(idle_timeout: Duration, epoch: Instant) -> Result<Self, FlowTableError> {
         if idle_timeout < MIN_IDLE_TIMEOUT {
             return Err(FlowTableError::IdleTimeoutTooShort);
@@ -242,30 +227,25 @@ impl<V> UdpFlowTable<V> {
         self.flows.contains_key(endpoint)
     }
 
-    /// The live value for `endpoint`, without touching its deadline.
+    /// Returns the live value without refreshing its deadline.
     ///
-    /// Deliberately not a refresh: the caller that reaches for this has already
-    /// refreshed the mapping through
-    /// [`get_or_insert_with`](Self::get_or_insert_with), and refreshing twice
-    /// for one packet would make the idle timeout depend on how many times a
-    /// path happened to look the flow up.
+    /// Callers refresh through [`get_or_insert_with`](Self::get_or_insert_with)
+    /// once per packet; refreshing again during lookup would make expiry
+    /// depend on how often the path inspected the flow.
     pub fn get_mut(&mut self, endpoint: &InternalEndpoint) -> Option<&mut V> {
         self.flows.get_mut(endpoint).map(|state| &mut state.value)
     }
 
-    /// The earliest instant that may contain an expired flow. Conservative:
-    /// wheel slots are deadline hints, so the answer can be early but never
-    /// late. O(WHEEL_BUCKETS) worst case, O(1) typical, and independent of the
-    /// number of live flows.
+    /// Returns a conservative earliest expiry instant. Wheel slots are hints,
+    /// so the result may be early but never late and does not scan live flows.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.wheel
             .next_due()
             .map(|second| self.wheel.epoch + Duration::from_secs(second))
     }
 
-    /// Drops flows failing `keep`, returning the number removed. Stale
-    /// expiration entries die with the flows they point at on the next
-    /// `expire`, at no extra cost.
+    /// Removes flows rejected by `keep`, returning the number removed.
+    /// Stale wheel entries are ignored during the next expiry pass.
     pub fn retain(&mut self, mut keep: impl FnMut(&InternalEndpoint, &mut V) -> bool) -> usize {
         let before = self.flows.len();
         self.flows
@@ -285,9 +265,7 @@ impl<V> UdpFlowTable<V> {
 
         let state = match self.flows.entry(endpoint) {
             Entry::Occupied(mut occupied) => {
-                // Refresh mutates only the deadline; the wheel slot from the
-                // last touch is a hint expiry re-validates, so a packet flood
-                // adds zero expiry-index memory.
+                // Refreshing the deadline does not add another wheel entry.
                 occupied.get_mut().deadline = deadline;
                 occupied.into_mut()
             }
@@ -302,29 +280,22 @@ impl<V> UdpFlowTable<V> {
         Ok(&mut state.value)
     }
 
-    /// Evicts every flow whose real deadline has arrived, returning the
-    /// values so the caller can dispose of them; refreshed flows whose stale
-    /// slot surfaced early are re-bucketed instead.
-    ///
-    /// O(surfaced slots). Allocates only when something actually expires:
-    /// `Vec::new` is allocation-free until its first push, and the surfaced
-    /// buffer is reused across calls.
+    /// Evicts flows whose exact deadline has arrived and returns their values.
+    /// Refreshed flows from stale wheel slots are re-bucketed.
     pub fn expire(&mut self, now: Instant) -> Vec<V> {
-        // Swapped out so the wheel and the flow map can be borrowed while the
-        // buffer is in hand; the empty `Vec` left behind owns no allocation.
+        // Temporarily owning the scratch buffer permits independent borrows of
+        // the wheel and flow map.
         let mut surfaced = std::mem::take(&mut self.surfaced);
         surfaced.clear();
         self.wheel.take_due(now, &mut surfaced);
 
         let mut expired = Vec::new();
         for endpoint in surfaced.drain(..) {
-            // One hash lookup per surfaced slot, whichever branch it takes.
             match self.flows.entry(endpoint) {
                 Entry::Occupied(occupied) if occupied.get().deadline <= now => {
                     expired.push(occupied.remove().value);
                 }
-                // The real deadline governs: a refreshed flow whose stale slot
-                // surfaced early is re-bucketed, not evicted.
+                // A stale slot is harmless; the exact deadline governs.
                 Entry::Occupied(occupied) => {
                     let deadline = occupied.get().deadline;
                     self.wheel.insert(deadline, endpoint);
