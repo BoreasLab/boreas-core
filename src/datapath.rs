@@ -1,7 +1,7 @@
-//! The sans-io datapath core owns flow state and policy decisions, but no socket,
-//! clock, or task. Fragments are reassembled before planning, flows are created
-//! only after planning succeeds, queues are bounded, and each transmit names its
-//! destination side.
+//! Sans-IO datapath state and policy. It owns no socket, clock, or task.
+//!
+//! Fragments are reassembled before planning, flows open only after a valid
+//! plan, queues are bounded, and every transmit names its destination side.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -20,7 +20,7 @@ use crate::{
     route_planned, udp_datagram_len, write_too_big, write_udp,
 };
 
-/// Packet source or transmit destination.
+/// Packet source or transmit destination side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     Tunnel,
@@ -28,7 +28,7 @@ pub enum Side {
 }
 
 impl Side {
-    /// Returns the other side.
+    /// Returns the opposite side.
     pub fn across(self) -> Self {
         match self {
             Self::Tunnel => Self::Egress,
@@ -37,10 +37,9 @@ impl Side {
     }
 }
 
-/// One packet the core has decided to forward and its destination side.
+/// A packet queued for one side of the datapath.
 ///
-/// [`Pooled`] avoids a heap allocation per packet and is affine, so this type is
-/// intentionally not `Clone`.
+/// [`Pooled`] owns a pool slot, so a transmit is intentionally not `Clone`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Transmit {
     pub to: Side,
@@ -55,24 +54,23 @@ pub enum FlowEvent {
     ReassemblyDiscarded,
     Resteered(SteeringReason),
     FlowTornDown(InternalEndpoint),
-    /// A planned packet could not fit the shared pool.
+    /// The shared pool could not hold a planned packet.
     TransmitDropped,
-    /// A QUIC attempt was dropped by the steering backstop.
+    /// The QUIC backstop dropped an attempt.
     QuicSteered,
-    /// An over-sized packet was answered with an ICMP Packet Too Big for this MTU.
+    /// An oversized packet received an ICMP Packet Too Big for this MTU.
     PathReported(Mtu),
 }
 
-/// Resolved addresses of inspected hosts and their expiry deadlines.
+/// Resolved inspection addresses and their expiry deadlines.
 ///
-/// One hash probe serves both QUIC backstop and TCP candidacy. The bounded set
-/// is small, so a `HashMap` gives expected O(1) packet probes; `earliest` avoids
-/// scanning it on every reactor wakeup.
+/// The bounded hash map serves both QUIC backstop and TCP candidacy. `earliest`
+/// avoids scanning it on every timer wakeup.
 struct InspectedAddresses {
     window: Duration,
     capacity: NonZeroUsize,
     until: HashMap<IpAddr, Instant>,
-    /// The minimum deadline, maintained on insert and recomputed during expiry.
+    /// Earliest stored deadline.
     earliest: Option<Instant>,
 }
 
@@ -86,7 +84,7 @@ impl InspectedAddresses {
         }
     }
 
-    /// Opens or extends the window and returns addresses refused at capacity.
+    /// Opens or extends the window; returns addresses refused at capacity.
     fn admit(&mut self, addresses: &[IpAddr], now: Instant) -> usize {
         let Some(deadline) = now.checked_add(self.window) else {
             return addresses.len();
@@ -106,14 +104,14 @@ impl InspectedAddresses {
         refused
     }
 
-    /// Whether this address is live. The deadline is checked even before a sweep.
+    /// Whether the address is live, even before expiry runs.
     fn live(&self, address: &IpAddr, now: Instant) -> bool {
         self.until
             .get(address)
             .is_some_and(|deadline| *deadline > now)
     }
 
-    /// Expires entries when the earliest deadline has arrived.
+    /// Removes entries whose deadlines have arrived.
     fn expire(&mut self, now: Instant) {
         if self.earliest.is_none_or(|earliest| earliest > now) {
             return;
@@ -127,42 +125,39 @@ impl InspectedAddresses {
     }
 }
 
-/// Memory and time bounds for a [`Datapath`].
+/// Resource and lifetime bounds for a [`Datapath`].
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub reassembly_timeout: std::time::Duration,
     pub max_pending_reassemblies: NonZeroUsize,
-    /// RFC 4787 REQ-5 minimum idle timeout.
+    /// RFC 4787 REQ-5 minimum mapping lifetime.
     pub flow_idle_timeout: std::time::Duration,
-    /// Per-flow datagram queue depth and fairness bound.
+    /// Per-flow datagram queue capacity and fairness bound.
     pub datagram_buffer_capacity: NonZeroUsize,
-    /// Lifetime of inspected addresses for QUIC backstop and TCP candidacy.
+    /// Inspection-address lifetime for QUIC backstop and TCP candidacy.
     pub inspection_window: Duration,
-    /// Maximum number of addresses admitted from network input.
+    /// Maximum addresses admitted from network input.
     pub max_inspected_addresses: NonZeroUsize,
-    /// TCP ports shared with the local stack's listener set. A mismatch sends a
-    /// terminated flow to an unserved port and produces a reset.
+    /// TCP ports served by the local stack. A mismatch produces a reset.
     pub inspected_ports: &'static [u16],
-    /// Source ports reserved for local re-origination. Excluding them prevents
-    /// a re-originated connection from being inspected again.
+    /// Source ports reserved for local re-origination. They prevent recursive
+    /// inspection of re-originated connections.
     ///
-    /// `None` when the proxy performs re-origination.
+    /// `None` when the proxy owns re-origination.
     pub origination_ports: Option<OriginationPorts>,
 }
 
-/// The ports HTTP interception serves.
+/// Default HTTP interception ports.
 pub const DEFAULT_INSPECTED_PORTS: &[u16] = &[80, 443];
 
-/// One intercepted DNS query waiting for the shell to resolve it.
-///
-/// Its pooled payload keeps pending queries within the shared memory budget.
+/// An intercepted DNS query waiting for shell resolution.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DnsQuery {
-    /// The client endpoint.
+    /// Querying client endpoint.
     pub client: InternalEndpoint,
-    /// The resolver endpoint, which must be the reply source.
+    /// Resolver endpoint; replies must use it as their source.
     pub resolver: InternalEndpoint,
-    /// The DNS message, without its IP and UDP headers.
+    /// DNS message without IP or UDP headers.
     pub payload: Pooled,
 }
 
@@ -171,9 +166,9 @@ pub enum DatapathError {
     Malformed(PacketError),
     Plan(PlanError),
     FlowTable(FlowTableError),
-    /// A synthesized packet could not be written.
+    /// A synthesized packet could not be encoded.
     Write(WriteError),
-    /// Inspection cannot produce candidates because DNS is forwarded on a packet egress.
+    /// Packet egress forwards DNS, so inspection has no candidates.
     Vacuous,
 }
 
@@ -228,42 +223,41 @@ impl From<FlowTableError> for DatapathError {
     }
 }
 
-/// One datagram of a terminated flow, including its target.
+/// One terminated-flow datagram and its remote target.
 ///
-/// The target belongs to each datagram because RFC 4787 endpoint-independent
-/// mappings let one unconnected UDP port talk to multiple peers.
+/// RFC 4787 endpoint-independent mapping lets one local UDP port reach many
+/// peers, so the target travels with each datagram.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Outbound {
-    /// The client mapping for the egress association.
+    /// Client mapping for the egress association.
     pub client: InternalEndpoint,
-    /// The peer addressed by this datagram.
+    /// Peer addressed by this datagram.
     pub target: std::net::SocketAddr,
     pub payload: Pooled,
 }
 
 struct FlowState {
     plan: FlowPlan,
-    /// Client datagrams waiting for the egress. Storage is pooled globally, with
-    /// a per-flow capacity preserving fairness. Replies bypass this queue and
-    /// become tunnel-bound transmits because the reactor drains them synchronously.
+    /// Client datagrams waiting for egress. Storage is globally pooled with a
+    /// per-flow bound; replies become synchronous tunnel-bound transmits.
     buffer: DatagramBuffer<(std::net::SocketAddr, Pooled)>,
 }
 
 pub struct Datapath {
     filter: FilterPolicy,
     dns: DnsPolicy,
-    /// The layer accepted by the configured egress.
+    /// Layer accepted by the configured egress.
     accepts: Accepts,
     egress: PathProperties,
     path_mtu: Mtu,
-    /// One planned result per [`Inspection`] verdict. The two-element array
-    /// avoids a cache key and preserves planning errors on the packet path.
+    /// Cached plan for each [`Inspection`] verdict. The array preserves planning
+    /// errors on the packet path without a separate cache key.
     plans: [Result<FlowPlan, PlanError>; 2],
-    /// Sorted interception ports, queried by binary search.
+    /// Sorted interception ports for binary search.
     inspected_ports: Box<[u16]>,
-    /// Source ports reserved for this session's re-originated connections.
+    /// Source ports reserved by this session's re-originated connections.
     origination_ports: Option<OriginationPorts>,
-    /// Shared payload storage for forwarded packets and queued datagrams.
+    /// Shared storage for forwarded packets and queued datagrams.
     pool: Arc<BufferPool>,
     datagram_buffer_capacity: NonZeroUsize,
     reassembler: Reassembler,
@@ -272,18 +266,16 @@ pub struct Datapath {
     events: VecDeque<FlowEvent>,
     transmits: VecDeque<Transmit>,
     queries: VecDeque<DnsQuery>,
-    /// Packets of terminated flows waiting for the shell's local TCP stack.
+    /// Terminated-flow packets waiting for the shell's TCP stack.
     terminate: VecDeque<Pooled>,
-    /// Non-empty flows in round-robin order. One pop, receive, and requeue is
-    /// amortized O(1), avoiding an O(live flows) sweep per datagram. Expired
-    /// flows leave stale entries, which are skipped.
+    /// Non-empty flows in round-robin order. Stale entries from expired flows
+    /// are skipped; each receive and requeue is amortized O(1).
     ready: VecDeque<InternalEndpoint>,
 }
 
 impl Datapath {
-    /// `pool` must admit at least `path_mtu` bytes per slice; a packet larger
-    /// than a slice cannot be held and is dropped and counted like any other
-    /// exhaustion.
+    /// `pool` must provide slices at least as large as `path_mtu`; larger packets
+    /// are dropped and counted when no slice can hold them.
     pub fn new(
         filter: FilterPolicy,
         dns: DnsPolicy,
@@ -293,17 +285,17 @@ impl Datapath {
         limits: Limits,
         pool: Arc<BufferPool>,
     ) -> Result<Self, DatapathError> {
-        // Forwarded DNS cannot populate the candidacy index for packet egress.
+        // Packet egress with forwarded DNS cannot populate inspection candidacy.
         if filter == FilterPolicy::InspectHttp
             && dns == DnsPolicy::Forward
             && accepts == Accepts::IpPackets
         {
             return Err(DatapathError::Vacuous);
         }
-        // Retain one plan for each inspection verdict.
+        // Cache one plan for each inspection verdict.
         let plans = Inspection::ALL
             .map(|inspection| plan_flow(filter, inspection, accepts, egress, path_mtu));
-        // A flow cannot enter with an unserviceable plan.
+        // Reject configurations with an unusable plan.
         for plan in &plans {
             (*plan)?;
         }
@@ -339,12 +331,12 @@ impl Datapath {
         })
     }
 
-    /// Returns the cached plan for a verdict.
+    /// Returns the cached plan for an inspection verdict.
     fn plan(&self, inspection: Inspection) -> Result<FlowPlan, PlanError> {
         self.plans[inspection.index()]
     }
 
-    /// Whether this TCP packet is a local-inspection candidate.
+    /// Classifies a TCP packet for local inspection.
     fn inspection(&self, packet: IngressPacket, from: Side, now: Instant) -> Inspection {
         let Transport::Tcp {
             source_port,
@@ -353,7 +345,7 @@ impl Datapath {
         else {
             return Inspection::Excluded;
         };
-        // Exclude this session's own re-originated connections to prevent recursion.
+        // Do not inspect connections originated by this session.
         if self
             .origination_ports
             .is_some_and(|ports| ports.contains(source_port))
@@ -373,16 +365,16 @@ impl Datapath {
         Inspection::Candidate
     }
 
-    /// Handles a packet from the client's TUN.
+    /// Handles a packet from the client TUN.
     pub fn on_tun_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
         self.dispatch(packet, buf, Side::Tunnel, now)
     }
 
-    /// Handles a decapsulated packet from the egress.
+    /// Handles a decapsulated egress packet.
     pub fn on_egress_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
-        // Egress fragments should already have been reassembled by the peer.
+        // Egress input must already be reassembled.
         if packet.transport == Transport::Fragment {
             self.events.push_back(FlowEvent::ReassemblyDiscarded);
             return Ok(());
@@ -397,12 +389,12 @@ impl Datapath {
         from: Side,
         now: Instant,
     ) -> Result<(), DatapathError> {
-        // Steering applies to outbound attempts, not inbound responses.
+        // Apply steering only to outbound attempts.
         let backstop = match from {
             Side::Tunnel if self.inspected.live(&packet.destination, now) => Backstop::Active,
             Side::Tunnel | Side::Egress => Backstop::Lapsed,
         };
-        // Settle actions independent of the egress path before planning.
+        // Resolve path-independent admission before planning.
         let action = match admit(packet.transport, self.dns, backstop) {
             Admission::Settled(action) => action,
             Admission::Planned => {
@@ -422,11 +414,11 @@ impl Datapath {
             }
             IngressAction::ForwardPacket(plan) => {
                 let clamp = match plan.transport {
-                    // MSS clamping affects the initial SYN only.
+                    // MSS clamping applies only to the initial SYN.
                     TransportPath::PacketFastPath { inner_mtu } => {
-                        // Report oversized DF packets locally so the sender can
-                        // discover the inner MTU. RFC 1122 §3.2.2 and RFC 4443
-                        // §2.4 (e) prohibit answering ICMP errors with errors.
+                        // Report oversized DF packets locally so the sender learns
+                        // the inner MTU. RFC 1122 Sec. 3.2.2 and RFC 4443 Sec. 2.4(e)
+                        // prohibit answering ICMP errors with errors.
                         if from == Side::Tunnel
                             && packet.transport != Transport::Icmp(IcmpClass::Error)
                             && buf.len() > usize::from(inner_mtu.get())
@@ -447,7 +439,7 @@ impl Datapath {
                 if self.open_flow(endpoint, plan, now)? {
                     self.events.push_back(FlowEvent::StreamOpened(endpoint));
                 }
-                // The shell owns the local TCP stack; capture only the client side.
+                // The shell owns TCP; capture only the client-facing packet.
                 if from == Side::Tunnel {
                     self.capture_for_termination(buf);
                 }
@@ -458,14 +450,14 @@ impl Datapath {
                 if self.open_flow(endpoint, plan, now)? {
                     self.events.push_back(FlowEvent::DatagramOpened(endpoint));
                 }
-                // Capture client datagrams; replies return through the association.
+                // Capture client datagrams; replies use the association.
                 if from == Side::Tunnel {
                     self.capture_datagram(packet, buf, endpoint);
                 }
                 Ok(())
             }
             IngressAction::HandleIcmp(_) => {
-                // The effect shell generates any client-facing PTB.
+                // The effect shell owns client-facing PTB generation.
                 self.forward(buf, from.across(), None);
                 Ok(())
             }
@@ -473,7 +465,7 @@ impl Datapath {
         }
     }
 
-    /// Captures a DNS query for the shell; the pooled payload bounds pending work.
+    /// Captures a DNS query for the shell within the shared pool budget.
     fn intercept_dns(&mut self, packet: IngressPacket, buf: &[u8]) {
         let Transport::Udp {
             source_port,
@@ -503,12 +495,12 @@ impl Datapath {
         self.queries.pop_front()
     }
 
-    /// Returns the shared payload pool used by the core and resolver.
+    /// Returns the pool shared by the core and resolver.
     pub fn pool(&self) -> &Arc<BufferPool> {
         &self.pool
     }
 
-    /// Captures a whole packet for the local TCP stack; pool exhaustion is counted.
+    /// Captures a whole packet for the local TCP stack.
     fn capture_for_termination(&mut self, buf: &[u8]) {
         match self.pool.take(buf) {
             Some(packet) => self.terminate.push_back(packet),
@@ -516,7 +508,7 @@ impl Datapath {
         }
     }
 
-    /// Queues a client datagram with its peer for the egress association.
+    /// Queues a client datagram and peer for the egress association.
     fn capture_datagram(&mut self, packet: IngressPacket, buf: &[u8], client: InternalEndpoint) {
         let Transport::Udp {
             destination_port, ..
@@ -529,12 +521,12 @@ impl Datapath {
             self.events.push_back(FlowEvent::TransmitDropped);
             return;
         };
-        // The flow should have been created immediately above; drop on expiry.
+        // The flow may have expired between admission and capture.
         let Some(flow) = self.flows.get_mut(&client) else {
             self.events.push_back(FlowEvent::TransmitDropped);
             return;
         };
-        // One ready-list entry per empty-to-non-empty transition.
+        // Add one ready-list entry per empty-to-non-empty transition.
         let was_idle = flow.buffer.is_empty();
         if flow.buffer.try_send((target, payload)) == SendOutcome::Dropped {
             self.events.push_back(FlowEvent::DatagramDropped(client));
@@ -545,7 +537,7 @@ impl Datapath {
         }
     }
 
-    /// Returns one queued datagram in round-robin order, if any. Amortized O(1).
+    /// Returns one queued datagram in round-robin order. Amortized O(1).
     pub fn poll_datagram(&mut self) -> Option<Outbound> {
         while let Some(client) = self.ready.pop_front() {
             let Some(flow) = self.flows.get_mut(&client) else {
@@ -566,8 +558,8 @@ impl Datapath {
         None
     }
 
-    /// Delivers an egress datagram as a synthesized packet for its client.
-    /// RFC 4787 REQ-6 requires refreshing the mapping in this direction too.
+    /// Delivers an egress datagram as a packet for its client.
+    /// RFC 4787 REQ-6 also refreshes the mapping in this direction.
     pub fn deliver_datagram(
         &mut self,
         client: InternalEndpoint,
@@ -598,19 +590,19 @@ impl Datapath {
         Ok(SendOutcome::Buffered)
     }
 
-    /// Returns the next packet for the local TCP stack, if any.
+    /// Returns the next packet for the local TCP stack.
     pub fn poll_terminate(&mut self) -> Option<Pooled> {
         self.terminate.pop_front()
     }
 
-    /// Records resolved addresses used for QUIC backstop and TCP candidacy.
+    /// Records resolved addresses for QUIC backstop and TCP candidacy.
     pub fn inspect_addresses(&mut self, addresses: &[IpAddr], now: Instant) {
         for _ in 0..self.inspected.admit(addresses, now) {
             self.events.push_back(FlowEvent::TransmitDropped);
         }
     }
 
-    /// Queues a DNS answer from the requested resolver address.
+    /// Queues a DNS answer sourced from the requested resolver.
     pub fn answer_dns(
         &mut self,
         client: InternalEndpoint,
@@ -630,7 +622,7 @@ impl Datapath {
         Ok(())
     }
 
-    /// Copies one packet into the shared pool and queues it for `to`.
+    /// Copies one packet into the pool and queues it for `to`.
     fn forward(&mut self, buf: &[u8], to: Side, clamp: Option<Mtu>) {
         let Some(mut bytes) = self.pool.take(buf) else {
             self.events.push_back(FlowEvent::TransmitDropped);
@@ -642,7 +634,7 @@ impl Datapath {
         self.transmits.push_back(Transmit { to, bytes });
     }
 
-    /// Answers an over-sized packet with a client-facing ICMP Packet Too Big.
+    /// Answers an oversized packet with a client-facing ICMP Packet Too Big.
     fn report_too_big(&mut self, buf: &[u8], inner_mtu: Mtu) {
         let Some(mut reply) = self.pool.take_zeroed(self.pool.slice_size().get()) else {
             self.events.push_back(FlowEvent::TransmitDropped);
@@ -650,7 +642,7 @@ impl Datapath {
         };
         match write_too_big(&mut reply, buf, inner_mtu.get()) {
             Ok(len) => {
-                // The ICMP message is shorter than a full pool slice.
+                // ICMP output is shorter than a full pool slice.
                 let shrunk = reply.resize(len);
                 debug_assert!(shrunk, "an ICMP error is shorter than a slice");
                 self.transmits.push_back(Transmit {
@@ -659,7 +651,7 @@ impl Datapath {
                 });
                 self.events.push_back(FlowEvent::PathReported(inner_mtu));
             }
-            // A failed report is counted; the sender can retry the packet.
+            // Count a failed report; the sender can retry.
             Err(_) => self.events.push_back(FlowEvent::TransmitDropped),
         }
     }
@@ -675,14 +667,14 @@ impl Datapath {
                 Ok(())
             }
             PushOutcome::Complete(datagram) => {
-                // Re-parse the complete datagram so planning uses its real header.
+                // Plan from the completed datagram's actual header.
                 let packet = IngressPacket::parse(&datagram)?;
                 self.dispatch(packet, &datagram, from, now)
             }
         }
     }
 
-    /// Opens or refreshes a flow and reports whether it was newly created.
+    /// Opens or refreshes a flow and reports whether it was new.
     fn open_flow(
         &mut self,
         endpoint: InternalEndpoint,
@@ -698,11 +690,11 @@ impl Datapath {
         Ok(!existed)
     }
 
-    /// Re-plans every live flow after an egress path change. O(live flows).
+    /// Re-plans live flows after an egress path change. O(live flows).
     pub fn on_path_change(&mut self, accepts: Accepts, next: PathProperties) {
         self.accepts = accepts;
         self.egress = next;
-        // Keep planning errors so later packets receive the same refusal.
+        // Preserve planning errors for later packet refusals.
         self.plans = Inspection::ALL
             .map(|inspection| plan_flow(self.filter, inspection, accepts, next, self.path_mtu));
         let Self {
@@ -724,7 +716,7 @@ impl Datapath {
                 path_mtu,
             ) {
                 Ok(Replan::Unchanged) => true,
-                // Replace the plan with the one matching the new verdict.
+                // Store the plan for the new verdict.
                 Ok(Replan::Resteer { reason, plan }) => {
                     state.plan = plan;
                     events.push_back(FlowEvent::Resteered(reason));
@@ -746,7 +738,7 @@ impl Datapath {
         self.events.pop_front()
     }
 
-    /// Returns the earliest deadline for the shell's single timer.
+    /// Returns the earliest deadline for the shell's shared timer.
     pub fn poll_timeout(&self) -> Option<Instant> {
         [
             self.reassembler.next_deadline(),
@@ -758,7 +750,7 @@ impl Datapath {
         .min()
     }
 
-    /// Expires reassembly, inspection, and flow state.
+    /// Expires reassembly, inspection, and flow state at `now`.
     pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.reassembler.expire(now);
         self.inspected.expire(now);
@@ -829,19 +821,19 @@ mod tests {
         .unwrap()
     }
 
-    /// A wire-valid IPv4 TCP SYN to port 443.
+    /// Builds a wire-valid IPv4 TCP SYN to port 443.
     fn tcp_syn() -> [u8; 40] {
         let mut packet = [0u8; 40];
-        packet[0] = 0x45; // IPv4, 5-word header
+        packet[0] = 0x45; // IPv4 with a five-word header
         packet[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
-        packet[8] = 64; // TTL
-        packet[9] = 6; // TCP
+        packet[8] = 64; // time to live
+        packet[9] = 6; // TCP protocol
         packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
         packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
         packet[20..22].copy_from_slice(&49152u16.to_be_bytes()); // source port
-        packet[22..24].copy_from_slice(&443u16.to_be_bytes()); // destination
-        packet[32] = 0x50; // data offset: 5 words
-        packet[33] = 0x02; // SYN
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes()); // destination port
+        packet[32] = 0x50; // five-word TCP header
+        packet[33] = 0x02; // SYN flag
         packet
     }
 
@@ -852,7 +844,7 @@ mod tests {
         ]
     }
 
-    /// A wire-valid IPv4 packet with the given destination, protocol, and port.
+    /// Builds a wire-valid IPv4 packet for a destination, protocol, and port.
     fn ipv4(protocol: u8, destination: [u8; 4], destination_port: u16) -> [u8; 40] {
         let mut packet = [0u8; 40];
         packet[0] = 0x45;
@@ -864,15 +856,15 @@ mod tests {
         packet[20..22].copy_from_slice(&49152u16.to_be_bytes());
         packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
         if protocol == 6 {
-            packet[32] = 0x50; // data offset: 5 words
-            packet[33] = 0x02; // SYN
+            packet[32] = 0x50; // five-word TCP header
+            packet[33] = 0x02; // SYN flag
         } else {
             packet[24..26].copy_from_slice(&20u16.to_be_bytes()); // UDP length
         }
         packet
     }
 
-    /// Only TCP to a resolved inspected address on an intercepted port terminates.
+    /// Only resolved TCP traffic on an intercepted port terminates.
     #[test]
     fn only_a_flow_selected_for_inspection_leaves_the_packet_fast_path() {
         const INSPECTED: [u8; 4] = [198, 51, 100, 2];
@@ -890,7 +882,7 @@ mod tests {
         .unwrap();
         let now = Instant::now();
 
-        // Before resolution, the address is not inspected.
+        // An address is not inspected before resolution.
         path.on_tun_packet(&ipv4(6, INSPECTED, 443), now).unwrap();
         assert_eq!(
             path.poll_transmit().map(|transmit| transmit.to),
@@ -908,7 +900,7 @@ mod tests {
         );
         assert!(path.poll_terminate().is_some());
 
-        // Other hosts, ports, and transports retain the packet path.
+        // Other hosts, ports, and transports retain packet forwarding.
         for (label, packet) in [
             ("another host on the same port", ipv4(6, ELSEWHERE, 443)),
             ("the same host on another port", ipv4(6, INSPECTED, 22)),
@@ -923,7 +915,7 @@ mod tests {
             assert!(path.poll_terminate().is_none(), "{label}");
         }
 
-        // After the window lapses, the flow returns to the packet path.
+        // Expiry returns the flow to packet forwarding.
         path.on_timeout(now + Duration::from_secs(61));
         path.on_tun_packet(&ipv4(6, INSPECTED, 443), now + Duration::from_secs(61))
             .unwrap();
@@ -933,7 +925,7 @@ mod tests {
         );
     }
 
-    /// Re-originated connections are excluded from inspection by source port.
+    /// Re-originated connections are excluded by source port.
     #[test]
     fn this_session_s_own_re_originated_connections_are_never_inspected() {
         const INSPECTED: [u8; 4] = [198, 51, 100, 2];
@@ -955,13 +947,13 @@ mod tests {
         let now = Instant::now();
         path.inspect_addresses(&[IpAddr::V4(Ipv4Addr::from(INSPECTED))], now);
 
-        // A client connection terminates.
+        // The client connection terminates.
         let mut client = ipv4(6, INSPECTED, 443);
         client[20..22].copy_from_slice(&49_152u16.to_be_bytes());
         path.on_tun_packet(&client, now).unwrap();
         assert!(path.poll_terminate().is_some(), "the client flow is taken");
 
-        // The session's connection uses a reserved source port and crosses as a packet.
+        // Reserved source ports take the packet path.
         for port in [45_000u16, 45_005, 45_009] {
             let mut originated = ipv4(6, INSPECTED, 443);
             originated[20..22].copy_from_slice(&port.to_be_bytes());
@@ -984,7 +976,7 @@ mod tests {
         );
     }
 
-    /// Forwarded DNS cannot populate inspection candidacy for packet egress.
+    /// Forwarded DNS cannot create inspection candidates for packet egress.
     #[test]
     fn a_configuration_that_could_never_inspect_is_refused() {
         assert_eq!(
@@ -1001,7 +993,7 @@ mod tests {
             Some(DatapathError::Vacuous)
         );
 
-        // A stream egress decides through its own termination path.
+        // A flow egress decides through its termination path.
         assert!(
             Datapath::new(
                 FilterPolicy::InspectHttp,
@@ -1016,20 +1008,20 @@ mod tests {
         );
     }
 
-    /// A completed reassembly re-enters dispatch as a full IP packet.
+    /// Completed reassembly re-enters dispatch as a full IP packet.
     #[test]
     fn a_reassembled_datagram_re_enters_dispatch_as_a_packet() {
         let mut path = datapath(crate::DatagramFidelity::Native);
         let now = Instant::now();
 
-        // Split the UDP datagram at the IPv4 fragment offset unit.
+        // Split the UDP datagram at an IPv4 fragment-offset boundary.
         let mut head = [0u8; 28];
         head[0] = 0x45;
         head[2..4].copy_from_slice(&28u16.to_be_bytes());
         head[4..6].copy_from_slice(&0xbeefu16.to_be_bytes());
         head[6..8].copy_from_slice(&0x2000u16.to_be_bytes()); // more fragments
-        head[8] = 64;
-        head[9] = 17;
+        head[8] = 64; // time to live
+        head[9] = 17; // UDP protocol
         head[12..16].copy_from_slice(&[192, 0, 2, 1]);
         head[16..20].copy_from_slice(&[198, 51, 100, 2]);
         head[20..22].copy_from_slice(&1234u16.to_be_bytes());
@@ -1037,7 +1029,7 @@ mod tests {
         head[24..26].copy_from_slice(&16u16.to_be_bytes()); // UDP length
 
         let mut tail = head;
-        tail[6..8].copy_from_slice(&1u16.to_be_bytes()); // last fragment, at 8
+        tail[6..8].copy_from_slice(&1u16.to_be_bytes()); // final fragment at offset 8
         tail[20..28].copy_from_slice(b"payload!");
 
         path.on_tun_packet(&head, now).unwrap();
@@ -1053,7 +1045,7 @@ mod tests {
             })),
             "the flow is planned from the datagram's own header"
         );
-        // The egress receives the whole datagram.
+        // Egress receives the completed datagram.
         let datagram = path.poll_datagram().expect("the payload was forwarded");
         assert!(
             datagram.payload.ends_with(b"payload!"),
@@ -1066,13 +1058,13 @@ mod tests {
         let mut path = datapath(crate::DatagramFidelity::Native);
         let now = Instant::now();
 
-        // A lone fragment is quarantined.
+        // A lone fragment stays pending.
         let mut first = udp_packet();
         first[6] = 0x20; // more fragments, offset 0
         path.on_tun_packet(&first, now).unwrap();
         assert_eq!(path.poll_event(), None);
 
-        // A complete datagram opens one flow.
+        // A complete datagram opens a flow.
         path.on_tun_packet(&udp_packet(), now).unwrap();
         assert_eq!(
             path.poll_event(),
@@ -1094,7 +1086,7 @@ mod tests {
             Some(FlowEvent::DatagramOpened(_))
         ));
 
-        // MASQUE's QUIC-to-HTTP/2 fallback preserves the flow.
+        // QUIC-to-HTTP/2 fallback preserves the flow.
         path.on_path_change(Accepts::Flows, egress(crate::DatagramFidelity::Emulated));
         assert_eq!(
             path.poll_event(),
@@ -1110,7 +1102,7 @@ mod tests {
 
     #[test]
     fn layer_loss_tears_down_flows() {
-        // Open a flow, then remove its accepted layer.
+        // Remove the accepted layer from an existing flow.
         let now = Instant::now();
         let mut path = datapath(crate::DatagramFidelity::Native);
         path.on_tun_packet(&udp_packet(), now).unwrap();
@@ -1126,7 +1118,7 @@ mod tests {
 
     #[test]
     fn a_terminated_flow_hands_its_packets_to_the_local_stack() {
-        // Terminated TCP packets go to the local stack whole, not to transmit.
+        // Terminated TCP packets go whole to the local stack.
         let mut path = datapath(crate::DatagramFidelity::Native);
         let now = Instant::now();
         let syn = tcp_syn();
@@ -1161,7 +1153,7 @@ mod tests {
 
     #[test]
     fn a_transmit_always_leaves_by_the_side_it_did_not_arrive_on() {
-        // Forwarding always crosses the datapath.
+        // Forwarding always crosses to the opposite side.
         assert_eq!(Side::Tunnel.across(), Side::Egress);
         assert_eq!(Side::Egress.across(), Side::Tunnel);
         for side in [Side::Tunnel, Side::Egress] {
@@ -1192,7 +1184,7 @@ mod tests {
 
     #[test]
     fn an_exhausted_pool_drops_and_counts_rather_than_allocating() {
-        // Exhaustion is counted rather than allocated or blocked.
+        // Exhaustion is counted without allocation or blocking.
         let pool = BufferPool::new(
             NonZeroUsize::new(1500).unwrap(),
             NonZeroUsize::new(1).unwrap(),
@@ -1232,7 +1224,7 @@ mod tests {
         let _ = path.poll_event();
 
         path.on_timeout(now + Duration::from_secs(121));
-        // A fresh packet recreates the flow and emits a new event.
+        // A later packet recreates the expired flow.
         assert!(path.flows.is_empty());
         path.on_tun_packet(&udp_packet(), now + Duration::from_secs(122))
             .unwrap();
@@ -1244,7 +1236,7 @@ mod tests {
 
     #[test]
     fn an_unplannable_configuration_is_refused_at_construction() {
-        // Excessive overhead leaves no valid inner MTU, so construction fails.
+        // Excessive overhead leaves no valid inner MTU.
         let starved = egress(crate::DatagramFidelity::Native);
         let starved = PathProperties {
             overhead_bytes: 400,
@@ -1269,7 +1261,7 @@ mod tests {
 
     #[test]
     fn a_full_queue_drops_and_returns_its_bytes_to_the_pool() {
-        // The per-flow bound preserves fairness before the shared pool fills.
+        // The per-flow bound preserves fairness while pool space remains.
         let pool = BufferPool::new(
             NonZeroUsize::new(1500).unwrap(),
             NonZeroUsize::new(8).unwrap(),
@@ -1296,7 +1288,7 @@ mod tests {
         path.on_tun_packet(&udp_packet(), now).unwrap();
         assert_eq!(pool.available(), 6, "queued payloads hold the budget");
 
-        // The third datagram exceeds queue capacity while pool space remains.
+        // Queue capacity rejects the third datagram despite free pool space.
         path.on_tun_packet(&udp_packet(), now).unwrap();
         assert_eq!(pool.available(), 6, "the refused buffer was returned");
         assert_eq!(
@@ -1304,13 +1296,13 @@ mod tests {
             Some(FlowEvent::DatagramDropped(endpoint))
         );
 
-        // Expiry releases the queued buffers through `Drop`.
+        // Expiry drops the queued buffers and releases their pool slots.
         path.on_timeout(now + Duration::from_secs(121));
         assert!(path.flows.is_empty());
         assert_eq!(pool.available(), 8);
     }
 
-    /// A flow egress preserves each datagram's target and synthesizes replies.
+    /// Flow egress preserves each target and synthesizes replies.
     #[test]
     fn a_client_datagram_carries_its_target_out_and_its_reply_back() {
         let mut path = datapath(crate::DatagramFidelity::Native);
@@ -1331,7 +1323,7 @@ mod tests {
         assert_eq!(&*out.payload, &udp_packet()[28..]);
         assert!(path.poll_datagram().is_none(), "exactly one datagram");
 
-        // The reply is a whole IP packet from the peer to the client.
+        // The reply is a whole IP packet from peer to client.
         let peer = InternalEndpoint {
             address: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
             port: 53,
@@ -1354,7 +1346,7 @@ mod tests {
         );
         assert_eq!(parsed.payload(&transmit.bytes), Some(&b"reply"[..]));
 
-        // An expired mapping has no client to receive a reply.
+        // An expired mapping has no client for a reply.
         path.on_timeout(now + Duration::from_secs(121));
         assert_eq!(
             path.deliver_datagram(client, peer, b"late", now + Duration::from_secs(121)),
@@ -1362,13 +1354,13 @@ mod tests {
         );
     }
 
-    /// Round-robin draining prevents one source from starving another.
+    /// Round-robin draining prevents source starvation.
     #[test]
     fn queued_datagrams_drain_fairly_across_flows() {
         let mut path = datapath(crate::DatagramFidelity::Native);
         let now = Instant::now();
 
-        // Interleave two datagrams from each flow.
+        // Queue two datagrams from each flow.
         let from = |port: u16| {
             let mut packet = udp_packet();
             packet[20..22].copy_from_slice(&port.to_be_bytes());
@@ -1390,16 +1382,14 @@ mod tests {
         );
     }
 
-    /// A wire-valid IPv4 ICMP packet between two hosts, carrying `kind`/`code`
-    /// and `body`. One builder for both directions, so a test states only the
-    /// direction it is about.
+    /// Builds a wire-valid IPv4 ICMP packet with `kind`, `code`, and `body`.
     fn icmpv4(source: [u8; 4], destination: [u8; 4], kind: u8, body: &[u8]) -> Vec<u8> {
         let total = 28 + body.len();
         let mut packet = vec![0u8; total];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
         packet[8] = 64;
-        packet[9] = 1; // ICMP
+        packet[9] = 1; // ICMP protocol
         packet[12..16].copy_from_slice(&source);
         packet[16..20].copy_from_slice(&destination);
         packet[20] = kind;
@@ -1408,9 +1398,7 @@ mod tests {
         packet
     }
 
-    /// A UDP datagram of exactly `total` bytes, with the Don't Fragment bit set
-    /// or clear. QUIC is the sender this stands in for: it sets DF and expects
-    /// to be told when a packet does not fit.
+    /// Builds a UDP datagram of exactly `total` bytes with optional DF.
     fn sized_udp(total: usize, dont_fragment: bool) -> Vec<u8> {
         let mut packet = vec![0u8; total];
         packet[0] = 0x45;
@@ -1419,7 +1407,7 @@ mod tests {
             packet[6] = 0x40;
         }
         packet[8] = 64;
-        packet[9] = 17; // UDP
+        packet[9] = 17; // UDP protocol
         packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
         packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
         packet[20..22].copy_from_slice(&49152u16.to_be_bytes());
@@ -1428,9 +1416,7 @@ mod tests {
         packet
     }
 
-    /// A session over an egress that carries whole IP packets. The fast path is
-    /// the case ICMP has to work on, because it is the only one where the
-    /// client's own stack is the other end of the conversation.
+    /// Builds a packet-native session for ICMP and MTU tests.
     fn fast_path() -> Datapath {
         Datapath::new(
             FilterPolicy::PassThrough,
@@ -1444,11 +1430,7 @@ mod tests {
         .unwrap()
     }
 
-    /// **ICMP is not a special case for a packet egress; it is one more
-    /// protocol that crosses.** Ping and traceroute work through the tunnel for
-    /// exactly this reason, and nothing but a test says so — the forwarding arm
-    /// names no transport, so a future refinement of the classifier could
-    /// silently stop reaching it.
+    /// ICMP uses the same packet-forwarding path in both directions.
     #[test]
     fn icmp_crosses_a_packet_egress_in_both_directions() {
         let mut path = fast_path();
@@ -1467,11 +1449,8 @@ mod tests {
         assert_eq!(&back.bytes[..], &reply[..]);
     }
 
-    /// **The one error this crate originates.** The client's TUN is 1500 and
-    /// the tunnel is 1440, so a 1500-byte QUIC datagram is one the client may
-    /// legitimately send and this session cannot carry. Forwarding it to be
-    /// fragmented or dropped downstream is a black hole; the sender is told
-    /// instead, and learns its path from the answer.
+    /// An oversized non-fragmentable client packet receives a local PTB instead
+    /// of being forwarded beyond the smaller tunnel MTU.
     #[test]
     fn an_oversized_packet_that_forbids_fragmentation_is_answered_not_dropped() {
         let mut path = fast_path();
@@ -1510,9 +1489,7 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))
     }
 
-    /// The report is for senders who said they cannot fragment. A packet that
-    /// permits fragmentation gets the ordinary path, and a packet that fits
-    /// was never anyone's problem.
+    /// Only oversized non-fragmentable packets receive a local report.
     #[test]
     fn a_packet_that_fits_or_permits_fragmenting_is_forwarded_as_before() {
         let now = Instant::now();
@@ -1531,10 +1508,8 @@ mod tests {
         }
     }
 
-    /// A report is generated for the client's own packets and never for what
-    /// arrives from the egress: an over-sized packet coming inward is the
-    /// far side's path problem, and answering it would send an ICMP error to a
-    /// host that is not this session's sender.
+    /// Only client packets receive local reports; an oversized egress packet is
+    /// the far side's path problem.
     #[test]
     fn nothing_arriving_from_the_egress_is_reported_on() {
         let mut path = fast_path();
@@ -1551,14 +1526,13 @@ mod tests {
         ));
     }
 
-    /// A UDP datagram over IPv6 of exactly `total` bytes. There is no DF bit to
-    /// set: RFC 8200 §4.5 removed in-network fragmentation, so every IPv6
-    /// packet is one its sender forbade fragmenting.
+    /// Builds an IPv6 UDP datagram of exactly `total` bytes.
+    /// RFC 8200 Sec. 4.5 provides no in-network fragmentation bit.
     fn sized_udp_v6(total: usize) -> Vec<u8> {
         let mut packet = vec![0u8; total];
         packet[0] = 0x60;
         packet[4..6].copy_from_slice(&((total - 40) as u16).to_be_bytes());
-        packet[6] = 17; // UDP
+        packet[6] = 17; // UDP next header
         packet[7] = 64;
         packet[8..24].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
         packet[24..40].copy_from_slice(&Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
@@ -1568,12 +1542,8 @@ mod tests {
         packet
     }
 
-    /// **IPv6 reports the same fact with a different message, and getting the
-    /// two confused is silent.** A v4 report is Destination Unreachable /
-    /// Fragmentation Needed with a `u16` MTU in the second header word; a v6
-    /// report is Packet Too Big, its own type, with a `u32` MTU one word
-    /// earlier. A v4-shaped message on a v6 packet parses as something else
-    /// entirely and no stack complains — it just never learns its path.
+    /// IPv6 uses Packet Too Big with a 32-bit MTU field, not IPv4's
+    /// Fragmentation Needed message and 16-bit field.
     #[test]
     fn an_ipv6_report_is_packet_too_big_not_fragmentation_needed() {
         let mut path = fast_path();
@@ -1602,10 +1572,7 @@ mod tests {
         );
     }
 
-    /// The ICMPv6 checksum covers a pseudo-header of the IPv6 addresses, the
-    /// payload length, and the next-header value; ICMPv4's covers the ICMP
-    /// message alone. A v6 message checksummed the v4 way is discarded by every
-    /// receiver, and a test that only ever built v4 would never notice.
+    /// ICMPv6 includes the IPv6 pseudo-header in its checksum; ICMPv4 does not.
     #[test]
     fn both_families_checksum_the_way_their_own_rfc_says() {
         let now = Instant::now();
@@ -1616,8 +1583,7 @@ mod tests {
             let mut path = fast_path();
             path.on_tun_packet(&oversized, now).unwrap();
             let reply = path.poll_transmit().unwrap_or_else(|| panic!("{label}"));
-            // `from_ip` verifies nothing, so the checksum is recomputed over
-            // what was written and compared with what was written.
+            // Recompute the checksum because `from_ip` does not verify it.
             let sliced = etherparse::SlicedPacket::from_ip(&reply.bytes)
                 .unwrap_or_else(|error| panic!("{label}: {error:?}"));
             let ok = match sliced.transport {
@@ -1638,25 +1604,19 @@ mod tests {
         }
     }
 
-    /// RFC 1122 §3.2.2 and RFC 4443 §2.4 (e): an error is never answered with
-    /// an error, or two hosts each reporting the other's report never stop.
-    /// **The classification differs by family and that is the whole hazard** —
-    /// IPv6 says "type below 128", IPv4 says "one of these five", and IPv6's
-    /// rule applied to IPv4 would read Echo Request (type 8) as an error and
-    /// stop answering the one probe a person can run by hand.
+    /// RFC 1122 Sec. 3.2.2 and RFC 4443 Sec. 2.4(e) prohibit error replies to
+    /// errors. IPv4 and IPv6 classify ICMP errors differently.
     #[test]
     fn an_oversized_icmp_error_is_not_answered_but_an_oversized_echo_is() {
         let now = Instant::now();
         let mut body = vec![0u8; 1472];
-        body[0] = 0x45; // whatever an error would be quoting
+            body[0] = 0x45; // quoted IPv4 header marker
 
         for (label, kind, answered) in [
             ("v4 destination unreachable", 3, false),
             ("v4 time exceeded", 11, false),
             ("v4 redirect", 5, false),
-            // **Type 8 is the whole point.** IPv4 calls it Echo Request and
-            // answers it; IPv6 has nothing there and, being below 128, calls
-            // it an error and stays quiet. One number, two verdicts.
+            // IPv4 type 8 is Echo Request, not an error.
             ("v4 echo request", 8, true),
         ] {
             let mut path = fast_path();
@@ -1683,7 +1643,7 @@ mod tests {
         ] {
             let mut path = fast_path();
             let mut packet = sized_udp_v6(1500);
-            packet[6] = 58; // ICMPv6
+            packet[6] = 58; // ICMPv6 next header
             packet[40] = kind;
             packet[41] = 0;
             path.on_tun_packet(&packet, now).unwrap();

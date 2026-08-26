@@ -1,35 +1,12 @@
-//! MASQUE CONNECT-IP (RFC 9484) as a packet egress.
+//! MASQUE CONNECT-IP (RFC 9484) packet egress.
 //!
-//! An IP packet from the client's TUN becomes an HTTP Datagram (RFC 9297) on a
-//! QUIC connection to a MASQUE proxy, and the proxy's datagrams become IP
-//! packets for the client. That is the whole protocol from this crate's side:
-//! CONNECT-IP is a *tunnel of whole IP packets*, which is why it implements
-//! [`PacketEgress`] alongside WireGuard rather than needing a new layer.
+//! TUN packets become HTTP Datagrams on a QUIC connection, and peer datagrams
+//! become packets for the client. `quiche` supplies the sans-IO QUIC state;
+//! [`PacketEgress`] supplies bytes and explicit timer ticks around it.
 //!
-//! **`quiche` is the QUIC stack, and it is sans-io — which is why it fits.**
-//! [`PacketEgress`] is bytes in, [`EgressEmit`] out, timers on an explicit
-//! tick; `quiche::Connection` is exactly that shape (`recv`, `send`,
-//! `on_timeout`) and performs no I/O of its own. [Verification](../docs/verification.md)
-//! pre-authorised "tokio-quiche and quiche"; of the two only plain `quiche`
-//! composes here, because `tokio-quiche` owns its own sockets and would fight
-//! the seam the reactor already drives. It is also the stack Cloudflare's own
-//! WARP MASQUE client speaks, so the wire is exercised against a real
-//! deployment rather than only against a specification.
-//!
-//! **Two framings stack, and both are varints.** RFC 9297 puts a Quarter
-//! Stream ID in front of every HTTP Datagram; RFC 9484 puts a Context ID in
-//! front of the payload, where context 0 means "an IP packet". So the QUIC
-//! datagram is `varint(flow_id) || varint(0) || packet`, and
-//! [`encode_ip_datagram`] and [`decode_ip_datagram`] are that pure codec,
-//! testable without a connection.
-//!
-//! **The tunnel's states are a closed sum, so an unusable tunnel cannot be
-//! written to.** A *usable* flow id exists only inside
-//! [`TunnelState::Established`], which is the proof that the proxy answered
-//! `2xx`; there is no way to encode a datagram before that. The id is known
-//! earlier than that — from the moment the request is sent — and it lives in
-//! [`TunnelState::Requested`] until the answer arrives, rather than in a field
-//! beside the state where the two could disagree about which phase this is in.
+//! HTTP Datagrams carry `varint(flow_id) || varint(0) || packet`: RFC 9297's
+//! Quarter Stream ID followed by RFC 9484's IP-packet context. A flow ID is
+//! usable only in [`TunnelState::Established`], after a successful CONNECT.
 
 use std::{
     net::SocketAddr,
@@ -45,92 +22,62 @@ use crate::{
     wire::{Reader, Writer},
 };
 
-/// The CONNECT-IP context ID for a full IP packet, fixed by RFC 9484 §6.
+/// RFC 9484 context ID for a complete IP packet.
 const IP_PACKET_CONTEXT: u64 = 0;
 
-/// A conservative upper bound on everything wrapped around one tunnelled IP
-/// packet, used for inner-MTU arithmetic before a connection exists. Once one
-/// does, [`MasqueEgress::properties`] reports the *measured* ceiling from
-/// `quiche` instead, which is always the tighter and truer number.
-///
-/// The terms, worst case: 40 bytes of outer IPv6 and 8 of UDP; a QUIC short
-/// header of 1 flag byte, up to 20 bytes of destination connection ID, and up
-/// to 4 of packet number; a 16-byte AEAD tag; a DATAGRAM frame type and length
-/// (1 + 2); and the two varints above (up to 4 + 1).
+/// Static worst-case encapsulation overhead before a connection is established.
+/// An established connection reports its measured ceiling from `quiche`.
 pub const MASQUE_OVERHEAD_BYTES: u16 = 40 + 8 + 1 + 20 + 4 + 16 + 3 + 5;
 
-/// How often the egress is ticked when it has nothing more urgent to ask for.
-/// QUIC's real timer is not a cadence — it is a deadline that moves with loss
-/// recovery — so [`PacketEgress::next_deadline`] is what the reactor actually
-/// arms against, and this is only the backstop.
+/// Backstop tick interval when QUIC has no more precise deadline.
 const MASQUE_TICK: Duration = Duration::from_millis(250);
 
-/// Static configuration for one MASQUE proxy.
+/// Configuration for one MASQUE proxy.
 pub struct MasqueConfig {
-    /// The proxy's UDP endpoint.
+    /// Proxy UDP endpoint.
     pub peer: SocketAddr,
-    /// The local address QUIC should believe it is sending from. The socket is
-    /// the shell's, so this is what the connection stamps on its packets
-    /// rather than something this type binds.
+    /// Local address reported to QUIC; this type does not bind it.
     pub local: SocketAddr,
-    /// The name presented in SNI and verified against the proxy's certificate.
+    /// SNI and certificate-verification name.
     pub server_name: String,
-    /// `:authority` for the CONNECT request.
+    /// CONNECT request authority.
     pub authority: String,
-    /// `:path` for the CONNECT request.
+    /// CONNECT request path.
     pub path: String,
-    /// The `:protocol` pseudo-header. RFC 9484 registers `connect-ip`, and
-    /// that is the default; Cloudflare WARP expects `cf-connect-ip`, so a
-    /// deployment that targets it sets this rather than patching the crate.
+    /// CONNECT request protocol identifier.
     pub protocol: String,
-    /// What RFC 4787 mapping behavior the *proxy* provides.
-    ///
-    /// Deliberately configuration and not a constant: the mapping is performed
-    /// by the proxy's own NAT, so this crate cannot observe it, and a hard-coded
-    /// optimistic claim would be an unmeasured assertion in the one place the
-    /// planner trusts. A deployment declares what it measured.
+    /// RFC 4787 mapping behavior provided by the proxy.
     pub nat_behavior: NatBehavior,
 }
 
 impl MasqueConfig {
-    /// The RFC 9484 registered protocol identifier.
+    /// RFC 9484 protocol identifier.
     pub const STANDARD_PROTOCOL: &'static str = "connect-ip";
-    /// What Cloudflare WARP's MASQUE deployment expects instead.
+    /// Cloudflare WARP protocol identifier.
     pub const CLOUDFLARE_PROTOCOL: &'static str = "cf-connect-ip";
 }
 
-/// Why a tunnel is no longer usable. Each is terminal: the shell replaces the
-/// egress or reports the failure, and none of them is retried in place.
+/// Terminal reason a tunnel is no longer usable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloseReason {
-    /// The proxy answered the CONNECT request with a non-2xx status.
+    /// CONNECT returned a non-2xx status.
     Refused(u16),
-    /// The QUIC connection closed, by either peer or by idle timeout.
+    /// QUIC connection closed.
     ConnectionClosed,
-    /// The proxy's response was not a CONNECT-IP response at all.
+    /// Response was not a valid CONNECT-IP response.
     Malformed,
 }
 
-/// The tunnel's lifecycle. A flow id exists only once the proxy has agreed to
-/// carry packets, so no code path can address a datagram before then.
+/// MASQUE tunnel lifecycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TunnelState {
-    /// The QUIC handshake is still in flight; no CONNECT-IP request has been
-    /// sent yet.
+    /// QUIC handshake in progress; no CONNECT request sent.
     Connecting,
-    /// The CONNECT-IP request is on the wire. `flow_id` is its request stream's
-    /// quarter id, known from the moment the request is sent and load-bearing
-    /// only once the proxy answers.
-    ///
-    /// **This is where a pending flow id belongs.** It used to sit in a field
-    /// beside this enum, so `Established` with nothing pending and `Connecting`
-    /// with something pending were both representable, and the transition read
-    /// two values that could disagree. One of them now implies the other.
+    /// CONNECT request sent; waiting for the response.
     Requested {
         flow_id: u64,
     },
-    /// The proxy answered `2xx`. `flow_id` is the request stream's quarter id,
-    /// which every HTTP Datagram on this tunnel carries.
+    /// CONNECT accepted; `flow_id` prefixes every HTTP Datagram.
     Established {
         flow_id: u64,
     },
@@ -138,9 +85,6 @@ pub enum TunnelState {
 }
 
 /// Writes one IP packet as a CONNECT-IP HTTP Datagram payload.
-///
-/// `varint(flow_id) || varint(0) || packet`. O(packet length), one copy into
-/// the caller's buffer and no allocation of its own.
 pub fn encode_ip_datagram(flow_id: u64, packet: &[u8], out: &mut Vec<u8>) {
     out.clear();
     Writer::new(out)
@@ -149,11 +93,7 @@ pub fn encode_ip_datagram(flow_id: u64, packet: &[u8], out: &mut Vec<u8>) {
         .bytes(packet);
 }
 
-/// Reads the IP packet out of a CONNECT-IP HTTP Datagram payload.
-///
-/// `None` unless the datagram belongs to this tunnel's flow and carries
-/// context 0: another context is a capsule this tunnel does not implement, and
-/// another flow is not ours to interpret. O(1) — two varints and a slice.
+/// Reads an IP packet belonging to the expected flow and context.
 pub fn decode_ip_datagram(datagram: &[u8], expected_flow_id: u64) -> Option<&[u8]> {
     let mut reader = Reader::new(datagram);
     if reader.varint()? != expected_flow_id {
@@ -166,7 +106,7 @@ pub fn decode_ip_datagram(datagram: &[u8], expected_flow_id: u64) -> Option<&[u8
     (!packet.is_empty()).then_some(packet)
 }
 
-/// A MASQUE CONNECT-IP tunnel as a sans-io packet egress.
+/// Sans-IO MASQUE CONNECT-IP packet egress.
 pub struct MasqueEgress {
     conn: quiche::Connection,
     h3: Option<quiche::h3::Connection>,
@@ -174,24 +114,18 @@ pub struct MasqueEgress {
     state: TunnelState,
     config: MasqueConfig,
     pool: Arc<BufferPool>,
-    /// One scratch buffer for `quiche::Connection::send`, reused for the life
-    /// of the egress so a packet costs no allocation for the space it is built
-    /// in. Emissions are copied out of it into pooled buffers.
+    /// Reusable buffer for QUIC packets; emissions are copied into pool buffers.
     scratch: Vec<u8>,
-    /// One scratch buffer for building HTTP Datagram payloads.
+    /// Reusable buffer for HTTP Datagram payloads.
     datagram: Vec<u8>,
-    /// IP packets successfully handed to the tunnel. The MASQUE half of the
-    /// fast-path counter `WireGuardEgress` keeps.
+    /// IP packets handed to the tunnel without local termination.
     fast_path_packets: u64,
 }
 
 impl MasqueEgress {
-    /// Builds a tunnel over an already-configured `quiche` connection.
-    ///
-    /// The connection is the caller's to configure — ALPN, certificate
-    /// verification, datagram queues, and transport parameters are deployment
-    /// policy, not this type's — so it is passed in rather than built here.
-    /// [`MasqueEgress::client_config`] provides the settings CONNECT-IP requires.
+    /// Builds a tunnel around an already-configured `quiche` connection.
+    /// The caller owns ALPN, certificate verification, queues, and transport
+    /// parameters; [`MasqueEgress::client_config`] supplies CONNECT-IP defaults.
     pub fn new(
         conn: quiche::Connection,
         config: MasqueConfig,
@@ -199,8 +133,7 @@ impl MasqueEgress {
         max_packet: usize,
     ) -> Result<Self, EgressError> {
         let mut h3_config = quiche::h3::Config::new().map_err(|_| EgressError::Masque)?;
-        // The CONNECT-IP request is an Extended CONNECT (RFC 9220), so the
-        // `:protocol` pseudo-header is only legal once this is negotiated.
+        // CONNECT-IP uses the RFC 9220 extended CONNECT form.
         h3_config.enable_extended_connect(true);
         Ok(Self {
             conn,
@@ -219,28 +152,24 @@ impl MasqueEgress {
         &self.state
     }
 
-    /// Packets this tunnel carried without local termination.
+    /// Number of packets carried without local termination.
     pub fn fast_path_packets(&self) -> u64 {
         self.fast_path_packets
     }
 
-    /// A `quiche::Config` with everything CONNECT-IP needs: the h3 ALPN,
-    /// datagrams enabled in both directions, and the transport limits the
-    /// control stream requires. Certificate verification is the caller's to
-    /// set, because a test proxy and a production one differ there and nowhere
-    /// else.
+    /// Builds a QUIC configuration with HTTP/3, bidirectional datagrams, and
+    /// transport limits for the CONNECT control stream. The caller configures
+    /// certificate verification.
     pub fn client_config(max_idle: Duration, queue: usize) -> Result<quiche::Config, EgressError> {
         let mut config =
             quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|_| EgressError::Masque)?;
         config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .map_err(|_| EgressError::Masque)?;
-        // Datagrams are the entire data path: without them CONNECT-IP has
-        // nothing to carry packets in.
+        // CONNECT-IP carries packets only through QUIC datagrams.
         config.enable_dgram(true, queue, queue);
         config.set_max_idle_timeout(max_idle.as_millis() as u64);
-        // The request stream carries only the CONNECT exchange and capsules,
-        // so these are sized for control traffic rather than bulk transfer.
+        // The request stream carries control traffic, not packet payloads.
         config.set_initial_max_data(1_000_000);
         config.set_initial_max_stream_data_bidi_local(100_000);
         config.set_initial_max_stream_data_bidi_remote(100_000);
@@ -250,11 +179,8 @@ impl MasqueEgress {
         Ok(config)
     }
 
-    /// Everything `quiche` wants to put on the wire, as pooled emissions.
-    ///
-    /// Exhaustion stops the drain rather than allocating: the remaining
-    /// packets stay in `quiche`'s own send buffer and leave on the next call,
-    /// which is the same congestion discipline the rest of the crate follows.
+    /// Drains QUIC output into pooled emissions.
+    /// Pool exhaustion leaves unsent data in `quiche` for the next call.
     fn drain_send(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
         loop {
             match self.conn.send(&mut self.scratch) {
@@ -273,8 +199,7 @@ impl MasqueEgress {
         }
     }
 
-    /// Advances the HTTP/3 layer: opens it once the handshake completes, sends
-    /// the CONNECT-IP request, reads the proxy's answer, and harvests inbound
+    /// Advances HTTP/3, sends CONNECT-IP after the handshake, and drains peer
     /// datagrams as IP packets.
     fn advance(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
         if self.conn.is_closed() {
@@ -294,17 +219,14 @@ impl MasqueEgress {
                 quiche::h3::Header::new(b":scheme", b"https"),
                 quiche::h3::Header::new(b":authority", self.config.authority.as_bytes()),
                 quiche::h3::Header::new(b":path", self.config.path.as_bytes()),
-                // RFC 9297: the endpoint intends to use the capsule protocol on
-                // this stream, which is what makes HTTP Datagrams legal on it.
+                // RFC 9297 requires this indication for HTTP Datagrams.
                 quiche::h3::Header::new(b"capsule-protocol", b"?1"),
             ];
-            // `fin: false` — the stream stays open for capsules and is what
-            // keeps the tunnel alive.
+            // Keep the request stream open for the tunnel lifetime.
             let stream_id = h3
                 .send_request(&mut self.conn, &request, false)
                 .map_err(|_| EgressError::Masque)?;
-            // RFC 9297 §2.1: the Quarter Stream ID is the request stream's id
-            // divided by four, which is what every datagram is prefixed with.
+            // RFC 9297 uses the request stream ID divided by four as the prefix.
             self.state = TunnelState::Requested {
                 flow_id: stream_id / 4,
             };
@@ -316,8 +238,7 @@ impl MasqueEgress {
         Ok(())
     }
 
-    /// Reads whatever the HTTP/3 layer has to say. The only event that moves
-    /// this tunnel's state is the response to its own CONNECT request.
+    /// Processes HTTP/3 events relevant to this tunnel's CONNECT request.
     fn poll_h3(&mut self) -> Result<(), EgressError> {
         let Some(h3) = self.h3.as_mut() else {
             return Ok(());
@@ -342,9 +263,8 @@ impl MasqueEgress {
                         (None, _) => TunnelState::Closed(CloseReason::Malformed),
                     };
                 }
-                // A CONNECT-IP tunnel carries its packets in datagrams; body
-                // data on the request stream is capsule traffic this tunnel
-                // does not implement, and finishing the stream ends it.
+                // The request stream carries no packet body; finishing it closes
+                // the tunnel.
                 Ok((_, quiche::h3::Event::Finished)) => {
                     self.state = TunnelState::Closed(CloseReason::ConnectionClosed);
                 }
@@ -358,9 +278,8 @@ impl MasqueEgress {
         }
     }
 
-    /// Turns inbound HTTP Datagrams into tunnel-bound IP packets. A datagram
-    /// for another flow or context is skipped, not an error: a proxy may
-    /// legitimately multiplex more than this tunnel understands.
+    /// Converts matching HTTP Datagrams into tunnel-bound IP packets. Other
+    /// flows and contexts are ignored because the proxy may multiplex them.
     fn drain_datagrams(&mut self, out: &mut Vec<EgressEmit>) {
         let TunnelState::Established { flow_id } = self.state else {
             return;
@@ -373,8 +292,7 @@ impl MasqueEgress {
                     };
                     match self.pool.take(packet) {
                         Some(pooled) => out.push(EgressEmit::ToTunnel(pooled)),
-                        // The budget is spent; the packet is a counted drop at
-                        // the shell, exactly as a forwarded packet would be.
+                        // Stop when the packet pool cannot accept another packet.
                         None => return,
                     }
                 }
@@ -386,22 +304,18 @@ impl MasqueEgress {
 
 impl PacketEgress for MasqueEgress {
     fn properties(&self) -> PathProperties {
-        // Once the connection is up, `quiche` knows the real datagram ceiling;
-        // before that there is only the static estimate. Reporting the
-        // measured number when it exists is what keeps the inner MTU honest.
+        // Use the measured QUIC ceiling once available; otherwise use the
+        // pre-connection estimate.
         let max_datagram_size = self
             .conn
             .dgram_max_writable_len()
             .and_then(|len| u16::try_from(len.saturating_sub(usize::from(PREFIX_BYTES))).ok());
         PathProperties {
-            // CONNECT-IP carries whole IP packets, so a client's QUIC datagram
-            // crosses as itself rather than being re-framed onto a stream.
+            // Whole IP packets retain datagram boundaries through CONNECT-IP.
             datagram_fidelity: DatagramFidelity::Native,
             overhead_bytes: MASQUE_OVERHEAD_BYTES,
             max_datagram_size,
-            // The inner header's ECN crosses verbatim, but nothing propagates
-            // it to the outer QUIC packet and no capture has verified either
-            // direction. Claim nothing, as WireGuard does.
+            // ECN preservation is not established for either direction.
             preserves_ecn: false,
             nat_behavior: self.config.nat_behavior,
         }
@@ -414,16 +328,14 @@ impl PacketEgress for MasqueEgress {
     ) -> Result<(), EgressError> {
         if let TunnelState::Established { flow_id } = self.state {
             encode_ip_datagram(flow_id, packet, &mut self.datagram);
-            // A datagram that does not fit the path cannot be fragmented: QUIC
-            // forbids it. Dropping is the honest answer and the reason
-            // `max_datagram_size` is reported to the planner at all.
+            // QUIC datagrams cannot be fragmented; an oversized packet is
+            // dropped and the planner receives the reported size limit.
             if self.conn.dgram_send(&self.datagram).is_ok() {
                 self.fast_path_packets += 1;
             }
         }
-        // Before the tunnel is up the packet is dropped rather than queued: the
-        // client's own retransmission is a better buffer than one here, and an
-        // unbounded queue is what this crate refuses everywhere else.
+        // Do not queue packets while CONNECT is pending; retransmission belongs
+        // to the client and this egress has no unbounded buffer.
         self.drain_send(out)
     }
 
@@ -432,8 +344,7 @@ impl PacketEgress for MasqueEgress {
         datagram: &[u8],
         out: &mut Vec<EgressEmit>,
     ) -> Result<(), EgressError> {
-        // `recv` needs a mutable buffer and may rewrite it in place, so the
-        // caller's borrowed datagram is copied into scratch space first.
+        // `recv` may rewrite its input, so copy the caller's datagram first.
         let mut owned = datagram.to_vec();
         let info = quiche::RecvInfo {
             from: self.config.peer,
@@ -441,8 +352,7 @@ impl PacketEgress for MasqueEgress {
         };
         match self.conn.recv(&mut owned, info) {
             Ok(_) => {}
-            // Anything can arrive on a public UDP port; a datagram this
-            // connection cannot parse is an observation, not a tunnel failure.
+            // An unparsable packet on the shared UDP path is not a tunnel error.
             Err(_) => return Err(EgressError::MalformedNetworkPacket),
         }
         self.advance(out)?;
@@ -459,16 +369,13 @@ impl PacketEgress for MasqueEgress {
         MASQUE_TICK
     }
 
-    /// QUIC's timer is a moving deadline set by loss recovery, not a cadence,
-    /// so this is the number the reactor must actually arm against; a fixed
-    /// interval would either burn wakeups or miss a retransmission.
+    /// Returns QUIC's loss-recovery deadline for reactor scheduling.
     fn next_deadline(&self) -> Option<Instant> {
         self.conn.timeout().map(|left| Instant::now() + left)
     }
 }
 
-/// Worst-case bytes the two varints add in front of an IP packet: a 4-byte
-/// flow id and a 1-byte context.
+/// Maximum prefix size for a flow ID and the IP-packet context.
 const PREFIX_BYTES: u16 = 5;
 
 #[cfg(test)]
@@ -478,8 +385,7 @@ mod tests {
     #[test]
     fn the_datagram_codec_round_trips_and_refuses_what_is_not_ours() {
         let packet = [0x45, 0x00, 0x00, 0x1c, 0xde, 0xad];
-        // Every varint width the flow id can take, so the prefix length is
-        // exercised rather than assumed.
+        // Cover every encoded width used by flow IDs.
         for flow_id in [0u64, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824] {
             let mut encoded = Vec::new();
             encode_ip_datagram(flow_id, &packet, &mut encoded);
@@ -488,27 +394,24 @@ mod tests {
                 Some(&packet[..]),
                 "flow {flow_id} must round-trip"
             );
-            // A datagram belonging to another flow is not ours to interpret.
+            // A different flow is not this tunnel's payload.
             assert_eq!(decode_ip_datagram(&encoded, flow_id.wrapping_add(1)), None);
         }
 
-        // Context 1 is a capsule this tunnel does not implement. The two
-        // varints are written as the literal bytes RFC 9000 gives them, so
-        // this asserts against the wire rather than against our own encoder.
+        // Context 1 is not an IP packet. These literal bytes check the wire
+        // representation independently of the encoder.
         let mut other_context = vec![0x04, 0x01];
         other_context.extend_from_slice(&packet);
         assert_eq!(decode_ip_datagram(&other_context, 4), None);
 
-        // Truncated input is `None`, never a panic: these bytes are untrusted.
+        // Untrusted truncated input must return `None`, not panic.
         assert_eq!(decode_ip_datagram(&[], 0), None);
         assert_eq!(decode_ip_datagram(&[0x40], 0), None);
-        // Flow 4, context 0, and no packet behind them.
+        // Flow 4 and context 0 without a packet is incomplete.
         assert_eq!(decode_ip_datagram(&[0x04, 0x00], 4), None);
     }
 
-    /// A minimal MASQUE proxy: a real `quiche` server that accepts one
-    /// CONNECT-IP request and reflects every IP packet it is given back down
-    /// the same flow. Enough to prove the wire, and nothing more.
+    /// Minimal real `quiche` proxy for one CONNECT-IP request and packet echo.
     struct Proxy {
         conn: quiche::Connection,
         h3: Option<quiche::h3::Connection>,
@@ -517,8 +420,7 @@ mod tests {
     }
 
     impl Proxy {
-        /// Feeds one client datagram in and returns everything the proxy wants
-        /// to send back.
+        /// Feeds one client datagram and returns the proxy's pending output.
         fn exchange(&mut self, incoming: Option<&[u8]>) -> Vec<Vec<u8>> {
             if let Some(datagram) = incoming {
                 let mut owned = datagram.to_vec();
@@ -538,8 +440,7 @@ mod tests {
             if let Some(h3) = self.h3.as_mut() {
                 while let Ok((stream_id, event)) = h3.poll(&mut self.conn) {
                     if let quiche::h3::Event::Headers { list, .. } = event {
-                        // Answer only a well-formed CONNECT-IP request, so the
-                        // test proves the client sent one.
+                        // The assertions verify the client's CONNECT request.
                         let method = header(&list, b":method");
                         let protocol = header(&list, b":protocol");
                         assert_eq!(method.as_deref(), Some("CONNECT"));
@@ -552,7 +453,7 @@ mod tests {
                 }
             }
 
-            // Reflect every IP packet back on the same flow.
+            // Echo matching packets on the same flow.
             if let Some(flow_id) = self.flow_id {
                 while let Ok(len) = self.conn.dgram_recv(&mut self.scratch) {
                     let Some(packet) = decode_ip_datagram(&self.scratch[..len], flow_id) else {
@@ -593,8 +494,7 @@ mod tests {
         "198.51.100.7:443".parse().unwrap()
     }
 
-    /// The credentials `quiche` loads from disk, from the shared test
-    /// helpers: `quiche` offers no in-memory form, and two modules need one.
+    /// Creates the certificate files required by `quiche`'s test server.
     fn proxy_certificate() -> (
         std::path::PathBuf,
         std::path::PathBuf,
@@ -603,9 +503,7 @@ mod tests {
         crate::testing::self_signed("proxy.example")
     }
 
-    /// The P17 mechanism gate, in process: a real QUIC handshake, a real
-    /// Extended CONNECT carrying `:protocol = connect-ip`, and an IP packet
-    /// that crosses as an HTTP Datagram and comes back byte-identical.
+    /// Verifies a real QUIC handshake, Extended CONNECT, and packet echo.
     #[test]
     fn an_ip_packet_round_trips_through_a_real_connect_ip_tunnel() {
         let (cert_path, key_path, _dir) = proxy_certificate();
@@ -630,9 +528,8 @@ mod tests {
         server_config.set_initial_max_streams_uni(16);
 
         let mut client_config = MasqueEgress::client_config(Duration::from_secs(5), 64).unwrap();
-        // The proxy's certificate is self-signed for this test; production
-        // verification is the caller's to configure, which is exactly why
-        // `client_config` does not decide it.
+        // The test proxy is self-signed; production verification belongs to the
+        // caller of `client_config`.
         client_config.verify_peer(false);
 
         let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
@@ -676,7 +573,7 @@ mod tests {
         };
         let mut egress = MasqueEgress::new(client_conn, config, Arc::clone(&pool), 1350).unwrap();
 
-        // Drive the handshake and the CONNECT exchange to completion.
+        // Drive the handshake and CONNECT exchange.
         let mut out = Vec::new();
         egress.tick(&mut out).unwrap();
         for _ in 0..16 {
@@ -707,8 +604,7 @@ mod tests {
             egress.state()
         );
 
-        // Once the tunnel is up the planner sees a real datagram ceiling
-        // rather than only the static estimate.
+        // An established tunnel exposes the measured datagram ceiling.
         let properties = egress.properties();
         assert_eq!(properties.datagram_fidelity, DatagramFidelity::Native);
         assert!(
@@ -716,8 +612,7 @@ mod tests {
             "an established tunnel reports its measured ceiling"
         );
 
-        // The gate: a whole IP packet crosses as an HTTP Datagram and returns
-        // byte-identical.
+        // Verify that a whole IP packet crosses and returns byte-identically.
         let packet = [
             0x45, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
