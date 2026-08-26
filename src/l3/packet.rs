@@ -23,11 +23,11 @@ pub enum Transport {
     Fragment,
 }
 
-/// Whether an ICMP message reports a failure or asks a question.
+/// Classifies ICMP messages without conflating the IPv4 and IPv6 rules.
 ///
-/// It exists for one rule — RFC 1122 §3.2.2 and RFC 4443 §2.4 (e) both forbid
-/// answering an error with an error — and **the two families decide it
-/// differently, which is the trap this type exists to close.**
+/// RFC 1122 §3.2.2 and RFC 4443 §2.4 (e) forbid answering an error with an
+/// error. IPv4 uses an explicit list, while IPv6 uses the high bit of the
+/// type, so a shared numeric range would misclassify one family.
 ///
 /// RFC 4443 §2.1 gives ICMPv6 a structural answer: *"Error messages are
 /// identified as such by a zero in the high-order bit of the message Type field
@@ -38,17 +38,14 @@ pub enum Transport {
 /// of the few things a user can run to discover a path MTU by hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcmpClass {
-    /// Destination Unreachable, Redirect, Source Quench, Time Exceeded,
-    /// Parameter Problem, and every ICMPv6 type below 128.
+    /// An ICMPv4 error type from RFC 1122's list, or an ICMPv6 type below 128.
     Error,
-    /// Echo, Timestamp, Address Mask, Router and Neighbor Discovery — anything
-    /// that is a question rather than a complaint.
+    /// A request, reply, notification, or other non-error ICMP message.
     Informational,
 }
 
-/// RFC 1122 §3.2.2's list, verbatim: Destination Unreachable (3), Source Quench
-/// (4), Redirect (5), Time Exceeded (11), Parameter Problem (12). A list, not a
-/// range, because IPv4 has no bit that says so.
+/// Applies RFC 1122 §3.2.2's IPv4 error list. The gaps are intentional: IPv4
+/// has no type bit that can replace the list.
 fn icmpv4_class(type_u8: u8) -> IcmpClass {
     match type_u8 {
         3 | 4 | 5 | 11 | 12 => IcmpClass::Error,
@@ -56,9 +53,8 @@ fn icmpv4_class(type_u8: u8) -> IcmpClass {
     }
 }
 
-/// RFC 4443 §2.1: the high-order bit of the type *is* the classification, so
-/// this is total over all 256 values and stays correct for types IANA has not
-/// assigned yet.
+/// Applies RFC 4443 §2.1 to every possible IPv6 type, including unassigned
+/// values.
 fn icmpv6_class(type_u8: u8) -> IcmpClass {
     if type_u8 < 128 {
         IcmpClass::Error
@@ -73,15 +69,15 @@ pub struct IngressPacket {
     pub destination: IpAddr,
     pub ecn: IpEcn,
     pub transport: Transport,
-    /// Offset and length, not a slice, so this `Copy` summary outlives the
-    /// input borrow. Zero for transports without payload.
+    /// The payload's location in the original packet. Storing coordinates
+    /// keeps this `Copy` summary independent of the input borrow.
     pub payload_at: u16,
     pub payload_len: u16,
 }
 
 impl IngressPacket {
-    /// The transport payload, given the very bytes this packet was parsed
-    /// from. `None` when `packet` is not those bytes.
+    /// Borrows the transport payload from the packet used for parsing.
+    /// Returns `None` when the coordinates are outside the supplied bytes.
     pub fn payload<'a>(&self, packet: &'a [u8]) -> Option<&'a [u8]> {
         let at = usize::from(self.payload_at);
         packet.get(at..at + usize::from(self.payload_len))
@@ -93,8 +89,8 @@ pub enum PacketError {
     Malformed(etherparse::err::packet::SliceError),
     MissingNetworkLayer,
     UnsupportedNetworkLayer,
-    /// Wire lengths are 16-bit; reject rather than truncate so `IngressPacket`
-    /// offsets stay exact.
+    /// A wire length or payload offset cannot be represented exactly in the
+    /// summary type.
     Oversized,
 }
 
@@ -170,9 +166,8 @@ impl IngressPacket {
         };
 
         let (payload_at, payload_len) = match payload {
-            // `payload` is a subslice of `packet`, so the difference of their
-            // start addresses is its offset. Both fit a `u16` for any packet an
-            // IP header can describe.
+            // The parser returns a subslice of the original input. Keep only
+            // its coordinates so the result remains copyable.
             Some(payload) => (
                 u16::try_from(payload.as_ptr() as usize - packet.as_ptr() as usize)
                     .map_err(|_| PacketError::Oversized)?,
@@ -192,25 +187,22 @@ impl IngressPacket {
     }
 }
 
-/// Bytes of IP and UDP header, per family.
+/// Fixed IP and UDP header sizes used by the packet writers.
 const IPV4_UDP_HEADER: usize = 20 + 8;
 const IPV6_UDP_HEADER: usize = 40 + 8;
 
-/// The largest payload each family's headers leave room for inside the
-/// 16-bit length fields.
+/// Maximum payload sizes permitted by the corresponding 16-bit wire lengths.
 const MAX_IPV4_UDP_PAYLOAD: usize = u16::MAX as usize - IPV4_UDP_HEADER;
 const MAX_IPV6_UDP_PAYLOAD: usize = u16::MAX as usize - 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// The endpoints are not of the same address family. Unreachable for a
-    /// reply built from one received packet, and an error rather than a guess
-    /// because there is no correct guess.
+    /// The endpoints use different address families; no valid header can be
+    /// selected without guessing.
     MixedFamilies,
     PayloadTooLarge,
     OutputTooSmall,
-    /// An ICMP error was asked for about bytes that are not a packet. There is
-    /// nothing to quote and therefore nothing the sender could authenticate.
+    /// The reported bytes are not a parseable packet and cannot be quoted.
     Unquotable,
 }
 
@@ -227,8 +219,8 @@ impl fmt::Display for WriteError {
 
 impl Error for WriteError {}
 
-/// Whether the sender forbade fragmentation, and so must be told when a packet
-/// does not fit rather than have it silently disappear.
+/// Reports whether an oversized packet requires an explicit fragmentation
+/// failure instead of silent loss.
 ///
 /// IPv6 has no in-network fragmentation at all (RFC 8200 §4.5), so every IPv6
 /// packet answers yes; IPv4 answers on the DF bit. A malformed or truncated
@@ -243,42 +235,31 @@ pub fn forbids_fragmentation(packet: &[u8]) -> bool {
     }
 }
 
-/// The largest ICMP error each family may be, so the message that reports a
-/// path is never itself too big for it. RFC 1812 §4.3.2.3 asks for as much of
-/// the original as fits in 576 bytes; RFC 4443 §2.4 (c) caps at the IPv6
-/// minimum MTU.
+/// Upper bounds for ICMP errors generated for an oversized packet. IPv4 uses
+/// RFC 1812's 576-byte limit; IPv6 uses the minimum MTU from RFC 4443 §2.4(c).
 const MAX_ICMPV4_ERROR: usize = 576;
 const MAX_ICMPV6_ERROR: usize = 1280;
 
-/// Writes an ICMP Packet Too Big for `quoted`, offering `next_hop_mtu`.
+/// Writes an ICMP Packet Too Big message quoting `quoted`.
 ///
-/// **The one error this crate originates.** A client's TUN is as wide as the
-/// session's path MTU, the tunnel is narrower by the egress's overhead, and a
-/// packet in between is one the client may legitimately send and this session
-/// cannot carry. TCP never reaches it — its MSS was clamped on the SYN — so
-/// what this serves is QUIC, which sets DF and discovers its path by exactly
-/// this message (RFC 8899). Dropping instead is a black hole the sender has no
-/// way to see.
+/// A packet can fit the device-facing MTU while exceeding the tunnel's inner
+/// path MTU. TCP is constrained earlier by SYN MSS clamping; this error gives
+/// datagram transports such as QUIC the feedback needed to reduce their size.
 ///
-/// **The source address is the quoted packet's own destination.** A router
-/// would use its own interface address; Boreas has no address on the client's
-/// link to use. Every stack authenticates one of these by the packet it quotes
-/// rather than by who sent it (RFC 1122 §4.2.3.9 for TCP, RFC 8899 §4.6.2 for
-/// datagram transports), so quoting is what makes it credible, and a source
-/// the client was already talking to is the one that cannot be mistaken for a
-/// different path.
+/// The generated source is the quoted packet's destination. That is the peer
+/// the client already knows, since the device-facing side has no router
+/// address of its own to advertise.
 ///
-/// O(quoted length), bounded by the family's ceiling above, and allocation-free
-/// apart from the builder's own.
+/// Work is proportional to the bounded quoted length and does not allocate
+/// beyond the builder's own state.
 pub fn write_too_big(
     out: &mut [u8],
     quoted: &[u8],
     next_hop_mtu: u16,
 ) -> Result<usize, WriteError> {
     let parsed = IngressPacket::parse(quoted).map_err(|_| WriteError::Unquotable)?;
-    // The two builders are different types with the same shape, so each arm
-    // finishes its own message rather than being unified through a trait that
-    // exists nowhere but here.
+    // IPv4 and IPv6 builders expose different concrete types, so finish each
+    // family in its own match arm.
     match (parsed.destination, parsed.source) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
             let builder =
@@ -308,9 +289,7 @@ pub fn write_too_big(
     }
 }
 
-/// Runs one builder's `write` against exactly the prefix of `out` it claimed,
-/// so a builder that wrote a different length than it reported cannot go
-/// unnoticed and cannot scribble past what the caller offered.
+/// Restricts a builder to the output prefix it reported before writing.
 fn emit(
     out: &mut [u8],
     len: usize,
@@ -321,11 +300,10 @@ fn emit(
     Ok(len)
 }
 
-/// Hop limit on a locally originated ICMP error. 64 is the IANA-recommended
-/// default and what every host stack writes.
+/// Default hop limit for locally generated ICMP errors.
 const ICMP_TTL: u8 = 64;
 
-/// The number of bytes [`write_udp`] needs for `payload_len` payload bytes.
+/// Returns the complete datagram size for a payload of `payload_len` bytes.
 pub fn udp_datagram_len(family: IpAddr, payload_len: usize) -> usize {
     let header = match family {
         IpAddr::V4(_) => IPV4_UDP_HEADER,
@@ -334,15 +312,11 @@ pub fn udp_datagram_len(family: IpAddr, payload_len: usize) -> usize {
     header + payload_len
 }
 
-/// Writes one whole UDP datagram — IP header, UDP header, payload — into
-/// `out`, returning its length.
+/// Writes an IP header, UDP header, and payload into `out`.
 ///
-/// The dual of [`IngressPacket::parse`], and the only place this crate
-/// originates a packet rather than forwarding one. Checksums are computed in
-/// full: a locally synthesized datagram has no incremental predecessor to
-/// adjust from, and the UDP checksum is written for IPv4 as well as IPv6 even
-/// though IPv4 permits omitting it, because a stub resolver behind a
-/// middlebox is exactly the client that will notice a zero.
+/// This is the packet-writing counterpart to [`IngressPacket::parse`]. It
+/// computes complete IP and UDP checksums, including the optional IPv4 UDP
+/// checksum, because the datagram has no prior checksum to update.
 ///
 /// O(payload length), and allocation-free.
 pub fn write_udp(
@@ -448,8 +422,8 @@ fn write_udp_header(out: &mut [u8], source_port: u16, destination_port: u16, pay
     out[8..].copy_from_slice(payload);
 }
 
-/// RFC 768: a computed UDP checksum of zero is transmitted as all ones,
-/// because zero on the wire is the sentinel for "not computed".
+/// Encodes RFC 768's zero-checksum escape: computed zero is sent as `0xffff`,
+/// while wire zero means that no checksum was computed.
 fn transmitted_checksum(sum: u16) -> [u8; 2] {
     if sum == 0 {
         [0xff, 0xff]
