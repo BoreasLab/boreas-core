@@ -1,28 +1,18 @@
-//! The seam between a sans-io state machine and the reactor: one bounded
-//! channel per direction, and an `AsyncRead + AsyncWrite` over the pair.
+//! The bridge between a sans-io state machine and the reactor: one bounded
+//! channel per direction exposed as `AsyncRead + AsyncWrite`.
 //!
-//! Two drivers in this crate need exactly this. [`run_terminator`](crate::run_terminator)
-//! turns each `smoltcp` connection into a stream the interception layer serves;
-//! the driver behind [`QuicConnection`](crate::QuicConnection) turns each
-//! `quiche` bidirectional stream into one a proxy protocol writes its header
-//! onto. Their pumps differ
-//! — the two stacks disagree about how a socket reports the peer's FIN and
-//! about what a partial write means — but the hand-off is identical, and the
-//! `poll_read`/`poll_write` contract is subtle enough that having one of it is
-//! worth more than having each driver's version read locally.
+//! [`run_terminator`](crate::run_terminator) uses it for `smoltcp` connections,
+//! and [`QuicConnection`](crate::QuicConnection) uses it for `quiche` streams.
+//! Their pumps differ, but the async hand-off and its polling contract are the
+//! same.
 //!
-//! **Backpressure is the protocol's own window, never a drop.** A datagram may
-//! be dropped under load; a byte stream may not, because a dropped byte is a
-//! corrupted response. So a driver takes a channel permit *before* it reads
-//! from its socket. When no permit is available the bytes stay where they are,
-//! the advertised window closes, and the peer stops sending — which is the
-//! mechanism both TCP and QUIC already provide for this and neither needs help
-//! with.
+//! **Byte-stream backpressure is flow control, not loss.** A driver reserves a
+//! channel permit before reading from its socket. With no permit, bytes remain
+//! in the transport and the peer's TCP or QUIC flow-control window closes.
 //!
-//! **Shutdown is expressed by ownership.** Dropping the write half's sender is
-//! what tells the driver to send FIN, and dropping the driver's inbound sender
-//! is what gives the reader end of stream. Neither direction needs a flag the
-//! other has to poll, and neither can be observed half-applied.
+//! **Shutdown is expressed by ownership.** Dropping the write sender tells the
+//! driver to send FIN after queued bytes; dropping the inbound sender gives
+//! the reader end of stream. No shared shutdown flag is required.
 
 use std::{
     io,
@@ -38,52 +28,44 @@ use tokio::{
 };
 use tokio_util::sync::PollSender;
 
-/// Caps per-probe copying; channel depth times this is per-stream bridge
-/// buffering atop the transport's own.
+/// Maximum bytes copied into one bridge message.
 pub(crate) const CHUNK: usize = 16 * 1024;
 
-/// Chunks in flight per direction; smooths hand-off atop the transport window.
+/// Maximum queued chunks in each direction.
 pub(crate) const DEPTH: usize = 8;
 
-/// A transport stream, bridged to the reactor as an ordinary async byte stream.
+/// A transport stream exposed to the reactor as an async byte stream.
 ///
-/// Half-close is exposed: closing the write half sends FIN; an exhausted read
-/// half observes the peer's FIN.
+/// Closing the write half sends FIN; an exhausted read half observes peer FIN.
 ///
-/// **An abrupt failure arrives as end of stream, not as an error.** If the
-/// driver dies — a reset connection, a cancelled task — its senders drop, and a
-/// reader cannot distinguish that from an orderly FIN. Consumers here are HTTP
-/// implementations that already treat a truncated body as a failure of the
-/// message rather than of the socket, so the distinction does not change what
-/// anything does with it.
+/// A failed or cancelled driver also appears as end of stream because its
+/// sender is dropped. HTTP consumers already treat a truncated body as a
+/// message failure.
 #[derive(Debug)]
 pub struct BridgedStream {
     inbound: mpsc::Receiver<Bytes>,
-    /// `None` once the write half is shut down.
+    /// Absent after the write half is shut down.
     outbound: Option<PollSender<Bytes>>,
-    /// Wakes the driver after a write, so a stream task never waits for the
-    /// next packet or timer to have its bytes delivered.
+    /// Wakes the driver after a write so queued bytes are delivered promptly.
     wake: Arc<Notify>,
-    /// The unconsumed tail of a chunk larger than the last read buffer.
+    /// Unconsumed bytes from a chunk larger than the last read buffer.
     pending: Bytes,
 }
 
-/// The driver's half of one stream's plumbing.
+/// The driver's half of one stream bridge.
 pub(crate) struct Plumbing {
-    /// Peer bytes toward the task. `None` once the peer's FIN has been observed
-    /// and the task has been given its end of stream.
+    /// Peer bytes toward the task; absent after peer FIN is delivered.
     pub(crate) to_task: Option<mpsc::Sender<Bytes>>,
     pub(crate) from_task: mpsc::Receiver<Bytes>,
-    /// A chunk the transport's send buffer could not take in full. Held so the
-    /// next sweep resumes exactly where this one stopped, which is what makes a
-    /// partial write lossless.
+    /// A chunk not fully accepted by the transport. Retaining it makes partial
+    /// writes lossless.
     pub(crate) pending_out: Option<Bytes>,
-    /// Set once the task's sender is gone and everything it wrote has been
-    /// handed to the transport, so FIN is sent exactly once.
+    /// Set after the task sender is gone and queued bytes have drained, so FIN
+    /// is sent once.
     pub(crate) finished: bool,
 }
 
-/// Wires one stream: the half the consumer holds and the half the driver pumps.
+/// Creates the consumer and driver halves of one stream bridge.
 pub(crate) fn pair(wake: Arc<Notify>) -> (BridgedStream, Plumbing) {
     let (to_task, inbound) = mpsc::channel(DEPTH);
     let (outbound, from_task) = mpsc::channel(DEPTH);
@@ -103,14 +85,10 @@ pub(crate) fn pair(wake: Arc<Notify>) -> (BridgedStream, Plumbing) {
     )
 }
 
-/// Two streams wired to each other, for driving a consumer that expects a
-/// [`BridgedStream`] without standing up the driver that normally produces one.
+/// Creates two directly connected streams for consumer tests.
 ///
-/// There is no pump between them: each side's outbound sender *is* the other's
-/// inbound receiver, so the halves carry bytes directly. That makes this a
-/// faithful stand-in for the real thing on everything the consumer can observe
-/// — chunking, backpressure at [`DEPTH`], and half-close by dropping a sender —
-/// while owning no socket and no state machine.
+/// There is no pump or socket: each outbound sender is the other inbound
+/// receiver, preserving chunking, [`DEPTH`] backpressure, and half-close.
 #[cfg(test)]
 pub(crate) fn duplex() -> (BridgedStream, BridgedStream) {
     let wake = Arc::new(Notify::new());
@@ -143,20 +121,12 @@ impl AsyncRead for BridgedStream {
             match this.inbound.poll_recv(cx) {
                 Poll::Ready(Some(chunk)) => {
                     this.pending = chunk;
-                    // **Taking a chunk frees a permit, and the driver must be
-                    // told.** A driver that filled this channel stopped reading
-                    // from its socket, which is how backpressure is applied —
-                    // but it then sleeps until its next timer, and nothing else
-                    // will wake it, because the peer has been told to stop
-                    // sending and so no packet is coming either. Without this
-                    // the connection stalls until the idle timeout: observed as
-                    // a 30-second hang under load, and invisible without it
-                    // because the channel only fills when the consumer is
-                    // slower than the wire.
+                    // Receiving frees a channel permit. Wake the driver so it
+                    // can resume reading instead of waiting for its next timer.
                     this.wake.notify_one();
                 }
-                // The driver dropped its sender: the peer sent FIN, and an
-                // empty read is how `AsyncRead` spells end of stream.
+                // Dropping the driver sender is the bridge's end-of-stream
+                // signal.
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
             }
@@ -198,17 +168,15 @@ impl AsyncWrite for BridgedStream {
         }
     }
 
-    /// Bytes are already queued for the driver; there is no buffer of our own
-    /// to force out, and waiting for the peer to acknowledge them is not what
-    /// flush means here.
+    /// Bytes are already queued for the driver; there is no local buffer to
+    /// flush or peer acknowledgement to await.
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        // Dropping the sender is the signal: the driver sees a closed channel,
-        // drains what was queued, and only then sends FIN.
+        // Closing the channel tells the driver to drain queued bytes before FIN.
         this.outbound = None;
         this.wake.notify_one();
         Poll::Ready(Ok(()))
@@ -220,9 +188,8 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The half-close law, from both ends: a shut-down write half refuses
-    /// further writes without disturbing the read half, and a dropped inbound
-    /// sender reads as end of stream rather than as an error.
+    /// A write half can close independently, and a dropped inbound sender reads
+    /// as end of stream rather than as an error.
     #[tokio::test]
     async fn each_half_closes_without_disturbing_the_other() {
         let (mut stream, mut plumbing) = pair(Arc::new(Notify::new()));
@@ -239,7 +206,7 @@ mod tests {
             "the write half stays shut"
         );
 
-        // The read half is untouched by the write half's shutdown.
+        // Write shutdown does not affect the read half.
         let sender = plumbing.to_task.take().unwrap();
         sender.send(Bytes::from_static(b"in")).await.unwrap();
         drop(sender);
@@ -248,9 +215,8 @@ mod tests {
         assert_eq!(received, b"in");
     }
 
-    /// A chunk larger than the reader's buffer must be delivered in full across
-    /// successive reads. The `pending` tail is what makes that true, and losing
-    /// it would silently truncate every response larger than one read.
+    /// A chunk larger than the reader's buffer is delivered across successive
+    /// reads; the pending tail prevents truncation.
     #[tokio::test]
     async fn a_chunk_larger_than_the_read_buffer_is_delivered_whole() {
         let (mut stream, mut plumbing) = pair(Arc::new(Notify::new()));
