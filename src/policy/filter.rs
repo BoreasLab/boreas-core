@@ -1,32 +1,21 @@
-//! The filter-list pipeline: list text in, host rules out.
+//! Filter-list compilation from text into host policy rules.
 //!
-//! This is the compiler between two very different worlds. A filter list is
-//! hundreds of thousands of lines of Adblock Plus syntax written against
-//! *URLs*, and the tier this crate can enforce without a CA installed is
-//! *names*. Most of a list is therefore not enforceable here — and the honest
-//! response to that is to say so per rule rather than to approximate.
+//! Filter lists describe URLs, while this tier can enforce only names without
+//! a CA. Rules outside that faculty are reported individually rather than
+//! approximated.
 //!
-//! Three decisions carry the design.
+//! Three decisions define the compiler.
 //!
-//! **A line classifies into a closed sum, and every arm is a real answer.**
-//! [`Rule`] has a variant for "enforceable", a variant for "nothing to
-//! enforce", and a variant for "well-formed but this tier cannot decide it",
-//! carrying [`Deferred`] to say which faculty is missing. A rule that needs a
-//! URL is not a parse error and not a silent drop; it is a counted deferral,
-//! and the count is what tells an operator how much coverage waits on MITM.
+//! **A line classifies into a closed sum.** [`Rule`] distinguishes enforceable
+//! rules, ignored lines, and well-formed rules this tier cannot decide. The
+//! [`Deferred`] value records the missing faculty and preserves its count.
 //!
-//! **Deferring is the fail-open direction, and it is chosen deliberately.**
-//! `||ads.example^$third-party` blocks a host only in third-party context, and
-//! there is no third party at the name tier — the same host is first-party to
-//! itself. Compiling it into a name rule would break the site that owns it.
-//! Not compiling it loses coverage that P14 recovers with real URLs. Losing
-//! coverage is recoverable; breaking a site the user chose to visit is not.
+//! **Deferral is fail-open.** `||ads.example^$third-party` requires request
+//! context that the name tier does not have. Compiling it as a name rule could
+//! block the site that owns the name; P14 can recover the deferred coverage.
 //!
-//! **The interpretation is narrower than Adblock Plus, never wider.** `||host`
-//! anchors at a domain boundary in ABP, which also matches `host.evil.example`;
-//! this compiler treats it as `host` and its subdomains, which does not. Every
-//! divergence goes in that direction, so a compiled list can under-block and
-//! cannot over-block.
+//! **Interpretation is narrower than Adblock Plus, never wider.** The suffix
+//! index may under-block a pattern but cannot turn it into a broader block.
 
 use std::{fmt, net::IpAddr, ops::Add};
 
@@ -35,40 +24,35 @@ use crate::{HostPolicy, HostVerdict, Name};
 /// What one line of a filter list means to the name tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
-    /// Block this name and everything under it.
+    /// Block this name and its subdomains.
     Block(Name),
-    /// Exempt this name and everything under it. Beats every block.
+    /// Allow this name and its subdomains; it overrides blocks.
     Allow(Name),
-    /// Well formed, and this tier cannot enforce it.
+    /// Well-formed, but outside this tier's capabilities.
     Deferred(Deferred),
-    /// Nothing to enforce: blank, comment, or list header.
+    /// A blank, comment, or list header.
     Ignored,
 }
 
-/// Which faculty an unenforceable rule needs. Each is a phase, not an excuse.
+/// The capability missing from an unenforceable rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Deferred {
-    /// Needs a scheme, path, or query — so it needs the URLs that only
-    /// interception produces.
+    /// Needs a scheme, path, or query from an intercepted URL.
     NeedsUrl,
-    /// Needs request context: `$third-party`, `$script`, `$image`. The same
-    /// host is first-party to itself, so a name rule cannot express it.
+    /// Needs request context such as `$third-party`, `$script`, or `$image`.
     NeedsRequestContext,
-    /// A cosmetic, scriptlet, or redirect rule. P16 owns these.
+    /// A cosmetic, scriptlet, or redirect rule owned by P16.
     Cosmetic,
-    /// A hosts-file line mapping a name to a real address rather than to a
-    /// sink. Boreas answers names by policy, not by substituting addresses.
+    /// A hosts-file mapping to a real address rather than a sink.
     HostsMapping,
-    /// A wildcard or regular-expression pattern. Matching one needs a scan
-    /// this index does not perform.
+    /// A wildcard or regular expression that requires a scan.
     Pattern,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleError {
-    /// The line names a host DNS cannot carry: too long, an empty label, or a
-    /// label holding the presentation separator. Refused rather than
-    /// normalized, so a rule and a query always agree about what a name is.
+    /// The line names a host DNS cannot represent, so it is rejected rather
+    /// than normalized.
     UnrepresentableHost,
 }
 
@@ -82,11 +66,11 @@ impl fmt::Display for RuleError {
 
 impl std::error::Error for RuleError {}
 
-/// What a list contributed, and what it did not.
+/// Counts what a list contributed and what it deferred or rejected.
 ///
-/// A commutative monoid under [`ListReport::merge`], with [`Default`] as its
-/// identity, which is what lets several lists be compiled independently and
-/// their reports summed in any order.
+/// [`ListReport::merge`] is associative and commutative, with [`Default`] as
+/// its identity, so independently compiled reports can be combined in any
+/// order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ListReport {
     pub blocked: u32,
@@ -96,10 +80,8 @@ pub struct ListReport {
     pub deferred: Deferrals,
 }
 
-/// Deferrals by missing faculty. Reported per kind because the kinds have very
-/// different futures: `NeedsUrl` and `NeedsRequestContext` are recovered by
-/// P14's interception, `Cosmetic` by P16, and `Pattern` by nothing currently
-/// planned.
+/// Deferrals grouped by the capability each rule requires. `NeedsUrl` and
+/// `NeedsRequestContext` are recovered by P14, while `Cosmetic` is owned by P16.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Deferrals {
     pub needs_url: u32,
@@ -147,8 +129,7 @@ impl Add for Deferrals {
 }
 
 impl ListReport {
-    /// The monoid operation. Associative and commutative, with `default()` as
-    /// the identity: saturating addition on each field, componentwise.
+    /// Combines reports with componentwise saturating addition.
     pub fn merge(self, other: Self) -> Self {
         Self {
             blocked: self.blocked.saturating_add(other.blocked),
@@ -159,7 +140,7 @@ impl ListReport {
         }
     }
 
-    /// Lines seen, which is every line of every list compiled into it.
+    /// Returns the number of input lines represented by this report.
     pub fn lines(self) -> u32 {
         self.blocked
             .saturating_add(self.allowed)
@@ -169,22 +150,20 @@ impl ListReport {
     }
 }
 
-/// Adblock Plus syntax this compiler names. Everything else is a deferral.
+/// Adblock Plus syntax recognized by this compiler.
 const EXCEPTION_PREFIX: &str = "@@";
 const DOMAIN_ANCHOR: &str = "||";
-/// The separator that terminates a host in an ABP pattern.
+/// ABP's host terminator.
 const SEPARATOR: char = '^';
-/// Option list introducer: `$third-party`, `$script`, and the rest.
+/// Introduces ABP options such as `$third-party` and `$script`.
 const OPTIONS: char = '$';
 
-/// Classifies one line.
+/// Classifies one filter-list line.
 ///
-/// Total on the enforceable and unenforceable cases alike; the only error is a
-/// host DNS cannot represent, which is a rejected rule rather than a
-/// misparsed one.
+/// The only error is a host that DNS cannot represent. Other unsupported but
+/// well-formed syntax becomes an explicit deferral.
 ///
-/// O(line length), allocation-free: the only owned value produced is a
-/// [`Name`], which is inline storage.
+/// Runs in line length and stores only the inline [`Name`] value it produces.
 pub fn parse_rule(line: &str) -> Result<Rule, RuleError> {
     let line = line.trim();
     if line.is_empty() || is_comment(line) {
@@ -193,8 +172,7 @@ pub fn parse_rule(line: &str) -> Result<Rule, RuleError> {
     if let Some(rest) = hosts_entry(line) {
         return rest;
     }
-    // Cosmetic and scriptlet rules all carry `#` before any host we could
-    // read, and all of them belong to the rewriting phase.
+    // Cosmetic and scriptlet markers belong to the rewriting phase.
     if line.contains("##") || line.contains("#@#") || line.contains("#?#") || line.contains("#$#") {
         return Ok(Rule::Deferred(Deferred::Cosmetic));
     }
@@ -204,13 +182,11 @@ pub fn parse_rule(line: &str) -> Result<Rule, RuleError> {
         None => (line, false),
     };
     let Some(pattern) = pattern.strip_prefix(DOMAIN_ANCHOR) else {
-        // A bare pattern is a substring match against a URL, which is exactly
-        // the faculty this tier lacks.
+        // A bare pattern needs URL matching.
         return Ok(Rule::Deferred(Deferred::NeedsUrl));
     };
 
-    // Options decide a rule by request context, so a name index cannot answer
-    // them; see the module documentation for why deferring beats guessing.
+    // Options depend on request context that a name index cannot represent.
     if pattern.contains(OPTIONS) {
         return Ok(Rule::Deferred(Deferred::NeedsRequestContext));
     }
@@ -233,9 +209,8 @@ pub fn parse_rule(line: &str) -> Result<Rule, RuleError> {
     })
 }
 
-/// `!` introduces an Adblock Plus comment and `[` a list header. `#` is a
-/// hosts-file comment, but it also introduces cosmetic rules, so it counts as
-/// a comment only when what follows cannot be one of those.
+/// Recognizes list comments and headers while leaving cosmetic markers for the
+/// rule classifier.
 fn is_comment(line: &str) -> bool {
     match line.as_bytes() {
         [b'!', ..] | [b'[', ..] => true,
@@ -245,13 +220,10 @@ fn is_comment(line: &str) -> bool {
     }
 }
 
-/// A hosts-file line: an address, then one or more names, then an optional
-/// trailing comment. `None` when the line does not start with an address, in
-/// which case it is Adblock Plus syntax.
+/// Parses a hosts-file line, returning `None` for Adblock Plus syntax.
 ///
-/// Only a sink address means "block". A line mapping a name to a real address
-/// is a genuine hosts entry, and answering it would make Boreas a host table
-/// rather than a filter; that is a deferral, not a block.
+/// Sink addresses produce blocks. Real address mappings are deferred because
+/// this compiler filters names instead of replacing their addresses.
 fn hosts_entry(line: &str) -> Option<Result<Rule, RuleError>> {
     let mut tokens = line.split_whitespace();
     let address: IpAddr = tokens.next()?.parse().ok()?;
@@ -262,8 +234,7 @@ fn hosts_entry(line: &str) -> Option<Result<Rule, RuleError>> {
     if !(address.is_unspecified() || address.is_loopback()) {
         return Some(Ok(Rule::Deferred(Deferred::HostsMapping)));
     }
-    // A hosts line may carry several names; the first is the rule and the rest
-    // are handled by `extend_from_list`, which re-enters per name.
+    // The first name is the rule; additional names are expanded by the caller.
     Some(match Name::parse(host) {
         Some(name) if !name.is_root() => Ok(Rule::Block(name)),
         _ => Err(RuleError::UnrepresentableHost),
@@ -271,21 +242,17 @@ fn hosts_entry(line: &str) -> Option<Result<Rule, RuleError>> {
 }
 
 impl HostPolicy {
-    /// Compiles `list` into this policy, reporting what it took and deferred.
+    /// Compiles `list` into this policy and reports every classification.
     ///
-    /// O(bytes of `list`), one pass, and the index grows by O(distinct
-    /// enforceable hosts). A full EasyList-scale build is a few hundred
-    /// thousand lines, so this is a sub-second operation on the target device
-    /// and belongs off the datapath either way — the result is swapped in
-    /// through the shell's `watch` channel, never edited in place.
+    /// Runs in one pass over `list`; the index grows with distinct enforceable
+    /// hosts. The result is built off the datapath and swapped through the
+    /// shell's `watch` channel.
     ///
-    /// Repeated compilation is idempotent: the index is a set, so the same
-    /// list applied twice yields the same policy.
+    /// Reapplying a list is idempotent because the index is a set.
     pub fn extend_from_list(&mut self, list: &str) -> ListReport {
         let mut report = ListReport::default();
         for line in list.lines() {
-            // A hosts line may name several hosts; each is its own rule, and
-            // splitting here keeps `parse_rule` a function of one rule.
+            // Expand sink lines here so `parse_rule` remains single-rule.
             for rule in hosts_names(line) {
                 match rule {
                     Ok(Rule::Block(name)) => {
@@ -306,10 +273,8 @@ impl HostPolicy {
     }
 }
 
-/// One line as one or more rules: a hosts line listing several names yields
-/// one rule per name, and everything else yields exactly one rule.
-///
-/// O(names on the line), allocation-free.
+/// Expands a multi-name sink line into one rule per name; other lines yield one
+/// rule. The iterator allocates nothing.
 fn hosts_names(line: &str) -> impl Iterator<Item = Result<Rule, RuleError>> {
     let mut tokens = line.split_whitespace();
     let sink = tokens
@@ -353,7 +318,7 @@ mod tests {
     fn enforceable_rules_compile_and_normalize() {
         assert_eq!(rule("||doubleclick.net^"), block("doubleclick.net"));
         assert_eq!(rule("||DoubleClick.NET^"), block("doubleclick.net"));
-        // The separator is optional in Adblock Plus; both forms name a host.
+        // The separator is optional in Adblock Plus.
         assert_eq!(rule("||ads.example.com"), block("ads.example.com"));
         assert_eq!(rule("@@||cdn.example.com^"), allow("cdn.example.com"));
         assert_eq!(rule("  ||spaced.example^  "), block("spaced.example"));
@@ -366,13 +331,13 @@ mod tests {
         assert_eq!(rule(":: tracker.example"), block("tracker.example"));
         assert_eq!(rule("::1  tracker.example"), block("tracker.example"));
 
-        // A real mapping is a hosts table entry, not a filter rule.
+        // A real mapping is a hosts entry, not a filter rule.
         assert_eq!(
             rule("93.184.215.14 example.com"),
             Ok(Rule::Deferred(Deferred::HostsMapping))
         );
 
-        // Several names on one sink line are several rules.
+        // Each name on a sink line becomes its own rule.
         let mut policy = HostPolicy::new();
         let report = policy.extend_from_list("0.0.0.0 a.example b.example c.example # why\n");
         assert_eq!(report.blocked, 3);
@@ -386,7 +351,7 @@ mod tests {
 
     #[test]
     fn unenforceable_rules_defer_by_the_faculty_they_need() {
-        // Needs a URL: a path, a scheme anchor, or a bare substring pattern.
+        // Paths, scheme anchors, and bare patterns need a URL.
         assert_eq!(
             rule("||example.com/ads/banner.gif"),
             Ok(Rule::Deferred(Deferred::NeedsUrl))
@@ -397,9 +362,7 @@ mod tests {
         );
         assert_eq!(rule("/ads/banner"), Ok(Rule::Deferred(Deferred::NeedsUrl)));
 
-        // Needs request context. This is the deferral that matters most: the
-        // same host is first-party to itself, so compiling it as a name rule
-        // would break the site that owns it.
+        // Request-context options cannot be represented by a name rule.
         assert_eq!(
             rule("||example.com^$third-party"),
             Ok(Rule::Deferred(Deferred::NeedsRequestContext))
@@ -409,7 +372,7 @@ mod tests {
             Ok(Rule::Deferred(Deferred::NeedsRequestContext))
         );
 
-        // Cosmetic and scriptlet rules belong to the rewriting phase.
+        // Cosmetic and scriptlet rules belong to P16's rewriting phase.
         for line in [
             "example.com##.ad-banner",
             "example.com#@#.ad-banner",
@@ -419,7 +382,7 @@ mod tests {
             assert_eq!(rule(line), Ok(Rule::Deferred(Deferred::Cosmetic)), "{line}");
         }
 
-        // Patterns need a scan the index does not perform.
+        // Pattern matching needs a scan the index does not perform.
         assert_eq!(
             rule("||ads.*.example^"),
             Ok(Rule::Deferred(Deferred::Pattern))
@@ -437,8 +400,7 @@ mod tests {
         ] {
             assert_eq!(rule(line), Ok(Rule::Ignored), "{line:?}");
         }
-        // A leading `#` introduces a comment only when what follows cannot be
-        // a cosmetic separator.
+        // A leading `#` is a comment only when it is not cosmetic syntax.
         assert_eq!(rule("##.ad"), Ok(Rule::Deferred(Deferred::Cosmetic)));
     }
 
@@ -452,9 +414,8 @@ mod tests {
 
     #[test]
     fn an_exception_beats_every_block_however_specific() {
-        // The Adblock Plus law, and the fail-open direction the product
-        // mandates: a rule that says "never touch this" is not overridden by a
-        // more specific rule that says "block".
+        // An exception means "never touch this" and is not overridden by a
+        // more specific block.
         let mut policy = HostPolicy::new();
         let report = policy.extend_from_list(
             "! a list\n\
@@ -487,15 +448,14 @@ mod tests {
         let left = apart.extend_from_list(first);
         let right = apart.extend_from_list(second);
 
-        // Associativity and the identity, checked on the values a real build
-        // produces rather than on invented ones.
+        // Check associativity and identity on reports from real list input.
         assert_eq!(whole, left.merge(right));
         assert_eq!(whole, right.merge(left), "merge is commutative");
         assert_eq!(whole, whole.merge(ListReport::default()));
         assert_eq!(whole.lines(), 6, "every line is accounted for exactly once");
         assert_eq!(together.len(), apart.len());
 
-        // Idempotent: a set index, so the same list twice is the same policy.
+        // The set index makes repeated compilation idempotent.
         let before = together.len();
         let _ = together.extend_from_list(&format!("{first}{second}"));
         assert_eq!(together.len(), before);
@@ -503,10 +463,7 @@ mod tests {
 
     #[test]
     fn a_compiled_list_under_blocks_rather_than_over_blocks() {
-        // The stated invariant: every divergence from Adblock Plus goes toward
-        // matching less. `||example.com` anchors at a domain boundary in ABP,
-        // which also matches `example.com.evil.example`; the suffix index does
-        // not, and that is the safe direction.
+        // Any divergence from Adblock Plus must match less, never more.
         let mut policy = HostPolicy::new();
         policy.extend_from_list("||example.com\n");
         assert_eq!(
