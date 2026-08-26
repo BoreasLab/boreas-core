@@ -1,21 +1,15 @@
-//! Recycled payload buffers.
+//! Bounded, recycled payload buffers.
 //!
-//! A datagram queued for a flow must live somewhere until the egress takes it.
-//! Owning a fresh `Vec<u8>` per queued datagram makes that cost the product
-//! `flows x queue depth x MTU`: about 120 MB at the 10,000-flow acceptance
-//! target with a depth of eight. A fixed pool of MTU-sized buffers replaces the
-//! product with a single budget. Memory is `capacity x slice_size` and never
-//! more, exhaustion is a drop rather than a wait, and a returned buffer keeps
-//! its allocation for the next datagram.
+//! Queued datagrams need storage until their egress consumes them. A pool of
+//! fixed-size buffers turns per-datagram allocation into one bounded budget:
+//! memory is at most `capacity x slice_size`, exhaustion drops immediately,
+//! and returned buffers retain their allocations.
 //!
-//! The pool owns no bytes and performs no I/O, so it belongs beside the pure
-//! core rather than inside the runtime shell. Two properties carry the design:
+//! The pool owns no I/O, so it belongs beside the pure core. Two properties
+//! define ownership:
 //!
-//! - `Pooled` is affine. It is deliberately not `Clone`, so a payload has
-//!   exactly one owner from the producer to the wire and two handles onto the
-//!   same bytes are unrepresentable rather than merely discouraged.
-//! - `Drop` is the release. There is no separate `release` call to forget, and
-//!   an expiring flow returns its whole queue by dropping it.
+//! - `Pooled` is not `Clone`, so each payload has one owner.
+//! - `Drop` releases the allocation, including when a flow expires.
 
 use std::{
     num::NonZeroUsize,
@@ -23,20 +17,18 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-/// A bounded budget of equally sized byte buffers.
+/// A bounded pool of equally sized byte buffers.
 ///
-/// Buffers are allocated lazily and recycled forever after: an idle system
-/// holds nothing, and a busy one converges on its own high-water mark.
+/// Allocation is lazy and buffers are recycled, so an idle pool holds no
+/// buffers and a busy pool stops at its high-water mark.
 pub struct BufferPool {
     slice_size: NonZeroUsize,
     capacity: NonZeroUsize,
     state: Mutex<PoolState>,
 }
 
-/// Invariant, established at construction and preserved by every method:
-/// `free.len() <= live <= capacity`. `live` counts every buffer that exists,
-/// on loan or cached, and is what bounds memory; `free` is only the recycling
-/// cache.
+/// `live` counts allocated buffers, whether on loan or cached. `free` is only
+/// the recycling cache, and `free.len() <= live <= capacity` always holds.
 struct PoolState {
     free: Vec<Vec<u8>>,
     live: usize,
@@ -44,10 +36,8 @@ struct PoolState {
 }
 
 impl BufferPool {
-    /// `slice_size` is the largest datagram the pool will carry, normally the
-    /// path MTU; `capacity` is how many such buffers may exist at once.
-    /// Both are `NonZeroUsize` because a pool of zero buffers, or of buffers
-    /// holding zero bytes, admits nothing and would only fail later.
+    /// Creates a pool for datagrams up to `slice_size`, with at most `capacity`
+    /// allocated buffers. Nonzero inputs make an unusable pool unrepresentable.
     pub fn new(slice_size: NonZeroUsize, capacity: NonZeroUsize) -> Arc<Self> {
         Arc::new(Self {
             slice_size,
@@ -60,27 +50,23 @@ impl BufferPool {
         })
     }
 
-    /// Copies `bytes` into a pooled buffer. `None` means the datagram exceeds
-    /// the slice size, or the budget is spent; both are drops, never waits.
-    ///
-    /// O(`bytes.len()`) copy, O(1) accounting; recycled buffers never
-    /// reallocate.
+    /// Copies `bytes` into a pooled buffer. `None` means the datagram is too
+    /// large or the budget is exhausted; neither case waits.
     pub fn take(self: &Arc<Self>, bytes: &[u8]) -> Option<Pooled> {
         let mut pooled = self.reserve(bytes.len())?;
         pooled.bytes.extend_from_slice(bytes);
         Some(pooled)
     }
 
-    /// Builds a zeroed pooled buffer; the datapath uses it for synthesized IP
-    /// datagrams without an extra allocation.
+    /// Builds a zeroed pooled buffer for synthesized IP datagrams.
     pub fn take_zeroed(self: &Arc<Self>, len: usize) -> Option<Pooled> {
         let mut pooled = self.reserve(len)?;
         pooled.bytes.resize(len, 0);
         Some(pooled)
     }
 
-    /// Reserves one budget unit and returns an empty buffer. Sole mutation
-    /// point for `free.len() <= live <= capacity`.
+    /// Reserves one budget unit and returns an empty buffer. This is the only
+    /// method that increases the live allocation count.
     fn reserve(self: &Arc<Self>, len: usize) -> Option<Pooled> {
         if len > self.slice_size.get() {
             return None;
@@ -94,7 +80,7 @@ impl BufferPool {
                     state.exhausted = state.exhausted.saturating_add(1);
                     return None;
                 }
-                // Reserve under lock; allocate outside it.
+                // Reserve under the lock, then allocate outside it.
                 None => {
                     state.live += 1;
                     None
@@ -108,36 +94,32 @@ impl BufferPool {
         })
     }
 
-    /// How many further `take` calls can succeed before the budget is spent.
+    /// Returns the number of additional buffers the pool can provide.
     pub fn available(&self) -> usize {
         let state = self.state();
         self.capacity.get() - state.live + state.free.len()
     }
 
-    /// Datagrams dropped because the budget was spent. The producer sees its
-    /// own `None`; this is the aggregate an operator reads.
+    /// Returns the number of datagrams dropped for budget exhaustion.
     pub fn exhausted(&self) -> u64 {
         self.state().exhausted
     }
 
-    /// The largest datagram this pool admits.
+    /// Returns the largest datagram size this pool admits.
     pub fn slice_size(&self) -> NonZeroUsize {
         self.slice_size
     }
 
-    /// Every critical section is a `Vec` push/pop plus integer arithmetic, so
-    /// none of them can unwind while the invariant is broken. A poisoned lock
-    /// therefore carries no corrupted state and recovering from it is sound —
-    /// which matters because the alternative, failing closed, would silently
-    /// drop every datagram for the rest of the process's life. That argument
-    /// is now the crate's, in [`crate::locked`], and holds at every mutex here.
+    /// Recovers a poisoned lock because each critical section changes only the
+    /// pool invariant's guarded vector and counters. The shared rationale is
+    /// in [`crate::locked`].
     fn state(&self) -> MutexGuard<'_, PoolState> {
         crate::locked(&self.state)
     }
 }
 
-/// A buffer on loan from a [`BufferPool`]. Derefs to the bytes written into
-/// it; `Drop` returns the allocation to the pool.
+/// A buffer loaned from a [`BufferPool`]. Deref exposes its written bytes and
+/// `Drop` returns its allocation.
 ///
 /// Not `Clone`: see the module documentation.
 pub struct Pooled {
@@ -153,9 +135,8 @@ impl Deref for Pooled {
     }
 }
 
-/// In-place rewriting of the bytes on loan. Sound precisely because `Pooled`
-/// is affine: one handle, one writer, so `&mut` here cannot alias another view
-/// of the same payload. `clamp_mss` is the caller this exists for.
+/// Provides unique mutable access to the loaned bytes. `Pooled` is affine, so
+/// no other handle can alias this view.
 impl DerefMut for Pooled {
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
@@ -163,17 +144,8 @@ impl DerefMut for Pooled {
 }
 
 impl Pooled {
-    /// Resizes the buffer in place, zero-filling any growth.
-    ///
-    /// For a producer that spends its budget *before* it knows how many bytes
-    /// it will write — a `smoltcp` transmit token is handed out first and told
-    /// its length second — so the reservation and the length are two steps
-    /// rather than one. Never reallocates: the buffer already carries the
-    /// pool's slice capacity, and `len` beyond it is refused rather than grown
-    /// past the budget.
-    ///
-    /// Returns whether the length was admitted. O(len) for the fill, O(1)
-    /// otherwise.
+    /// Resizes the loan in place, zero-filling growth, and rejects lengths past
+    /// the pool slice size without reallocating.
     #[must_use]
     pub fn resize(&mut self, len: usize) -> bool {
         if len > self.pool.slice_size.get() {
@@ -183,7 +155,7 @@ impl Pooled {
         true
     }
 
-    /// The largest length [`Self::resize`] will admit.
+    /// Returns the largest length [`Self::resize`] accepts.
     pub fn capacity_hint(&self) -> usize {
         self.pool.slice_size.get()
     }
@@ -211,8 +183,7 @@ impl std::fmt::Debug for Pooled {
 
 impl Drop for Pooled {
     fn drop(&mut self) {
-        // `mem::take` leaves an empty `Vec`, which owns no allocation, so the
-        // capacity travels back to the pool intact and `live` is unchanged.
+        // Move the allocation back while leaving the dropped value empty.
         let mut buffer = std::mem::take(&mut self.bytes);
         buffer.clear();
         self.pool.state().free.push(buffer);
@@ -241,10 +212,10 @@ mod tests {
             .collect();
         assert_eq!(pool.available(), 0);
 
-        // Exhaustion returns `None` rather than waiting, and is counted.
+        // Exhaustion drops immediately and is counted.
         assert!(pool.take(b"x").is_none());
         assert_eq!(pool.exhausted(), 1);
-        // A datagram larger than a slice is refused without spending budget.
+        // An oversized datagram does not spend budget.
         assert!(pool.take(b"far too large for this pool").is_none());
         assert_eq!(pool.exhausted(), 1);
 
@@ -261,8 +232,7 @@ mod tests {
         assert_eq!(&*first, b"aaaaaaaa");
         drop(first);
 
-        // Recycled, not reallocated: the shorter datagram must not inherit the
-        // previous contents past its own length.
+        // Reuse must not expose bytes beyond the new length.
         let second = pool.take(b"bb").expect("recycled");
         assert_eq!(&*second, b"bb");
         assert_eq!(second.len(), 2);
@@ -273,8 +243,7 @@ mod tests {
         let (slice_size, capacity) = sizes(1500, 10_000);
         let pool = BufferPool::new(slice_size, capacity);
         assert_eq!(pool.available(), 10_000);
-        // `live` is the allocation count; an untouched pool has allocated
-        // nothing, which is what makes a 15 MB budget free until it is used.
+        // An untouched pool has allocated nothing.
         assert_eq!(pool.state().live, 0);
 
         let held = pool.take(b"one datagram").expect("within budget");
