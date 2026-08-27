@@ -1,12 +1,7 @@
-//! The P8 gate, extended by P10's fusion. Each test names one property:
+//! P8 shell tests extended by P10's fusion.
 //!
-//! 1. the reactor carries a packet from the device out through the egress and
-//!    shuts down leaving no task behind;
-//! 2. its timer is armed against deadlines it can name — the core's, the
-//!    telemetry report, the egress tick — never a poll interval;
-//! 3. a malformed packet is an observation, not the end of the reactor;
-//! 4. a datagram producer is never blocked, and a refusal releases its buffer;
-//! 5. control messages reach the core in order.
+//! They cover packet routing and shutdown, named-deadline wakeups, malformed
+//! packet survivability, non-blocking datagram relay, and ordered controls.
 
 use std::{
     num::NonZeroUsize,
@@ -34,8 +29,7 @@ fn properties() -> PathProperties {
     }
 }
 
-/// `flow_idle_timeout` is the RFC 4787 floor, which is also the deadline the
-/// timer test reads back out of the core.
+/// Uses the RFC 4787 floor as the flow deadline tested by the timer case.
 fn datapath_on(accepts: Accepts, queue_depth: usize, pool: Arc<BufferPool>) -> Datapath {
     Datapath::new(
         FilterPolicy::PassThrough,
@@ -48,8 +42,7 @@ fn datapath_on(accepts: Accepts, queue_depth: usize, pool: Arc<BufferPool>) -> D
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
-            // Long enough to outlast a browser's cached Alt-Svc entry for
-            // an origin, which is what the DNS rewrite alone cannot reach.
+            // Covers a browser's cached Alt-Svc window.
             inspection_window: Duration::from_secs(60),
             max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
             inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
@@ -67,14 +60,11 @@ fn pool(slices: usize) -> Arc<BufferPool> {
     )
 }
 
-/// A device over two tokio channels. Both `recv` implementations await a
-/// channel, which tokio documents as cancel-safe, so this mock satisfies the
-/// obligation `AsyncDevice::recv` states.
+/// A channel-backed device with cancel-safe receives.
 struct MockDevice {
     inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     sent: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// Counts `recv` calls, which is how the timer test observes that the
-    /// reactor is not waking on a fixed interval.
+    /// Counts receives so the timer test can detect fixed-interval polling.
     reads: Arc<AtomicU64>,
 }
 
@@ -123,9 +113,7 @@ struct Wire {
     reads: Arc<AtomicU64>,
 }
 
-/// The network seam over the same channel shape. `recv` awaits a tokio
-/// channel, which is cancel-safe, so it satisfies the obligation
-/// `AsyncNetwork::recv` states.
+/// A channel-backed network with a cancel-safe receive.
 struct MockNetwork {
     inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     sent: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -185,10 +173,8 @@ fn network() -> (MockNetwork, Peer) {
     )
 }
 
-/// A packet egress with no protocol: bytes cross unchanged in both
-/// directions. It isolates the reactor's routing — device to egress to
-/// network, network to egress to core to device — from any tunnel's
-/// cryptography, which `tests/egress.rs` covers separately.
+/// A byte-preserving packet egress that isolates reactor routing from tunnel
+/// cryptography, covered separately by `tests/egress.rs`.
 struct PassThroughEgress {
     pool: Arc<BufferPool>,
 }
@@ -229,9 +215,7 @@ impl PacketEgress for PassThroughEgress {
     }
 }
 
-/// A DNS upstream that is never consulted: these sessions are configured with
-/// `DnsPolicy::Forward`, so the core emits no queries at all. It exists to
-/// name that fact rather than to answer anything.
+/// An upstream that fails if queried; these sessions use `DnsPolicy::Forward`.
 struct NoUpstream;
 
 impl DnsUpstream for NoUpstream {
@@ -276,11 +260,8 @@ fn udp_frame() -> Vec<u8> {
 
 #[tokio::test]
 async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
-    // The fused shape, end to end inside the reactor. A packet from the
-    // client's TUN must leave through the egress and appear on the network,
-    // and a datagram from the network must be decapsulated and delivered to
-    // the device. A shell that owned only a device could do neither, and the
-    // packet would come straight back at the client.
+    // Device packets reach the network, and network datagrams return to the
+    // device without looping back through the TUN.
     let (device, mut wire) = wire();
     let (net, mut peer) = network();
     let pool = pool(64);
@@ -316,16 +297,14 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
         .expect("channel open");
     assert_eq!(inbound, udp_frame());
 
-    // Shutdown drains: the reactor's `JoinHandle` completes.
+    // Shutdown waits for the reactor task.
     shell.shutdown().await.expect("clean shutdown");
 }
 
 #[tokio::test(start_paused = true)]
 async fn the_timer_is_armed_against_the_core_deadline_not_a_poll_interval() {
-    // With tokio's clock paused, time only advances when every task is idle,
-    // so the reactor's own timer is the thing being measured. An idle core has
-    // no deadline at all, and the reactor must therefore wake only for its
-    // telemetry tick — not twenty times a second for a poll interval.
+    // With Tokio's clock paused, wakeups measure the reactor's own timer. An
+    // idle core has no deadline, so only telemetry and egress ticks should run.
     let (device, wire) = wire();
     let (net, _peer) = network();
     let pool = pool(64);
@@ -343,16 +322,14 @@ async fn the_timer_is_armed_against_the_core_deadline_not_a_poll_interval() {
         },
     );
 
-    // Let the reactor reach its first wait, then run an hour of virtual time.
+    // Reach the first wait, then run an hour of virtual time.
     tokio::task::yield_now().await;
     let before = wire.reads.load(Ordering::Relaxed);
     tokio::time::advance(Duration::from_secs(3600)).await;
     let woke = wire.reads.load(Ordering::Relaxed) - before;
 
-    // Every wakeup in an idle hour is a named deadline: 7 200 telemetry
-    // reports at 500 ms and 14 400 egress ticks at 250 ms, so about 21 600.
-    // A 50 ms poll interval would be 72 000. The bound fails loudly for the
-    // latter and leaves the accounted-for wakeups ample room.
+    // Named deadlines produce about 21,600 wakeups: 7,200 telemetry reports
+    // and 14,400 egress ticks. A 50 ms poll interval would produce 72,000.
     assert!(
         woke < 30_000,
         "reactor woke {woke} times in an idle hour: it is polling, not waiting on a deadline"
@@ -381,11 +358,8 @@ async fn a_malformed_packet_is_counted_not_fatal() {
     );
     let wire = wire.inbound;
 
-    // Three packets an untrusted network sends on purpose:
-    //   - a truncated IP header, which the core cannot parse at all;
-    //   - a SYN whose MSS option claims two bytes it does not carry, which the
-    //     clamp must decline rather than read past;
-    //   - a well-formed datagram, which must still be forwarded afterwards.
+    // Exercise a truncated IP header, an MSS option that ends before its value,
+    // and a valid datagram that must still be forwarded afterwards.
     wire.send(vec![0x45]).await.unwrap();
     wire.send(truncated_mss_syn()).await.unwrap();
     wire.send(udp_frame()).await.unwrap();
@@ -399,11 +373,10 @@ async fn a_malformed_packet_is_counted_not_fatal() {
                 .expect("channel open"),
         );
     }
-    // The unparseable packet is dropped; the malformed option passes through
-    // unclamped and byte-identical, which is the whole point of declining.
+    // The invalid packet is dropped; the malformed option passes through
+    // unclamped and byte-identical.
     assert_eq!(forwarded, vec![truncated_mss_syn(), udp_frame()]);
 
-    // And the rejection was reported rather than swallowed.
     let rejected = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match shell.next_telemetry().await {
@@ -420,9 +393,7 @@ async fn a_malformed_packet_is_counted_not_fatal() {
     shell.shutdown().await.expect("clean shutdown");
 }
 
-/// An IPv4 SYN whose TCP header ends in a `kind = 2, length = 2` MSS option.
-/// The option claims a value it does not carry, which is the shape that used
-/// to index past the end of the segment.
+/// Builds an IPv4 SYN whose MSS option ends before its two-byte value.
 fn truncated_mss_syn() -> Vec<u8> {
     let mut packet = vec![0u8; 44];
     packet[0] = 0x45;
@@ -442,12 +413,8 @@ fn truncated_mss_syn() -> Vec<u8> {
     packet
 }
 
-/// **The L4 datagram path through the reactor.** On a flow-accepting egress a
-/// client datagram is not a packet to forward: it must reach the relay carrying
-/// the target the client addressed, and the reply must come back down the
-/// device as a whole IP packet from that peer. Neither half existed — the
-/// payload was queued and never drained, and there was nothing to drain it
-/// into.
+/// A flow egress carries the client's datagram target to the relay and turns a
+/// peer reply back into an IP packet for the device.
 #[tokio::test]
 async fn a_client_datagram_reaches_the_relay_and_its_reply_reaches_the_device() {
     let (device, mut wire) = wire();
@@ -492,7 +459,7 @@ async fn a_client_datagram_reaches_the_relay_and_its_reply_reaches_the_device() 
         "a terminated datagram is consumed, not forwarded"
     );
 
-    // The reply, synthesized back into an IP packet addressed to the client.
+    // The reply is synthesized into an IP packet addressed to the client.
     in_tx
         .send(Inbound {
             client: outbound.client,
@@ -540,7 +507,7 @@ async fn control_messages_reach_the_core_in_order() {
         },
     );
 
-    // Open a flow, then withdraw the layer it runs on.
+    // Open a datagram flow, then withdraw its layer.
     wire.inbound.send(udp_frame()).await.unwrap();
     let opened = tokio::time::timeout(Duration::from_secs(2), shell.next_telemetry())
         .await

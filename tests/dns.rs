@@ -1,16 +1,12 @@
-//! The P11 gate, driven through the whole shell: a client's UDP/53 query
-//! enters the device, the core intercepts it, the resolver applies host policy
-//! and ECH policy, and the answer comes back addressed from the resolver the
-//! client asked.
+//! The P11 gate: a client's UDP/53 query crosses the shell, receives host and
+//! ECH policy, and returns from the requested resolver.
 //!
-//! Two properties close the phase:
+//! The tests require that:
 //!
-//! 1. answers for A, AAAA, HTTPS, and SVCB carry provenance sufficient to
-//!    explain a verdict — which rule matched, which transport answered, and
-//!    what happened to ECH;
-//! 2. ECH is not disabled globally when host policy suffices: an inspected
-//!    host loses its ECH configuration and an allowed host, in the same
-//!    session, on the same run, keeps it.
+//! 1. A, AAAA, HTTPS, and SVCB answers carry rule, transport, and ECH
+//!    provenance.
+//! 2. ECH policy is per host: inspection strips it, while an allowed host in
+//!    the same session keeps it.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -83,7 +79,7 @@ fn reply(request: &[u8], answers: &[(&str, RecordType, Vec<u8>)]) -> Vec<u8> {
 fn https_rdata(target: &str, ech: bool) -> Vec<u8> {
     let mut out = 1u16.to_be_bytes().to_vec();
     out.extend_from_slice(&wire_name(target));
-    // The shape a real HTTPS record has today: h3 first, then h2.
+    // Match the real record shape: h3 first, then h2.
     out.extend_from_slice(&SVCPARAM_ALPN.to_be_bytes());
     out.extend_from_slice(&6u16.to_be_bytes());
     out.extend_from_slice(b"\x02h3\x02h2");
@@ -136,8 +132,7 @@ impl AsyncDevice for MockDevice {
     }
 }
 
-/// A network seam nothing arrives on: this session's traffic is DNS, which
-/// never reaches the egress.
+/// A network seam that never receives DNS traffic.
 struct SilentNetwork;
 
 impl AsyncNetwork for SilentNetwork {
@@ -190,8 +185,7 @@ impl PacketEgress for NullEgress {
     }
 }
 
-/// An upstream that answers from a script and counts every time it is asked.
-/// The count is what proves a blocked name never leaves the device.
+/// A scripted upstream whose count proves blocked names never leave the device.
 struct ScriptedUpstream {
     consulted: Arc<AtomicU64>,
 }
@@ -208,8 +202,7 @@ impl DnsUpstream for ScriptedUpstream {
         async move {
             let parsed = Message::parse(&request).expect("a well-formed query");
             let name = parsed.question().name.to_string();
-            // The owner name is the queried name, which is what an authority
-            // answers with and what makes the rewrite path realistic.
+            // Authorities echo the queried owner name.
             let answers: Vec<(&str, RecordType, Vec<u8>)> = match parsed.question().qtype {
                 RecordType::Https => vec![(
                     name.as_str(),
@@ -261,8 +254,7 @@ fn datapath(pool: Arc<BufferPool>) -> Datapath {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
-            // Long enough to outlast a browser's cached Alt-Svc entry for
-            // an origin, which is what the DNS rewrite alone cannot reach.
+            // Covers a browser's cached Alt-Svc window.
             inspection_window: Duration::from_secs(60),
             max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
             inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
@@ -280,8 +272,7 @@ fn dns_packet(message: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Unwraps one datagram the shell sent to the device back into its DNS
-/// message, checking it is addressed the way a stub resolver requires.
+/// Extracts a DNS answer and checks the address a stub resolver requires.
 fn dns_answer(packet: &[u8]) -> Vec<u8> {
     let parsed = IngressPacket::parse(packet).expect("a well-formed datagram");
     assert_eq!(
@@ -332,9 +323,8 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
         },
     );
 
-    // Three queries in one session: a blocked name, an inspected one, and an
-    // allowed one. The third is the control for the ECH property — if ECH were
-    // a session switch rather than a host rule, it would move with the second.
+    // The allowed query controls that ECH is per host rather than a session-wide
+    // switch.
     let script = [
         (0x0001u16, "ads.tracker.example", RecordType::A),
         (0x0002, "www.shop.example", RecordType::Https),
@@ -370,16 +360,13 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
     }
     answers.sort_by_key(|(id, ..)| *id);
 
-    // 1. The blocked name is refused locally, and nothing left the device for
-    //    it: three queries reached the upstream, not four.
+    // The blocked name is refused locally; only three queries reach upstream.
     assert_eq!(answers[0].0, 0x0001);
     assert_eq!(answers[0].1, Rcode::NameError);
     assert!(answers[0].2.is_empty());
     assert_eq!(consulted.load(Ordering::Relaxed), 3);
 
-    // 2. The inspected host's HTTPS answer lost its ECH parameter, and since
-    //    the upstream advertised h3, its ALPN block as well: both rewrites
-    //    follow from the one verdict.
+    // Inspection strips ECH and the upstream's h3 advertisement from HTTPS.
     let (_, rcode, records) = &answers[1];
     assert_eq!(*rcode, Rcode::NoError);
     assert_eq!(records[0].0, RecordType::Https);
@@ -395,8 +382,7 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
         .collect();
     assert!(keys.is_empty(), "only the two parameters were removed");
 
-    // 3. The allowed host, in the same session and the same run, keeps its ECH
-    //    configuration. This is the gate: policy is per host, never global.
+    // The allowed host in the same session keeps ECH.
     let (_, _, records) = &answers[2];
     assert_eq!(records[0].0, RecordType::Https);
     assert!(
@@ -404,13 +390,12 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
         "an allowed host must not pay for an inspected one"
     );
 
-    // 4. AAAA answers cross unchanged; only SVCB-shaped records are touched.
+    // AAAA answers pass unchanged; only SVCB-shaped records are rewritten.
     let (_, _, records) = &answers[3];
     assert_eq!(records[0].0, RecordType::Aaaa);
     assert_eq!(records[0].1.len(), 16);
 
-    // 5. Every verdict is explainable after the fact: the rule that matched,
-    //    the transport that answered, and what happened to ECH.
+    // Every verdict reports its rule, transport, and ECH outcome.
     let mut reports = Vec::new();
     while reports.len() < script.len() {
         match tokio::time::timeout(Duration::from_secs(5), shell.next_telemetry())
@@ -461,15 +446,14 @@ async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
     assert_eq!(aaaa.alpn, AlpnOutcome::Absent, "and nothing to steer");
 
     shell.shutdown().await.expect("clean shutdown");
-    // Every pooled buffer the queries and answers borrowed has come back.
+    // All borrowed buffers return to the pool.
     assert_eq!(pool.available(), 64);
 }
 
 #[tokio::test]
 async fn a_forwarding_session_never_intercepts() {
-    // The other half of the policy: with `DnsPolicy::Forward` the same packet
-    // is ordinary traffic. It reaches the egress and produces no query, so the
-    // upstream is never asked and no answer is synthesized.
+    // Forwarded DNS reaches egress as ordinary traffic and never queries the
+    // upstream or synthesizes an answer.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
     let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(16);
     let consulted = Arc::new(AtomicU64::new(0));
@@ -486,8 +470,7 @@ async fn a_forwarding_session_never_intercepts() {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
-            // Long enough to outlast a browser's cached Alt-Svc entry for
-            // an origin, which is what the DNS rewrite alone cannot reach.
+            // Covers a browser's cached Alt-Svc window.
             inspection_window: Duration::from_secs(60),
             max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
             inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
@@ -520,7 +503,7 @@ async fn a_forwarding_session_never_intercepts() {
         .send(dns_packet(&query(9, "ads.tracker.example", RecordType::A)))
         .await
         .unwrap();
-    // Nothing comes back down the device: the packet went outward.
+    // The packet went outward, so the device receives no answer.
     assert!(
         tokio::time::timeout(Duration::from_millis(200), sent_rx.recv())
             .await
@@ -534,9 +517,7 @@ async fn a_forwarding_session_never_intercepts() {
 
 #[tokio::test]
 async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
-    // The M2 mechanism: a compiled list replaces the whole index under a live
-    // reactor, and the next query is decided by the new one. This is the P8
-    // `watch` channel finally carrying what it was built for.
+    // A live reactor receives the compiled policy through the `watch` channel.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
     let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(16);
     let consulted = Arc::new(AtomicU64::new(0));
@@ -576,12 +557,11 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
             .rcode()
     };
 
-    // An empty policy blocks nothing, so the name resolves upstream.
+    // An empty policy forwards the name upstream.
     assert_eq!(ask(1).await, Rcode::NoError);
     assert_eq!(consulted.load(Ordering::Relaxed), 1);
 
-    // Compile a list and publish it. Adblock Plus and hosts-file syntax in one
-    // build, with an exception that must survive the more specific block.
+    // Publish both list syntaxes with an exception overriding a block.
     let mut built = HostPolicy::new();
     let report = built.extend_from_list(
         "! test list\n\
@@ -600,7 +580,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
         .send(Arc::new(built))
         .expect("the reactor is running");
 
-    // The same query is now refused, and nothing left the device for it.
+    // The new policy refuses the same query locally.
     assert_eq!(ask(2).await, Rcode::NameError);
     assert_eq!(
         consulted.load(Ordering::Relaxed),
@@ -608,7 +588,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
         "a blocked name costs no upstream query"
     );
 
-    // The exception in the same list still wins over the block above it.
+    // The exception still overrides the block.
     inbound_tx
         .send(dns_packet(&query(3, "safe.tracker.example", RecordType::A)))
         .await
@@ -623,7 +603,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
     );
     assert_eq!(consulted.load(Ordering::Relaxed), 2);
 
-    // And the swap was reported, with what the new policy holds.
+    // Reload telemetry reports the new rule counts.
     let reported = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match shell.next_telemetry().await {
@@ -649,8 +629,7 @@ async fn a_filter_list_build_takes_effect_without_restarting_the_session() {
     assert_eq!(pool.available(), 64);
 }
 
-/// A UDP datagram from the client to `destination` on `port`, which is how a
-/// browser opens a QUIC connection.
+/// Builds a client UDP datagram for `destination` and `port`.
 fn udp_to(destination: IpAddr, port: u16, payload: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 2048];
     let len = write_udp(
@@ -669,10 +648,8 @@ fn udp_to(destination: IpAddr, port: u16, payload: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cache() {
-    // The P13 gate. Steering acts at discovery, before a connection exists,
-    // so an inspected host's answer loses its HTTP/3 advertisement; the
-    // transient UDP/443 backstop covers the window in which a browser still
-    // holds a cached Alt-Svc entry and would race QUIC anyway.
+    // Steering acts at discovery; the UDP/443 backstop covers stale Alt-Svc
+    // entries that would otherwise race QUIC.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
     let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(16);
     let consulted = Arc::new(AtomicU64::new(0));
@@ -708,7 +685,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
         dns_answer(&packet)
     };
 
-    // HTTPS and SVCB both carry SvcParams, so both are steered.
+    // HTTPS and SVCB both carry the steerable SvcParams.
     for (id, qtype) in [(1u16, RecordType::Https), (2, RecordType::Svcb)] {
         inbound_tx
             .send(dns_packet(&query(id, "www.shop.example", qtype)))
@@ -738,8 +715,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
         );
     }
 
-    // An allowed host in the same session keeps its HTTP/3 advertisement:
-    // steering is per host, exactly as ECH policy is.
+    // Steering is per host, so an allowed host keeps HTTP/3.
     inbound_tx
         .send(dns_packet(&query(
             3,
@@ -756,16 +732,14 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
         "an allowed host must not pay for an inspected one"
     );
 
-    // Resolve the inspected host's address, which is what opens the backstop.
+    // Resolving the inspected host opens the backstop.
     inbound_tx
         .send(dns_packet(&query(4, "www.shop.example", RecordType::A)))
         .await
         .unwrap();
     let _ = next(4).await;
 
-    // A QUIC attempt to that address is now refused, so the browser's race
-    // resolves to TCP. TCP to the same address and port is untouched — it is
-    // the destination steering is trying to reach.
+    // QUIC to the steered address is refused; TCP to that address is untouched.
     let steered: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
     inbound_tx
         .send(udp_to(steered, HTTPS_PORT, b"\x00fake quic initial"))
@@ -778,8 +752,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
         "a steered QUIC attempt must not be answered or looped back"
     );
 
-    // A QUIC attempt to any other address crosses normally, which the egress
-    // sees rather than the device.
+    // QUIC to another address reaches egress normally.
     inbound_tx
         .send(udp_to(
             Ipv4Addr::new(198, 51, 100, 9).into(),
@@ -789,7 +762,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
         .await
         .unwrap();
 
-    // The drops are counted, which is the convergence signal.
+    // The drop count is the steering convergence signal.
     let steered_count = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match shell.next_telemetry().await {
@@ -810,8 +783,7 @@ async fn steering_removes_h3_at_discovery_and_the_backstop_covers_the_stale_cach
     assert_eq!(pool.available(), 64);
 }
 
-/// Resolver addresses are ordinary `SocketAddr`s; this only pins that the
-/// constructor is usable without a running upstream.
+/// The Do53 constructor works without a running upstream.
 #[test]
 fn a_do53_upstream_names_its_transport() {
     let upstream = boreas_core::Do53Upstream::new(

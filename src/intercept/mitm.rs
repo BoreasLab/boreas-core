@@ -1,26 +1,12 @@
-//! P14 interception: terminate the client's TLS with a forged leaf, and record
-//! the two invariants the milestone gate is written against.
+//! P14 TLS interception with a forged leaf.
 //!
-//! This is deliberately narrow, exactly as [Delivery](../docs/delivery.md)
-//! scopes P14: an **explicit, manually maintained allowlist**, and h1/h2 only.
-//! A host not on the allowlist is spliced byte-for-byte — the fail-open default
-//! [Filtering](../docs/filtering.md) mandates — and only an allowlisted host is
-//! handed to the terminating TLS server built here.
+//! P14 permits only an explicit allowlist and h1/h2. Other hosts are spliced
+//! byte-for-byte, as [Filtering](../docs/filtering.md) requires. h3 remains
+//! pass-through because a user-installed root cannot validate QUIC traffic.
 //!
-//! Two properties are load-bearing enough to be types rather than comments:
-//!
-//! - **The application protocol is chosen by ALPN, never bridged.** Boreas
-//!   terminates h1 as h1 and h2 as h2; it never translates a live exchange from
-//!   one version to another. The *origin* chooses, from the client's own offer,
-//!   and this server then advertises that one protocol — so an origin that
-//!   speaks only h1 is served rather than refused. [`VersionCrossings`] counts
-//!   any exchange whose client and upstream protocols differ, and the P14 gate
-//!   is that the count stays zero. Modelling the protocol as a closed [`Wire`]
-//!   sum keeps "which versions exist" in one place the counter, the acceptors,
-//!   and the offer all read.
-//! - **h3 is never terminated.** A locally added root cannot validate over
-//!   QUIC, so h3 is pass-through and the ALPN offer omits it. There is no h3
-//!   variant to bridge to, which is why [`Wire`] has two members and not three.
+//! ALPN chooses the wire, and the interceptor advertises only the origin's
+//! choice. [`VersionCrossings`] counts any client/upstream mismatch; the P14
+//! gate requires zero crossings. The closed [`Wire`] sum excludes h3.
 
 use std::{
     collections::HashSet,
@@ -37,10 +23,9 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 use crate::MitmResolver;
 
-/// The application protocol negotiated on a terminated connection. Closed at
-/// two: h1 and h2 are the only versions Boreas terminates, because h3 rides
-/// QUIC where a user-added root cannot validate and is therefore passed through
-/// rather than intercepted.
+/// The application protocol negotiated on a terminated connection.
+///
+/// Only h1 and h2 are terminated. h3 rides QUIC and remains pass-through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wire {
     Http1,
@@ -48,11 +33,10 @@ pub enum Wire {
 }
 
 impl Wire {
-    /// Both wires, in the order a server prefers them.
+    /// Both wires, in server preference order.
     pub const ALL: [Self; 2] = [Self::Http2, Self::Http1];
 
-    /// The ALPN identifier this wire is negotiated under. One table, so the
-    /// three functions below cannot disagree about a spelling.
+    /// The ALPN identifier for this wire.
     #[must_use]
     pub const fn identifier(self) -> &'static [u8] {
         match self {
@@ -61,16 +45,14 @@ impl Wire {
         }
     }
 
-    /// The wire an ALPN identifier names, or `None` for one Boreas does not
-    /// terminate — `h3` above all, which rides QUIC where a user-added root
-    /// cannot validate.
+    /// Returns the wire named by an ALPN identifier, or `None` for unsupported
+    /// protocols such as `h3`.
     #[must_use]
     pub fn from_identifier(name: &[u8]) -> Option<Self> {
         Self::ALL.into_iter().find(|wire| wire.identifier() == name)
     }
 
-    /// The wire a *negotiated* ALPN names, or `Http1` as the RFC 7301 default
-    /// when nothing was negotiated — which is what a bare HTTP/1.1 client does.
+    /// Returns the negotiated wire, defaulting to `Http1` when ALPN is absent.
     #[must_use]
     pub fn from_alpn(selected: Option<&[u8]>) -> Self {
         selected
@@ -79,29 +61,29 @@ impl Wire {
     }
 }
 
-/// Whether a host is intercepted or spliced. A closed sum so the caller cannot
-/// forget the fail-open branch: there is no third "maybe" state, and splice is
-/// the answer for everything not explicitly admitted.
+/// Whether a host is intercepted or spliced.
+///
+/// Splicing is the fail-open result for every host outside the allowlist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterceptDecision {
     Intercept,
     Splice,
 }
 
-/// The explicit interception allowlist. P14 keeps it exact-match and
-/// hand-maintained on purpose: automatic broadening waits for P15's demotion
-/// machinery, so until then every intercepted host is one a human named.
+/// The explicit, exact-match interception allowlist.
 ///
-/// Membership is an $O(1)$ hash probe on a `HashSet`, whose SipHash resists the
-/// collision flooding an attacker-chosen SNI could otherwise attempt.
+/// P14 keeps it human-maintained; automatic broadening belongs to P15's
+/// demotion machinery.
+///
+/// Membership is an $O(1)$ hash probe. `HashSet`'s SipHash resists collision
+/// flooding from attacker-controlled SNI values.
 #[derive(Clone, Debug, Default)]
 pub struct InterceptPolicy {
     allow: HashSet<String>,
 }
 
 impl InterceptPolicy {
-    /// Builds a policy from an explicit host list. Hosts are lower-cased so the
-    /// decision matches a `ClientHello` SNI, which is case-insensitive.
+    /// Builds an exact-match policy, lower-casing hosts for case-insensitive SNI.
     pub fn new(hosts: impl IntoIterator<Item = String>) -> Self {
         Self {
             allow: hosts
@@ -111,14 +93,10 @@ impl InterceptPolicy {
         }
     }
 
-    /// Intercept only an exactly allowlisted host; splice everything else.
+    /// Intercepts exactly allowlisted hosts and splices everything else.
     ///
-    /// **No allocation on the deciding path.** Every host reaching here came
-    /// through [`DomainName`](crate::DomainName), which lower-cases at
-    /// construction, so the borrowed name is already the key — and a
-    /// `HashSet<String>` probes on `&str` directly. The owned copy is the
-    /// fallback for a caller that has not normalized, which is a test and not
-    /// a connection.
+    /// Normalized [`DomainName`](crate::DomainName) values probe the set without
+    /// allocation. Uppercase inputs use a temporary lowercase copy.
     pub fn decide(&self, host: &str) -> InterceptDecision {
         let found = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
             self.allow.contains(&host.to_ascii_lowercase())
@@ -141,12 +119,10 @@ impl InterceptPolicy {
     }
 }
 
-/// Counts exchanges whose client-facing and upstream protocols differ.
+/// Counts exchanges whose client and upstream protocols differ.
 ///
-/// The P14 gate is that this stays zero: Boreas serves the version it received
-/// and never bridges one to another, so a non-zero count is a bug in the
-/// exchange, not a workload property. A monotone counter under relaxed ordering
-/// is enough — it is read for a gate, not to synchronize anything.
+/// The P14 gate requires zero crossings. Relaxed ordering is sufficient because
+/// this counter reports a gate result and does not synchronize other state.
 #[derive(Debug, Default)]
 pub struct VersionCrossings(AtomicU64);
 
@@ -155,8 +131,7 @@ impl VersionCrossings {
         Self(AtomicU64::new(0))
     }
 
-    /// Records one completed exchange, returning whether it crossed versions.
-    /// A crossing increments the counter; a same-version exchange does not.
+    /// Records an exchange and returns whether its wires differ.
     pub fn record(&self, client: Wire, upstream: Wire) -> bool {
         let crossed = client != upstream;
         if crossed {
@@ -165,37 +140,29 @@ impl VersionCrossings {
         crossed
     }
 
-    /// Total crossings observed. The gate asserts this is zero.
+    /// Returns the total crossings observed.
     pub fn count(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
 }
 
-/// The terminating TLS server: a rustls `ServerConfig` that presents a forged
-/// leaf for whatever SNI a client offers.
+/// A terminating TLS server that presents a forged leaf for the client's SNI.
 ///
-/// **One acceptor per wire, and the caller says which.** The version a session
-/// serves is settled by the *origin*, not by the client — see
-/// [`Offer`](crate::Offer) — so this advertises exactly the one protocol the
-/// origin agreed to, and a crossed version is unrepresentable rather than
-/// merely counted. Both configurations are built once at construction, so
-/// choosing between them costs an array index instead of a handshake's worth of
-/// setup.
+/// The origin settles the session wire, so the caller selects one acceptor and
+/// the server advertises only that protocol. Both acceptors are built once.
 ///
-/// A client that offered no ALPN at all still negotiates none: RFC 7301 forbids
-/// a server from selecting a protocol the client did not offer, which rustls
-/// implements, so the fixed configuration is safe for that client too.
+/// A client that offers no ALPN still negotiates none; RFC 7301 forbids the
+/// server from selecting a protocol the client did not offer.
 #[derive(Clone)]
 pub struct Interceptor {
     acceptors: [TlsAcceptor; Wire::ALL.len()],
 }
 
 impl Interceptor {
-    /// Builds the server from a certificate resolver. The `ring` provider is
-    /// named explicitly rather than taken from a process-global default, so
-    /// this composes without a `CryptoProvider::install_default` side effect —
-    /// and it is the one provider already in the graph for WireGuard and the
-    /// DNS upstreams, so no second crypto stack ships.
+    /// Builds both wire-specific acceptors from a certificate resolver.
+    ///
+    /// The `ring` provider is explicit, avoiding process-global installation
+    /// and reusing the provider already used by WireGuard and DNS upstreams.
     pub fn new(resolver: Arc<MitmResolver>) -> Result<Self, rustls::Error> {
         let resolver: Arc<dyn ResolvesServerCert> = resolver;
         let build = |wire: Wire| -> Result<TlsAcceptor, rustls::Error> {
@@ -211,7 +178,7 @@ impl Interceptor {
         })
     }
 
-    /// Terminates one client connection, advertising `wire` and nothing else.
+    /// Terminates one client connection, advertising only `wire`.
     pub async fn terminate<S>(&self, stream: S, wire: Wire) -> io::Result<TlsStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -220,10 +187,7 @@ impl Interceptor {
             .iter()
             .position(|candidate| *candidate == wire)
             .expect("Wire::ALL is every wire");
-        // A client that opens a connection and then handshakes slowly, or not
-        // at all, otherwise holds a task and a forged leaf for as long as it
-        // likes. The peek before this bounded the client's *first* bytes; this
-        // bounds the rest of what it says.
+        // Bound the handshake after the initial client-byte peek.
         crate::within(
             crate::Wait::ClientHandshake,
             self.acceptors[index].accept(stream),
@@ -250,7 +214,7 @@ mod tests {
         let policy = InterceptPolicy::new(["Example.com".to_owned()]);
         assert_eq!(policy.decide("example.com"), InterceptDecision::Intercept);
         assert_eq!(policy.decide("EXAMPLE.COM"), InterceptDecision::Intercept);
-        // Fail open: anything not named is spliced, never intercepted.
+        // Anything not named is spliced, never intercepted.
         assert_eq!(policy.decide("evil.example"), InterceptDecision::Splice);
         assert_eq!(policy.decide("example.com.evil"), InterceptDecision::Splice);
     }
@@ -261,16 +225,13 @@ mod tests {
         assert!(!crossings.record(Wire::Http2, Wire::Http2));
         assert!(!crossings.record(Wire::Http1, Wire::Http1));
         assert_eq!(crossings.count(), 0, "the gate: same-version stays zero");
-        // A bridged exchange — which the design never produces — would show up.
+        // A bridged exchange would increment the gate counter.
         assert!(crossings.record(Wire::Http1, Wire::Http2));
         assert_eq!(crossings.count(), 1);
     }
 
-    /// The in-process P14 gate: a client that trusts the Boreas root completes a
-    /// TLS handshake to an arbitrary host through the interceptor, validates the
-    /// forged leaf for that exact name, negotiates h2, and exchanges plaintext
-    /// the server decrypts. This is the whole CA-to-resolver-to-server chain,
-    /// proven without a device.
+    /// Verifies root trust, forged-leaf validation for SNI, h2 negotiation, and
+    /// plaintext exchange through the interceptor.
     #[tokio::test]
     async fn a_trusting_client_validates_the_forged_leaf_and_exchanges_bytes() {
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
@@ -281,8 +242,7 @@ mod tests {
         ));
         let interceptor = Interceptor::new(resolver).unwrap();
 
-        // A client that trusts the root and asks for a host it has never seen a
-        // real certificate for.
+        // The client trusts the Boreas root for an otherwise unknown host.
         let mut roots = RootCertStore::empty();
         roots.add(root_der).unwrap();
         let mut client_config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
@@ -319,8 +279,7 @@ mod tests {
             .connect(server_name, client_io)
             .await
             .expect("client handshake validates the forged leaf against the root");
-        // The forged leaf validated for the requested SNI, or `connect` above
-        // would have failed. Now application bytes cross end to end.
+        // Successful connect proves the forged leaf matches the requested SNI.
         tls.write_all(b"hello").await.unwrap();
         tls.flush().await.unwrap();
         let mut buf = [0u8; 5];

@@ -1,11 +1,7 @@
 //! The C entry points, driven exactly as a host drives them.
 //!
-//! **The `rlib` crate type exists for this.** A `cdylib` alone would leave
-//! every one of these functions reachable only from a language this repository
-//! does not build, and the whole point of the boundary is that its failure
-//! modes — a null pointer, a caught panic, a short buffer, a context freed
-//! while a callback is inside it — are the ones nobody notices until a device
-//! is in the loop.
+//! The `rlib` target lets these entry points run in-process, where null
+//! pointers, caught panics, short buffers, and callback lifetimes are testable.
 
 use std::{
     ffi::{CString, c_char, c_void},
@@ -34,7 +30,6 @@ struct Host {
     protected: AtomicUsize,
     released: AtomicUsize,
     sent: AtomicUsize,
-    /// How many times `recv` answered "nothing yet".
     polled: AtomicUsize,
 }
 
@@ -58,11 +53,8 @@ unsafe extern "C" fn recv(context: *mut c_void, _buf: *mut u8, _cap: usize) -> i
     if host.closed.load(Ordering::Relaxed) {
         return -5; // EIO: the interface went away
     }
-    // **A bounded wait, then "nothing yet".** This is the shape the ABI exists
-    // to allow: a host that must not sit in a callback indefinitely waits a
-    // little and returns zero, and Boreas asks again. A .NET host has to work
-    // this way, because a callback blocked in cooperative mode stalls every
-    // managed thread's collection.
+    // Return zero after a bounded wait so Boreas retries without blocking a
+    // cooperative host indefinitely.
     std::thread::sleep(std::time::Duration::from_millis(5));
     host.polled.fetch_add(1, Ordering::Relaxed);
     0
@@ -86,8 +78,7 @@ unsafe extern "C" fn protect(context: *mut c_void, _socket: i64) -> i32 {
     0
 }
 
-/// Ends any blocked read, exactly as `close(fd)` does to a real TUN. Called
-/// while `recv` may be sitting in its loop, which is the whole contract.
+/// Ends a blocked read, matching `close(fd)` for a real TUN.
 ///
 /// # Safety
 ///
@@ -105,8 +96,7 @@ unsafe extern "C" fn release(context: *mut c_void) {
     host.released.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Two vtables over one `Host`, each holding its own leaked reference so each
-/// `release` reclaims exactly one.
+/// Builds two vtables, each owning one leaked reference to the host.
 fn vtables(host: &Arc<Host>) -> (BoreasDevice, BoreasBypass) {
     let device = BoreasDevice {
         context: Arc::into_raw(Arc::clone(host)).cast::<c_void>().cast_mut(),
@@ -124,8 +114,7 @@ fn vtables(host: &Arc<Host>) -> (BoreasDevice, BoreasBypass) {
     (device, bypass)
 }
 
-/// A configuration that starts: filtering needs a resolver it can answer from,
-/// which is what `ConfigError::NothingToFilter` exists to say.
+/// A configuration that starts successfully with a resolver and one filter list.
 fn config(lists: &[*const c_char], resolver: *const c_char) -> BoreasConfig {
     BoreasConfig {
         egress: BoreasEgress::Direct,
@@ -146,15 +135,8 @@ fn config(lists: &[*const c_char], resolver: *const c_char) -> BoreasConfig {
     }
 }
 
-/// Waits for something a spawned task will do, rather than assuming it already
-/// has.
-///
-/// **A count a background thread produces cannot be asserted on immediately.**
-/// The device's `recv` sleeps before it answers, so on a loaded machine the
-/// whole start-reload-stop sequence below finishes inside one call and the
-/// count is legitimately still zero. Waiting for the observable is what makes
-/// that an assertion instead of a race; the bound is generous because only a
-/// genuine failure should ever reach it.
+/// Waits for a spawned task's observable effect instead of assuming scheduling
+/// order.
 fn eventually(ready: impl Fn() -> bool) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
@@ -179,9 +161,7 @@ fn empty_event() -> BoreasEvent {
     }
 }
 
-/// **The whole lifecycle, through the ABI a host actually calls.** Start,
-/// reload, stop — and the two host contexts released exactly once each, which
-/// is the property that separates a shim from a leak.
+/// Verifies start, reload, shutdown, and exactly-once context release.
 #[test]
 fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
     let host = Host::new();
@@ -202,7 +182,7 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
     assert_eq!(status, Status::Ok, "the tunnel must start");
     assert!(!handle.is_null());
 
-    // A reload answers with what is now in force, without restarting anything.
+    // Reload reports the active rules without restarting the tunnel.
     let replacement = CString::new("||tracker.example^\n||other.example^").unwrap();
     let replacements = [replacement.as_ptr()];
     let mut event = empty_event();
@@ -218,21 +198,16 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
     assert_eq!(event.kind, BoreasEventKind::Reloaded);
     assert_eq!(event.blocked_rules, 2, "both rules are in force");
 
-    // Before tearing anything down, because `close` ends the read loop: a
-    // count still zero after shutdown stays zero, and the wait would never
-    // finish.
+    // Ensure the read loop ran before shutdown, which ends it through `close`.
     assert!(
         eventually(|| host.polled.load(Ordering::Relaxed) > 0),
         "a zero-length read must be asked again rather than forwarded as a packet"
     );
 
-    // **No closing from the test.** A real host stops the tunnel first and
-    // tears its interface down afterwards, which is exactly the ordering that
-    // deadlocks if `release` is the only signal: the read waits for the host
-    // and the host waits for `release`. `free` calls `close` for it.
+    // `free` calls `close`; a real host must stop the tunnel before tearing down
+    // its interface or the blocked read and release callback can wait on each other.
     assert_eq!(unsafe { boreas_tunnel_shutdown(handle) }, Status::Ok);
-    // Idempotent: a teardown path that must remember whether it already ran
-    // is a teardown path with a race in it.
+    // Shutdown is idempotent.
     assert_eq!(unsafe { boreas_tunnel_shutdown(handle) }, Status::Ok);
     assert_eq!(unsafe { boreas_tunnel_free(handle) }, Status::Ok);
 
@@ -248,12 +223,7 @@ fn a_tunnel_starts_reloads_and_stops_through_the_c_abi() {
     );
 }
 
-/// **The guarantee `obligations.md` is built on.** A reader parked in
-/// `next_event` must not delay anything else, because a healthy idle tunnel
-/// emits nothing and that reader can be parked for hours. If the handle reached
-/// the tunnel directly the two calls would alias a `&mut`, and the honest
-/// contract would be "one call at a time" — which is no contract at all when
-/// the one permitted caller never returns.
+/// A parked `next_event` reader must not block reload or shutdown.
 #[test]
 fn a_blocked_reader_delays_nothing_else() {
     let host = Host::new();
@@ -275,14 +245,11 @@ fn a_blocked_reader_delays_nothing_else() {
         Status::Ok
     );
 
-    // A reader on a thread of its own, exactly as a host runs one. It parks:
-    // nothing has gone wrong, so nothing is reported.
     let parked = Sendable(handle);
     let reader = std::thread::spawn(move || {
         let handle = parked;
         let mut event = empty_event();
-        // A real loop, because a reload publishes a `Reloaded` on the stream as
-        // well as returning one — so a reader legitimately wakes mid-test.
+        // Reload publishes an event on this stream as well as returning one.
         loop {
             let status = unsafe {
                 boreas_tunnel_next_event(
@@ -299,10 +266,9 @@ fn a_blocked_reader_delays_nothing_else() {
             }
         }
     });
-    // Long enough that the reader is certainly inside the call.
+    // Let the reader enter the blocking call.
     std::thread::sleep(std::time::Duration::from_millis(150));
 
-    // Every other entry point, while it is parked there.
     let replacement = CString::new("||tracker.example^\n||other.example^").unwrap();
     let replacements = [replacement.as_ptr()];
     let mut event = empty_event();
@@ -337,8 +303,7 @@ fn a_blocked_reader_delays_nothing_else() {
     );
     assert_eq!(certificate_len, 0, "this tunnel does not intercept");
 
-    // And shutdown is what releases the reader, which is how a host ends the
-    // loop without a second signalling mechanism of its own.
+    // Shutdown closes the device read and releases the parked reader.
     assert_eq!(unsafe { boreas_tunnel_shutdown(handle) }, Status::Ok);
     assert_eq!(
         reader.join().expect("the reader thread must not panic"),
@@ -349,14 +314,12 @@ fn a_blocked_reader_delays_nothing_else() {
     assert_eq!(host.released.load(Ordering::Relaxed), 2);
 }
 
-/// A handle is `Send` to a host in any other language; Rust needs telling.
 struct Sendable(*mut BoreasTunnel);
 // SAFETY: the ABI's contract is that every entry point but `free` is callable
 // from any thread concurrently, which is exactly what this test exercises.
 unsafe impl Send for Sendable {}
 
-/// A null argument is a caller's bug, and it must be told rather than
-/// dereferenced.
+/// Every entry point rejects required null arguments.
 #[test]
 fn every_entry_point_refuses_a_null_argument() {
     let mut handle: *mut BoreasTunnel = ptr::null_mut();
@@ -435,21 +398,17 @@ fn every_entry_point_refuses_a_null_argument() {
         },
         Status::NullArgument
     );
-    // Freeing null is the one exception: a host that unconditionally frees an
-    // initialised pointer is doing the right thing, not a wrong one.
+    // Freeing null is the idempotent exception.
     assert_eq!(unsafe { boreas_tunnel_free(ptr::null_mut()) }, Status::Ok);
 }
 
-/// A configuration that cannot be a tunnel is refused before anything is
-/// built, and the host's contexts are still released — a failure that leaked
-/// them would be a failure the host could not retry from.
+/// A refused configuration releases callback contexts before returning.
 #[test]
 fn a_refused_configuration_still_releases_what_it_was_handed() {
     let host = Host::new();
     let (device, bypass) = vtables(&host);
-    // Filtering with no resolver: on a packet egress a flow is selected for
-    // inspection because a DNS answer named its address, so a tunnel that
-    // never sees a question can filter nothing.
+    // Filtering requires a resolver; without one, parsed lists cannot inspect
+    // flows selected by DNS answers.
     let list = CString::new("||ads.example^").unwrap();
     let lists = [list.as_ptr()];
 
@@ -466,8 +425,7 @@ fn a_refused_configuration_still_releases_what_it_was_handed() {
     assert_eq!(Arc::strong_count(&host), 1);
 }
 
-/// An MTU below the IPv6 minimum is configuration, not a runtime failure, and
-/// is caught before a runtime is even built.
+/// Rejects an MTU below IPv6's minimum before building the runtime.
 #[test]
 fn a_link_narrower_than_ipv6_permits_is_refused() {
     let host = Host::new();
