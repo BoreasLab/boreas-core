@@ -1,9 +1,8 @@
-//! P16 HTML body rewriting with bounded, fail-open streaming.
+//! P16 HTML rewriting with bounded, fail-open streaming.
 //!
-//! Headers produce [`Rewritable`] before decoding or parsing begins. Limits
-//! apply to held parser state, graceful bail-outs flush held bytes, and
-//! ambiguous markup ends visibly. Injected styles use one CSP hash; elements
-//! with `integrity=` remain untouched.
+//! [`Rewritable`] is decided from headers before decoding. Limits cover held
+//! parser state, graceful bail-outs flush it, and ambiguous markup ends
+//! visibly. Injected styles use one CSP hash; `integrity=` elements stay put.
 
 use std::{
     collections::BTreeSet,
@@ -41,16 +40,16 @@ const CSP: &str = "content-security-policy";
 // Rewritability
 // ---------------------------------------------------------------------------
 
-/// Reason a response body is forwarded unchanged.
+/// Why a response body is forwarded unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotRewritable {
-    /// The status has no complete body.
+    /// The status has no complete response body.
     NoWholeBody,
-    /// The media type is not `text/html`.
+    /// The media type is not HTML.
     NotHtml,
     /// The content coding is unsupported or stacked.
     ContentCoded,
-    /// The declared charset is unsupported by the rewriter.
+    /// The declared charset is unsupported.
     UnsupportedCharset,
 }
 
@@ -65,23 +64,23 @@ impl fmt::Display for NotRewritable {
     }
 }
 
-/// Content codings supported by this build.
+/// Content codings this build can decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coding {
     /// No coding or `identity`.
     Identity,
-    /// RFC 1952 gzip coding.
+    /// RFC 1952 gzip.
     Gzip,
     /// RFC 1950 zlib, named `deflate` on the wire.
     Deflate,
-    /// RFC 7932 Brotli coding.
+    /// RFC 7932 Brotli.
     Brotli,
-    /// RFC 8878 Zstandard coding.
+    /// RFC 8878 Zstandard.
     Zstd,
 }
 
 impl Coding {
-    /// Parses one `Content-Encoding` token into a supported coding.
+    /// Parses one `Content-Encoding` token.
     fn from_token(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "" | "identity" => Some(Self::Identity),
@@ -94,7 +93,7 @@ impl Coding {
     }
 }
 
-/// Validated permission to rewrite a response body and decode its coding.
+/// Validated permission to rewrite and decode a response body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rewritable {
     encoding: AsciiCompatibleEncoding,
@@ -102,7 +101,7 @@ pub struct Rewritable {
 }
 
 impl Rewritable {
-    /// Returns the body's content coding.
+    /// Returns the content coding.
     #[must_use]
     pub fn coding(self) -> Coding {
         self.coding
@@ -119,7 +118,7 @@ pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable,
     {
         return Err(NotRewritable::NoWholeBody);
     }
-    // Only one non-identity coding is decoded; stacked codings pass through.
+    // Stacked non-identity codings pass through because only one is decoded.
     let mut coding = Coding::Identity;
     for token in headers
         .get_all(CONTENT_ENCODING)
@@ -131,7 +130,7 @@ pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable,
             (_, None) => return Err(NotRewritable::ContentCoded),
             (_, Some(Coding::Identity)) => {}
             (Coding::Identity, Some(named)) => coding = named,
-            // A second non-identity coding cannot be decoded here.
+            // This decoder handles only one non-identity coding.
             (_, Some(_)) => return Err(NotRewritable::ContentCoded),
         }
     }
@@ -145,7 +144,7 @@ pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable,
         return Err(NotRewritable::NotHtml);
     }
     let encoding = match charset {
-        // Match browser handling of a document-declared charset.
+        // Match browser handling of a declared charset.
         None => AsciiCompatibleEncoding::utf_8(),
         Some(label) => encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
             .and_then(AsciiCompatibleEncoding::new)
@@ -174,9 +173,9 @@ fn media_type(value: &str) -> (&str, Option<&str>) {
 /// CSP result for one inline stylesheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlineStyle {
-    /// The policy already permits the stylesheet.
+    /// The policy already permits it.
     Granted,
-    /// The policy gains the stylesheet's hash.
+    /// The policy gains its hash.
     Widened(String),
     /// The policy forbids inline styles; no stylesheet is injected.
     Refused,
@@ -242,7 +241,7 @@ pub fn permit_inline_style(policy: &str, source: &str) -> InlineStyle {
     InlineStyle::Widened(widened.join("; "))
 }
 
-/// Finds the directive named `name`, comparing only its name token.
+/// Finds `name`, comparing only each directive's name token.
 fn position(directives: &[&str], name: &str) -> Option<usize> {
     directives.iter().position(|directive| {
         directive
@@ -357,7 +356,7 @@ pub struct StreamBudget {
     parsing_buffer_bytes: usize,
 }
 
-/// Reason a rewriting budget is invalid.
+/// Why a rewriting budget is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BudgetError {
     /// The memory ceiling is zero.
@@ -381,7 +380,7 @@ impl fmt::Display for BudgetError {
 impl std::error::Error for BudgetError {}
 
 impl StreamBudget {
-    /// Constructs a budget after checking its buffer fits the ceiling.
+    /// Constructs a budget after checking that its buffer fits the ceiling.
     pub fn new(max_memory_bytes: usize, parsing_buffer_bytes: usize) -> Result<Self, BudgetError> {
         match (max_memory_bytes, parsing_buffer_bytes) {
             (0, _) => Err(BudgetError::NoCeiling),
@@ -439,8 +438,8 @@ mod budget_tests {
 
 /// Count of rewrites abandoned on one connection.
 ///
-/// The session reads the counter after the exchange, so body polling cannot
-/// re-enter session state.
+/// The session reads this after the exchange, so body polling cannot re-enter
+/// session state.
 #[derive(Debug, Default)]
 pub struct RewriteFailures(AtomicU64);
 
@@ -454,8 +453,8 @@ impl RewriteFailures {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Number of rewrites that gave up. Relaxed ordering is sufficient because
-    /// this value informs a later demotion decision.
+    /// Number of rewrites that gave up. Relaxed ordering suffices because this
+    /// value only informs a later demotion decision.
     #[must_use]
     pub fn count(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
@@ -470,10 +469,10 @@ impl RewriteFailures {
 // Content-coding decode
 // ---------------------------------------------------------------------------
 
-/// Bounded Brotli output staging buffer.
+/// Maximum Brotli output staging buffer.
 const BROTLI_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Largest zstd block with block and frame headers, per RFC 8878.
+/// Largest zstd block with headers, per RFC 8878.
 const ZSTD_STAGING_BYTES: usize = 128 * 1024 + 3 + 18;
 
 /// Largest zstd window accepted before decoder allocation.
@@ -482,7 +481,7 @@ const ZSTD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 /// Maximum decoded output for one input chunk.
 const MAX_DECODED_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Whether `ruzstd` reported an incomplete frame rather than invalid bytes.
+/// Returns whether `ruzstd` reported incomplete input.
 fn incomplete(error: &ruzstd::decoding::errors::FrameDecoderError) -> bool {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = cause {
@@ -494,7 +493,7 @@ fn incomplete(error: &ruzstd::decoding::errors::FrameDecoderError) -> bool {
     false
 }
 
-/// Push adapter over `ruzstd`'s pull decoder.
+/// Push adapter for `ruzstd`'s pull decoder.
 struct Zstd {
     frame: ruzstd::decoding::FrameDecoder,
     /// Compressed bytes waiting for a complete block.
@@ -519,7 +518,7 @@ impl Zstd {
     fn drain(&mut self, source: &[u8]) -> Result<usize, Undecodable> {
         let mut used = 0;
         while used < source.len() {
-            // Limit each call to the staging bound.
+            // Bound each decoder call.
             let end = source.len().min(used + ZSTD_STAGING_BYTES);
             let (read, _) = match self.frame.decode_from_to(&source[used..end], &mut []) {
                 Ok(progress) => progress,
@@ -534,13 +533,13 @@ impl Zstd {
             if self.plain.len() > MAX_DECODED_CHUNK_BYTES {
                 return Err(Undecodable);
             }
-            // The checksum can be reported before all four bytes arrive.
+            // The checksum can precede its final four bytes.
             if read == 0 || read > end - used {
                 break;
             }
             used += read;
         }
-        // Reject a second concatenated frame instead of truncating it.
+        // Reject a second frame instead of truncating it.
         if self.started && self.frame.is_finished() && used < source.len() {
             return Err(Undecodable);
         }
@@ -549,7 +548,7 @@ impl Zstd {
 
     fn push(&mut self, chunk: &[u8]) -> Result<(), Undecodable> {
         if self.pending.is_empty() {
-            // Decode complete blocks and retain only the remainder.
+            // Retain only the incomplete remainder.
             let used = self.drain(chunk)?;
             self.pending.extend_from_slice(&chunk[used..]);
         } else {
@@ -563,7 +562,7 @@ impl Zstd {
     }
 }
 
-/// Push-driven decoder for one response body.
+/// Push decoder for one response body.
 enum Decoder {
     Identity,
     Gzip(Box<flate2::write::GzDecoder<Vec<u8>>>),
@@ -598,7 +597,7 @@ impl Decoder {
         }
     }
 
-    /// Decodes a chunk and borrows plaintext from the staging buffer.
+    /// Decodes a chunk and borrows plaintext from staging.
     fn decode<'a>(&'a mut self, chunk: &'a [u8]) -> Result<&'a [u8], Undecodable> {
         use std::io::Write;
         let plain: &[u8] = match self {
@@ -689,7 +688,7 @@ impl fmt::Display for Truncated {
 
 impl std::error::Error for Truncated {}
 
-/// Body stages. A failed rewriter is replaced and cannot be reused.
+/// Body stages. A failed rewriter cannot be reused.
 enum Stage {
     Rewriting(Box<HtmlRewriter<'static, Sink>>),
     /// Forward remaining bytes after a clean bail-out.
@@ -697,12 +696,12 @@ enum Stage {
     Ended,
 }
 
-/// Response body with the HTML tier applied.
-/// The mutex supplies [`ProxyBody`]'s `Sync` bound; access is through `&mut self`.
+/// Response body with HTML rewriting applied.
+/// The mutex supplies [`ProxyBody`]'s `Sync` bound; access remains mutable.
 pub struct RewritingBody<B> {
     inner: B,
     stage: Mutex<Stage>,
-    /// Decoding must precede rewriting because compressed bytes contain no HTML.
+    /// Decoding precedes rewriting because compressed bytes contain no HTML.
     decoder: Decoder,
     sink: Arc<Mutex<Vec<u8>>>,
     failures: Arc<RewriteFailures>,
@@ -718,7 +717,7 @@ impl<B> RewritingBody<B> {
         (!sink.is_empty()).then(|| Bytes::from(std::mem::take(&mut *sink)))
     }
 
-    /// Decodes and rewrites one chunk, falling back to forwarding after a clean bail-out.
+    /// Decodes and rewrites one chunk, or forwards after a clean bail-out.
     fn feed(&mut self, data: &[u8]) -> Result<(), Truncated> {
         let Self {
             stage,
@@ -735,7 +734,7 @@ impl<B> RewritingBody<B> {
         let decoded = match decoder.decode(data) {
             Ok(decoded) => decoded,
             Err(_) => {
-                // An undecodable remainder ends the body visibly.
+                // Undecodable input ends the body visibly.
                 failures.record();
                 *stage = Stage::Ended;
                 return Err(Truncated);
@@ -765,7 +764,7 @@ impl<B> RewritingBody<B> {
         outcome
     }
 
-    /// Finishes the decoder and rewriter after the inner body is exhausted.
+    /// Finishes decoding and rewriting after the inner body is exhausted.
     fn finish(&mut self) -> Result<(), Truncated> {
         let Self {
             stage,
@@ -776,7 +775,7 @@ impl<B> RewritingBody<B> {
         } = self;
         let stage = stage.get_mut().unwrap_or_else(|poison| poison.into_inner());
 
-        // Feed decoded tail bytes before ending the rewriter.
+        // Feed decoder tail bytes before ending the rewriter.
         let tail = match decoder.finish() {
             Ok(tail) => tail,
             Err(_) => {
@@ -829,7 +828,7 @@ impl<B> RewritingBody<B> {
     }
 }
 
-/// Whether `lol_html` flushed held bytes before giving up.
+/// Returns whether `lol_html` flushed held bytes before giving up.
 fn recoverable(error: &RewritingError) -> bool {
     matches!(
         error,
@@ -883,7 +882,7 @@ where
 // The seam the exchange uses
 // ---------------------------------------------------------------------------
 
-/// HTML rewriting tier and its per-stream budget.
+/// HTML rewriting tier with a per-stream budget.
 #[derive(Clone)]
 pub enum Rewriting {
     /// Forward bodies untouched.
@@ -919,7 +918,7 @@ impl Rewriting {
             .map(|rules| (rules, *budget, Arc::clone(failures)))
     }
 
-    /// Applies the tier to one response and updates matching headers.
+    /// Applies the tier to one response and updates its headers.
     pub fn apply<B>(&self, host: &str, response: Response<B>) -> Response<ProxyBody>
     where
         B: Body<Data = Bytes> + Unpin + Send + Sync + 'static,
@@ -937,8 +936,8 @@ impl Rewriting {
         let inject = relax_policy(&mut parts.headers, &rules.source);
         let decoder = Decoder::new(rewritable.coding);
         if !decoder.is_identity() {
-            // The output is decoded, so stale coding and length headers are
-            // invalid. Recompression is unnecessary on the terminated leg.
+            // Decoding invalidates coding and length headers; recompression is
+            // unnecessary on the terminated leg.
             parts.headers.remove(CONTENT_ENCODING);
             parts.headers.remove(http::header::CONTENT_LENGTH);
         }
@@ -963,7 +962,7 @@ where
     body.map_err(Into::into).boxed()
 }
 
-/// Rebuilds response CSP policies and reports whether injection remains allowed.
+/// Rebuilds CSP policies and reports whether injection remains allowed.
 /// Policies intersect, so one refusal suppresses injection.
 fn relax_policy(headers: &mut HeaderMap, source: &str) -> bool {
     let policies: Vec<String> = headers
@@ -988,7 +987,7 @@ fn relax_policy(headers: &mut HeaderMap, source: &str) -> bool {
             }
         }
     }
-    // An invalid rebuilt value suppresses injection but still permits removal.
+    // An invalid rebuilt value suppresses injection but permits removal.
     let rebuilt: Option<Vec<HeaderValue>> = widened
         .iter()
         .map(|value| HeaderValue::from_str(value).ok())
@@ -1026,7 +1025,7 @@ fn build(
                 .with_graceful_bail_out_on_memory_limit_exceeded(true),
         )
         .append_element_content_handler((
-            // Clone parsed components because the body outlives this call.
+            // The body outlives this call, so parsed components must be owned.
             std::borrow::Cow::Owned(rules.selector.clone()),
             lol_html::send::ElementContentHandlers::default().element(hide),
         ));
@@ -1137,7 +1136,7 @@ mod tests {
         );
     }
 
-    /// Unsupported character encodings are refused instead of guessed.
+    /// Unsupported character encodings are refused, never guessed.
     #[test]
     fn unsupported_character_encodings_are_refused() {
         for charset in [
@@ -1321,7 +1320,7 @@ mod streaming {
     const HOST: &str = "example.com";
     const HTML: &[(&str, &str)] = &[("content-type", "text/html; charset=utf-8")];
 
-    /// Body fixture that yields one supplied chunk per poll.
+    /// Body fixture yielding one supplied chunk per poll.
     struct Chunks(VecDeque<Bytes>);
 
     impl Chunks {
@@ -1445,7 +1444,7 @@ mod streaming {
         assert!(!body.contains("/b.js"), "an unsigned one was not removed");
     }
 
-    /// The CSP hash identifies the injected stylesheet exactly.
+    /// The CSP hash identifies the injected stylesheet.
     #[tokio::test]
     async fn the_injected_stylesheet_is_named_by_the_policy_it_widened() {
         let (rewriting, rules, _) = tier(&[".ad"], StreamBudget::default());
@@ -1501,7 +1500,7 @@ mod streaming {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
         let document = "<html><body><div class=\"ad\">present</div></body></html>";
         for fields in [
-            // Unsupported content coding.
+            // Unsupported coding.
             &[
                 ("content-type", "text/html"),
                 ("content-encoding", "compress"),
@@ -1544,7 +1543,7 @@ mod streaming {
         assert_eq!(failures.count(), 1, "the failure must be counted, once");
     }
 
-    /// Ambiguous markup produces a visible truncation instead of unsafe edits.
+    /// Ambiguous markup produces visible truncation instead of unsafe edits.
     #[tokio::test]
     async fn ambiguous_markup_ends_the_body_visibly_rather_than_silently_short() {
         let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());
@@ -1659,7 +1658,7 @@ mod streaming {
         }
     }
 
-    /// A truncated compressed stream reports an error instead of shortening silently.
+    /// A truncated compressed stream reports an error instead of shortening.
     #[tokio::test]
     async fn a_truncated_compressed_body_ends_visibly() {
         let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());

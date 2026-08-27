@@ -1,9 +1,7 @@
 //! Pure DNS parsing, policy, provenance, and ECH/ALPN response rewriting.
-//!
-//! DNS is the first enforcement tier and reaches applications that reject the
-//! Boreas CA. Names use fixed storage, compression pointers move strictly
-//! backwards, verdict provenance travels with each answer, and ECH policy is
-//! per host rather than a session-wide switch. Upstream I/O lives in the shell.
+//! Names use fixed storage, pointers move strictly backwards, verdict
+//! provenance travels with answers, and ECH policy is per host. Upstream I/O
+//! lives in the shell.
 
 use std::{
     collections::HashSet,
@@ -39,11 +37,11 @@ pub enum DnsError {
     ForwardPointer,
     /// The decoded name exceeds the RFC 1035 limit.
     NameTooLong,
-    /// A label contains `.`, which would make normalized suffix matching ambiguous.
+    /// A label contains `.`, making normalized suffix matching ambiguous.
     SeparatorInLabel,
     /// The message carries no question.
     NoQuestion,
-    /// More than one question; RFC 9619 section 4 forbids this for `OPCODE = 0`.
+    /// More than one question; RFC 9619 section 4 forbids this for `OPCODE=0`.
     MultipleQuestions(u16),
     /// The question uses compression and cannot be copied verbatim safely.
     CompressedQuestion,
@@ -192,7 +190,7 @@ impl Name {
                 0xc0 => {
                     let low = reader.u8().ok_or(DnsError::Truncated)?;
                     let target = usize::from(u16::from_be_bytes([length & 0x3f, low]));
-                    // Strict decrease bounds pointer traversal without a visited set.
+                    // Strict decrease bounds traversal without a visited set.
                     if target >= cursor {
                         return Err(DnsError::ForwardPointer);
                     }
@@ -361,7 +359,7 @@ pub struct Message<'a> {
     flags: u16,
     answer_count: u16,
     question: Question,
-    /// Original question bytes, safe to copy because compressed questions are refused.
+    /// Original question bytes; compressed questions are refused before copying.
     question_bytes: &'a [u8],
     answers_at: usize,
 }
@@ -432,7 +430,7 @@ impl<'a> Message<'a> {
         self.flags & FLAG_RECURSION_DESIRED != 0
     }
 
-    /// Lazily walks borrowed answer records; each item may fail on malformed bytes.
+    /// Lazily walks borrowed answer records; malformed records yield errors.
     pub fn answers(&self) -> Answers<'a> {
         Answers {
             message: self.bytes,
@@ -494,7 +492,7 @@ fn is_h3(identifier: &[u8]) -> bool {
     identifier == b"h3" || identifier.starts_with(b"h3-")
 }
 
-/// Returns the contiguous ALPN removal range for an HTTPS/SVCB record advertising HTTP/3.
+/// Returns the contiguous removal range for an HTTPS/SVCB HTTP/3 ALPN.
 /// O(parameters + ALPN identifiers), allocation-free.
 pub fn h3_alpn_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
     let mut found: Option<Range<usize>> = None;
@@ -606,7 +604,7 @@ impl<'a> SvcParams<'a> {
     }
 }
 
-/// Returns the `ech` SvcParam range after validating the complete parameter list.
+/// Returns the `ech` SvcParam range after validating all parameters.
 pub fn ech_param(rdata: &[u8]) -> Result<Option<Range<usize>>, DnsError> {
     let mut found = None;
     for param in svc_params(rdata)? {
@@ -637,9 +635,9 @@ pub struct Judgment {
     pub matched: Option<Name>,
 }
 
-/// Host rules indexed by normalized suffix. Exceptions win; otherwise the
-/// most-specific rule wins, with blocking before inspection at equal specificity.
-/// Lookup is O(labels) expected time and storage is O(distinct rule hosts).
+/// Host rules indexed by normalized suffix. Exceptions win, then the most
+/// specific rule, with blocking before inspection at equal specificity.
+/// Lookup is O(labels) expected time; storage is O(distinct rule hosts).
 #[derive(Default)]
 pub struct HostPolicy {
     allowed: HashSet<Box<[u8]>>,
@@ -657,7 +655,7 @@ impl HostPolicy {
         Self::insert(&mut self.blocked, name)
     }
 
-    /// Adds an exception that overrides matching block and inspection rules.
+    /// Adds an exception overriding matching block and inspection rules.
     pub fn allow(&mut self, name: &str) -> bool {
         Self::insert(&mut self.allowed, name)
     }
@@ -799,7 +797,7 @@ pub fn answer_policy(verdict: HostVerdict) -> AnswerPolicy {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryPlan {
-    /// Answer locally with [`write_refusal`]. No query leaves the device.
+    /// Answer locally with [`write_refusal`]; no query leaves the device.
     Refuse { rule: Name },
     /// Send it upstream, then run [`write_response`] with this policy.
     Forward { policy: AnswerPolicy },
@@ -955,10 +953,9 @@ pub struct Rewritten {
     pub alpn: AlpnOutcome,
 }
 
-/// Writes a response using the client's transaction and question and the
-/// upstream's result. Names stay uncompressed because RDATA removal would
-/// invalidate downstream compression pointers; stub clients need no authority
-/// or additional sections.
+/// Writes a response using the client's transaction and the upstream result.
+/// Names stay uncompressed because RDATA removal would invalidate downstream
+/// compression pointers; stub clients need no authority or additional sections.
 pub fn write_response(
     out: &mut [u8],
     query: &Message<'_>,
@@ -980,7 +977,7 @@ pub fn write_response(
 
     for answer in upstream.answers() {
         let answer = answer?;
-        // Only SVCB-shaped records can carry these parameters.
+        // Only SVCB-shaped records carry these parameters.
         let (ech_at, h3_at) = if answer.rtype.carries_svc_params() {
             (ech_param(answer.rdata)?, h3_alpn_param(answer.rdata)?)
         } else {
@@ -999,7 +996,7 @@ pub fn write_response(
         answers += 1;
     }
 
-    // Patch `ancount` after the answer pass.
+    // Patch `ancount` after emitting answers.
     let mut ancount = Bounded::at(out, ANCOUNT_AT).ok_or(DnsError::OutputTooSmall)?;
     ancount.u16(answers);
     ancount.finish().ok_or(DnsError::OutputTooSmall)?;
@@ -1086,7 +1083,7 @@ fn write_record(
         .u16(record.rtype.to_wire())
         .u16(record.class)
         .u32(record.ttl)
-        // Parts are separate here but contiguous on the wire.
+        // Parts are separate in memory but contiguous on the wire.
         .u16(length);
     for part in rdata.parts {
         writer.bytes(part);
@@ -1132,7 +1129,6 @@ mod tests {
         none[4..6].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(Message::parse(&none).err(), Some(DnsError::NoQuestion));
 
-        // A second question is refused even when `QDCOUNT` matches it.
         let mut two = one.clone();
         two[4..6].copy_from_slice(&2u16.to_be_bytes());
         two.extend_from_slice(&wire_name("tracker.example"));
@@ -1205,7 +1201,6 @@ mod tests {
 
     #[test]
     fn compression_terminates_because_pointers_run_backwards() {
-        // Backward pointers are the ordinary compressed-name case.
         let mut message = query("example.com", RecordType::A, 1);
         let name_at = HEADER_BYTES as u16;
         message.extend_from_slice(&(0xc000 | name_at).to_be_bytes());
@@ -1299,7 +1294,6 @@ mod tests {
 
     #[test]
     fn ech_is_stripped_for_inspected_hosts_and_for_nothing_else() {
-        // The policy law holds over every verdict.
         for verdict in [
             HostVerdict::Allowed,
             HostVerdict::Blocked,
@@ -1339,7 +1333,6 @@ mod tests {
             plan("other.example"),
             Err(answer_policy(HostVerdict::Allowed))
         );
-        // Inspection enables address steering.
         assert!(answer_policy(HostVerdict::Inspected).steers());
         assert!(!answer_policy(HostVerdict::Allowed).steers());
     }
@@ -1359,7 +1352,6 @@ mod tests {
         assert_eq!(ech_param(&rdata).unwrap(), Some(params[1].at.clone()));
         assert_eq!(&rdata[params[1].at.clone()][4..], ECH_CONFIG);
 
-        // No ECH parameter.
         let plain = https_rdata("target.example", Some(b"\x02h2"), None);
         assert_eq!(ech_param(&plain).unwrap(), None);
 

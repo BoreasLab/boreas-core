@@ -1,11 +1,9 @@
-//! One function turns a C description into a [`TunnelConfig`], and it is the
-//! only way in.
+//! Converts a C configuration into a [`TunnelConfig`]. This is the only
+//! construction path into the core.
 //!
-//! Everything crossing the boundary is a primitive or a pointer, so every
-//! invariant the core established by construction has to be re-established
-//! here. That is the "parse, don't validate" boundary for this crate: after
-//! [`BoreasConfig::parse`] the value is a `TunnelConfig` and nothing
-//! downstream re-checks it, and before it nothing is built at all.
+//! C provides primitives and pointers, so this boundary rebuilds the core's
+//! invariants once. After [`BoreasConfig::parse`] succeeds, downstream code
+//! receives a `TunnelConfig` and performs no second validation.
 
 use std::{
     ffi::{CStr, c_char},
@@ -20,42 +18,38 @@ use boreas_core::{
 
 use crate::Status;
 
-/// Which egress a [`BoreasConfig`] describes.
+/// Selects the egress described by a [`BoreasConfig`].
 ///
-/// A tag plus the fields each arm needs, because C has no sum type worth
-/// mirroring an enum onto. The invariant "only the fields this tag names are
-/// read" cannot be expressed here, so it is enforced in one place — the match
-/// in [`BoreasConfig::parse`] — rather than trusted at every field.
+/// The tag selects which configuration fields are read. C cannot express that
+/// relationship, so [`BoreasConfig::parse`] enforces it in one match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum BoreasEgress {
-    /// Out by the host's own routes. The ordinary content-blocker
-    /// configuration, and the only one in which nothing is proxied.
+    /// Sends traffic through the host's routes.
     Direct = 0,
-    /// A WireGuard peer, carrying whole IP packets.
+    /// Sends whole IP packets through a WireGuard peer.
     WireGuard = 1,
 }
 
-/// The cryptographic half of a WireGuard peer.
+/// Cryptographic configuration for a WireGuard peer.
 ///
-/// Keys are fixed-width arrays rather than pointers, so there is no length to
-/// get wrong and no lifetime to outlive the call.
+/// Fixed-width arrays carry their lengths in the type and do not borrow host
+/// memory.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BoreasWireGuard {
-    /// `host:port` of the peer. Not part of the keys: a peer that roams keeps
-    /// its keys and changes its address.
+    /// Peer address in `host:port` form. Its address may change independently
+    /// of the keys.
     pub endpoint: *const c_char,
     pub private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
-    /// A pre-shared key, and whether there is one. C has no `Option`, so the
-    /// flag is what distinguishes "no PSK" from "a PSK of thirty-two zeroes".
+    /// Optional pre-shared key. The flag distinguishes absence from a key of
+    /// thirty-two zero bytes.
     pub preshared_key: [u8; 32],
     pub has_preshared_key: bool,
 }
 
-/// How much one tunnel may hold. Zero means "use the default for this field",
-/// which is what lets a host set one ceiling without restating the rest.
+/// Per-tunnel resource ceilings. Zero selects the core default for that field.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct BoreasCeilings {
@@ -67,43 +61,40 @@ pub struct BoreasCeilings {
     pub pending_reassemblies: usize,
 }
 
-/// One tunnel, described in C.
+/// One tunnel described by the C ABI.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct BoreasConfig {
     pub egress: BoreasEgress,
-    /// Read only when `egress` is [`BoreasEgress::WireGuard`].
+    /// Read when `egress` is [`BoreasEgress::WireGuard`].
     pub wireguard: BoreasWireGuard,
-    /// What the host's own NAT does to a mapping. Read only when `egress` is
-    /// [`BoreasEgress::Direct`]; a phone behind carrier-grade NAT and a
-    /// desktop with a public address are the same code and different answers,
-    /// and only the host can tell which.
+    /// NAT mapping behavior observed by the host. Read when `egress` is
+    /// [`BoreasEgress::Direct`].
     pub nat_behavior: BoreasNat,
-    /// `host:port` of a DNS upstream to filter through, or null to forward
-    /// queries untouched.
+    /// DNS upstream in `host:port` form, or null for passthrough queries.
     pub resolver: *const c_char,
-    /// Filter lists, as NUL-terminated UTF-8, and how many.
+    /// NUL-terminated UTF-8 filter lists and their count.
     pub lists: *const *const c_char,
     pub list_count: usize,
-    /// Hosts to intercept, and how many. Zero means no interception at all,
-    /// which is the configuration that needs no certificate authority.
+    /// Intercepted hosts and their count. Zero disables interception and needs
+    /// no certificate authority.
     pub intercept_hosts: *const *const c_char,
     pub intercept_host_count: usize,
-    /// Stored certificate authority material, or null to generate a fresh one.
-    /// Both halves are required together.
+    /// Stored certificate authority material, or null to generate it. Both
+    /// halves must be supplied together.
     pub root_certificate: *const u8,
     pub root_certificate_len: usize,
     pub authority_keys: *const u8,
     pub authority_keys_len: usize,
-    /// Whether an intercepting tunnel also rewrites HTML bodies.
+    /// Enables HTML body rewriting for an intercepting tunnel.
     pub rewrite_documents: bool,
-    /// The MTU configured on the TUN. **Set the TUN to this and tell this the
-    /// same number**; see `api/platform.md`.
+    /// MTU configured on the TUN. Set the TUN and this field to the same value;
+    /// see `api/obligations.md`.
     pub mtu: u16,
     pub ceilings: BoreasCeilings,
 }
 
-/// RFC 4787 mapping behaviour, as the host observes it.
+/// RFC 4787 mapping behavior observed by the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum BoreasNat {
@@ -122,7 +113,7 @@ impl From<BoreasNat> for NatBehavior {
     }
 }
 
-/// Reads a NUL-terminated UTF-8 string.
+/// Copies a NUL-terminated UTF-8 string.
 ///
 /// # Safety
 ///
@@ -138,7 +129,7 @@ unsafe fn owned(pointer: *const c_char) -> Result<Option<String>, Status> {
         .map_err(|_| Status::NotUtf8)
 }
 
-/// Reads an array of NUL-terminated UTF-8 strings.
+/// Copies an array of NUL-terminated UTF-8 strings.
 ///
 /// # Safety
 ///
@@ -161,7 +152,7 @@ pub(crate) unsafe fn strings(
         .collect()
 }
 
-/// Reads a byte slice, or `None` when either half is absent.
+/// Copies a byte slice, or returns `None` when either half is absent.
 ///
 /// # Safety
 ///
@@ -179,9 +170,9 @@ fn ceiling(value: usize, default: NonZeroUsize) -> NonZeroUsize {
 }
 
 impl BoreasCeilings {
-    /// Built from the default and overwritten field by field, because
-    /// `Ceilings` is `#[non_exhaustive]`: a ceiling this ABI predates keeps
-    /// the core's default rather than failing to compile or reading zero.
+    /// Starts with core defaults and overwrites fields known to this ABI.
+    /// `Ceilings` is `#[non_exhaustive]`, so newer fields retain their defaults
+    /// when an older ABI parses the structure.
     fn parse(self) -> Ceilings {
         let mut ceilings = Ceilings::default();
         ceilings.buffer_slices = ceiling(self.buffer_slices, ceilings.buffer_slices);
@@ -198,10 +189,10 @@ impl BoreasCeilings {
 }
 
 impl BoreasConfig {
-    /// The one boundary a C description crosses to become a configuration.
+    /// Converts the borrowed C description into an owned configuration.
     ///
-    /// O(total string length): every string is copied once, because nothing
-    /// the host passed may be assumed to outlive the call.
+    /// O(total string length): every string is copied once because host memory
+    /// is valid only for this call.
     ///
     /// # Safety
     ///
@@ -222,19 +213,14 @@ impl BoreasConfig {
                     config: WireGuardConfig {
                         private_key: self.wireguard.private_key,
                         peer_public_key: self.wireguard.peer_public_key,
-                        // The flag, not a zero test: a key of thirty-two zeroes
-                        // is a key a host may legitimately have configured.
+                        // Presence is explicit because an all-zero key is valid.
                         preshared_key: self
                             .wireguard
                             .has_preshared_key
                             .then_some(self.wireguard.preshared_key),
-                        // A keepalive is what keeps a NAT mapping alive on a
-                        // handset that is idle in a pocket; 25 s is the
-                        // interval WireGuard's own clients use.
+                        // Keepalive maintains an idle NAT mapping.
                         persistent_keepalive: Some(25),
-                        // The tunnel is narrower than the link by whatever the
-                        // peer encapsulates, and the core answers the
-                        // difference with a Packet Too Big.
+                        // The inner MTU excludes WireGuard encapsulation.
                         inner_mtu: Mtu::new(self.mtu).map_err(|_| Status::Config)?,
                     },
                 }
@@ -254,9 +240,8 @@ impl BoreasConfig {
         let interception = if hosts.is_empty() {
             None
         } else {
-            // Both halves together or neither: a certificate with no keys is
-            // not a partially restored authority, it is a host that wrote one
-            // secure-storage slot and not the other.
+            // Both halves must be restored together; one half indicates an
+            // incomplete secure-storage write.
             let stored = match (
                 unsafe { bytes(self.root_certificate, self.root_certificate_len) },
                 unsafe { bytes(self.authority_keys, self.authority_keys_len) },
