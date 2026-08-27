@@ -1,17 +1,14 @@
-//! Helpers shared by this crate's own tests, and by nothing else.
+//! Helpers shared only by this crate's tests.
 //!
-//! `#[cfg(test)]` throughout, so none of it reaches the artefact. It exists
-//! because two modules need a real QUIC server to test against and `quiche`
-//! loads its credentials only from PEM files on disk — so both need the same
-//! self-signed certificate, the same DER-to-PEM encoder, and the same scratch
-//! directory that removes itself.
+//! They are test-only because the QUIC fixtures need PEM credentials on disk.
+//! The helpers provide one certificate generator, DER-to-PEM encoding, and a
+//! scratch directory with cleanup on drop.
 
 use std::path::{Path, PathBuf};
 
-/// A self-signed certificate for `name`, written where `quiche` can load it.
+/// Creates a self-signed certificate and key for `name` in a temporary folder.
 ///
-/// Returns the two paths and the directory that owns them: dropping the
-/// directory removes both, so a failing test leaves nothing behind.
+/// The returned directory owns both files and removes them on drop.
 pub fn self_signed(name: &str) -> (PathBuf, PathBuf, TempDir) {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
@@ -28,12 +25,10 @@ pub fn self_signed(name: &str) -> (PathBuf, PathBuf, TempDir) {
     (cert_path, key_path, dir)
 }
 
-/// Wraps DER as PEM, because `quiche` loads only PEM while `rcgen` here
-/// produces DER.
+/// Encodes DER as PEM for `quiche`, while `rcgen` supplies DER here.
 ///
-/// Written out rather than enabling `rcgen`'s `pem` feature: that feature is
-/// not `dev`-scoped, so it would ship a base64 implementation into the artefact
-/// to satisfy a need that exists only in tests.
+/// The encoder stays local instead of enabling `rcgen`'s `pem` feature, which
+/// would add a base64 implementation to the artifact for a test-only need.
 pub fn pem(label: &str, der: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::new();
@@ -59,7 +54,7 @@ pub fn pem(label: &str, der: &[u8]) -> String {
     format!("-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n")
 }
 
-/// A scratch directory that removes itself.
+/// Temporary directory removed recursively on drop.
 pub struct TempDir(PathBuf);
 
 impl TempDir {

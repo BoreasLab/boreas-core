@@ -1,7 +1,7 @@
-//! The device seam: raw IP packets in and out, an MTU, nothing else. Platform
-//! adapters implement this over OS handles; `SimDevice` implements it over a
-//! scripted in-memory wire so every load and conformance gate can run
-//! deterministically in-process.
+//! Device seam for raw IP packets and MTU only.
+//!
+//! Platform adapters implement it over OS handles; `SimDevice` implements it
+//! over a scripted in-memory wire for deterministic tests.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -13,15 +13,13 @@ use crate::Mtu;
 
 pub trait Device {
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize>;
-    /// Writes one packet **whole**; see [`crate::AsyncDevice::send`] for why
-    /// the byte count is absent from the result rather than returned unchecked.
+    /// Writes one complete packet. Partial packet writes are not a valid seam
+    /// result; see [`crate::AsyncDevice::send`].
     fn send(&mut self, buf: &[u8]) -> io::Result<()>;
     fn mtu(&self) -> Mtu;
 }
 
-/// SplitMix64: one multiply-xor-shift round per output. Seeded, deterministic,
-/// and adequate for loss and reorder scripts; not a CSPRNG, and nothing here
-/// needs one.
+/// Seeded SplitMix64 state for deterministic loss and reorder scripts.
 struct Rng(u64);
 
 impl Rng {
@@ -33,26 +31,25 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// Uniform in `0..rate`, used as `rng.below(rate) == 0` for a 1/rate event.
+    /// Returns a value in `0..rate` for one-in-`rate` events.
     fn below(&mut self, rate: u64) -> u64 {
         self.next() % rate
     }
 }
 
-/// A scripted in-memory wire. Delivery is scheduled against the virtual clock
-/// the harness drives, so reorder and delay are reproducible from the seed.
+/// An in-memory wire with virtual-time delivery, loss, and reordering.
 pub struct SimDevice {
     mtu: Mtu,
     rng: Rng,
-    /// Inbound packets by scheduled delivery tick.
+    /// Inbound packets grouped by delivery tick.
     inbound: BTreeMap<u64, VecDeque<Vec<u8>>>,
-    /// Everything the datapath sent, in order.
+    /// Packets sent by the datapath, in order.
     sent: Vec<Vec<u8>>,
     now: u64,
-    /// One-in-N loss rates; zero disables.
+    /// One-in-N inbound and outbound loss rates; zero disables loss.
     loss_in: u64,
     loss_out: u64,
-    /// Maximum extra ticks a packet may be delayed.
+    /// Maximum random delivery delay added by reordering.
     reorder_window: u64,
 }
 
@@ -85,8 +82,7 @@ impl SimDevice {
         self
     }
 
-    /// Queues a packet for delivery `delay` ticks from now, before any script
-    /// distortion applies.
+    /// Schedules a packet after `delay` ticks, before script jitter.
     pub fn inject(&mut self, packet: &[u8], delay: u64) {
         let jitter = if self.reorder_window > 0 {
             self.rng.below(self.reorder_window + 1)
@@ -99,27 +95,27 @@ impl SimDevice {
             .push_back(packet.to_vec());
     }
 
-    /// Advances the virtual clock.
+    /// Advances virtual time by `ticks`.
     pub fn advance(&mut self, ticks: u64) {
         self.now += ticks;
     }
 
-    /// Sets the virtual clock to an absolute tick.
+    /// Sets virtual time to an absolute tick.
     pub fn advance_to(&mut self, tick: u64) {
         self.now = tick;
     }
 
-    /// Changes the wire MTU mid-script.
+    /// Changes the wire MTU during a script.
     pub fn set_mtu(&mut self, mtu: Mtu) {
         self.mtu = mtu;
     }
 
-    /// What the datapath has sent so far, in order.
+    /// Returns packets sent by the datapath so far.
     pub fn sent(&self) -> &[Vec<u8>] {
         &self.sent
     }
 
-    /// The earliest tick with a pending inbound packet.
+    /// Returns the earliest tick with a pending packet.
     pub fn next_delivery(&self) -> Option<u64> {
         self.inbound.first_key_value().map(|(tick, _)| *tick)
     }
@@ -128,7 +124,7 @@ impl SimDevice {
 impl Device for SimDevice {
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.loss_in > 0 && self.rng.below(self.loss_in) == 0 {
-            // Consume one scheduled packet from its tick bucket and drop it.
+            // Loss consumes one scheduled packet from its bucket.
             if let Some(mut entry) = self.inbound.first_entry() {
                 let queue = entry.get_mut();
                 if queue.pop_front().is_some() && queue.is_empty() {
@@ -165,7 +161,7 @@ impl Device for SimDevice {
 
     fn send(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.loss_out > 0 && self.rng.below(self.loss_out) == 0 {
-            return Ok(()); // consumed, lost on the wire
+            return Ok(()); // consumed, but absent from the wire
         }
         self.sent.push(buf.to_vec());
         Ok(())
@@ -176,22 +172,17 @@ impl Device for SimDevice {
     }
 }
 
-/// The sans-io shell over any `Device`: drains the device into the datapath,
-/// drains the datapath back to the device, and fires timeouts on the virtual
-/// clock. Deterministic because every input is scripted.
+/// Deterministic shell that drains a device through the datapath and fires
+/// timeouts against virtual time.
 pub struct Harness<D> {
     pub device: D,
     pub datapath: crate::Datapath,
-    /// Virtual time base; one tick is one millisecond.
+    /// Virtual time base; each tick represents one millisecond.
     base: std::time::Instant,
-    /// Packets the core refused, counted rather than fatal — the same
-    /// classification the runtime shell makes, so a trace replayed here
-    /// behaves as it would in production.
+    /// Packets rejected by the core, counted as the runtime shell counts them.
     rejected: u64,
-    /// Egress-bound transmits, in order. The harness has no egress — that is
-    /// the runtime shell's job — so it records what would have crossed rather
-    /// than looping it back down the device, which is exactly the mistake
-    /// [`crate::Side`] exists to make unrepresentable.
+    /// Egress-bound packets in order. The harness records them because it has
+    /// no egress and must not loop them back to the device.
     to_egress: Vec<Vec<u8>>,
 }
 
@@ -206,25 +197,24 @@ impl<D: Device> Harness<D> {
         }
     }
 
-    /// Packets the core refused across every `step` so far.
+    /// Returns the number of packets rejected so far.
     pub fn rejected(&self) -> u64 {
         self.rejected
     }
 
-    /// Everything the core sent toward the egress, in order.
+    /// Returns packets sent toward the egress, in order.
     pub fn to_egress(&self) -> &[Vec<u8>] {
         &self.to_egress
     }
 
-    /// Runs one tick at `ticks`: deliver due packets, flush transmits, expire.
+    /// Delivers due packets, flushes transmits, and expires state at `ticks`.
     pub fn step(&mut self, ticks: u64) -> io::Result<()> {
         let now = self.base + Duration::from_millis(ticks);
         let mut buf = vec![0u8; usize::from(self.device.mtu().get())];
 
         loop {
             match self.device.recv(&mut buf) {
-                // Untrusted input: a rejected packet is an observation, not a
-                // reason to abandon the trace.
+                // Rejected input is counted so a trace can continue.
                 Ok(len) => {
                     if self.datapath.on_tun_packet(&buf[..len], now).is_err() {
                         self.rejected += 1;
@@ -287,8 +277,7 @@ mod tests {
                 max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
                 flow_idle_timeout: Duration::from_secs(120),
                 datagram_buffer_capacity: NonZeroUsize::new(64).unwrap(),
-                // Long enough to outlast a browser's cached Alt-Svc entry for
-                // an origin, which is what the DNS rewrite alone cannot reach.
+                // Long enough to cover the DNS steering backstop in the fixture.
                 inspection_window: Duration::from_secs(60),
                 max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
                 inspected_ports: crate::DEFAULT_INSPECTED_PORTS,
@@ -301,8 +290,7 @@ mod tests {
 
     #[test]
     fn harness_reproduces_directly_driven_results() {
-        // The gate: the same trace through the harness and through direct
-        // calls must emit byte-identical transmits.
+        // The harness and direct calls must emit identical transmits.
         let packet = udp_frame();
 
         let mut direct = datapath();
@@ -317,8 +305,8 @@ mod tests {
         let mut harness = Harness::new(device, datapath(), base);
         harness.step(0).unwrap();
 
-        // A packet from the client's TUN is bound for the egress, so the
-        // device sees nothing and the egress log holds it exactly once.
+        // This packet is egress-bound, so the device sees nothing and the
+        // egress log receives it once.
         assert_eq!(
             direct_transmits,
             vec![(crate::Side::Egress, packet.clone())]
@@ -329,7 +317,7 @@ mod tests {
 
     #[test]
     fn loss_and_reorder_are_scripted_and_deterministic() {
-        // One-in-one loss consumes everything.
+        // One-in-one loss consumes every scheduled packet.
         let mut device = SimDevice::new(Mtu::new(1500).unwrap(), 1).with_loss_in(1);
         device.inject(&udp_frame(), 0);
         let mut buf = vec![0u8; 1500];
@@ -338,7 +326,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
 
-        // Reordering changes delivery order but not content, reproducibly.
+        // Reordering changes order but preserves content for a fixed seed.
         let packets: Vec<Vec<u8>> = (0u8..4).map(|n| vec![0x45, n]).collect();
         let run = |seed| {
             let mut device = SimDevice::new(Mtu::new(1500).unwrap(), seed).with_reorder_window(3);

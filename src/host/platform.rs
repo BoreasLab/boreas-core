@@ -1,8 +1,7 @@
-//! Platform adapters: byte shims over OS handles, no policy. Each implements
-//! both the sync `Device` seam (for tests and the simulator) and the async
-//! `AsyncDevice` seam (for the reactor). The Android adapter wraps the
-//! VpnService file descriptor delivered over JNI; the Windows adapter wraps a
-//! Wintun session.
+//! Platform adapters are policy-free byte shims over OS handles.
+//!
+//! Each implements the sync `Device` seam and the async `AsyncDevice` seam.
+//! Android wraps the VpnService descriptor; Windows wraps a Wintun session.
 
 #[cfg(unix)]
 mod android {
@@ -10,28 +9,25 @@ mod android {
 
     use crate::{AsyncDevice, Device, Mtu, host::shell::whole};
 
-    /// Android's VpnService fd. Readiness comes from tokio's `AsyncFd`, so
-    /// `recv` is cancel-safe: it registers interest and only reads when the
-    /// reactor is actually waiting, so a dropped future consumes nothing.
+    /// Android VpnService descriptor driven by tokio's `AsyncFd`.
+    /// Readiness registration makes `recv` cancel-safe: a dropped future has
+    /// not consumed a packet.
     pub struct AndroidTun {
         fd: tokio::io::unix::AsyncFd<std::fs::File>,
         mtu: Mtu,
     }
 
     impl AndroidTun {
-        /// Takes ownership of the fd the JNI layer handed over, wrapped in the
-        /// `File` that owns its close-on-drop. The adapter never opens the
-        /// device; VpnService owns lifecycle and permissions.
+        /// Takes ownership of the JNI-provided descriptor through a `File`.
+        /// The `File` closes it on drop; VpnService owns device lifecycle and
+        /// permissions.
         ///
-        /// **Must be called on a Tokio runtime**, even by a caller that only
-        /// ever uses the sync [`Device`] seam: registration with the reactor
-        /// happens here rather than at first read, so a construction off the
-        /// runtime panics rather than failing later at a less obvious place.
+        /// **Must be called on a Tokio runtime.** `AsyncFd` registers with the
+        /// reactor during construction, including for sync-only callers.
         ///
-        /// The descriptor must already be non-blocking. `VpnService.establish`
-        /// returns one that is not, so set `O_NONBLOCK` before handing it
-        /// over — a blocking descriptor would stall the whole reactor on its
-        /// first read.
+        /// The descriptor must already be non-blocking. Set `O_NONBLOCK` on
+        /// the descriptor from `VpnService.establish` before handing it over;
+        /// a blocking descriptor would stall the reactor on its first read.
         pub fn from_owned_fd(fd: std::os::fd::OwnedFd, mtu: Mtu) -> io::Result<Self> {
             Ok(Self {
                 fd: tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))?,
@@ -102,14 +98,12 @@ mod android {
 
         /// A datagram socket pair standing in for the VpnService descriptor.
         ///
-        /// Datagram rather than stream, deliberately: a TUN preserves packet
-        /// boundaries, and a stream pair would let a test pass that a real
-        /// device would fail. Non-blocking because `AsyncFd` requires it — a
-        /// blocking descriptor here would stall the whole reactor on its first
-        /// read, which is the failure this shim exists to avoid.
-        /// Polls `future` once and drops it, which is exactly what a lost
-        /// `select!` arm does to a `recv`. Two lines here rather than a
-        /// dependency on `futures-util` for one macro.
+        /// Datagram semantics preserve TUN packet boundaries; a stream pair
+        /// could let an invalid adapter pass. Non-blocking mode is required by
+        /// `AsyncFd` and prevents a read from stalling the reactor.
+        /// Polls `future` once and drops it, matching a `recv` future whose
+        /// `select!` arm lost the race. Keeping this local avoids a dependency
+        /// for one polling helper.
         fn poll_once<F: Future>(future: F) -> std::task::Poll<F::Output> {
             let mut future = std::pin::pin!(future);
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -144,17 +138,14 @@ mod android {
             assert_eq!(&back[..read], b"outbound packet");
         }
 
-        /// **The obligation the seam states, and the one whose breach is
-        /// silent.** The reactor selects over `recv` and drops the future every
-        /// time another arm wins, which is routine. An implementation that had
-        /// already consumed bytes would lose a packet per lost race — and the
-        /// symptom is not an error, it is a connection that stalls for reasons
-        /// nothing records.
+        /// The reactor routinely drops `recv` when another `select!` arm wins.
+        /// A read that consumed before completion would lose a packet without
+        /// producing an error, leaving the connection stalled.
         #[tokio::test]
         async fn a_dropped_read_consumes_nothing() {
             let (mut tun, peer) = tun();
 
-            // A read with nothing to read, abandoned.
+            // Abandon a read before any packet is available.
             {
                 let mut buf = [0u8; 1500];
                 assert!(
@@ -173,9 +164,7 @@ mod android {
             );
         }
 
-        /// Several reads dropped in a row, each after a packet is already
-        /// waiting. This is the shape that catches an implementation which
-        /// consumes on poll rather than on completion.
+        /// Dropped reads must not consume a packet that is already waiting.
         #[tokio::test]
         async fn repeated_dropped_reads_lose_no_packet() {
             let (mut tun, peer) = tun();
@@ -183,9 +172,8 @@ mod android {
 
             for _ in 0..8 {
                 let mut buf = [0u8; 1500];
-                // This one *can* complete, since a packet is waiting; whether
-                // it does is not the point. The point is that dropping it
-                // must not be what consumes the packet.
+                // The read may complete here, but dropping it must not consume
+                // the packet if it does not.
                 if let std::task::Poll::Ready(Ok(read)) =
                     poll_once(AsyncDevice::recv(&mut tun, &mut buf))
                 {
@@ -205,10 +193,9 @@ mod android {
             assert_eq!(&buf[..read], b"one");
         }
 
-        /// The sync seam over the same descriptor, which the simulator drives.
-        ///
-        /// A `tokio::test` despite using none of the async seam: construction
-        /// registers with the reactor, so there has to be one.
+        /// The sync seam uses the same descriptor as the async seam.
+        /// Construction still needs a Tokio runtime because `AsyncFd` registers
+        /// with the reactor immediately.
         #[tokio::test]
         async fn the_sync_seam_reads_and_writes_the_same_descriptor() {
             let (mut tun, peer) = tun();
@@ -225,9 +212,8 @@ mod android {
             assert_eq!(&back[..read], b"sync outbound");
         }
 
-        /// A descriptor whose peer is gone reports the failure rather than
-        /// pretending the packet left. The reactor treats a device error as
-        /// fatal, which is right — there is nothing left to serve.
+        /// A closed peer produces an error instead of a false successful send.
+        /// The reactor treats that device failure as fatal.
         #[tokio::test]
         async fn a_write_to_a_closed_peer_is_an_error_not_a_silent_drop() {
             let (mut tun, peer) = tun();
@@ -246,29 +232,23 @@ mod windows {
 
     use crate::{AsyncDevice, Device, Mtu};
 
-    /// Windows Wintun session. Packets arrive through the driver's ring
-    /// buffer; the adapter moves them across the seam without interpreting.
-    /// The session is `Arc`-backed so the blocking-read path can hold its own
-    /// reference across a `spawn_blocking` boundary.
+    /// Wintun session adapter. It transfers packets from the driver's ring
+    /// buffer without interpreting them.
     pub struct WintunDevice {
         session: std::sync::Arc<wintun_bindings::Session>,
         mtu: Mtu,
         /// A blocking read already in flight, retained across calls.
         ///
-        /// This is what makes `recv` cancel-safe, and its absence was a real
-        /// defect: `spawn_blocking` cannot be cancelled, so dropping the join
-        /// handle lets the task run to completion and *discards the packet it
-        /// received*. The reactor drops this future every time another
-        /// `select!` arm wins, which is routine, so a fresh read per call
-        /// loses a packet per lost race. Holding the handle means the next
-        /// call awaits the same read instead of starting another.
+        /// `spawn_blocking` cannot cancel its task. Retaining the handle lets
+        /// the next call await the same read after a dropped future; starting a
+        /// new read would let the completed task discard its packet.
         pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
     }
 
     impl WintunDevice {
-        /// Takes the open session from the adapter setup path. `wintun.dll` is
-        /// the WireGuard-authorized signed binary; loading lives in the
-        /// platform crate, not here.
+        /// Takes an open session from adapter setup. Loading the
+        /// WireGuard-authorized signed `wintun.dll` belongs to the platform
+        /// setup path.
         pub fn from_session(session: std::sync::Arc<wintun_bindings::Session>, mtu: Mtu) -> Self {
             Self {
                 session,
@@ -320,12 +300,9 @@ mod windows {
             &'a mut self,
             buf: &'a mut [u8],
         ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
-            // Wintun's read wait is a Win32 event, not a tokio primitive, so
-            // the blocking read moves to the blocking pool. The task owns the
-            // bytes it read — it must, because nothing can hand them back
-            // through a cancelled future — and the handle stays in `self`
-            // until it has actually been observed. A dropped future therefore
-            // consumes nothing, which is the seam's stated obligation.
+            // Wintun waits on a Win32 event, so the read runs on the blocking
+            // pool. The task owns its bytes and the handle remains in `self`
+            // until observed; a dropped future therefore consumes nothing.
             async move {
                 if self.pending.is_none() {
                     let session = std::sync::Arc::clone(&self.session);
@@ -342,8 +319,8 @@ mod windows {
                     .as_mut()
                     .expect("the read was just started")
                     .await;
-                // Reached only after the join future resolved, so the packet
-                // is in hand and the slot is genuinely free.
+                // The join resolved, so the packet is in hand and the slot is
+                // free for the next read.
                 self.pending = None;
 
                 let bytes = joined.map_err(io::Error::other)??;
