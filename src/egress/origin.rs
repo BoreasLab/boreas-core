@@ -31,9 +31,7 @@ pub struct OriginationPorts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortRangeError {
-    /// The range is empty.
     Empty,
-    /// The range includes port 0.
     IncludesZero,
 }
 
@@ -55,7 +53,6 @@ pub const DEFAULT_ORIGINATION_PORTS: OriginationPorts = OriginationPorts {
 };
 
 impl OriginationPorts {
-    /// Constructs a range with exclusive `end`.
     pub fn new(start: u16, end: u16) -> Result<Self, PortRangeError> {
         if start == 0 {
             return Err(PortRangeError::IncludesZero);
@@ -66,19 +63,15 @@ impl OriginationPorts {
         Ok(Self { start, end })
     }
 
-    /// Returns whether `port` belongs to this range.
     pub fn contains(self, port: u16) -> bool {
         (self.start..self.end).contains(&port)
     }
 
-    /// Returns the number of simultaneous leases this range permits.
     pub fn capacity(self) -> usize {
         usize::from(self.end - self.start)
     }
 }
 
-/// Available local ports.
-///
 /// A free list makes allocation and return constant time. `Drop` returns every
 /// lease, including one released by close, reset, cancellation, or unwind.
 struct Ports {
@@ -102,7 +95,6 @@ impl Ports {
     }
 }
 
-/// One bound port held for the connection lifetime.
 struct PortLease {
     port: u16,
     ports: Arc<Ports>,
@@ -114,8 +106,6 @@ impl Drop for PortLease {
     }
 }
 
-/// Byte stream that releases its port when dropped.
-///
 /// The field makes the lease lifetime equal to the stream lifetime.
 struct Originated<S> {
     stream: S,
@@ -173,7 +163,6 @@ impl TunnelledDialer {
         }
     }
 
-    /// Returns the ports the datapath must exclude from inspection.
     pub fn ports(&self) -> OriginationPorts {
         self.range
     }
@@ -223,7 +212,6 @@ impl StreamEgress for TunnelledDialer {
     }
 }
 
-/// Returns the unspecified local address for `address`'s family and `port`.
 fn local_for(address: SocketAddr, port: u16) -> SocketAddr {
     match address {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
@@ -231,8 +219,6 @@ fn local_for(address: SocketAddr, port: u16) -> SocketAddr {
     }
 }
 
-/// Resolves a target into an address to dial.
-///
 /// Name resolution occurs through the tunnel, so the host stack sees the same
 /// DNS policy and view as the client.
 pub(crate) async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> {
@@ -245,8 +231,6 @@ pub(crate) async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> 
     }
 }
 
-/// Packet egress placeholder for a flow-only session.
-///
 /// Flow egress carries TCP and UDP associations directly, so no raw packet
 /// operation is available here. Keeping a concrete implementation preserves
 /// uniform reactor errors and telemetry.
@@ -294,19 +278,14 @@ impl crate::PacketEgress for NoPacketEgress {
     }
 }
 
-/// The packet and flow effects derived from one configured egress.
 pub struct Assembly {
-    /// Drives the reactor with whole IP packets and emits encapsulated datagrams.
     pub packets: Box<dyn crate::PacketEgress>,
-    /// Carries intercepted and spliced connections to their egress.
     pub flows: Arc<dyn StreamEgress>,
     /// Local ports the datapath excludes from inspection, or `None` for a proxy
     /// flow effect that re-originates nothing locally.
     pub origination_ports: Option<OriginationPorts>,
 }
 
-/// Splits one configured egress into the packet and flow effects.
-///
 /// Stream egress pairs with [`NoPacketEgress`]. Packet egress drives the reactor
 /// and uses a [`TunnelledDialer`] for re-originated flows. The shared range
 /// keeps dialing and inspection exclusion aligned.
@@ -352,7 +331,6 @@ mod tests {
         assert!(!range.contains(44_999));
     }
 
-    /// Re-originated connections bind inside the classifier's excluded range.
     #[tokio::test]
     async fn every_re_originated_connection_binds_inside_the_excluded_range() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -398,8 +376,6 @@ mod tests {
         assert!(dialer.connect(&Target::Ip(origin)).await.is_ok());
     }
 
-    /// Both egress variants produce both effects; only packet egress needs
-    /// excluded origination ports.
     #[test]
     fn every_egress_variant_assembles_into_both_effects() {
         struct NoStreams;

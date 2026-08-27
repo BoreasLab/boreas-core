@@ -14,12 +14,9 @@ use crate::{EgressError, ProxyError};
 
 // Pure protocol state.
 
-/// Streaming decode result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decoded<T> {
-    /// More input is needed.
     Incomplete,
-    /// A complete message and the number of bytes consumed.
     Complete { value: T, consumed: usize },
 }
 
@@ -28,10 +25,8 @@ pub enum Decoded<T> {
 /// Calls may repeat the same input while more bytes arrive. Implementations
 /// emit each phase once and report the exact consumed prefix.
 pub trait Negotiation {
-    /// Value established by the negotiation.
     type Output;
 
-    /// Processes all received input and appends output for the next phase.
     fn advance(
         &mut self,
         input: &[u8],
@@ -39,17 +34,13 @@ pub trait Negotiation {
     ) -> Result<Decoded<Self::Output>, ProxyError>;
 }
 
-/// Codec result carrying the unconsumed input remainder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decode<'a> {
-    /// Framing continues; decoded bytes are in the sink.
     Framed { rest: &'a [u8] },
-    /// Framing ended; `rest` is transparent payload from now on.
     Transparent { rest: &'a [u8] },
 }
 
 impl<'a> Decode<'a> {
-    /// Number of input bytes consumed, bounded by the input slice.
     fn consumed(self, input: &[u8]) -> usize {
         let rest = match self {
             Self::Framed { rest } | Self::Transparent { rest } => rest,
@@ -58,46 +49,34 @@ impl<'a> Decode<'a> {
     }
 }
 
-/// Pure post-negotiation framing codec.
 pub trait Codec {
-    /// Decodes available input and appends plaintext to `out`.
     fn decode<'a>(&mut self, input: &'a [u8], out: &mut Vec<u8>) -> Result<Decode<'a>, ProxyError>;
 
-    /// Encodes one bounded payload into `out`.
     fn encode(&mut self, _payload: &[u8], _out: &mut Vec<u8>) -> Result<(), ProxyError> {
         Err(ProxyError::Unframed)
     }
 
-    /// Maximum payload accepted by one [`Self::encode`] call.
     fn max_payload(&self) -> usize {
         usize::MAX
     }
 
-    /// Whether writes are framed as well as reads.
     fn writes(&self) -> Writes {
         Writes::Framed
     }
 }
 
-/// Static write-framing property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Writes {
-    /// Payloads use [`Codec::encode`].
     Framed,
-    /// Payloads reach the inner stream unchanged.
     Verbatim,
 }
 
 // I/O adapter.
 
-/// Read size during negotiation.
 const NEGOTIATION_CHUNK: usize = 512;
 
-/// Maximum negotiation buffer size.
 const MAX_NEGOTIATION: usize = 16 * 1024;
 
-/// Drives one [`Negotiation`] and returns bytes read past its frame.
-///
 /// The caller must replay the returned surplus through [`crate::Prefixed`].
 pub async fn negotiate<S, H>(
     stream: &mut S,
@@ -137,28 +116,19 @@ where
     }
 }
 
-/// Read size while framing is active.
 const FRAMED_CHUNK: usize = 16 * 1024;
 
-/// Async byte stream adapter for a [`Codec`].
-///
 /// Transparent codecs bypass framing after their header.
 pub struct Framed<S, C> {
     inner: S,
     codec: C,
-    /// Input awaiting codec consumption.
     coded: Vec<u8>,
-    /// Decoded bytes awaiting the caller.
     plain: Vec<u8>,
     plain_at: usize,
-    /// Whether reads now pass directly to `inner`.
     transparent: bool,
-    /// Encoded bytes awaiting `inner`.
     pending: Vec<u8>,
     pending_at: usize,
-    /// Caller-payload length represented by `pending`.
     taken: usize,
-    /// Write mode captured at construction.
     writes: Writes,
 }
 
@@ -178,7 +148,6 @@ impl<S, C: Codec> Framed<S, C> {
         }
     }
 
-    /// Starts with bytes already read during negotiation.
     pub fn with_prefix(inner: S, codec: C, prefix: Vec<u8>) -> Self {
         Self {
             coded: prefix,
@@ -186,7 +155,6 @@ impl<S, C: Codec> Framed<S, C> {
         }
     }
 
-    /// Hands buffered plaintext to the caller.
     fn drain(&mut self, buf: &mut ReadBuf<'_>) -> Option<()> {
         let held = self
             .plain
@@ -312,7 +280,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Codec + Unpin> AsyncWrite for Framed<
     }
 }
 
-/// Converts a codec failure into a terminal stream error.
 fn fatal(error: ProxyError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
@@ -321,8 +288,6 @@ fn fatal(error: ProxyError) -> std::io::Error {
 mod tests {
     use super::*;
 
-    /// Two-round negotiation used to test repeated input, surplus, and
-    /// one-time phase output.
     #[derive(Default)]
     struct Greeting {
         greeted: bool,
@@ -358,7 +323,6 @@ mod tests {
         }
     }
 
-    /// Split input must produce the same verdict as one complete reply.
     #[test]
     fn a_negotiation_reaches_the_same_verdict_however_the_bytes_are_split() {
         for prefix in 0..=2usize {
@@ -382,7 +346,6 @@ mod tests {
         }
     }
 
-    /// Re-entering an emitted phase must not duplicate its output.
     #[test]
     fn re_offering_the_same_input_writes_nothing_further() {
         let mut machine = Greeting::default();
@@ -402,7 +365,6 @@ mod tests {
         assert!(fourth.is_empty(), "and so is the request");
     }
 
-    /// The I/O driver returns bytes read beyond the negotiation.
     #[tokio::test]
     async fn the_driver_returns_what_it_read_past_the_negotiation() {
         let (mut peer, ours) = tokio::io::duplex(256);
@@ -429,8 +391,7 @@ mod tests {
         );
     }
 
-    /// Unfinished peer chatter is rejected at the buffer ceiling. Silence is
-    /// left to the session deadline in [`crate::Wait`].
+    /// Silence is left to the session deadline in [`crate::Wait`].
     #[tokio::test]
     async fn a_negotiation_the_peer_will_not_end_is_refused_rather_than_buffered() {
         let (mut peer, ours) = tokio::io::duplex(4096);
@@ -458,7 +419,6 @@ mod tests {
         assert!(outcome.is_err(), "an endless negotiation is refused");
     }
 
-    /// Codec that strips a two-byte header before becoming transparent.
     #[derive(Default)]
     struct StripTwo {
         stripped: bool,
@@ -485,8 +445,6 @@ mod tests {
         }
     }
 
-    /// Read-only framing must leave writes transparent.
-    ///
     /// `StripTwo` has no encoder, so a successful round trip proves that
     /// [`Writes::Verbatim`] bypasses [`Codec::encode`].
     #[tokio::test]
@@ -509,8 +467,6 @@ mod tests {
         assert_eq!(&back, b"straight through");
     }
 
-    /// A small caller buffer must receive all payload bytes that arrived with
-    /// the header.
     #[tokio::test]
     async fn a_small_reader_takes_every_byte_of_a_surplus_larger_than_its_buffer() {
         let (mut peer, ours) = tokio::io::duplex(4096);
@@ -541,7 +497,6 @@ mod tests {
         assert_eq!(total, 300, "every byte of the surplus reached the caller");
     }
 
-    /// Codec with a one-byte length prefix.
     #[derive(Default)]
     struct LengthPrefixed;
 
@@ -572,7 +527,6 @@ mod tests {
         }
     }
 
-    /// Frames must decode correctly across arbitrary read boundaries.
     #[tokio::test]
     async fn framing_survives_arbitrary_read_boundaries() {
         for chunk in [1usize, 2, 3, 17, 1024] {
@@ -610,7 +564,6 @@ mod tests {
         }
     }
 
-    /// `poll_write` reports payload bytes, not the larger encoded frame.
     #[tokio::test]
     async fn a_write_is_framed_and_reported_in_the_callers_own_units() {
         let (mut peer, ours) = tokio::io::duplex(4096);
@@ -625,7 +578,6 @@ mod tests {
         assert_eq!(&back, b"\x07payload");
     }
 
-    /// Payloads larger than one frame are split at the codec limit.
     #[tokio::test]
     async fn a_write_larger_than_one_frame_is_split() {
         let (mut peer, ours) = tokio::io::duplex(8192);

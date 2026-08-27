@@ -31,22 +31,18 @@ use tokio::{
 
 use crate::{H2Profile, Rewriting, VersionCrossings, Wire};
 
-/// Common body type for forwarded and synthetic responses.
 pub type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
-/// URL-filter result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterVerdict {
     Allow,
     Block,
 }
 
-/// Decides whether a request for the intercepted host is allowed.
 pub trait RequestFilter: Send + Sync + 'static {
     fn decide(&self, host: &str, request: &Request<Incoming>) -> FilterVerdict;
 }
 
-/// Filter that forwards every request.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllowAll;
 
@@ -75,7 +71,6 @@ const HOP_BY_HOP: [&str; 7] = [
 const ALT_SVC: &str = "alt-svc";
 const ALT_SVC_CLEAR: &str = "clear";
 
-/// Result of removing HTTP/3 alternatives from `Alt-Svc`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AltSvc {
     /// No recognized HTTP/3 alternative was removed.
@@ -200,7 +195,6 @@ fn steer_response(headers: &mut HeaderMap) {
     headers.insert(ALT_SVC, replacement);
 }
 
-/// Whether hop-by-hop upgrade fields must be preserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handling {
     Ordinary,
@@ -268,14 +262,12 @@ fn boxed_full(bytes: &'static [u8]) -> ProxyBody {
         .boxed()
 }
 
-/// Returns the policy-block response.
 fn blocked() -> Response<ProxyBody> {
     let mut response = Response::new(boxed_full(b""));
     *response.status_mut() = StatusCode::FORBIDDEN;
     response
 }
 
-/// Returns the visible upstream-failure response.
 fn bad_gateway() -> Response<ProxyBody> {
     let mut response = Response::new(boxed_full(b""));
     *response.status_mut() = StatusCode::BAD_GATEWAY;
@@ -307,13 +299,11 @@ impl Upstream {
     }
 }
 
-/// Pending client and upstream halves of an h1 upgrade.
 struct Pending {
     client: OnUpgrade,
     upstream: OnUpgrade,
 }
 
-/// State shared by requests on one terminated connection.
 struct Proxy {
     host: Arc<str>,
     upstream: Upstream,
@@ -321,7 +311,6 @@ struct Proxy {
     crossings: Arc<VersionCrossings>,
     wire: Wire,
     rewriting: Rewriting,
-    /// Upgrade halves awaiting the connection-loop splice.
     upgrade: StdMutex<Option<Pending>>,
 }
 
@@ -362,7 +351,6 @@ impl Proxy {
     }
 }
 
-/// Splices the upgraded streams until either side closes.
 async fn splice_upgrade(pending: Pending) -> io::Result<()> {
     let (client, upstream) =
         tokio::try_join!(pending.client, pending.upstream).map_err(io::Error::other)?;
@@ -373,7 +361,6 @@ async fn splice_upgrade(pending: Pending) -> io::Result<()> {
         .map(drop)
 }
 
-/// Runs one terminated connection with the same HTTP wire on both legs.
 pub async fn run_exchange<C, U>(
     host: impl Into<Arc<str>>,
     wire: Wire,
@@ -512,7 +499,6 @@ mod tests {
 
     const HOST_NAME: &str = "intercepted.example";
 
-    /// Blocks paths with the configured prefix.
     struct BlockPrefix(&'static str);
 
     impl RequestFilter for BlockPrefix {
@@ -525,7 +511,6 @@ mod tests {
         }
     }
 
-    /// Origin fixture that reflects header order and `Accept-Encoding`.
     async fn fake_upstream_reflecting_head(io: DuplexStream) {
         let service = service_fn(|request: Request<Incoming>| async move {
             let names: Vec<&str> = request.headers().keys().map(HeaderName::as_str).collect();
@@ -545,7 +530,6 @@ mod tests {
             .await;
     }
 
-    /// Origin fixture that reflects the request path.
     async fn fake_upstream_h1(io: DuplexStream) {
         let service = service_fn(|request: Request<Incoming>| async move {
             let path = request.uri().path().to_owned();
@@ -558,7 +542,6 @@ mod tests {
             .await;
     }
 
-    /// HTTP/2 origin fixture that reflects the request path.
     async fn fake_upstream_h2(io: DuplexStream) {
         let service = service_fn(|request: Request<Incoming>| async move {
             let path = request.uri().path().to_owned();
@@ -656,7 +639,6 @@ mod tests {
         assert_eq!(crossings.count(), 0, "no exchange crossed versions");
     }
 
-    /// Origin fixture that accepts h1 upgrades and echoes the raw stream.
     async fn upgrading_origin(io: DuplexStream) {
         let service = service_fn(|mut request: Request<Incoming>| async move {
             let protocol = request
@@ -694,7 +676,6 @@ mod tests {
             .await;
     }
 
-    /// An accepted h1 upgrade carries bytes through the splice.
     #[tokio::test]
     async fn a_protocol_upgrade_survives_the_proxy_and_carries_bytes() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -763,7 +744,6 @@ mod tests {
         assert_eq!(crossings.count(), 0, "an upgrade crosses no versions");
     }
 
-    /// Forwarded responses lose HTTP/3 alternatives.
     #[test]
     fn every_http3_alternative_is_withdrawn_and_nothing_else_is_touched() {
         for untouched in [
@@ -800,7 +780,6 @@ mod tests {
         );
     }
 
-    /// Steering is applied to forwarded response headers.
     #[tokio::test]
     async fn a_forwarded_response_loses_its_http3_advertisement() {
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
@@ -873,7 +852,6 @@ mod tests {
         );
     }
 
-    /// Only a complete h1 upgrade offer preserves upgrade fields.
     #[test]
     fn only_a_complete_offer_is_read_as_an_upgrade() {
         let offer = Request::builder()
@@ -967,7 +945,6 @@ mod tests {
         assert_eq!(crossings.count(), 0, "h2 to h2 crosses nothing");
     }
 
-    /// Relaying preserves header order and `Accept-Encoding` values.
     #[tokio::test]
     async fn a_relayed_request_keeps_its_field_order_and_encodings() {
         let (client_io, server_io) = tokio::io::duplex(4096);
@@ -1009,7 +986,6 @@ mod tests {
         );
     }
 
-    /// Removing hop-by-hop fields preserves the remaining order.
     #[test]
     fn dropping_a_field_leaves_the_order_of_the_rest() {
         let mut headers = HeaderMap::new();

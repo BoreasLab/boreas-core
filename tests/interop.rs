@@ -31,17 +31,13 @@ use boreas_core::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Whether a missing reference binary is a skip or a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Demand {
-    /// Announce the missing binary and pass.
     Optional,
-    /// Require a usable binary, as CI does.
     Required,
 }
 
 impl Demand {
-    /// Reads the mode from the environment.
     fn current() -> Self {
         match std::env::var("BOREAS_INTEROP").as_deref() {
             Ok("required") => Self::Required,
@@ -50,7 +46,6 @@ impl Demand {
     }
 }
 
-/// The reference binary, or the requested skip/failure mode.
 fn reference_binary() -> Result<PathBuf, Demand> {
     let demand = Demand::current();
     let Some(raw) = std::env::var_os("BOREAS_SINGBOX") else {
@@ -60,8 +55,6 @@ fn reference_binary() -> Result<PathBuf, Demand> {
     path.is_file().then_some(path).ok_or(demand)
 }
 
-/// Returns the binary, or announces a permitted skip and returns `None`.
-///
 /// # Panics
 ///
 /// Under `BOREAS_INTEROP=required`, when no usable binary was named.
@@ -85,23 +78,17 @@ fn reference_or_skip(test: &str) -> Option<PathBuf> {
     }
 }
 
-/// Running reference server, terminated on drop.
 struct Reference {
     child: Child,
     _dir: TempDir,
 }
 
-/// Private CA and leaf certificate for the reference server.
-///
 /// The separate CA and leaf form a chain accepted by both the `boring` and
 /// `rustls` clients. Verification remains enabled so the TLS transport is part
 /// of the interoperability check.
 struct Certificate {
-    /// DER-encoded CA trusted by the client.
     authority: Vec<u8>,
-    /// CA PEM file for `quiche`'s file-based trust loader.
     authority_path: PathBuf,
-    /// Leaf certificate and private-key files for the server.
     certificate: PathBuf,
     key: PathBuf,
     _dir: TempDir,
@@ -149,7 +136,6 @@ impl Certificate {
         }
     }
 
-    /// Builds a TLS transport that trusts this CA and offers `alpn`.
     fn tls_transport(
         &self,
         server: SocketAddr,
@@ -170,7 +156,6 @@ impl Certificate {
     }
 }
 
-/// Wraps DER as PEM without enabling `rcgen`'s additional feature.
 fn pem(label: &str, der: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::new();
@@ -203,7 +188,6 @@ impl Drop for Reference {
 }
 
 impl Reference {
-    /// Starts the reference binary with `config` and waits for TCP readiness.
     fn start(binary: &PathBuf, config: &str, ports: &[u16]) -> Self {
         let dir = TempDir::new();
         let path = dir.path().join("config.json");
@@ -239,8 +223,6 @@ impl Reference {
     }
 }
 
-/// Returns a process-unique port that is free for both TCP and UDP.
-///
 /// A per-process counter prevents concurrent tests from selecting the same
 /// port. Binding both protocols checks for conflicts outside the process.
 fn free_port() -> u16 {
@@ -263,7 +245,6 @@ fn free_port() -> u16 {
     }
 }
 
-/// Scratch directory removed on drop.
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -288,7 +269,6 @@ impl Drop for TempDir {
     }
 }
 
-/// Echo server used to verify a complete proxy round trip.
 async fn start_echo() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -312,7 +292,6 @@ async fn start_echo() -> SocketAddr {
     address
 }
 
-/// Reproducible pre-shared key material, sliced to each method's length.
 const PSK: [u8; 32] = [7u8; 32];
 
 fn psk_base64(len: usize) -> String {
@@ -334,7 +313,6 @@ fn psk_base64(len: usize) -> String {
     encoded
 }
 
-/// Verifies that a foreign server decrypts and echoes Shadowsocks 2022 traffic.
 /// This covers subkey derivation, nonce order, header layouts, chunk framing,
 /// and response-salt handling beyond self-tests.
 #[tokio::test]
@@ -399,7 +377,6 @@ async fn shadowsocks_2022_interoperates_with_the_reference_server() {
     }
 }
 
-/// Verifies SOCKS5 against the independent reference server.
 #[tokio::test]
 async fn socks5_interoperates_with_the_reference_server() {
     let Some(binary) = reference_or_skip("socks5_interoperates_with_the_reference_server") else {
@@ -443,7 +420,6 @@ async fn socks5_interoperates_with_the_reference_server() {
     assert_eq!(&buf, b"socks interop");
 }
 
-/// Verifies VLESS address encoding against the reference server.
 /// A domain target exercises the family byte that differs from SOCKS5.
 #[tokio::test]
 async fn vless_interoperates_with_the_reference_server() {
@@ -489,8 +465,6 @@ async fn vless_interoperates_with_the_reference_server() {
     assert_eq!(&buf, b"vless interop");
 }
 
-/// Verifies Hysteria2 over a real QUIC connection.
-///
 /// The exchange covers QUIC, HTTP/3 status 233, stream setup, bidirectional
 /// pumping, and request/response framing. Two flows must share one connection
 /// and use different stream IDs.
@@ -584,7 +558,6 @@ async fn hysteria2_interoperates_with_the_reference_server() {
     assert_eq!(&buf, b"again");
 }
 
-/// Dials until the reference's UDP listener responds.
 /// UDP gives no separate readiness signal, so bounded retries serve as the
 /// probe and fail faster than the handshake deadline.
 async fn dial_with_retries(
@@ -610,9 +583,6 @@ async fn dial_with_retries(
 
 const TRANSPORT_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
-/// Runs one VLESS flow against a sing-box inbound and checks a payload round trip.
-/// `transport_json` selects the inbound transport; nonempty `tls_json` enables
-/// the matching TLS server configuration.
 async fn vless_transport_round_trip(
     name: &str,
     transport_json: &str,
@@ -685,7 +655,6 @@ async fn vless_transport_round_trip(
     panic!("{name}: every attempt failed, last: {last}");
 }
 
-/// Dials once, writes the payload, and verifies the read-back.
 /// Errors retain enough context for a retry caller to report the last failure.
 async fn transport_round_trip(
     egress: &impl StreamEgress,
@@ -737,7 +706,6 @@ async fn vless_over_websocket_interoperates_with_the_reference_server() {
     .await;
 }
 
-/// Verifies the deployed WebSocket-over-TLS composition and ALPN selection.
 #[tokio::test]
 async fn vless_over_websocket_tls_interoperates_with_the_reference_server() {
     vless_transport_round_trip(

@@ -21,7 +21,6 @@ use etherparse::{Ipv6ExtensionSlice, NetSlice, SlicedPacket};
 use crate::{PacketError, wire::checksum};
 
 const MAX_DATAGRAM_BYTES: usize = u16::MAX as usize;
-/// One bitmap bit per 8-byte wire offset block.
 const BLOCK_BITS: usize = MAX_DATAGRAM_BYTES / 8 + 1;
 const BITMAP_WORDS: usize = BLOCK_BITS.div_ceil(64);
 
@@ -44,9 +43,7 @@ pub struct Fragment<'a> {
     offset: u16,
     more_fragments: bool,
     payload: &'a [u8],
-    /// Header prefix inherited from the offset-zero fragment.
     headers: &'a [u8],
-    /// IPv6 Next Header position to replace; absent for IPv4.
     next_header_at: Option<usize>,
 }
 
@@ -122,7 +119,6 @@ impl<'a> Fragment<'a> {
         self.destination
     }
 
-    /// Transport protocol carried by the fragment.
     pub fn protocol(&self) -> u8 {
         self.protocol
     }
@@ -172,7 +168,6 @@ fn ipv6_fragment_header(packet: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-/// Complete IP packet rebuilt from received fragments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReassembledPacket(Vec<u8>);
 
@@ -194,8 +189,6 @@ impl std::ops::Deref for ReassembledPacket {
     }
 }
 
-/// Rebuilds a packet from offset-zero headers and reassembled data.
-///
 /// Returns `None` when family or length fields cannot represent the result.
 fn rebuild(
     headers: &[u8],
@@ -240,11 +233,8 @@ fn rebuild(
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushOutcome {
-    /// Fragment accepted; more data is required.
     Pending,
-    /// Every block arrived exactly once.
     Complete(ReassembledPacket),
-    /// Fragment rejected or datagram poisoned.
     Discarded,
 }
 
@@ -563,8 +553,6 @@ mod tests {
 
     const NOW: fn() -> Instant = Instant::now;
 
-    /// The IPv4 header every synthetic fragment below carries, with More
-    /// Fragments set and a length that reassembly must correct.
     const HEADER: [u8; 20] = [
         0x45, 0x00, 0x00, 0x1c, 0xbe, 0xef, 0x20, 0x00, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2,
     ];
@@ -583,9 +571,6 @@ mod tests {
         }
     }
 
-    /// The datagram [`HEADER`]'s fragments must reassemble into: the same
-    /// header with Total Length corrected, the fragment fields cleared, and the
-    /// checksum recomputed over the result.
     fn datagram(payload: &[u8]) -> ReassembledPacket {
         let mut packet = HEADER.to_vec();
         packet.extend_from_slice(payload);
@@ -685,7 +670,6 @@ mod tests {
         assert_eq!(tiny.push(second, now), PushOutcome::Pending);
     }
 
-    /// Counts expiry slots; one slot must represent one pending datagram.
     fn index_slots(reassembler: &Reassembler) -> usize {
         reassembler.expirations.values().map(Vec::len).sum()
     }
