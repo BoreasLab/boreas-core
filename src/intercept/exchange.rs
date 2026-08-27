@@ -31,18 +31,22 @@ use tokio::{
 
 use crate::{H2Profile, Rewriting, VersionCrossings, Wire};
 
+/// Common body type for forwarded and synthetic responses.
 pub type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
+/// URL-filter result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterVerdict {
     Allow,
     Block,
 }
 
+/// Decides whether a request for the intercepted host is allowed.
 pub trait RequestFilter: Send + Sync + 'static {
     fn decide(&self, host: &str, request: &Request<Incoming>) -> FilterVerdict;
 }
 
+/// Filter that forwards every request.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllowAll;
 
@@ -65,12 +69,11 @@ const HOP_BY_HOP: [&str; 7] = [
     "content-length",
 ];
 
-// Alt-Svc steering.
-
 /// RFC 7838 field name and withdrawal value.
 const ALT_SVC: &str = "alt-svc";
 const ALT_SVC_CLEAR: &str = "clear";
 
+/// Result of removing HTTP/3 alternatives from `Alt-Svc`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AltSvc {
     /// No recognized HTTP/3 alternative was removed.
@@ -174,7 +177,6 @@ fn percent_decode(id: &str) -> String {
     out
 }
 
-/// Applies [`steer_alt_svc`] to response headers.
 fn steer_response(headers: &mut HeaderMap) {
     let steering = steer_alt_svc(
         headers
@@ -202,7 +204,6 @@ enum Handling {
     Upgrade,
 }
 
-/// Recognizes a complete h1 upgrade offer.
 fn handling<B>(request: &Request<B>) -> Handling {
     let offers_upgrade = request
         .headers()
@@ -361,6 +362,7 @@ async fn splice_upgrade(pending: Pending) -> io::Result<()> {
         .map(drop)
 }
 
+/// Runs one terminated connection with the same HTTP wire on both legs.
 pub async fn run_exchange<C, U>(
     host: impl Into<Arc<str>>,
     wire: Wire,
@@ -1009,8 +1011,6 @@ mod tests {
         strip_hop_by_hop(&mut untouched, Handling::Ordinary);
         assert_eq!(untouched, headers);
     }
-
-    // HTTP/2 fingerprint.
 
     const FRAME_HEADERS: u8 = 0x1;
     const FRAME_PRIORITY: u8 = 0x2;

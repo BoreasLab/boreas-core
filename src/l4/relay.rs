@@ -6,16 +6,16 @@
 //! client datagrams and targets ([`Outbound`]); this module forwards them and
 //! synthesizes replies.
 //!
-//! **One association serves one client mapping.** A shared association could
-//! not attribute replies when clients contact the same peer; keying by client
-//! endpoint makes RFC 4787 endpoint independence structural.
+//! One association serves one client mapping. A shared association could
+//! not attribute replies when clients contact the same peer. Keying by client
+//! endpoint preserves RFC 4787 endpoint independence.
 //!
-//! **Receive ownership and send sharing are explicit in the types.**
+//! Receive ownership and send sharing are explicit in the types.
 //! [`DatagramSource`] takes `&mut self`, so one task reads each association;
 //! [`DatagramSink`] is shared, so association holders may send. A single
 //! `select!` can drive both directions without a lock.
 //!
-//! **Every resource is bounded.** Association count, per-association queues,
+//! Every resource is bounded. Association count, per-association queues,
 //! payload storage, and idle lifetime all have limits. Refusals become counted
 //! drops rather than waits.
 
@@ -32,7 +32,6 @@ use crate::{
     Association, BufferPool, EgressError, InternalEndpoint, Outbound, StreamEgress, Target,
 };
 
-/// Outbound datagrams retained by one association.
 const ASSOCIATION_DEPTH: usize = 32;
 
 /// Resource limits for one relay.
@@ -178,7 +177,6 @@ pub async fn run_relay(
     tracker.wait().await;
 }
 
-/// Opens one client association and moves datagrams until idle or cancelled.
 async fn serve_association(
     egress: &dyn StreamEgress,
     pool: &Arc<BufferPool>,
@@ -212,7 +210,6 @@ async fn serve_association(
                         counts.datagrams_dropped += 1;
                     }
                 }
-                // The mapping is gone, so its association ends with the sender.
                 None => break,
             },
 
@@ -285,7 +282,6 @@ mod tests {
         SocketAddr::from(([198, 51, 100, 2], 53))
     }
 
-    /// An association that records sends and echoes payloads from their target.
     #[derive(Default)]
     struct Echo {
         sent: Mutex<Vec<(SocketAddr, Vec<u8>)>>,
@@ -369,7 +365,6 @@ mod tests {
         }
     }
 
-    /// Client datagrams reach their targets and replies return to their mapping.
     #[tokio::test]
     async fn a_client_datagram_crosses_the_association_and_its_reply_returns() {
         let echo = Arc::new(Echo::default());
@@ -419,7 +414,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Separate associations prevent replies crossing client mappings.
     #[tokio::test]
     async fn each_client_mapping_gets_its_own_association() {
         let echo = Arc::new(Echo::default());
@@ -474,7 +468,6 @@ mod tests {
             .unwrap();
     }
 
-    /// The association ceiling turns excess client mappings into counted drops.
     #[tokio::test]
     async fn the_association_ceiling_refuses_rather_than_grows() {
         let echo = Arc::new(Echo::default());
@@ -524,7 +517,6 @@ mod tests {
         );
     }
 
-    /// An egress that never completes association establishment.
     struct NeverAnswers;
 
     impl StreamEgress for NeverAnswers {
@@ -550,8 +542,6 @@ mod tests {
         }
     }
 
-    /// A stalled association must end at the proxy dial deadline so its task,
-    /// queue, and pooled payloads do not remain live indefinitely.
     #[tokio::test(start_paused = true)]
     async fn an_egress_that_never_answers_gives_the_association_up() {
         let pool = pool();

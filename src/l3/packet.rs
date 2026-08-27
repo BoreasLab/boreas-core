@@ -23,19 +23,18 @@ pub enum Transport {
     Fragment,
 }
 
-/// Classifies ICMP messages without conflating the IPv4 and IPv6 rules.
+/// Classifies ICMP messages without applying IPv6's type-bit rule to IPv4.
 ///
 /// RFC 1122 §3.2.2 and RFC 4443 §2.4 (e) forbid answering an error with an
 /// error. IPv4 uses an explicit list, while IPv6 uses the high bit of the
-/// type, so a shared numeric range would misclassify one family.
+/// type.
 ///
 /// RFC 4443 §2.1 gives ICMPv6 a structural answer: *"Error messages are
 /// identified as such by a zero in the high-order bit of the message Type field
 /// value. Thus, error messages have message Types from 0 to 127."* ICMPv4 has
-/// no such bit and never did; RFC 1122 §3.2.2 names its error messages as a
-/// closed list instead. Applying IPv6's rule to IPv4 would read Echo Request —
-/// type 8 — as an error and silently stop answering `ping -M do`, which is one
-/// of the few things a user can run to discover a path MTU by hand.
+/// no such bit; RFC 1122 §3.2.2 names its error messages as a closed list.
+/// Applying IPv6's rule to IPv4 would classify Echo Request, type 8, as an
+/// error and suppress `ping -M do`, a common manual path-MTU check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcmpClass {
     /// An ICMPv4 error type from RFC 1122's list, or an ICMPv6 type below 128.
@@ -187,11 +186,9 @@ impl IngressPacket {
     }
 }
 
-/// Fixed IP and UDP header sizes used by the packet writers.
 const IPV4_UDP_HEADER: usize = 20 + 8;
 const IPV6_UDP_HEADER: usize = 40 + 8;
 
-/// Maximum payload sizes permitted by the corresponding 16-bit wire lengths.
 const MAX_IPV4_UDP_PAYLOAD: usize = u16::MAX as usize - IPV4_UDP_HEADER;
 const MAX_IPV6_UDP_PAYLOAD: usize = u16::MAX as usize - 8;
 
@@ -219,14 +216,11 @@ impl fmt::Display for WriteError {
 
 impl Error for WriteError {}
 
-/// Reports whether an oversized packet requires an explicit fragmentation
-/// failure instead of silent loss.
+/// Reports whether an oversized packet requires an explicit fragmentation failure.
 ///
-/// IPv6 has no in-network fragmentation at all (RFC 8200 §4.5), so every IPv6
-/// packet answers yes; IPv4 answers on the DF bit. A malformed or truncated
-/// header answers no, which forwards the packet to whatever will reject it
-/// properly instead of synthesizing an error about bytes this did not
-/// understand.
+/// IPv6 has no in-network fragmentation (RFC 8200 §4.5), so every IPv6 packet
+/// answers yes; IPv4 answers from the DF bit. A malformed or truncated header
+/// answers no, so no error is synthesized for bytes that were not understood.
 pub fn forbids_fragmentation(packet: &[u8]) -> bool {
     match packet.first().map(|version| version >> 4) {
         Some(4) => packet.get(6).is_some_and(|flags| flags & 0x40 != 0),
@@ -244,13 +238,13 @@ const MAX_ICMPV6_ERROR: usize = 1280;
 ///
 /// A packet can fit the device-facing MTU while exceeding the tunnel's inner
 /// path MTU. TCP is constrained earlier by SYN MSS clamping; this error gives
-/// datagram transports such as QUIC the feedback needed to reduce their size.
+/// datagram transports such as QUIC feedback to reduce their size.
 ///
 /// The generated source is the quoted packet's destination. That is the peer
 /// the client already knows, since the device-facing side has no router
 /// address of its own to advertise.
 ///
-/// Work is proportional to the bounded quoted length and does not allocate
+/// Work is proportional to the bounded quoted length and uses no allocation
 /// beyond the builder's own state.
 pub fn write_too_big(
     out: &mut [u8],
@@ -318,7 +312,7 @@ pub fn udp_datagram_len(family: IpAddr, payload_len: usize) -> usize {
 /// computes complete IP and UDP checksums, including the optional IPv4 UDP
 /// checksum, because the datagram has no prior checksum to update.
 ///
-/// O(payload length), and allocation-free.
+/// It runs in O(payload length) time without allocation.
 pub fn write_udp(
     out: &mut [u8],
     source: InternalEndpoint,

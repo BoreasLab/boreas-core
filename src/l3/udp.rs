@@ -372,8 +372,8 @@ mod tests {
         // The audited defect: `next_due` scanned every entry in every bucket,
         // so the reactor paid O(flows) to arm one timer. The structural proof
         // is that the answer depends only on which buckets are occupied, so a
-        // table holding one flow and a table holding ten thousand — all in the
-        // same second — must agree exactly.
+        // table holding one flow and a table holding ten thousand, all in the
+        // same second, must agree exactly.
         let start = Instant::now();
         let mut one = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
         let mut many = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn a_rotation_collision_never_reports_a_deadline_late() {
         // Entries a full wheel rotation apart share a bucket. `next_due` may
-        // answer early — the caller re-checks the real deadline — but must
+        // answer early; the caller re-checks the real deadline, but it must
         // never answer late, or a flow would outlive its mapping.
         let start = Instant::now();
         let mut table = UdpFlowTable::new(Duration::from_secs(600), start).unwrap();
@@ -418,7 +418,6 @@ mod tests {
             "reported {reported:?} is later than the earliest real deadline"
         );
 
-        // And both still expire at their own deadlines, in order.
         assert_eq!(
             table.expire(start + Duration::from_secs(599)),
             Vec::<u16>::new()

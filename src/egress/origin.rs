@@ -1,12 +1,11 @@
 //! Re-origination through packet egress for intercepted flows.
 //!
-//! A terminated flow returns to the origin through the host TCP stack. Those
-//! packets enter Boreas's TUN and use the packet egress, so no second TCP stack
-//! or TCP-over-TCP layer is needed.
+//! A terminated flow returns to the origin through the host TCP stack. Its
+//! packets enter Boreas's TUN and use packet egress, avoiding a second TCP
+//! stack or TCP-over-TCP.
 //!
-//! Re-originated connections target the same address and port that made the
-//! original flow eligible for inspection. [`OriginationPorts`] gives the
-//! dialer and classifier one shared range, preventing recursive interception.
+//! [`OriginationPorts`] gives the dialer and classifier one shared range, so
+//! re-originated connections avoid recursive interception.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -106,7 +105,7 @@ impl Drop for PortLease {
     }
 }
 
-/// The field makes the lease lifetime equal to the stream lifetime.
+/// Keeps the port lease alive for the stream's lifetime.
 struct Originated<S> {
     stream: S,
     _lease: PortLease,
@@ -231,9 +230,11 @@ pub(crate) async fn resolve(target: &Target) -> Result<SocketAddr, EgressError> 
     }
 }
 
+/// Packet egress placeholder for a flow-only session.
+///
 /// Flow egress carries TCP and UDP associations directly, so no raw packet
-/// operation is available here. Keeping a concrete implementation preserves
-/// uniform reactor errors and telemetry.
+/// operation is available. This implementation preserves uniform reactor
+/// errors and telemetry.
 pub struct NoPacketEgress;
 
 impl crate::PacketEgress for NoPacketEgress {
@@ -278,14 +279,19 @@ impl crate::PacketEgress for NoPacketEgress {
     }
 }
 
+/// The packet and flow effects derived from one configured egress.
 pub struct Assembly {
+    /// Drives the reactor with whole IP packets and emits encapsulated datagrams.
     pub packets: Box<dyn crate::PacketEgress>,
+    /// Carries intercepted and spliced connections to their egress.
     pub flows: Arc<dyn StreamEgress>,
     /// Local ports the datapath excludes from inspection, or `None` for a proxy
     /// flow effect that re-originates nothing locally.
     pub origination_ports: Option<OriginationPorts>,
 }
 
+/// Splits one configured egress into the packet and flow effects.
+///
 /// Stream egress pairs with [`NoPacketEgress`]. Packet egress drives the reactor
 /// and uses a [`TunnelledDialer`] for re-originated flows. The shared range
 /// keeps dialing and inspection exclusion aligned.
@@ -362,7 +368,6 @@ mod tests {
             held.push(stream);
         }
 
-        // The range is the ceiling; excess connections are refused.
         assert!(
             matches!(
                 dialer.connect(&Target::Ip(origin)).await,
@@ -371,11 +376,11 @@ mod tests {
             "the ceiling must refuse rather than escape the range"
         );
 
-        // Dropping a stream returns its port and admits the next connection.
         held.pop();
         assert!(dialer.connect(&Target::Ip(origin)).await.is_ok());
     }
 
+    /// Packet egress adds excluded origination ports; stream egress does not.
     #[test]
     fn every_egress_variant_assembles_into_both_effects() {
         struct NoStreams;
