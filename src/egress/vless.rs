@@ -332,7 +332,6 @@ impl<T: ProxyTransport + 'static> DatagramSink for VlessDatagrams<T> {
     }
 }
 
-/// Receiving half of a VLESS UDP association.
 struct VlessReplies {
     inbound: mpsc::Receiver<(Vec<u8>, Target)>,
     /// Keeps the streams and reader tasks alive while the source is used.
@@ -390,7 +389,6 @@ impl<T: ProxyTransport + 'static> StreamEgress for VlessEgress<T> {
         }
     }
 
-    /// Creates a lazily dialed datagram association.
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
             let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_DEPTH);
@@ -503,7 +501,6 @@ mod tests {
         ));
     }
 
-    /// VLESS address encoding differs from SOCKS5.
     #[test]
     fn the_address_encoding_is_vmess_shaped_and_not_socks5_shaped() {
         let target = domain("example.com", 443);
@@ -605,7 +602,6 @@ mod tests {
         assert_eq!(decode_response(&[9, 0]), Err(ProxyError::Version(9)));
     }
 
-    /// UDP and TCP requests differ only in the command byte.
     #[test]
     fn a_datagram_request_differs_from_a_stream_one_by_its_command() {
         let user = UserId::parse("11111111-2222-3333-4444-555555555555").unwrap();
@@ -629,7 +625,6 @@ mod tests {
         );
     }
 
-    /// Frames survive arbitrary read boundaries without short delivery.
     #[tokio::test]
     async fn frames_reassemble_across_arbitrary_read_boundaries() {
         let target = Target::Ip("198.51.100.7:53".parse().unwrap());
@@ -678,7 +673,6 @@ mod tests {
         }
     }
 
-    /// The response header is consumed once before all frames.
     #[tokio::test]
     async fn the_response_header_is_consumed_exactly_once() {
         let target = Target::Ip("198.51.100.7:53".parse().unwrap());
@@ -706,7 +700,6 @@ mod tests {
         assert_eq!(inbound_rx.recv().await.unwrap().0, b"world");
     }
 
-    /// Cancellation ends a reader that is waiting for input.
     #[tokio::test]
     async fn cancelling_ends_a_reader_that_is_still_waiting() {
         let (_writer, reader) = tokio::io::duplex(64);
@@ -726,7 +719,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Payload arriving with the header is fully exposed to a small reader.
     #[tokio::test]
     async fn a_small_reader_takes_every_byte_that_arrived_with_the_header() {
         let (mut peer, ours) = tokio::io::duplex(4096);
@@ -761,7 +753,6 @@ mod tests {
         );
     }
 
-    /// The response header can arrive across arbitrary reads.
     #[tokio::test]
     async fn the_header_is_stripped_across_arbitrary_read_boundaries() {
         for chunk in [1usize, 2, 3, 64] {
@@ -797,7 +788,6 @@ mod tests {
         }
     }
 
-    /// Payload remains transparent after one response-header decode.
     #[test]
     fn the_header_is_consumed_exactly_once() {
         let mut codec = ResponseHeader::default();
@@ -818,7 +808,6 @@ mod tests {
         assert!(out.is_empty(), "a strip produces nothing of its own");
     }
 
-    /// Unsupported response versions are rejected.
     #[test]
     fn a_response_from_a_protocol_this_is_not_is_refused() {
         let mut codec = ResponseHeader::default();

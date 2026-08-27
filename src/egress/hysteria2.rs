@@ -170,6 +170,7 @@ impl crate::Negotiation for OpenStream {
     }
 }
 
+// UDP over QUIC.
 
 /// One Hysteria2 UDP message carried by one QUIC DATAGRAM.
 ///

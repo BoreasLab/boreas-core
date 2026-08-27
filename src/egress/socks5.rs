@@ -413,7 +413,6 @@ impl<B: TunnelBypass> Socks5Egress<B> {
         Self { config, bypass }
     }
 
-    /// Connects to the proxy and completes RFC 1928 negotiation.
     async fn exchange(
         &self,
         command: u8,
@@ -497,8 +496,8 @@ impl DatagramSink for Relay {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<(), EgressError>> {
         Box::pin(async move {
-            // Sized once for the worst case this call can produce — the header
-            // is at most `4 + 256 + 2` bytes — so the encode never reallocates.
+            // Sized for the worst case this call can produce: the header is at
+            // most `4 + 256 + 2` bytes, so the encode never reallocates.
             let mut framed = Vec::with_capacity(payload.len() + MAX_DATAGRAM_HEADER);
             encode_datagram(target, payload, &mut framed);
             whole_datagram(self.socket.send(&framed).await?, framed.len())
@@ -506,7 +505,6 @@ impl DatagramSink for Relay {
     }
 }
 
-/// Receiving half of a SOCKS5 association.
 struct Socks5Source {
     relay: Arc<Relay>,
     framed: Vec<u8>,
@@ -714,7 +712,6 @@ mod tests {
         }
     }
 
-    /// Exercises negotiation without a socket.
     #[test]
     fn the_unauthenticated_exchange_greets_requests_and_reads_its_reply() {
         use crate::Negotiation;
@@ -766,7 +763,6 @@ mod tests {
         assert!(reply_at < consumed, "the offset spans more than one phase");
     }
 
-    /// Authentication adds one round trip without repeating the greeting.
     #[test]
     fn the_authenticated_exchange_adds_one_round_trip_and_repeats_nothing() {
         use crate::Negotiation;
@@ -797,7 +793,6 @@ mod tests {
         assert_eq!(request, expected, "the request follows the status byte");
     }
 
-    /// Negotiation reaches the same result for every input split.
     #[test]
     fn the_exchange_reaches_the_same_verdict_however_the_bytes_are_split() {
         use crate::Negotiation;
@@ -817,7 +812,6 @@ mod tests {
         );
     }
 
-    /// A proxy cannot select a method the client did not offer.
     #[test]
     fn a_method_that_was_never_offered_is_refused() {
         use crate::Negotiation;
@@ -830,7 +824,6 @@ mod tests {
         ));
     }
 
-    /// Rejected credentials end negotiation before the request.
     #[test]
     fn a_rejected_credential_ends_the_exchange() {
         use crate::Negotiation;

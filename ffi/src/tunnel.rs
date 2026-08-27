@@ -32,7 +32,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 /// Bounded event buffer between the driver and host.
 const EVENT_DEPTH: usize = 64;
 
-/// Command sent from a host call to the driver.
 enum Command {
     Reload {
         lists: Vec<String>,
@@ -47,7 +46,6 @@ enum Command {
     },
 }
 
-/// Owns the tunnel and serves events and commands until shutdown.
 async fn drive(
     mut tunnel: Tunnel,
     mut commands: mpsc::Receiver<Command>,
@@ -81,7 +79,6 @@ async fn drive(
     let _ = tunnel.stop().await;
 }
 
-/// Running tunnel handle and its runtime.
 pub struct BoreasTunnel {
     runtime: tokio::runtime::Runtime,
     /// Serializes event readers without aliasing the receiver.
@@ -92,7 +89,6 @@ pub struct BoreasTunnel {
 }
 
 impl BoreasTunnel {
-    /// Sends one command and waits for its reply; `None` means the driver ended.
     fn ask<T>(&self, build: impl FnOnce(oneshot::Sender<T>) -> Command) -> Option<T> {
         let (reply, answer) = oneshot::channel();
         self.commands.blocking_send(build(reply)).ok()?;
@@ -156,7 +152,6 @@ impl BoreasEvent {
         }
     }
 
-    /// Converts a reload event to its flat representation.
     fn reloaded(event: &Event) -> Self {
         let mut flat = Self::empty(BoreasEventKind::Reloaded);
         if let Event::Reloaded {

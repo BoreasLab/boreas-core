@@ -159,7 +159,6 @@ fn failed(code: isize) -> io::Error {
     io::Error::from_raw_os_error(i32::try_from(-code).unwrap_or(libc_eio()))
 }
 
-/// Returns the platform-independent fallback `EIO` value.
 const fn libc_eio() -> i32 {
     5
 }
@@ -282,7 +281,6 @@ impl AsyncDevice for Device {
     }
 }
 
-/// Adapts [`BoreasBypass`] to [`TunnelBypass`].
 #[derive(Clone, Copy)]
 pub struct Bypass {
     ops: BoreasBypass,
@@ -374,7 +372,6 @@ impl Bypass {
     }
 }
 
-/// Returns the wildcard address matching `peer`'s family.
 fn unspecified(peer: SocketAddr) -> SocketAddr {
     match peer {
         SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),

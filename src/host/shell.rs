@@ -287,7 +287,6 @@ struct Answer {
     steered: Vec<std::net::IpAddr>,
 }
 
-/// Reactor side of the resolver channels.
 struct Queries {
     out: mpsc::Sender<DnsQuery>,
     back: mpsc::Receiver<Answer>,
@@ -546,7 +545,6 @@ impl Counters {
     }
 }
 
-/// Awaits the next termination reply, or remains pending without a terminator.
 async fn next_reply(termination: &mut Option<Termination>) -> Option<Pooled> {
     match termination {
         Some(termination) => termination.replies.recv().await,
@@ -554,7 +552,6 @@ async fn next_reply(termination: &mut Option<Termination>) -> Option<Pooled> {
     }
 }
 
-/// Awaits the next relay datagram, or remains pending without a relay.
 async fn next_inbound(relay: &mut Option<Relay>) -> Option<Inbound> {
     match relay {
         Some(relay) => relay.inbound.recv().await,
@@ -829,7 +826,6 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 mod tests {
     use super::*;
 
-    /// Pins the distinction between Tokio task unwinding and cancellation.
     #[tokio::test]
     async fn a_panicking_task_is_counted_and_a_cancelled_one_is_not() {
         let panics = Panics::new();
