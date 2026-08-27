@@ -21,31 +21,20 @@ use std::{fmt, net::IpAddr, ops::Add};
 
 use crate::{HostPolicy, HostVerdict, Name};
 
-/// What one line of a filter list means to the name tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
-    /// Block this name and its subdomains.
     Block(Name),
-    /// Allow this name and its subdomains; it overrides blocks.
     Allow(Name),
-    /// Well-formed, but outside this tier's capabilities.
     Deferred(Deferred),
-    /// A blank, comment, or list header.
     Ignored,
 }
 
-/// The capability missing from an unenforceable rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Deferred {
-    /// Needs a scheme, path, or query from an intercepted URL.
     NeedsUrl,
-    /// Needs request context such as `$third-party`, `$script`, or `$image`.
     NeedsRequestContext,
-    /// A cosmetic, scriptlet, or redirect rule owned by P16.
     Cosmetic,
-    /// A hosts-file mapping to a real address rather than a sink.
     HostsMapping,
-    /// A wildcard or regular expression that requires a scan.
     Pattern,
 }
 
@@ -129,7 +118,6 @@ impl Add for Deferrals {
 }
 
 impl ListReport {
-    /// Combines reports with componentwise saturating addition.
     pub fn merge(self, other: Self) -> Self {
         Self {
             blocked: self.blocked.saturating_add(other.blocked),
@@ -140,7 +128,6 @@ impl ListReport {
         }
     }
 
-    /// Returns the number of input lines represented by this report.
     pub fn lines(self) -> u32 {
         self.blocked
             .saturating_add(self.allowed)
@@ -150,7 +137,6 @@ impl ListReport {
     }
 }
 
-/// Adblock Plus syntax recognized by this compiler.
 const EXCEPTION_PREFIX: &str = "@@";
 const DOMAIN_ANCHOR: &str = "||";
 /// ABP's host terminator.
@@ -242,8 +228,8 @@ fn hosts_entry(line: &str) -> Option<Result<Rule, RuleError>> {
 }
 
 impl HostPolicy {
-    /// Compiles `list` into this policy and reports every classification.
-    ///
+        /// Compiles `list` into this policy and reports every classification.
+        ///
     /// Runs in one pass over `list`; the index grows with distinct enforceable
     /// hosts. The result is built off the datapath and swapped through the
     /// shell's `watch` channel.
@@ -273,8 +259,7 @@ impl HostPolicy {
     }
 }
 
-/// Expands a multi-name sink line into one rule per name; other lines yield one
-/// rule. The iterator allocates nothing.
+/// The iterator allocates nothing.
 fn hosts_names(line: &str) -> impl Iterator<Item = Result<Rule, RuleError>> {
     let mut tokens = line.split_whitespace();
     let sink = tokens

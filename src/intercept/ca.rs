@@ -80,7 +80,6 @@ impl std::error::Error for CaError {
 const NOT_BEFORE: (i32, u8, u8) = (2020, 1, 1);
 const NOT_AFTER: (i32, u8, u8) = (2100, 1, 1);
 
-/// Shared root parameters for generation and restoration.
 fn root_params() -> Result<CertificateParams, CaError> {
     let mut params = CertificateParams::new(Vec::<String>::new()).map_err(CaError::Signing)?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -127,12 +126,10 @@ impl CaMaterial {
         })
     }
 
-    /// Returns the public certificate for trust-store installation.
     pub fn root_certificate(&self) -> &[u8] {
         &self.root_certificate
     }
 
-    /// Returns the private material for secure storage.
     pub fn keys(&self) -> &CaKeys {
         &self.keys
     }
@@ -145,17 +142,14 @@ impl CaMaterial {
 pub struct CaKeys(Vec<u8>);
 
 impl CaKeys {
-    /// Returns the versioned bytes to store.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    /// Wraps stored bytes; validation occurs during authority restoration.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self(bytes.into())
     }
 
-    /// Current serialized format version.
     const VERSION: u8 = 1;
 
     fn pack(root: &[u8], leaf: &[u8]) -> Self {
@@ -167,7 +161,6 @@ impl CaKeys {
         Self(bytes)
     }
 
-    /// Parses the complete serialized key pair.
     fn unpack(&self) -> Result<(&[u8], &[u8]), CaError> {
         let mut reader = Reader::new(&self.0);
         if reader.u8() != Some(Self::VERSION) {
@@ -227,7 +220,6 @@ pub struct CertificateAuthority {
 }
 
 impl CertificateAuthority {
-    /// Opens the requested generated or restored authority.
     pub fn open(trust: Trust) -> Result<Self, CaError> {
         match trust {
             Trust::Generate => Self::generate(),
@@ -235,7 +227,6 @@ impl CertificateAuthority {
         }
     }
 
-    /// Generates a fresh root and leaf key.
     pub fn generate() -> Result<Self, CaError> {
         let root_key = KeyPair::generate().map_err(CaError::KeyGeneration)?;
         let params = root_params()?;
@@ -290,12 +281,10 @@ impl CertificateAuthority {
         })
     }
 
-    /// Returns the root certificate for trust-store installation.
     pub fn root_der(&self) -> &CertificateDer<'static> {
         &self.root_der
     }
 
-    /// Mints a host leaf over the shared leaf key.
     pub fn leaf_for(&self, host: &str) -> Result<Arc<CertifiedKey>, CaError> {
         let mut params = CertificateParams::new(vec![host.to_owned()]).map_err(CaError::Signing)?;
         params.distinguished_name.push(DnType::CommonName, host);
@@ -372,7 +361,6 @@ impl MitmResolver {
         }
     }
 
-    /// Returns the cached leaf or fail-open `None` after a signing failure.
     pub fn leaf(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let mut cache = crate::locked(&self.cache);
         cache.get_or_insert(host, || self.authority.leaf_for(host).ok())
@@ -437,7 +425,6 @@ mod tests {
         );
     }
 
-    /// Restored leaves continue to chain to the installed root.
     #[test]
     fn a_restored_authority_mints_under_the_root_it_restored() {
         let original = CertificateAuthority::generate().unwrap();
@@ -468,7 +455,6 @@ mod tests {
         );
     }
 
-    /// Extracts the issuer field from a DER certificate for the test.
     fn issuer_of(der: &rustls::pki_types::CertificateDer<'_>) -> Vec<u8> {
         fn field(bytes: &[u8]) -> (&[u8], &[u8]) {
             let (length, rest) = match bytes[1] {
@@ -491,7 +477,6 @@ mod tests {
         field(rest).0.to_vec()
     }
 
-    /// Invalid or truncated stored material is rejected completely.
     #[test]
     fn material_a_host_could_not_store_intact_is_refused() {
         let good = CertificateAuthority::generate().unwrap().material();
@@ -529,7 +514,6 @@ mod tests {
         }
     }
 
-    /// A certificate and keys from different authorities are rejected.
     #[test]
     fn a_certificate_and_keys_from_different_authorities_are_refused() {
         let mine = CertificateAuthority::generate().unwrap().material();
@@ -548,7 +532,6 @@ mod tests {
         assert_eq!(restored.root_der().as_ref(), mine.root_certificate());
     }
 
-    /// Public root DER is separate from private key material.
     #[test]
     fn the_public_artefact_is_not_inside_the_secret() {
         let material = CertificateAuthority::generate().unwrap().material();
@@ -563,7 +546,6 @@ mod tests {
         );
     }
 
-    /// Generation and restoration expose the same host-side outputs.
     #[test]
     fn opening_with_or_without_stored_material_leaves_the_host_the_same_two_jobs() {
         let first = CertificateAuthority::open(Trust::Generate).unwrap();
@@ -582,7 +564,6 @@ mod tests {
         );
     }
 
-    /// Restoration reports unreadable material instead of replacing it.
     #[test]
     fn material_that_will_not_parse_is_reported_rather_than_replaced() {
         let good = CertificateAuthority::generate().unwrap().material();

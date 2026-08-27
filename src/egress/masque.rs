@@ -152,7 +152,6 @@ impl MasqueEgress {
         &self.state
     }
 
-    /// Number of packets carried without local termination.
     pub fn fast_path_packets(&self) -> u64 {
         self.fast_path_packets
     }
@@ -369,7 +368,6 @@ impl PacketEgress for MasqueEgress {
         MASQUE_TICK
     }
 
-    /// Returns QUIC's loss-recovery deadline for reactor scheduling.
     fn next_deadline(&self) -> Option<Instant> {
         self.conn.timeout().map(|left| Instant::now() + left)
     }
@@ -411,7 +409,6 @@ mod tests {
         assert_eq!(decode_ip_datagram(&[0x04, 0x00], 4), None);
     }
 
-    /// Minimal real `quiche` proxy for one CONNECT-IP request and packet echo.
     struct Proxy {
         conn: quiche::Connection,
         h3: Option<quiche::h3::Connection>,
@@ -420,7 +417,6 @@ mod tests {
     }
 
     impl Proxy {
-        /// Feeds one client datagram and returns the proxy's pending output.
         fn exchange(&mut self, incoming: Option<&[u8]>) -> Vec<Vec<u8>> {
             if let Some(datagram) = incoming {
                 let mut owned = datagram.to_vec();
@@ -494,7 +490,6 @@ mod tests {
         "198.51.100.7:443".parse().unwrap()
     }
 
-    /// Creates the certificate files required by `quiche`'s test server.
     fn proxy_certificate() -> (
         std::path::PathBuf,
         std::path::PathBuf,
@@ -503,7 +498,6 @@ mod tests {
         crate::testing::self_signed("proxy.example")
     }
 
-    /// Verifies a real QUIC handshake, Extended CONNECT, and packet echo.
     #[test]
     fn an_ip_packet_round_trips_through_a_real_connect_ip_tunnel() {
         let (cert_path, key_path, _dir) = proxy_certificate();

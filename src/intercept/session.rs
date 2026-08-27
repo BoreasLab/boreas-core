@@ -24,31 +24,21 @@ use crate::{
     VersionCrossings, Wire, classify, run_exchange, wire::Reader,
 };
 
-/// TLS handshake record content type.
 const RECORD_HANDSHAKE: u8 = 0x16;
-/// TLS record-layer major version.
 const RECORD_MAJOR: u8 = 0x03;
 
-/// Maximum bytes inspected for one TLS record.
 const MAX_RECORD: usize = (1 << 14) + 5;
 
-/// Maximum cleartext request headers inspected before splicing.
 const MAX_REQUEST_HEADERS: usize = 64;
 
-/// Recognition result for the client's first bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Introduction {
-    /// More bytes are needed.
     Incomplete,
-    /// TLS metadata from one complete handshake record.
     Tls(Hello),
-    /// Complete cleartext HTTP/1.x head and optional host.
     Http { host: Option<DomainName> },
-    /// Input is neither TLS nor HTTP.
     Plain,
 }
 
-/// Origin connection mode once a host is known.
 enum Approach {
     Tls {
         profile: crate::ClientProfile,
@@ -57,7 +47,6 @@ enum Approach {
     Cleartext,
 }
 
-/// Recognizes TLS or cleartext HTTP without consuming `bytes`.
 pub fn introduce(bytes: &[u8]) -> Introduction {
     let mut reader = Reader::new(bytes);
     let Some(&[content, major, _minor]) = reader.array::<3>() else {
@@ -93,27 +82,18 @@ fn host_field(fields: &[httparse::Header<'_>]) -> Option<DomainName> {
     DomainName::new(authority.host()).ok()
 }
 
-/// Reason a connection was passed through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpliceReason {
-    /// The host is not on the allowlist.
     NotAllowlisted,
-    /// No usable host name was found.
     Unnamed,
-    /// Input was not recognized as TLS.
     NotTls,
-    /// Recognition exceeded its time or size bound.
     Undecided,
-    /// This host was previously demoted.
     Demoted(Demotion),
-    /// The origin handshake failed before local termination.
     OriginHandshake,
 }
 
-/// Result of serving one connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Handling {
-    /// Intercepted at the selected tier.
     Intercepted {
         host: DomainName,
         wire: Wire,
@@ -122,7 +102,6 @@ pub enum Handling {
     Spliced {
         reason: SpliceReason,
     },
-    /// Interception failed and the host was demoted.
     Demoted {
         host: DomainName,
         cause: Demotion,
@@ -131,11 +110,8 @@ pub enum Handling {
 
 #[derive(Debug)]
 pub enum SessionError {
-    /// Upstream connection or protocol failure.
     Upstream(EgressError),
-    /// The client rejected the forged TLS leaf.
     ClientHandshake(std::io::Error),
-    /// Bidirectional transfer failure.
     Transfer(std::io::Error),
 }
 
@@ -151,10 +127,8 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-/// Bounds for protocol recognition before policy applies.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionLimits {
-    /// Maximum wait for a conclusive introduction.
     pub peek_timeout: Duration,
 }
 
@@ -167,18 +141,14 @@ impl Default for SessionLimits {
     }
 }
 
-/// Shared immutable state for all sessions.
 pub struct Sessions {
     pub interceptor: Arc<Interceptor>,
     pub policy: Arc<InterceptPolicy>,
-    /// Egress for spliced and intercepted flows.
     pub egress: Arc<dyn StreamEgress>,
     pub filter: Arc<dyn RequestFilter>,
     pub crossings: Arc<VersionCrossings>,
-    /// Per-host record of interception failures.
     pub demotions: Arc<Demotions>,
     pub limits: SessionLimits,
-    /// Source for optional HTML element-hiding rules.
     cosmetic: Arc<dyn CosmeticSource>,
     budget: StreamBudget,
     /// BoringSSL origin connector, shared for profile and trust-anchor caches.
@@ -207,13 +177,11 @@ impl Sessions {
         })
     }
 
-    /// Adds trust roots for private or test origins.
     pub fn with_upstream_roots(mut self, extra_roots: &[Vec<u8>]) -> Result<Self, EgressError> {
         self.originator = Arc::new(Originator::new().with_extra_roots(extra_roots));
         Ok(self)
     }
 
-    /// Configures cosmetic rules and the per-stream rewrite budget.
     #[must_use]
     pub fn with_cosmetic_rules(
         mut self,
@@ -237,7 +205,6 @@ impl Sessions {
     }
 }
 
-/// Serves one terminated connection and reports how it was handled.
 pub async fn serve_session(
     stream: crate::TerminatedStream,
     server: std::net::SocketAddr,
@@ -397,8 +364,6 @@ fn learn(
     }
 }
 
-/// Reads until introduction, timeout, EOF, or the record bound decides.
-///
 /// Returns the bytes needed to replay the stream for splicing or termination.
 async fn peek(
     mut stream: crate::TerminatedStream,
@@ -424,8 +389,6 @@ async fn peek(
     }
 }
 
-/// Passes a connection through to the original socket address.
-///
 /// The original address preserves the client's DNS choice; resolving the host
 /// again could select a different destination.
 async fn splice(
@@ -447,8 +410,6 @@ async fn splice(
     Ok(Handling::Spliced { reason })
 }
 
-/// Serves accepted connections until cancellation and joins every child.
-///
 /// The terminator bounds admission; tracking children closes their TLS and
 /// egress resources during shutdown.
 pub async fn run_sessions(
@@ -488,7 +449,6 @@ pub async fn run_sessions(
 mod tests {
     use super::*;
 
-    /// TLS ClientHello constants used by introduction tests.
     const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
     const EXTENSION_SERVER_NAME: u16 = 0x0000;
     const NAME_TYPE_HOST: u8 = 0x00;
@@ -663,8 +623,6 @@ mod end_to_end {
     const ALLOWED: &str = "allowed.example";
     const OTHER: &str = "other.example";
 
-    /// Returns a DER CA and a leaf for `host`; the origin presents the leaf and
-    /// the session trusts the CA on its upstream leg.
     fn origin_certificate(
         host: &str,
     ) -> (
@@ -697,7 +655,6 @@ mod end_to_end {
         )
     }
 
-    /// Real TLS origin returning `200 origin` on a real socket.
     async fn start_tls_origin(host: &str) -> (SocketAddr, Vec<u8>) {
         let (authority, chain, key) = origin_certificate(host);
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -734,7 +691,6 @@ mod end_to_end {
         (address, authority)
     }
 
-    /// Real cleartext origin returning each request path.
     async fn start_cleartext_origin() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -785,8 +741,6 @@ mod end_to_end {
         (address, seen)
     }
 
-    /// Egress fixture that dials one fixed address for every target.
-    ///
     /// It exercises session assembly without requiring a configured proxy; real
     /// egress implementations are tested against a reference server elsewhere.
     struct ToOrigin(SocketAddr);
@@ -836,9 +790,8 @@ mod end_to_end {
         )
     }
 
-    /// A trusting client is intercepted end to end: SNI recognition, forged
-    /// leaf validation, upstream TLS, and the origin response all use real
-    /// connections. Only the egress address is fixed by the fixture.
+    /// Exercises real client, upstream, and origin connections; only the egress
+    /// address is fixed by the fixture.
     #[tokio::test]
     async fn an_allowlisted_host_is_intercepted_end_to_end() {
         let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
@@ -915,8 +868,8 @@ mod end_to_end {
         );
     }
 
-    /// An unlisted host reaches the origin byte-for-byte, including ClientHello.
-    /// Assert the bytes because a rewriting splice could still report Spliced.
+    /// Assert byte-for-byte forwarding because a rewriting splice could still
+    /// report `Spliced`.
     #[tokio::test]
     async fn an_unlisted_host_is_spliced_byte_for_byte() {
         let (origin, seen) = start_recording_origin().await;
@@ -959,8 +912,7 @@ mod end_to_end {
         );
     }
 
-    /// A cleartext site is still intercepted through `Host`; neither leg has a
-    /// TLS handshake, so the connection remains HTTP/1.1.
+    /// Neither leg has a TLS handshake, so the connection remains HTTP/1.1.
     #[tokio::test]
     async fn a_cleartext_host_is_intercepted_through_its_host_header() {
         let origin = start_cleartext_origin().await;
@@ -1005,10 +957,8 @@ mod end_to_end {
         );
     }
 
-    /// A client that rejects the Boreas root loses this connection after the
-    /// forged leaf is sent. The classified failure demotes the next connection
-    /// to a byte-exact splice; the origin is real because its handshake runs
-    /// first.
+    /// Origin handshake runs first; a leaf rejection demotes the next
+    /// connection to a byte-exact splice.
     #[tokio::test]
     async fn a_client_that_refuses_the_forged_leaf_demotes_the_host() {
         let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
@@ -1063,8 +1013,8 @@ mod end_to_end {
         );
     }
 
-    /// A demoted allowlisted host is spliced byte-for-byte, so the client speaks
-    /// directly to the origin and its pin is not challenged again.
+    /// The next connection remains byte-exact and does not challenge the pin
+    /// again.
     #[tokio::test]
     async fn a_demoted_host_splices_the_next_connection_byte_for_byte() {
         let (origin, seen) = start_recording_origin().await;
@@ -1138,7 +1088,6 @@ mod end_to_end {
         );
     }
 
-    /// A cleartext request without `Host` is spliced as an unnamed connection.
     #[tokio::test]
     async fn cleartext_without_a_host_is_spliced_with_its_reason() {
         let (origin, seen) = start_recording_origin().await;

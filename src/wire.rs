@@ -50,12 +50,10 @@ impl<'a> Reader<'a> {
         (at <= bytes.len()).then_some(Self { bytes, at })
     }
 
-    /// Number of bytes consumed from the original buffer.
     pub(crate) fn position(&self) -> usize {
         self.at
     }
 
-    /// Unconsumed input.
     pub(crate) fn rest(&self) -> &'a [u8] {
         &self.bytes[self.at..]
     }
@@ -68,21 +66,18 @@ impl<'a> Reader<'a> {
         self.remaining() == 0
     }
 
-    /// The next `length` bytes, or `None` if fewer remain.
     pub(crate) fn take(&mut self, length: usize) -> Option<&'a [u8]> {
         let taken = self.rest().get(..length)?;
         self.at += length;
         Some(taken)
     }
 
-    /// The next `N` bytes as a fixed-size array.
     pub(crate) fn array<const N: usize>(&mut self) -> Option<&'a [u8; N]> {
         let taken = self.rest().first_chunk::<N>()?;
         self.at += N;
         Some(taken)
     }
 
-    /// Advances past `length` bytes, or `None` if fewer remain.
     pub(crate) fn skip(&mut self, length: usize) -> Option<()> {
         self.take(length).map(drop)
     }
@@ -120,7 +115,6 @@ impl<'a> Reader<'a> {
         Some(value)
     }
 
-    /// A length-prefixed vector's body, the prefix being one byte.
     pub(crate) fn vector_u8(&mut self) -> Option<&'a [u8]> {
         let length = usize::from(self.u8()?);
         self.take(length)
@@ -195,19 +189,16 @@ impl<'a> Writer<'a> {
         self
     }
 
-    /// `value`, behind a one-byte length.
     pub(crate) fn vector_u8(&mut self, value: &[u8]) -> &mut Self {
         debug_assert!(value.len() <= usize::from(u8::MAX), "vector overruns u8");
         self.u8(value.len() as u8).bytes(value)
     }
 
-    /// `value`, behind a two-byte network-order length.
     pub(crate) fn vector_u16(&mut self, value: &[u8]) -> &mut Self {
         debug_assert!(value.len() <= usize::from(u16::MAX), "vector overruns u16");
         self.u16(value.len() as u16).bytes(value)
     }
 
-    /// `value`, behind a four-byte network-order length.
     pub(crate) fn vector_u32(&mut self, value: &[u8]) -> &mut Self {
         debug_assert!(
             u32::try_from(value.len()).is_ok(),
@@ -217,7 +208,6 @@ impl<'a> Writer<'a> {
         self.u32(value.len() as u32).bytes(value)
     }
 
-    /// `value`, behind a varint length.
     pub(crate) fn vector_varint(&mut self, value: &[u8]) -> &mut Self {
         self.varint(value.len() as u64).bytes(value)
     }
@@ -272,7 +262,6 @@ impl<'a> Bounded<'a> {
         self.bytes(&value.to_be_bytes())
     }
 
-    /// Writes `count` zero bytes.
     pub(crate) fn zeros(&mut self, count: usize) -> &mut Self {
         match self.out.get_mut(self.at..self.at + count) {
             Some(slot) if !self.overflowed => {
@@ -284,14 +273,12 @@ impl<'a> Bounded<'a> {
         self
     }
 
-    /// `value`, behind a one-byte length.
     pub(crate) fn vector_u8(&mut self, value: &[u8]) -> &mut Self {
         debug_assert!(value.len() <= usize::from(u8::MAX), "vector overruns u8");
         self.u8(value.len() as u8).bytes(value)
     }
 }
 
-/// Returns the encoded width of a varint.
 pub(crate) fn varint_len(value: u64) -> usize {
     octets::varint_len(value)
 }
@@ -341,7 +328,6 @@ mod tests {
         assert_eq!(Reader::new(&[0; 15]).ipv6(), None);
     }
 
-    /// Reads all supported fixed widths in network order.
     #[test]
     fn every_width_reads_in_network_order() {
         let mut reader = Reader::new(&[
@@ -356,7 +342,6 @@ mod tests {
         assert!(reader.is_empty());
     }
 
-    /// Returned vectors borrow the caller's buffer.
     #[test]
     fn a_read_borrows_rather_than_copies() {
         let bytes = [0x00, 0x03, b'a', b'b', b'c', b'd'];
@@ -367,7 +352,6 @@ mod tests {
         assert_eq!(reader.rest(), b"d");
     }
 
-    /// Length-prefixed vectors reject bodies that exceed the buffer.
     #[test]
     fn a_vector_longer_than_its_buffer_is_refused() {
         assert_eq!(Reader::new(&[4, 1, 2]).vector_u8(), None);
@@ -375,7 +359,6 @@ mod tests {
         assert_eq!(Reader::new(&[0, 0]).vector_u16(), Some(&[][..]));
     }
 
-    /// Seeking accepts positions inside the message only.
     #[test]
     fn a_seek_lands_where_it_was_told_or_nowhere() {
         let bytes = [1, 2, 3, 4];
@@ -384,7 +367,6 @@ mod tests {
         assert!(Reader::at(&bytes, 5).is_none());
     }
 
-    /// Varints use the shortest valid encoding at every width boundary.
     #[test]
     fn each_varint_uses_the_shortest_form_that_holds_it() {
         for (value, width) in [
@@ -409,7 +391,6 @@ mod tests {
         }
     }
 
-    /// Partial varints wait for more input and preserve the trailing bytes.
     #[test]
     fn every_varint_prefix_is_incomplete_and_the_tail_is_preserved() {
         for value in [0u64, 63, 64, 16_384, 1_073_741_824, octets::MAX_VAR_INT] {
@@ -428,7 +409,6 @@ mod tests {
         }
     }
 
-    /// Fixed-width vectors round-trip through their literal bodies.
     #[test]
     fn a_written_vector_reads_back_as_itself() {
         let body = b"boreas";
@@ -449,7 +429,6 @@ mod tests {
         assert!(reader.is_empty());
     }
 
-    /// Overflow is sticky and prevents a partial response from finishing.
     #[test]
     fn a_bounded_overflow_is_sticky() {
         let mut out = [0u8; 4];
@@ -466,7 +445,6 @@ mod tests {
         assert_eq!(out, [0x01, 0x02, 0x03, 0x04]);
     }
 
-    /// A bounded cursor must start inside the buffer.
     #[test]
     fn a_bounded_cursor_starts_inside_its_buffer_or_not_at_all() {
         let mut out = [0u8; 2];
@@ -490,7 +468,6 @@ mod tests {
         );
     }
 
-    /// Splitting the byte stream does not change its checksum.
     #[test]
     fn the_split_between_parts_does_not_change_the_sum() {
         let stream: Vec<u8> = (0..=60u8).collect();
@@ -502,7 +479,6 @@ mod tests {
         }
     }
 
-    /// Odd-length streams are padded with a zero byte.
     #[test]
     fn an_odd_length_stream_pads_with_zero() {
         assert_eq!(checksum(&[&[0xab]]), checksum(&[&[0xab, 0x00]]));
