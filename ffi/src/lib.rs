@@ -1,66 +1,42 @@
 //! The C boundary, and the Android boundary on top of it.
 //!
-//! [`boreas_core::api`] is a Rust-to-Rust contract: a host implements
-//! `AsyncDevice` and `TunnelBypass`, hands over a `TunnelConfig`, and awaits a
-//! `Tunnel`. Every consumer this project actually has is a Kotlin or a C#
-//! application, none of which can implement an async Rust trait or await a
-//! Rust future. This crate is the layer that turns that contract into one two
-//! managed runtimes can hold.
+//! The core API uses async Rust traits, while Kotlin and C# consume `repr(C)`
+//! values, status codes, and out-parameters. This crate converts between those
+//! contracts and rebuilds core invariants at the boundary.
 //!
-//! # Three things are lost at this boundary, and each one has an answer here
+//! # Boundary guarantees
 //!
-//! **Types.** Everything crossing is a primitive, a pointer, or a
-//! `#[repr(C)]` product. The invariants the core spent so much effort making
-//! unrepresentable cannot travel, so they are re-established on this side: one
-//! function turns a C configuration into a [`boreas_core::api::TunnelConfig`],
-//! and that function is the only way in. A configuration that fails to parse
-//! is [`Status::Config`] before anything is built.
+//! C inputs are parsed once into [`boreas_core::api::TunnelConfig`]. Invalid
+//! configuration returns [`Status::Config`] before runtime construction.
 //!
-//! **Totality.** A C caller has no `Result`, so every entry point returns a
-//! [`Status`] and writes its output through an out-parameter. `Status::Ok` is
-//! zero, so the C idiom `if (boreas_...(...)) { fail; }` reads correctly.
+//! Every entry point returns [`Status`] and writes outputs through
+//! out-parameters. `Status::Ok` is zero for C's conventional failure check.
 //!
-//! **Unwinding.** A panic that reaches an `extern "C"` frame aborts the
-//! process — the host's whole application, on a device where the tunnel is one
-//! feature of it. Since Rust 1.81 that abort is defined rather than undefined,
-//! which makes it predictable and no less fatal. Nothing here is allowed to
-//! unwind: [`boundary`] is the single combinator every entry point is written
-//! in, and it catches.
+//! Panics must not cross an `extern "C"` frame. [`boundary`] catches them for
+//! every entry point.
 //!
 //! # What the host still owes
 //!
-//! The two obligations in `api/platform.md` do not go away; they change shape
-//! into [`BoreasDevice`] and [`BoreasBypass`], two vtables of function
-//! pointers. Both are called from Tokio worker threads, so **the host's
-//! callbacks must be safe to call from any thread**, and that requirement is
-//! the load-bearing half of every `unsafe impl Send` in this crate.
+//! [`BoreasDevice`] and [`BoreasBypass`] are called from Tokio worker threads.
+//! Host callbacks must therefore be safe to call from any thread.
 //!
 //! # Scope
 //!
-//! Egress is [`BoreasEgress`]: direct, or a WireGuard peer. Those are what M1
-//! gates on — "a working single-interface WireGuard client on Android and
-//! Windows" — and the proxy egresses are deliberately not mirrored yet, because
-//! six VLESS transports crossing as C structs is a surface to design once the
-//! platforms are real rather than twice.
+//! [`BoreasEgress`] exposes direct and WireGuard egress. Proxy egresses are not
+//! part of this C surface.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 /// The version of the C ABI this library implements.
 ///
-/// **Bumped when a symbol, a field, or the meaning of a call changes.** The
-/// header and the library ship together and must be updated together; this is
-/// how a host proves they were. A stale `libboreas.so` in an installer
-/// otherwise reads fields at the wrong offsets and behaves inexplicably, and
-/// there is no other moment at which that is cheap to notice.
-///
-/// `ffi/include/boreas.h` declares the same number as `BOREAS_ABI_VERSION`,
-/// and `ffi/tests/header.rs` fails the build if the two drift.
+/// Bump this when a symbol, field, or call meaning changes. Keep it synchronized
+/// with `BOREAS_ABI_VERSION` in `ffi/include/boreas.h`; `ffi/tests/header.rs`
+/// checks the pair.
 pub const ABI_VERSION: u32 = 1;
 
 /// The ABI version this library was built as.
 ///
-/// Compare against `BOREAS_ABI_VERSION` from the header at startup and refuse
-/// to run on a mismatch.
+/// Hosts should compare it with `BOREAS_ABI_VERSION` at startup.
 #[unsafe(no_mangle)]
 pub extern "C" fn boreas_abi_version() -> u32 {
     ABI_VERSION
@@ -71,9 +47,7 @@ mod seam;
 mod status;
 mod tunnel;
 
-/// The Android bypass. Compiled only there, because it is the only platform
-/// whose obligation is a method on a managed object rather than a socket
-/// option, and the only one that needs a JVM to satisfy it.
+/// Android bypass using the managed-object method required by that platform.
 #[cfg(target_os = "android")]
 pub mod android;
 

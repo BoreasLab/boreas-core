@@ -1,8 +1,6 @@
-//! The P10 gate, exercised in-process: the scripted harness drives packets
-//! through the datapath's packet fast path into a real WireGuard egress, a
-//! second egress terminates the tunnel, and the decapsulated packet re-enters
-//! the datapath's egress side byte-identical. No sockets, no real devices —
-//! those belong to the M1 product gate, which this environment cannot run.
+//! P10 packet fast-path gate, exercised in-process. A scripted harness drives
+//! packets through two WireGuard egresses and checks byte-exact re-entry.
+//! Sockets and real devices belong to the M1 product gate.
 
 use std::{net::Ipv4Addr, num::NonZeroUsize, sync::Arc, time::Duration};
 
@@ -11,9 +9,8 @@ use boreas_core::{
     Harness, Limits, Mtu, NatBehavior, PathProperties, SimDevice, WireGuardConfig, WireGuardEgress,
 };
 
-/// Slices large enough for an encapsulated 1420-byte packet, and a budget
-/// nothing here approaches: an exhaustion in this test would be a defect, not
-/// the congestion path (`src/egress/mod.rs` covers that one).
+/// Pool sized for encapsulated 1420-byte packets; exhaustion here would be a
+/// test defect rather than the congestion path in `src/egress/mod.rs`.
 fn pool() -> Arc<BufferPool> {
     BufferPool::new(
         NonZeroUsize::new(2048).unwrap(),
@@ -31,8 +28,7 @@ fn udp_frame(source: Ipv4Addr, source_port: u16) -> Vec<u8> {
 }
 
 fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
-    // The egress's real path properties drive the plan, exactly as the shell
-    // would derive them from the `Egress` sum.
+    // The shell derives the plan from the egress's live path properties.
     let egress = Egress::Packet(Box::new(client_egress(Arc::clone(&pool))));
     let properties = egress.properties();
     assert_eq!(egress.accepts(), Accepts::IpPackets);
@@ -47,8 +43,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
-            // Long enough to outlast a browser's cached Alt-Svc entry for
-            // an origin, which is what the DNS rewrite alone cannot reach.
+            // Covers a browser's cached Alt-Svc window.
             inspection_window: Duration::from_secs(60),
             max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
             inspected_ports: boreas_core::DEFAULT_INSPECTED_PORTS,
@@ -98,8 +93,7 @@ fn public_key_of(private: [u8; 32]) -> [u8; 32] {
     gotatun::x25519::PublicKey::from(&secret).to_bytes()
 }
 
-/// Pumps network-bound emits from one egress into the other until the
-/// exchange settles, returning everything either end wrote to its tunnel.
+/// Delivers network emits between egresses until the exchange settles.
 fn pump(
     client: &mut WireGuardEgress,
     server: &mut WireGuardEgress,
@@ -140,16 +134,12 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
     let base = std::time::Instant::now();
     let pool = pool();
 
-    // The device offers the packet; the harness runs the datapath over it.
     let mut device = SimDevice::new(Mtu::new(1500).unwrap(), 7);
     device.inject(&frame, 0);
     let mut harness = Harness::new(device, packet_datapath(Arc::clone(&pool)), base);
     harness.step(0).expect("device is scripted, not lossy");
 
-    // The packet path forwarded the packet untouched, toward the egress and
-    // not back down the device it arrived on, and planned no flow: a
-    // packet-path flow is local termination, and the fast-path counter on the
-    // egress is what proves none of this entered smoltcp.
+    // Fast path preserves bytes, targets egress, and opens no smoltcp flow.
     assert_eq!(
         harness.to_egress(),
         std::slice::from_ref(&frame),
@@ -164,8 +154,8 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
         "the packet path opens no flows"
     );
 
-    // The forwarded packet enters the WireGuard egress; the first packet also
-    // triggers the handshake, which the loopback exchange completes.
+    // The first packet triggers the handshake, which the loopback exchange
+    // completes.
     let mut client = client_egress(Arc::clone(&pool));
     let mut server = server_egress(Arc::clone(&pool));
     let mut first = Vec::new();
@@ -176,8 +166,8 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
     assert_eq!(tunnelled, vec![frame.clone()], "wire payload survives");
     assert_eq!(client.fast_path_packets(), 1);
 
-    // The decapsulated packet re-enters the datapath's egress side and is
-    // forwarded back toward the client byte-identically, on the tunnel side.
+    // Decapsulation re-enters the datapath and returns the packet byte-identically
+    // on the tunnel side.
     harness
         .datapath
         .on_egress_packet(&tunnelled[0], base)
@@ -206,8 +196,8 @@ fn wireguard_properties_plan_the_packet_fast_path() {
     )
     .expect("WireGuard path properties plan");
 
-    // 1500 - 80 leaves 1420, the conventional WireGuard MTU, and QUIC clears
-    // the 1200-byte floor with headroom.
+    // 1500 - 80 leaves the conventional 1420-byte WireGuard MTU and clears
+    // QUIC's 1200-byte floor.
     assert_eq!(
         plan,
         boreas_core::FlowPlan {

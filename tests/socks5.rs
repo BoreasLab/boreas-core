@@ -1,14 +1,10 @@
-//! P17: the SOCKS5 egress driven against a real proxy.
+//! P17 SOCKS5 egress against a real proxy.
 //!
-//! The codec's laws are unit-tested in `src/egress/socks5.rs`; what needs a socket is
-//! the *driver* — the greeting, the authentication sub-negotiation, the reply
-//! framing, and the UDP relay's lifetime. So this file implements a minimal but
-//! genuine RFC 1928 proxy and makes the egress talk to it.
+//! Unit tests cover codec laws. This file exercises the socket driver: RFC 1928
+//! greeting, RFC 1929 authentication, reply framing, and UDP relay lifetime.
 //!
-//! The proxy validates rather than rubber-stamps: it refuses a greeting that
-//! does not offer a method it accepts, and it checks the credentials it was
-//! configured with. A client that spoke the protocol incorrectly would fail
-//! these tests rather than pass them by accident.
+//! The proxy rejects unsupported methods and invalid credentials, so protocol
+//! errors fail the tests instead of passing by accident.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -24,14 +20,11 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
-/// What the test proxy demands of its clients, and what it sends them.
 #[derive(Clone)]
 struct ProxyPolicy {
     credentials: Option<(String, String)>,
-    /// Bytes written *in the same `write_all` as the CONNECT reply*, standing
-    /// in for a server-first protocol's banner. The single write is the point:
-    /// it is what makes the reply and the payload arrive in one segment, which
-    /// is the case a reply reader that over-reads and discards gets wrong.
+    /// Bytes sent with the CONNECT reply to test surplus preservation. A
+    /// server-first protocol may send its banner in the same write.
     banner: &'static [u8],
 }
 
@@ -44,9 +37,7 @@ impl ProxyPolicy {
     }
 }
 
-/// Reads the client's greeting and answers with a method, performing RFC 1929
-/// authentication when this proxy requires it. Returns whether the client may
-/// proceed.
+/// Negotiates the greeting and optional RFC 1929 authentication.
 async fn negotiate(stream: &mut TcpStream, policy: &ProxyPolicy) -> std::io::Result<bool> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).await?;
@@ -84,7 +75,7 @@ async fn negotiate(stream: &mut TcpStream, policy: &ProxyPolicy) -> std::io::Res
     Ok(ok)
 }
 
-/// Reads a request and returns its command byte and target.
+/// Parses a request into its command and target.
 async fn read_request(stream: &mut TcpStream) -> std::io::Result<(u8, Target)> {
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
@@ -114,7 +105,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<(u8, Target)> {
     Ok((head[1], target))
 }
 
-/// Writes a reply with the given code and bound address.
+/// Encodes a reply with a bound address and trailing bytes.
 async fn write_reply(
     stream: &mut TcpStream,
     code: u8,
@@ -139,9 +130,8 @@ async fn write_reply(
 
 /// Runs one connection of a minimal SOCKS5 proxy.
 ///
-/// CONNECT dials the target and splices; UDP ASSOCIATE binds a relay that
-/// echoes each datagram back to its sender, framed as the protocol requires,
-/// which is what proves the client's header handling in both directions.
+/// CONNECT dials an IP target and splices. UDP ASSOCIATE binds a relay that
+/// echoes each datagram with its protocol header.
 async fn serve(mut stream: TcpStream, policy: ProxyPolicy) {
     if !negotiate(&mut stream, &policy).await.unwrap() {
         return;
@@ -150,8 +140,7 @@ async fn serve(mut stream: TcpStream, policy: ProxyPolicy) {
     match command {
         1 => {
             let Target::Ip(address) = target else {
-                // A CONNECT to a name would need resolution; the test dials by
-                // address so the proxy stays a proxy.
+                // The test dials by address so the proxy does not resolve names.
                 write_reply(&mut stream, 4, ([0, 0, 0, 0], 0).into(), b"")
                     .await
                     .unwrap();
@@ -170,15 +159,13 @@ async fn serve(mut stream: TcpStream, policy: ProxyPolicy) {
                 .await
                 .unwrap();
 
-            // The relay outlives the request but not the control connection,
-            // which is the lifetime RFC 1928 §7 specifies.
+            // RFC 1928 §7 ties the relay lifetime to the control connection.
             let relaying = async {
                 let mut buf = vec![0u8; 2048];
                 loop {
                     let (read, from) = relay.recv_from(&mut buf).await.unwrap();
                     let (destination, payload) = decode_datagram(&buf[..read]).unwrap();
-                    // Echo the payload back, attributed to the destination the
-                    // client addressed, so the client's decode is exercised.
+                    // Preserve the destination so the client's decoder sees it.
                     let mut framed = Vec::new();
                     encode_datagram(&destination, payload, &mut framed);
                     relay.send_to(&framed, from).await.unwrap();
@@ -197,7 +184,6 @@ async fn serve(mut stream: TcpStream, policy: ProxyPolicy) {
     }
 }
 
-/// Starts the proxy and returns the address it listens on.
 async fn start_proxy(policy: ProxyPolicy) -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -210,7 +196,6 @@ async fn start_proxy(policy: ProxyPolicy) -> SocketAddr {
     address
 }
 
-/// An echo server for CONNECT to reach.
 async fn start_echo() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -264,7 +249,6 @@ async fn authentication_is_performed_when_the_proxy_requires_it() {
     })
     .await;
 
-    // The right credentials get through.
     let authenticated = egress(proxy, Some(Credentials::new("boreas", "secret").unwrap()));
     let mut stream = authenticated
         .connect(&Target::Ip(echo))
@@ -275,7 +259,7 @@ async fn authentication_is_performed_when_the_proxy_requires_it() {
     stream.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"hello");
 
-    // The wrong ones do not, and the failure is named rather than a timeout.
+    // Invalid credentials fail during authentication rather than timing out.
     let wrong = egress(proxy, Some(Credentials::new("boreas", "wrong").unwrap()));
     let Err(error) = wrong.connect(&Target::Ip(echo)).await else {
         panic!("bad credentials must be refused");
@@ -285,8 +269,7 @@ async fn authentication_is_performed_when_the_proxy_requires_it() {
         "the refusal names itself: {error}"
     );
 
-    // Offering no credentials at all to a proxy that demands them ends in the
-    // proxy's own "no acceptable method", not in a hang.
+    // Omitting credentials returns the proxy's "no acceptable method" reply.
     let anonymous = egress(proxy, None);
     let Err(error) = anonymous.connect(&Target::Ip(echo)).await else {
         panic!("an unauthenticated client must be refused");
@@ -308,9 +291,7 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
         port: 53,
     };
 
-    // A datagram crosses with its destination in the header, and comes back
-    // attributed to that same destination: the framing works in both
-    // directions, which is the whole of RFC 1928 §7 that a client performs.
+    // RFC 1928 §7 framing preserves the destination in both directions.
     association
         .sink
         .send_to(b"\x12\x34query", &target)
@@ -328,10 +309,8 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
     assert_eq!(&buf[..read], b"\x12\x34query");
     assert_eq!(from, target, "the reply names the peer it came from");
 
-    // **The boundary is preserved or the read fails; it is never shortened.**
-    // A relay claiming native datagram fidelity that quietly delivered the
-    // first `n` bytes of a QUIC packet would satisfy every length check
-    // downstream and corrupt the connection anyway.
+    // Native datagram fidelity preserves boundaries or rejects the datagram;
+    // truncating a QUIC packet would corrupt the connection.
     association
         .sink
         .send_to(&[0xab; 200], &target)
@@ -353,18 +332,13 @@ async fn udp_associate_relays_datagrams_with_their_targets() {
     );
 }
 
-/// **The regression test for a reply reader that over-reads.**
+/// Regression test for a reply reader that over-reads.
 ///
-/// A SOCKS5 reply's length lives inside the reply, so a client must read at
-/// least the reply and may read past it. A server-first protocol — SSH, SMTP,
-/// IMAP — sends its banner the instant the proxy dials the target, and the
-/// proxy forwards it, so the banner arrives in the same segment as the reply
-/// for exactly the flows where it matters. A client that decodes the reply and
-/// then throws the buffer away loses the banner, with no error anywhere: the
-/// connection simply appears to have skipped the greeting it was waiting for.
+/// A SOCKS5 reply has an internal length and may be followed in the same write
+/// by a server-first banner. Discarding bytes beyond the reply loses that
+/// banner without an error.
 ///
-/// The test proxy writes the reply and the banner in one `write_all`, which is
-/// what makes the coalescing deterministic rather than a matter of timing.
+/// The proxy coalesces the reply and banner in one `write_all`.
 #[tokio::test]
 async fn a_banner_coalesced_with_the_reply_is_not_swallowed() {
     const BANNER: &[u8] = b"SSH-2.0-Boreas\r\n";
@@ -381,9 +355,7 @@ async fn a_banner_coalesced_with_the_reply_is_not_swallowed() {
         .await
         .expect("connect succeeds");
 
-    // Bounded, because the failure this guards against is a *hang*: a
-    // discarded banner leaves the reader waiting for bytes that were already
-    // consumed and thrown away, and a test that hangs reports nothing useful.
+    // Bound this read because swallowing the banner would otherwise hang.
     let mut greeting = vec![0u8; BANNER.len()];
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -397,8 +369,7 @@ async fn a_banner_coalesced_with_the_reply_is_not_swallowed() {
         "the bytes that followed the reply must be delivered, not discarded"
     );
 
-    // And the stream still works afterwards: the replayed prefix must not
-    // displace what the underlying socket goes on to deliver.
+    // Replayed surplus must not displace later socket bytes.
     stream.write_all(b"after").await.unwrap();
     let mut echoed = [0u8; 5];
     tokio::time::timeout(

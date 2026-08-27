@@ -1,9 +1,7 @@
 //! The build pipeline, typed.
 //!
-//! The decisions live in [`android`] and [`release`] and are pure: every input
-//! arrives as an argument, so every branch is pinned by a test on fixed values.
-//! This file is the shell that gathers an environment, runs `git`, writes
-//! files, and renders output — and it is deliberately the only place that does.
+//! [`android`] and [`release`] contain pure decisions over typed inputs. This
+//! file gathers the environment, runs `git`, writes files, and renders output.
 //!
 //! ```text
 //! cargo xtask abis                    every Android ABI, one per line
@@ -12,11 +10,6 @@
 //! cargo xtask resolve                 what this event publishes, as key=value
 //! ```
 //!
-//! **This replaced two Python scripts, and the reason is in the commit that
-//! preceded it.** One shipped `TypeError: 'PosixPath' object is not callable`
-//! to CI, from a local shadowing the function below it; the other emitted `CC`
-//! without `CXX` and built a third of BoringSSL for the wrong architecture.
-//! Neither is expressible here — see [`android`] for which type forbids which.
 
 #![deny(unsafe_code)]
 
@@ -39,8 +32,8 @@ fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
 
-    // Four commands, each taking at most one argument. A dependency for this
-    // would be a dependency for a `match`.
+    // Four commands take at most one argument, so a match replaces a parser
+    // dependency.
     let outcome = match borrowed.as_slice() {
         ["abis"] => Ok(abis()),
         ["android-target", abi] => android_target(abi),
@@ -71,8 +64,7 @@ fn usage(given: &[&str]) -> String {
     )
 }
 
-/// The repository root: one level above this crate, which is where Cargo put
-/// it and where the workspace manifest is.
+/// The workspace root, one level above this crate.
 pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -82,8 +74,7 @@ pub fn repo_root() -> PathBuf {
 
 // ----------------------------------------------------------------- android
 
-/// Every ABI, which is what the release workflow's matrix is built from. The
-/// list lives in one place and CI reads it rather than repeating it.
+/// ABI names used by the release workflow matrix.
 fn abis() -> String {
     let mut rendered = String::new();
     for abi in &android::ABIS {
@@ -105,9 +96,8 @@ fn android_target(name: &str) -> Fallible {
 
 /// The cross toolchain for one ABI, as lines for `$GITHUB_ENV`.
 ///
-/// Writes the CMake wrapper as a side effect, because the environment has to
-/// name it and a path to a file nobody wrote is the class of bug this crate
-/// exists to end.
+/// Writes the CMake wrapper because the emitted environment names its path; a
+/// missing wrapper would surface later as a linker error.
 fn android_env(name: &str) -> Fallible {
     let abi = named(name)?;
     let (host, root) = (HostTag::current()?, ndk_root()?);
@@ -126,8 +116,7 @@ fn android_env(name: &str) -> Fallible {
     ))
 }
 
-/// Where the NDK is, preferring the variable a GitHub runner sets to the
-/// newest one it has.
+/// Selects the newest NDK path available in runner variables.
 fn ndk_root() -> Result<PathBuf, String> {
     ["ANDROID_NDK_LATEST_HOME", "ANDROID_NDK_HOME", "ANDROID_NDK"]
         .into_iter()
@@ -139,17 +128,14 @@ fn ndk_root() -> Result<PathBuf, String> {
 
 /// What this event publishes.
 ///
-/// **This is where the one untrusted string becomes a version.** `GITHUB_SHA`
-/// and `GITHUB_REF_NAME` arrive as text; both are parsed here, and what reaches
-/// [`release::resolve`] is already a `Version` and a `Sha`. That is the whole
-/// reason the algebra is total — the refusals live at the edge that receives
-/// the strings, not in the function that reasons about them.
+/// `GITHUB_SHA` and `GITHUB_REF_NAME` are parsed here, so
+/// [`release::resolve`] receives typed values and no longer handles input
+/// refusal.
 ///
-/// Nothing reads a version out of a manifest. The tag is the version.
+/// The tag is the sole release-version source.
 fn resolve() -> Fallible {
     let event = match std::env::var("GITHUB_REF_TYPE").as_deref() {
-        // `GITHUB_REF_TYPE` is `tag` exactly when a tag was pushed, so the
-        // workflow plumbs nothing and there is no branch to get wrong.
+        // A tag ref identifies a release; other refs use Push.
         Ok("tag") => {
             let name = std::env::var("GITHUB_REF_NAME")?;
             let version = Version::parse_tag(&name).ok_or_else(|| {
@@ -173,9 +159,7 @@ fn resolve() -> Fallible {
     )))
 }
 
-/// Every release tag in the repository. Anything that is not one — a
-/// pre-release included — is dropped here, at the boundary, so the algebra
-/// never sees a string.
+/// Reads release tags, ignoring pre-release tags before the pure resolver.
 fn released() -> Result<Vec<Version>, Box<dyn Error>> {
     Ok(git(&["tag", "--list", "v*"])?
         .lines()
@@ -213,9 +197,8 @@ fn outputs(publish: &Publish) -> String {
     ])
 }
 
-/// `key=value` lines, which is the one shape GitHub Actions reads for both
-/// `$GITHUB_ENV` and `$GITHUB_OUTPUT`. The caller redirects; this never opens
-/// either file, so running a command by hand prints rather than writes.
+/// Formats the `key=value` lines used by `$GITHUB_ENV` and `$GITHUB_OUTPUT`.
+/// The caller redirects stdout; this function never opens either file.
 fn assignments(pairs: &[(String, String)]) -> String {
     let mut rendered = String::new();
     for (key, value) in pairs {
@@ -228,8 +211,7 @@ fn assignments(pairs: &[(String, String)]) -> String {
 mod tests {
     use super::*;
 
-    /// The matrix in the release workflow is written by hand; this is what
-    /// stops it drifting from the table.
+    /// The release matrix matches the ABI table.
     #[test]
     fn the_abi_list_is_the_table() {
         assert_eq!(abis(), "arm64-v8a\nx86\nx86_64\n");
@@ -249,8 +231,7 @@ mod tests {
         );
     }
 
-    /// The rendering CI consumes, pinned. A stray space either side of `=` is
-    /// a variable that silently does not take effect.
+    /// GitHub Actions consumes bare `key=value` lines.
     #[test]
     fn assignments_are_bare_key_equals_value_lines() {
         let rendered = assignments(&[
