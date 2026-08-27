@@ -110,7 +110,6 @@ struct QueueDevice {
     mtu: usize,
 }
 
-/// Receive token owning its packet buffer.
 struct QueueRx(Pooled);
 
 impl RxToken for QueueRx {
@@ -189,21 +188,16 @@ pub struct LocalStack {
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// Ports with listeners maintained by this stack.
     ports: Vec<u16>,
     listeners: Vec<Listener>,
     limits: TerminationLimits,
-    /// Live connections and cached endpoints.
     established: HashMap<SocketHandle, (InternalEndpoint, InternalEndpoint)>,
     accepted: VecDeque<Terminated>,
     closed: VecDeque<StreamId>,
-    /// Origin for mapping caller instants to smoltcp milliseconds.
     base: Instant,
 }
 
 impl LocalStack {
-    /// Builds a terminator for `ports`.
-    ///
     /// The device advertises the smaller of `mtu` and the pool slice size, so
     /// every segment smoltcp creates fits its reserved buffer.
     pub fn new(
@@ -263,27 +257,22 @@ impl LocalStack {
         Ok(stack)
     }
 
-    /// Enqueues one pooled client packet for the next [`poll`](Self::poll).
     pub fn push(&mut self, packet: Pooled) {
         self.device.inbound.push_back(packet);
     }
 
-    /// Removes the next reply packet for the client.
     pub fn poll_transmit(&mut self) -> Option<Pooled> {
         self.device.outbound.pop_front()
     }
 
-    /// Returns the pool used by this stack.
     pub fn pool(&self) -> &Arc<BufferPool> {
         &self.device.pool
     }
 
-    /// Removes the next newly accepted connection.
     pub fn poll_accept(&mut self) -> Option<Terminated> {
         self.accepted.pop_front()
     }
 
-    /// Removes the next fully closed connection.
     pub fn poll_closed(&mut self) -> Option<StreamId> {
         self.closed.pop_front()
     }
@@ -294,7 +283,6 @@ impl LocalStack {
         SmolInstant::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
     }
 
-    /// Advances TCP state, emits replies, and harvests opened or closed streams.
     pub fn poll(&mut self, now: Instant) {
         let now = self.now(now);
         // Continue until smoltcp reports no more state changes.
@@ -305,7 +293,6 @@ impl LocalStack {
         self.replenish_listeners();
     }
 
-    /// Returns the next smoltcp service time, if one is scheduled.
     pub fn poll_at(&mut self, now: Instant) -> Option<Instant> {
         let smol_now = self.now(now);
         self.iface.poll_at(smol_now, &self.sockets).map(|at| {
@@ -315,7 +302,6 @@ impl LocalStack {
         })
     }
 
-    /// Reads up to `buf.len()` bytes from a stream.
     pub fn recv(&mut self, id: StreamId, buf: &mut [u8]) -> Result<usize, StreamError> {
         let socket = self.socket_mut(id)?;
         if socket.can_recv() {
@@ -332,7 +318,6 @@ impl LocalStack {
         }
     }
 
-    /// Writes into a stream's send buffer.
     pub fn send(&mut self, id: StreamId, buf: &[u8]) -> Result<usize, StreamError> {
         let socket = self.socket_mut(id)?;
         if !socket.may_send() {
@@ -349,31 +334,26 @@ impl LocalStack {
         }
     }
 
-    /// Whether `recv` can return bytes immediately.
     pub fn can_recv(&self, id: StreamId) -> bool {
         self.socket(id).is_some_and(Socket::can_recv)
     }
 
-    /// Whether `send` can accept bytes immediately.
     pub fn can_send(&self, id: StreamId) -> bool {
         self.socket(id).is_some_and(Socket::can_send)
     }
 
-    /// Gracefully closes this local half after buffered bytes drain.
     pub fn close(&mut self, id: StreamId) {
         if let Ok(socket) = self.socket_mut(id) {
             socket.close();
         }
     }
 
-    /// Aborts the connection with a RST.
     pub fn abort(&mut self, id: StreamId) {
         if let Ok(socket) = self.socket_mut(id) {
             socket.abort();
         }
     }
 
-    /// Number of live sockets, including listeners.
     pub fn socket_count(&self) -> usize {
         self.listeners.len() + self.established.len()
     }
@@ -391,7 +371,6 @@ impl LocalStack {
         Ok(self.sockets.get_mut::<Socket>(id.0))
     }
 
-    /// Publishes accepted listeners and reaps inactive connections.
     fn harvest(&mut self) {
         // A listener leaving `Listen` has become a connection.
         let mut converted = Vec::new();
@@ -435,7 +414,6 @@ impl LocalStack {
         }
     }
 
-    /// Restores each port's listener backlog up to the socket ceiling.
     fn replenish_listeners(&mut self) {
         for &port in &self.ports {
             let live = self.listeners.iter().filter(|l| l.port == port).count();
@@ -487,7 +465,6 @@ pub(crate) mod tests {
         Mtu::new(MTU).unwrap()
     }
 
-    /// Fixture pool with enough capacity for the exchange tests.
     fn pool() -> Arc<BufferPool> {
         BufferPool::new(
             NonZeroUsize::new(usize::from(MTU)).unwrap(),
@@ -495,13 +472,10 @@ pub(crate) mod tests {
         )
     }
 
-    /// Builds a terminator with the fixture pool.
     fn stack(ports: &[u16], limits: TerminationLimits, base: Instant) -> LocalStack {
         LocalStack::new(mtu(), ports, limits, pool(), base).expect("the fixture fits")
     }
 
-    /// A ceiling below one backlog per port must be rejected rather than leave
-    /// later ports without listeners.
     #[test]
     fn a_ceiling_that_cannot_hold_a_backlog_per_port_is_refused() {
         assert_eq!(
@@ -539,14 +513,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Bare client stack with one connecting TCP socket for integration-style
-    /// packet exchange against the terminator.
     pub(crate) struct Client {
         device: QueueDevice,
         iface: Interface,
         sockets: SocketSet<'static>,
         handle: SocketHandle,
-        /// Client-side virtual milliseconds.
         ms: u64,
     }
 
@@ -600,19 +571,16 @@ pub(crate) mod tests {
             self.sockets.get_mut::<Socket>(self.handle)
         }
 
-        /// Advances the client clock and polls its state machine.
         pub(crate) fn tick(&mut self) {
             self.ms += 20;
             let now = SmolInstant::from_millis(i64::try_from(self.ms).unwrap_or(i64::MAX));
             self.poll(now);
         }
 
-        /// Takes packets emitted since the previous call.
         pub(crate) fn take_outbound(&mut self) -> Vec<Vec<u8>> {
             self.device.outbound.drain(..).map(|p| p.to_vec()).collect()
         }
 
-        /// Delivers one packet to the client.
         pub(crate) fn deliver(&mut self, packet: &[u8]) {
             let pooled = self
                 .device
@@ -622,12 +590,10 @@ pub(crate) mod tests {
             self.device.inbound.push_back(pooled);
         }
 
-        /// Queues application bytes in the client socket.
         pub(crate) fn send(&mut self, bytes: &[u8]) -> Result<usize, SendError> {
             self.socket().send_slice(bytes)
         }
 
-        /// Takes application bytes received by the client.
         pub(crate) fn take_received(&mut self) -> Vec<u8> {
             let mut buf = [0u8; 512];
             match self.socket().recv_slice(&mut buf) {
@@ -637,7 +603,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Moves packets in both directions and advances both TCP clocks once.
     fn relay(server: &mut LocalStack, client: &mut Client, base: Instant, ms: u64) {
         let outbound: Vec<Vec<u8>> = client.take_outbound();
         for packet in outbound {
@@ -681,7 +646,6 @@ pub(crate) mod tests {
         assert_eq!(server.poll_accept(), None, "exactly one accept");
         let id = accepted.id;
 
-        // Client to server.
         let request = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
         assert_eq!(client.socket().send_slice(request), Ok(request.len()));
         ms = pump(&mut server, &mut client, base, ms, 4);
@@ -689,7 +653,6 @@ pub(crate) mod tests {
         let read = server.recv(id, &mut buf).expect("readable");
         assert_eq!(&buf[..read], request);
 
-        // Server to client.
         let response = b"HTTP/1.1 204 No Content\r\n\r\n";
         assert_eq!(server.send(id, response), Ok(response.len()));
         pump(&mut server, &mut client, base, ms, 4);
@@ -737,10 +700,8 @@ pub(crate) mod tests {
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
         let mut ms = pump(&mut server, &mut client, base, 0, 6);
         let id = server.poll_accept().expect("accepted").id;
-        // The accepted socket replaces one listener in the restored backlog.
         assert_eq!(server.socket_count(), 5);
 
-        // After the client's FIN, the receive half is closed.
         client.socket().close();
         ms = pump(&mut server, &mut client, base, ms, 4);
         let mut buf = [0u8; 16];
@@ -764,7 +725,6 @@ pub(crate) mod tests {
 
     #[test]
     fn the_socket_ceiling_refuses_connections_beyond_the_budget() {
-        // Three total sockets permit three connections and refuse the rest.
         let base = Instant::now();
         let mut server = stack(&[HTTPS], limits(3, 1), base);
         let mut clients: Vec<Client> = (0..5)

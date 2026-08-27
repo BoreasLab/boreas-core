@@ -59,7 +59,6 @@ enum Approach {
 
 /// Recognizes TLS or cleartext HTTP without consuming `bytes`.
 pub fn introduce(bytes: &[u8]) -> Introduction {
-    // Read the TLS record type, legacy version, and payload length.
     let mut reader = Reader::new(bytes);
     let Some(&[content, major, _minor]) = reader.array::<3>() else {
         return Introduction::Incomplete;
@@ -73,7 +72,6 @@ pub fn introduce(bytes: &[u8]) -> Introduction {
     Introduction::Tls(crate::read_hello(record))
 }
 
-/// Parses a complete cleartext HTTP/1.x request head and extracts its host.
 fn request_head(bytes: &[u8]) -> Introduction {
     let mut fields = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
     let mut request = httparse::Request::new(&mut fields);
@@ -86,7 +84,6 @@ fn request_head(bytes: &[u8]) -> Introduction {
     }
 }
 
-/// Validates and extracts the host portion of a `Host` authority.
 fn host_field(fields: &[httparse::Header<'_>]) -> Option<DomainName> {
     let value = fields
         .iter()
@@ -228,7 +225,6 @@ impl Sessions {
         self
     }
 
-    /// Selects response rewriting for an intercepted tier.
     fn rewriting(&self, tier: InterceptedTier, failures: &Arc<RewriteFailures>) -> Rewriting {
         match tier {
             InterceptedTier::Rewrite => Rewriting::On {
@@ -356,7 +352,6 @@ pub async fn serve_session(
         ),
     };
 
-    // Reaching exchange completion is a normal session result.
     let failures = Arc::new(RewriteFailures::new());
     let _ = run_exchange(
         host.as_str(),
@@ -423,7 +418,6 @@ async fn peek(
         let read = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Ok(Ok(0)) | Err(_) => return (introduce(&buf), buf, stream),
             Ok(Ok(read)) => read,
-            // Splicing handles the dead connection.
             Ok(Err(_)) => return (introduce(&buf), buf, stream),
         };
         buf.extend_from_slice(&chunk[..read]);
@@ -548,7 +542,6 @@ mod tests {
         );
     }
 
-    /// A partial ClientHello remains incomplete.
     #[test]
     fn every_proper_prefix_of_a_client_hello_is_incomplete() {
         let hello = client_hello(Some("example.com"));
@@ -561,7 +554,6 @@ mod tests {
         }
     }
 
-    /// TLS without SNI remains distinct from non-TLS input.
     #[test]
     fn tls_without_a_server_name_is_tls_with_no_host() {
         assert_eq!(
@@ -570,7 +562,6 @@ mod tests {
         );
     }
 
-    /// Cleartext HTTP uses `Host` as its introduction name.
     #[test]
     fn cleartext_http_is_read_for_its_host() {
         assert_eq!(
@@ -616,7 +607,6 @@ mod tests {
         );
     }
 
-    /// Corrupted input remains within the recognition result sum.
     #[test]
     fn no_mutation_of_a_client_hello_escapes_the_sum() {
         let hello = client_hello(Some("example.com"));
@@ -635,7 +625,6 @@ mod tests {
         );
     }
 
-    /// Invalid SNI names do not cross the `DomainName` boundary.
     #[test]
     fn a_hostile_server_name_is_refused_rather_than_admitted() {
         let long = "a".repeat(300);

@@ -25,17 +25,14 @@ use crate::{
     wire::Writer,
 };
 
-/// Obtains the byte stream used by a proxy protocol.
 pub trait ProxyTransport: Send + Sync {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>>;
 
-    /// Returns the layer's authority for HTTP `Host` fallback.
     fn authority(&self) -> Option<&str> {
         None
     }
 }
 
-/// A boxed transport preserves dynamic chain composition.
 impl ProxyTransport for Box<dyn ProxyTransport> {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>> {
         (**self).dial()
@@ -46,7 +43,6 @@ impl ProxyTransport for Box<dyn ProxyTransport> {
     }
 }
 
-/// Plain TCP through the tunnel bypass.
 pub struct PlainTransport<B> {
     server: SocketAddr,
     /// Stored because `SocketAddr` has no borrowed string view.
@@ -80,14 +76,10 @@ impl<B: TunnelBypass + 'static> ProxyTransport for PlainTransport<B> {
 
 // ---------------------------------------------------------------- TLS
 
-/// TLS over TCP.
 pub struct TlsConfig {
     pub server: SocketAddr,
-    /// SNI name and certificate verification name.
     pub server_name: String,
-    /// ALPN identifiers selected by the transport above.
     pub alpn: Vec<Vec<u8>>,
-    /// Additional DER-encoded trust anchors.
     pub extra_roots: Vec<Vec<u8>>,
 }
 
@@ -95,13 +87,11 @@ pub struct TlsTransport<B> {
     server: SocketAddr,
     server_name: String,
     originator: Arc<Originator>,
-    /// Wire-format ALPN list.
     alpn: Vec<u8>,
     bypass: B,
 }
 
 impl<B: TunnelBypass> TlsTransport<B> {
-    /// Builds a Chrome-shaped TLS client using the bundled trust roots.
     pub fn new(config: TlsConfig, bypass: B) -> Result<Self, EgressError> {
         // Validate the name before handing its string form to BoringSSL.
         rustls::pki_types::ServerName::try_from(config.server_name.as_str())
@@ -137,10 +127,8 @@ impl<B: TunnelBypass + 'static> ProxyTransport for TlsTransport<B> {
 
 // ------------------------------------------------------- HTTP framing
 
-/// `Host` override and additional headers for HTTP-shaped transports.
 #[derive(Clone, Default)]
 pub struct HttpHeaders {
-    /// Optional fronted `Host` name.
     pub host: Option<String>,
     pub extra: Vec<(String, String)>,
 }
@@ -151,7 +139,6 @@ impl HttpHeaders {
     }
 }
 
-/// Adds the leading slash required by HTTP request paths.
 fn normalise_path(path: &str) -> String {
     if path.starts_with('/') {
         path.to_owned()
@@ -167,7 +154,6 @@ pub struct WebSocketConfig {
     pub headers: HttpHeaders,
 }
 
-/// VLESS over WebSocket, projected to a byte stream with tungstenite.
 pub struct WebSocketTransport<T> {
     path: String,
     headers: HttpHeaders,
@@ -216,13 +202,11 @@ impl<T: ProxyTransport + 'static> ProxyTransport for WebSocketTransport<T> {
         })
     }
 
-    /// Delegates authority to the wrapped transport.
     fn authority(&self) -> Option<&str> {
         self.inner.authority()
     }
 }
 
-/// Projects WebSocket binary messages onto a byte stream.
 struct WebSocketStream<S> {
     socket: tokio_tungstenite::WebSocketStream<S>,
     /// Unconsumed tail of the last binary message.
@@ -331,7 +315,6 @@ pub struct HttpUpgradeConfig {
     pub headers: HttpHeaders,
 }
 
-/// VLESS over HTTP/1.1 Upgrade with raw bytes after the handshake.
 pub struct HttpUpgradeTransport<T> {
     path: String,
     headers: HttpHeaders,
@@ -368,9 +351,7 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpUpgradeTransport<T> {
 /// Go's default user agent used by sing-box when none is configured.
 const GO_USER_AGENT: &str = "Go-http-client/1.1";
 
-/// Pure HTTP/1.1 Upgrade negotiation state.
 struct Upgrade {
-    /// Request emitted on the first advance.
     request: Option<Vec<u8>>,
 }
 
@@ -385,7 +366,6 @@ impl Upgrade {
 impl crate::Negotiation for Upgrade {
     type Output = ();
 
-    /// Parses the bounded response head on each offer.
     fn advance(
         &mut self,
         input: &[u8],
@@ -454,7 +434,6 @@ fn encode_upgrade_request(path: &str, host: &str, headers: &HttpHeaders) -> Vec<
     request.into_bytes()
 }
 
-/// Converts a header name to MIME canonical form before sorting.
 fn canonical(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut starting = true;
@@ -475,12 +454,9 @@ fn canonical(name: &str) -> String {
 
 // --------------------------------------------------- HTTP/2 and gRPC
 
-/// Body framing used by HTTP/2 transports.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Framing {
-    /// Each write becomes one length-delimited message.
     Grpc,
-    /// The body is an unframed byte stream.
     Raw,
 }
 
@@ -497,14 +473,12 @@ pub struct HttpConfig {
     pub headers: HttpHeaders,
 }
 
-/// VLESS over gRPC with a streaming HTTP/2 body.
 pub struct GrpcTransport<T> {
     config: GrpcConfig,
     inner: T,
     connection: Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
 }
 
-/// VLESS over HTTP/2 with a streaming request body.
 pub struct HttpTransport<T> {
     config: HttpConfig,
     inner: T,
@@ -564,8 +538,8 @@ async fn h2_sender<T: ProxyTransport>(
     Ok(ready)
 }
 
-/// Opens an HTTP/2 stream without waiting for its response. The server needs
-/// request-body data before replying, so refusal is reported on the first read.
+/// The server needs request-body data before replying, so refusal is reported
+/// on the first read.
 fn h2_dial(
     mut sender: h2::client::SendRequest<bytes::Bytes>,
     request: http::Request<()>,
@@ -585,7 +559,6 @@ fn h2_dial(
     }))
 }
 
-/// Downlink state for an HTTP/2 stream response.
 enum Recv {
     Pending(h2::client::ResponseFuture),
     Ready(h2::RecvStream),
@@ -621,7 +594,6 @@ impl<T: ProxyTransport + 'static> ProxyTransport for GrpcTransport<T> {
         })
     }
 
-    /// Delegates authority to the wrapped transport.
     fn authority(&self) -> Option<&str> {
         self.inner.authority()
     }
@@ -650,13 +622,11 @@ impl<T: ProxyTransport + 'static> ProxyTransport for HttpTransport<T> {
         })
     }
 
-    /// Delegates authority to the wrapped transport.
     fn authority(&self) -> Option<&str> {
         self.inner.authority()
     }
 }
 
-/// HTTP/2 stream projected to a byte stream, optionally with gRPC framing.
 struct H2Stream {
     send: h2::SendStream<bytes::Bytes>,
     recv: Recv,
@@ -673,7 +643,7 @@ struct H2Stream {
 /// `00 | u32be(total) | 0x0A | protobuf-varint(len) | payload`.
 const GRPC_HEADER_MIN: usize = 6;
 
-/// Encodes protobuf's little-endian groups-of-seven varint.
+/// Protobuf uses little-endian groups-of-seven varints.
 ///
 /// This differs from [`crate::varint`], whose QUIC encoding uses high-bit length
 /// markers and diverges at 64.
@@ -685,7 +655,6 @@ fn put_protobuf_varint(mut value: u64, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
-/// Decodes a protobuf varint; `None` means the prefix is incomplete or invalid.
 fn get_protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     for (index, &byte) in bytes.iter().enumerate() {
@@ -701,7 +670,6 @@ fn get_protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Wraps one payload as a gRPC message.
 fn encode_grpc_message(payload: &[u8], out: &mut Vec<u8>) {
     let mut length = Vec::with_capacity(10);
     put_protobuf_varint(payload.len() as u64, &mut length);
@@ -874,7 +842,6 @@ pub struct QuicTransportConfig {
     pub idle_timeout: Duration,
 }
 
-/// VLESS over QUIC streams using the `h3` ALPN without HTTP/3 framing.
 pub struct QuicTransport<B> {
     config: QuicTransportConfig,
     bypass: B,
@@ -898,7 +865,6 @@ impl<B: TunnelBypass> QuicTransport<B> {
         }
     }
 
-    /// Builds a QUIC config for the caller to configure certificate verification.
     pub fn quic_config(idle_timeout: Duration) -> Result<quiche::Config, EgressError> {
         client_config(quiche::h3::APPLICATION_PROTOCOL, idle_timeout)
     }
@@ -941,7 +907,6 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Protobuf and QUIC varints agree below 64 but diverge at 64.
     #[test]
     fn the_protobuf_varint_is_not_the_quic_varint() {
         for value in [0u64, 1, 63] {
@@ -965,7 +930,6 @@ mod tests {
         assert_eq!(out, [0xac, 0x02]);
     }
 
-    /// Round trips values and rejects every incomplete prefix.
     #[test]
     fn protobuf_varints_round_trip_and_every_prefix_is_incomplete() {
         for value in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64] {
@@ -978,7 +942,6 @@ mod tests {
         }
     }
 
-    /// Matches the reference gRPC frame layout.
     #[test]
     fn a_grpc_message_matches_the_reference_layout() {
         let mut out = Vec::new();
@@ -1006,7 +969,6 @@ mod tests {
         assert_eq!(out.len(), 6 + 2 + 300);
     }
 
-    /// Normalizes paths without a leading slash.
     #[test]
     fn a_path_is_given_its_leading_slash() {
         assert_eq!(normalise_path("ws"), "/ws");
@@ -1014,7 +976,6 @@ mod tests {
         assert_eq!(normalise_path(""), "/");
     }
 
-    /// Prefers the configured `Host` and otherwise uses the fallback.
     #[test]
     fn the_host_header_prefers_the_override() {
         let headers = HttpHeaders {
@@ -1028,7 +989,6 @@ mod tests {
         );
     }
 
-    /// Matches Go's request-line and canonical header order.
     #[test]
     fn an_upgrade_request_is_byte_identical_to_the_reference_clients() {
         let request = encode_upgrade_request("/tunnel", "cdn.example", &HttpHeaders::default());
@@ -1043,7 +1003,6 @@ mod tests {
         );
     }
 
-    /// Sorts configured headers into Go's canonical header run.
     #[test]
     fn configured_headers_are_sorted_in_among_the_upgrade_pair() {
         let headers = HttpHeaders {
@@ -1074,7 +1033,6 @@ mod tests {
         );
     }
 
-    /// Replaces, rather than duplicates, the default user agent.
     #[test]
     fn a_configured_user_agent_replaces_gos_default_rather_than_joining_it() {
         let headers = HttpHeaders {
@@ -1087,7 +1045,6 @@ mod tests {
         assert!(!request.contains(GO_USER_AGENT));
     }
 
-    /// Falls back to the wrapped transport's authority.
     #[test]
     fn the_host_falls_back_to_what_the_layer_below_is_addressed_by() {
         let fronted = HttpHeaders {
@@ -1101,7 +1058,6 @@ mod tests {
         );
     }
 
-    /// Completes when the response arrives in arbitrarily sized chunks.
     #[tokio::test]
     async fn the_upgrade_completes_however_the_response_is_split() {
         for chunk in [1usize, 7, 4096] {
@@ -1139,7 +1095,6 @@ mod tests {
         }
     }
 
-    /// Requires upgrade headers in addition to status `101`.
     #[test]
     fn a_response_that_did_not_switch_protocols_is_refused() {
         use crate::Negotiation;
@@ -1160,7 +1115,6 @@ mod tests {
         }
     }
 
-    /// Compares upgrade values case-insensitively after trimming whitespace.
     #[test]
     fn header_values_are_compared_case_insensitively_and_untrimmed() {
         use crate::Negotiation;
@@ -1175,7 +1129,6 @@ mod tests {
         ));
     }
 
-    /// Handles gRPC headers split across HTTP/2 DATA frames.
     #[test]
     fn a_grpc_header_split_anywhere_is_read_once_it_is_whole() {
         for payload in [0usize, 1, 63, 64, 300, 100_000] {
@@ -1201,7 +1154,6 @@ mod tests {
         }
     }
 
-    /// Refuses a varint longer than the ten groups allowed by `u64`.
     #[test]
     fn a_length_field_that_never_ends_is_refused_rather_than_awaited() {
         let mut endless = vec![0u8; GRPC_HEADER_MIN];

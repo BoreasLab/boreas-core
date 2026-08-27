@@ -22,21 +22,16 @@ use crate::{
     wire::{Reader, Writer, varint_len},
 };
 
-/// Fixed pseudo-headers for the in-connection authentication request.
 const AUTH_AUTHORITY: &str = "hysteria";
 const AUTH_PATH: &str = "/auth";
 
-/// Lowercase HTTP/3 header names.
 const HEADER_AUTH: &[u8] = b"hysteria-auth";
 const HEADER_CC_RX: &[u8] = b"hysteria-cc-rx";
 const HEADER_PADDING: &[u8] = b"hysteria-padding";
-/// Whether the server accepts Hysteria2 datagrams.
 const HEADER_UDP: &str = "hysteria-udp";
 
-/// Hysteria2's nonstandard authentication success status.
 const STATUS_AUTH_OK: u16 = 233;
 
-/// Frame type for opening a TCP proxy stream.
 const FRAME_TCP_REQUEST: u64 = 0x401;
 
 /// Reference limits for lengths received from the server.
@@ -128,7 +123,6 @@ pub fn decode_tcp_response(bytes: &[u8]) -> Result<Decoded<TcpResponse>, ProxyEr
     })
 }
 
-/// Static configuration for one Hysteria2 server.
 pub struct Hysteria2Config {
     /// Server UDP endpoint.
     pub server: SocketAddr,
@@ -140,12 +134,9 @@ pub struct Hysteria2Config {
     pub nat_behavior: NatBehavior,
 }
 
-/// Factory for a fresh `quiche::Config` per connection.
 pub type QuicConfigFactory = Box<dyn Fn() -> Result<quiche::Config, EgressError> + Send + Sync>;
 
-/// Sends one stream-open frame and reads its response.
 struct OpenStream {
-    /// Consumed by the first call to `advance`.
     request: Option<Vec<u8>>,
 }
 
@@ -179,7 +170,6 @@ impl crate::Negotiation for OpenStream {
     }
 }
 
-// UDP over QUIC.
 
 /// One Hysteria2 UDP message carried by one QUIC DATAGRAM.
 ///
@@ -204,7 +194,6 @@ struct UdpMessage<'a> {
     payload: &'a [u8],
 }
 
-/// Fixed header bytes before the address.
 const UDP_FIXED: usize = 4 + 2 + 1 + 1;
 
 /// Reference `MaxDatagramFrameSize`.
@@ -320,7 +309,6 @@ impl Defragmenter {
     }
 }
 
-/// Hysteria2 stream and datagram egress.
 pub struct Hysteria2Egress<B> {
     config: Hysteria2Config,
     bypass: B,
@@ -351,12 +339,10 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
         }
     }
 
-    /// Builds a config with Hysteria2's ALPN and idle timeout.
     pub fn quic_config() -> Result<quiche::Config, EgressError> {
         client_config(quiche::h3::APPLICATION_PROTOCOL, IDLE_TIMEOUT)
     }
 
-    /// Returns the live connection, authenticating one if necessary.
     async fn connection(&self) -> Result<QuicConnection, EgressError> {
         let mut held = self.connection.lock().await;
         if let Some(connection) = held.as_ref()
@@ -416,10 +402,8 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
     }
 }
 
-/// One session's bounded inbound route.
 type Route = mpsc::Sender<(Vec<u8>, Target)>;
 
-/// Demultiplexes one connection's datagrams by session identifier.
 struct Sessions {
     /// Routes keyed by session identifier.
     routes: std::sync::Mutex<std::collections::HashMap<u32, Route>>,
@@ -435,7 +419,6 @@ impl Sessions {
         })
     }
 
-    /// Starts the single datagram reader and router.
     async fn serve(self: &Arc<Self>, connection: &QuicConnection, shutdown: CancellationToken) {
         let Some(mut inbound) = connection.receive_datagrams().await else {
             return;
@@ -477,7 +460,6 @@ impl Sessions {
         });
     }
 
-    /// Registers a session and returns its identifier and route.
     fn open(&self) -> (u32, mpsc::Receiver<(Vec<u8>, Target)>) {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(SESSION_DEPTH);
@@ -493,7 +475,6 @@ impl Sessions {
 /// Capacity of each bounded, lossy session route.
 const SESSION_DEPTH: usize = 64;
 
-/// Sending half of one Hysteria2 datagram association.
 struct UdpSession {
     connection: QuicConnection,
     hub: Arc<Sessions>,
@@ -532,7 +513,6 @@ impl DatagramSink for UdpSession {
     }
 }
 
-/// Receiving half of one Hysteria2 datagram association.
 struct UdpReplies {
     inbound: mpsc::Receiver<(Vec<u8>, Target)>,
     /// Keeps the route registered while this receiver exists.
@@ -569,7 +549,6 @@ impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
         }
     }
 
-    /// Opens a session on the shared connection; the first datagram establishes it.
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
             let connection = self.connection().await?;
@@ -617,7 +596,6 @@ mod tests {
     use super::*;
     use crate::DomainName;
 
-    /// Pins the stream-open wire layout.
     #[test]
     fn a_tcp_request_is_the_frame_type_then_two_length_prefixed_fields() {
         let target = Target::Domain {
@@ -639,7 +617,6 @@ mod tests {
         );
     }
 
-    /// Textual IPv6 targets remain bracketed.
     #[test]
     fn an_ipv6_target_is_bracketed_in_the_address_string() {
         let target = Target::Ip("[::1]:8080".parse().unwrap());
@@ -651,7 +628,6 @@ mod tests {
         );
     }
 
-    /// Incomplete prefixes stay incomplete and surplus is preserved.
     #[test]
     fn every_proper_prefix_of_a_response_is_incomplete() {
         let mut frame = vec![0u8, 0x02];
@@ -685,7 +661,6 @@ mod tests {
         );
     }
 
-    /// Nonzero status preserves the server's refusal reason.
     #[test]
     fn a_non_zero_status_is_a_refusal_carrying_its_message() {
         let mut frame = vec![1u8, 0x07];
@@ -697,7 +672,6 @@ mod tests {
         assert_eq!(value, TcpResponse::Refused("refused".to_owned()));
     }
 
-    /// Peer lengths above the protocol ceilings are rejected.
     #[test]
     fn a_length_beyond_the_protocol_ceiling_is_refused_not_allocated() {
         let mut frame = vec![0u8];
@@ -709,7 +683,6 @@ mod tests {
         assert_eq!(decode_tcp_response(&frame), Err(ProxyError::Header));
     }
 
-    /// Padding uses the reference range and alphabet.
     #[test]
     fn padding_stays_inside_the_reference_range_and_alphabet() {
         for _ in 0..64 {
@@ -723,7 +696,6 @@ mod tests {
         }
     }
 
-    /// Pins the UDP field order independently of the decoder.
     #[test]
     fn a_udp_message_lays_its_fields_out_where_the_specification_says() {
         let mut out = Vec::new();
@@ -754,7 +726,6 @@ mod tests {
         assert_eq!(read.payload, b"body");
     }
 
-    /// Truncated, empty-address, and non-UTF-8 messages are rejected.
     #[test]
     fn a_malformed_message_is_refused_rather_than_partially_believed() {
         let mut whole = Vec::new();
@@ -788,7 +759,6 @@ mod tests {
         assert!(UdpMessage::read(&not_utf8).is_none(), "the address is text");
     }
 
-    /// Every fragment fits the frame and repeats the address.
     #[test]
     fn every_fragment_fits_the_frame_and_carries_the_address_again() {
         let address = "a-rather-long-name.example.com:443";
@@ -814,7 +784,6 @@ mod tests {
         assert_eq!(rebuilt, payload);
     }
 
-    /// A fitting datagram uses one message.
     #[test]
     fn a_datagram_that_fits_is_not_fragmented() {
         let fragments = fragment(1, 0, "198.51.100.7:53", b"query").expect("it fits");
@@ -822,7 +791,6 @@ mod tests {
         assert_eq!(UdpMessage::read(&fragments[0]).unwrap().fragments, 1);
     }
 
-    /// Reassembly accepts any order and requires every fragment.
     #[test]
     fn reassembly_needs_every_fragment_and_tolerates_their_order() {
         let address = "198.51.100.7:53";
@@ -853,7 +821,6 @@ mod tests {
         }
     }
 
-    /// A new packet identifier replaces the partial packet.
     #[test]
     fn a_new_packet_discards_the_partial_one_before_it() {
         let address = "198.51.100.7:53";
@@ -873,7 +840,6 @@ mod tests {
         );
     }
 
-    /// Builds a response frame for decoder tests.
     fn encode_tcp_response(ok: bool, message: &str, padding: &[u8], out: &mut Vec<u8>) {
         Writer::new(out)
             .u8(if ok { 0 } else { 1 })
@@ -881,7 +847,6 @@ mod tests {
             .vector_varint(padding);
     }
 
-    /// Drives the stream-open negotiation without QUIC.
     #[test]
     fn opening_a_stream_writes_the_request_then_reads_its_response() {
         use crate::Negotiation;
@@ -905,7 +870,6 @@ mod tests {
         assert!(again.is_empty());
     }
 
-    /// The response decoder handles every input split and preserves surplus.
     #[test]
     fn the_response_is_read_however_the_bytes_are_split() {
         use crate::Negotiation;
@@ -927,7 +891,6 @@ mod tests {
         );
     }
 
-    /// A refusal is reported during stream opening.
     #[test]
     fn a_refused_stream_fails_the_dial_and_says_why() {
         use crate::Negotiation;

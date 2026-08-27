@@ -28,7 +28,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::wire::Reader;
 
-/// ClientHello extensions read by this module.
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const EXTENSION_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXTENSION_SIGNATURE_ALGORITHMS: u16 = 0x000d;
@@ -49,7 +48,6 @@ const fn is_grease(value: u16) -> bool {
     value >> 8 == value & 0x00ff && value & 0x000f == 0x000a
 }
 
-/// Maps an IANA group codepoint to a BoringSSL name.
 const fn group_name(codepoint: u16) -> Option<&'static str> {
     Some(match codepoint {
         23 => "P-256",
@@ -91,19 +89,16 @@ impl ClientProfile {
         }
     }
 
-    /// Whether the profile is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 
-    /// Supported groups for diagnostics.
     #[must_use]
     pub fn groups(&self) -> &[&'static str] {
         &self.groups
     }
 
-    /// Whether Brotli certificate decompression is enabled.
     #[must_use]
     pub fn compresses_certificates(&self) -> bool {
         self.compression.contains(&BROTLI_ALGORITHM)
@@ -123,7 +118,6 @@ pub struct Hello {
 pub struct Offer(Vec<crate::Wire>);
 
 impl Offer {
-    /// Reads supported protocols from an ALPN extension body.
     fn read(body: &[u8]) -> Self {
         let Some(list) = Reader::new(body).vector_u16() else {
             return Self::default();
@@ -141,13 +135,11 @@ impl Offer {
         Self(wires)
     }
 
-    /// Supported protocols in client order.
     #[must_use]
     pub fn wires(&self) -> &[crate::Wire] {
         &self.0
     }
 
-    /// Encodes the offer for a TLS handshake.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let names: Vec<&[u8]> = self.0.iter().map(|wire| wire.identifier()).collect();
@@ -216,18 +208,15 @@ pub fn read_hello(record: &[u8]) -> Hello {
     hello
 }
 
-/// Yields complete big-endian `u16` values, ignoring a trailing byte.
 fn u16s(body: &[u8]) -> impl Iterator<Item = u16> + '_ {
     let mut reader = Reader::new(body);
     std::iter::from_fn(move || reader.u16())
 }
 
-/// Reads codepoints from a two-byte-length-prefixed vector.
 fn codepoints(body: &[u8]) -> impl Iterator<Item = u16> + '_ {
     u16s(Reader::new(body).vector_u16().unwrap_or_default())
 }
 
-/// Reads the host name from a `server_name` extension.
 fn server_name(body: &[u8]) -> Option<crate::DomainName> {
     // ServerNameList contains typed, length-prefixed names.
     let mut names = Reader::new(body.get(2..)?);
@@ -300,7 +289,6 @@ impl From<ErrorStack> for MirrorError {
     }
 }
 
-/// Connector cache key: TLS profile and ALPN.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
     profile: ClientProfile,
@@ -309,7 +297,6 @@ struct Key {
 
 /// Opens TLS with a mirrored ClientHello and caches connectors by profile.
 pub struct Originator {
-    /// Additional DER-encoded trust anchors.
     extra: Vec<Vec<u8>>,
     connectors: Mutex<HashMap<Key, Arc<SslConnector>>>,
 }
@@ -330,7 +317,6 @@ impl Originator {
         self
     }
 
-    /// Returns or builds a connector for one profile and ALPN offer.
     fn connector(
         &self,
         profile: &ClientProfile,
@@ -463,7 +449,6 @@ pub struct HandshakeFailure {
 }
 
 impl HandshakeFailure {
-    /// Constructs synthetic handshake evidence for tests.
     #[must_use]
     pub fn new(refusal: Option<Refusal>, detail: impl Into<String>) -> Self {
         Self {
@@ -492,7 +477,6 @@ fn handshake_error<S: std::fmt::Debug>(error: tokio_boring::HandshakeError<S>) -
     })
 }
 
-/// Classifies the first recognized BoringSSL stack reason.
 fn refusal<S: std::fmt::Debug>(error: &tokio_boring::HandshakeError<S>) -> Option<Refusal> {
     let source = std::error::Error::source(error)?;
     let stack = source.downcast_ref::<boring::ssl::Error>()?.ssl_error()?;
@@ -617,7 +601,6 @@ impl H2Profile {
         self.connection_window_size.saturating_sub(SPEC_WINDOW_SIZE)
     }
 
-    /// Settings in wire order.
     const fn settings(&self) -> [(u16, Option<u32>); 6] {
         [
             (1, self.header_table_size),
@@ -661,7 +644,6 @@ impl H2Profile {
 mod tests {
     use super::*;
 
-    /// Matches Chrome's published fingerprint.
     #[test]
     fn the_chrome_profile_renders_chromes_published_fingerprint() {
         assert_eq!(
@@ -670,7 +652,6 @@ mod tests {
         );
     }
 
-    /// Omits absent settings instead of sending defaults.
     #[test]
     fn an_absent_setting_is_omitted_rather_than_defaulted() {
         let profile = H2Profile {
@@ -686,7 +667,6 @@ mod tests {
         );
     }
 
-    /// Recognizes exactly the sixteen RFC 8701 GREASE values.
     #[test]
     fn grease_is_exactly_the_reserved_values() {
         for nibble in 0..16u16 {
@@ -697,7 +677,6 @@ mod tests {
         }
     }
 
-    /// Mirrors a client group that BoringSSL does not enable by default.
     #[test]
     fn a_profile_carries_the_groups_the_client_offered() {
         let profile = profile_from(&[extension(
@@ -707,7 +686,6 @@ mod tests {
         assert_eq!(profile.groups(), ["X25519MLKEM768", "X25519", "P-256"]);
     }
 
-    /// Drops an unknown group without rejecting the handshake.
     #[test]
     fn an_unknown_group_is_dropped_not_fatal() {
         let profile = profile_from(&[extension(
@@ -717,7 +695,6 @@ mod tests {
         assert_eq!(profile.groups(), ["X25519"]);
     }
 
-    /// Removes GREASE codepoints from signature preferences.
     #[test]
     fn grease_is_stripped_from_signature_algorithms() {
         let profile = profile_from(&[extension(
@@ -728,7 +705,6 @@ mod tests {
         assert!(profile.grease, "the hello still counts as GREASE-bearing");
     }
 
-    /// Malformed input yields the empty, non-overriding profile.
     #[test]
     fn an_unreadable_hello_overrides_nothing() {
         for bytes in [b"".as_slice(), b"\x01", b"\x16\x03\x01", b"not tls at all"] {
@@ -736,7 +712,6 @@ mod tests {
         }
     }
 
-    /// The fallback profile includes the modern hybrid group.
     #[test]
     fn the_chrome_profile_offers_the_group_the_default_one_cannot() {
         let chrome = ClientProfile::chrome();
@@ -746,7 +721,6 @@ mod tests {
         assert!(chrome.grease);
     }
 
-    /// Preserves the client's supported ALPN order.
     #[test]
     fn an_offer_carries_the_clients_own_list_in_order() {
         let hello = read_hello(&client_hello(&[extension(
@@ -757,7 +731,6 @@ mod tests {
         assert_eq!(hello.alpn.encode(), b"\x02h2\x08http/1.1");
     }
 
-    /// Drops protocols this TCP leg cannot terminate.
     #[test]
     fn a_protocol_this_cannot_terminate_is_dropped() {
         let hello = read_hello(&client_hello(&[extension(
@@ -767,7 +740,6 @@ mod tests {
         assert_eq!(hello.alpn.wires(), [crate::Wire::Http1]);
     }
 
-    /// Treats an absent ALPN extension as an empty offer.
     #[test]
     fn a_hello_without_alpn_offers_nothing() {
         let hello = read_hello(&client_hello(&[]));
@@ -775,7 +747,6 @@ mod tests {
         assert!(hello.alpn.encode().is_empty());
     }
 
-    /// Builds a length-prefixed ALPN list.
     fn names(protocols: &[&[u8]]) -> Vec<u8> {
         let body = alpn_list(protocols);
         let mut out = u16::try_from(body.len()).unwrap().to_be_bytes().to_vec();
@@ -787,7 +758,6 @@ mod tests {
         read_hello(&client_hello(extensions)).profile
     }
 
-    /// Builds a two-byte-length-prefixed codepoint vector.
     fn vector_u16(values: &[u16]) -> Vec<u8> {
         let body: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
         let mut out = u16::try_from(body.len()).unwrap().to_be_bytes().to_vec();
@@ -802,7 +772,6 @@ mod tests {
         out
     }
 
-    /// Builds a ClientHello carrying `extensions`.
     fn client_hello(extensions: &[Vec<u8>]) -> Vec<u8> {
         let joined: Vec<u8> = extensions.concat();
         let mut body = vec![0x03, 0x03];

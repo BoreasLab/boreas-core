@@ -67,7 +67,6 @@ pub fn client_config(
     Ok(config)
 }
 
-/// Returns a distant wake time when no QUIC timer is pending.
 fn no_deadline() -> TokioInstant {
     TokioInstant::now() + Duration::from_secs(3600)
 }
@@ -94,7 +93,6 @@ pub struct H3Response {
 }
 
 impl H3Response {
-    /// Returns the first UTF-8 value for `name`, if present.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -104,7 +102,6 @@ impl H3Response {
 }
 
 impl Handshake {
-    /// Opens a QUIC connection over a UDP socket after it is connected to `peer`.
     pub async fn establish(
         socket: UdpSocket,
         peer: SocketAddr,
@@ -253,13 +250,11 @@ impl Handshake {
         }
     }
 
-    /// Sends everything `quiche` has queued.
     async fn flush(&mut self, scratch: &mut [u8]) -> Result<(), EgressError> {
         flush(&mut self.conn, &self.socket, scratch).await
     }
 }
 
-/// Drains `quiche`'s send queue onto the UDP socket.
 async fn flush(
     conn: &mut quiche::Connection,
     socket: &UdpSocket,
@@ -294,7 +289,6 @@ enum Command {
 }
 
 impl QuicConnection {
-    /// Opens a bidirectional stream, or fails if the driver has stopped.
     pub async fn open_bidi(&self) -> Result<BridgedStream, EgressError> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -332,7 +326,6 @@ impl QuicConnection {
     }
 }
 
-/// The task that owns the socket and the connection.
 struct Driver {
     conn: quiche::Connection,
     socket: UdpSocket,
@@ -429,7 +422,6 @@ impl Driver {
         }
     }
 
-    /// Moves bytes in both directions and retires finished streams.
     fn service(&mut self, chunk: &mut [u8]) {
         // Drain the transport queue; a slow claimant loses packets rather than
         // blocking streams on the same connection.
@@ -656,7 +648,6 @@ mod tests {
             Self { address, shutdown }
         }
 
-        /// Client configuration for the fixture's self-signed certificate.
         fn config(datagrams: bool) -> quiche::Config {
             let mut config = client_config(&[b"echo"], Duration::from_secs(10)).unwrap();
             config.verify_peer(false);
@@ -685,7 +676,6 @@ mod tests {
         }
     }
 
-    /// A stream carries bytes both ways through the driver task.
     #[tokio::test]
     async fn a_stream_carries_bytes_through_a_real_connection() {
         let echo = Echo::start(false).await;
@@ -707,7 +697,6 @@ mod tests {
         assert_eq!(&back, b"question");
     }
 
-    /// A datagram crosses the driver and returns through its inbound queue.
     #[tokio::test]
     async fn a_datagram_crosses_and_comes_back() {
         let echo = Echo::start(true).await;
@@ -733,7 +722,6 @@ mod tests {
         assert_eq!(back, b"one datagram");
     }
 
-    /// The inbound datagram stream has exactly one claimant.
     #[tokio::test]
     async fn the_datagram_stream_is_claimed_exactly_once() {
         let echo = Echo::start(true).await;
@@ -751,7 +739,6 @@ mod tests {
         );
     }
 
-    /// A black-holed handshake ends at its deadline instead of hanging.
     #[tokio::test(start_paused = true)]
     async fn a_handshake_to_a_black_hole_gives_up_on_its_deadline() {
         // The OS accepts packets, but no peer reads or answers them.
@@ -768,7 +755,6 @@ mod tests {
         assert!(matches!(outcome, Err(EgressError::Quic)));
     }
 
-    /// Cancellation stops the driver and closes its handle.
     #[tokio::test]
     async fn cancelling_the_driver_closes_the_connection() {
         let echo = Echo::start(false).await;
