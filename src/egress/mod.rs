@@ -1,13 +1,11 @@
-//! Egress implementations and the shared packet and flow vocabulary.
+//! Egress implementations and shared packet and flow vocabulary.
 //!
-//! `Egress` derives its accepted layer from its variant, while each
-//! implementation supplies the path properties behind that variant.
-//! `PacketEgress` is sans-IO: packets enter, pooled emissions leave, and an
-//! explicit tick drives protocol timers.
+//! `Egress` derives its accepted layer from its variant. `PacketEgress` is
+//! sans-IO: packets enter, pooled emissions leave, and an explicit tick drives
+//! protocol timers.
 //!
-//! `WireGuardEgress` wraps GotaTun's sans-IO `Tunn`; socket I/O stays in the
-//! shell. Emissions use the datapath's pooled-buffer budget, so exhaustion is
-//! a counted drop rather than a per-packet allocation or wait.
+//! `WireGuardEgress` wraps GotaTun's sans-IO `Tunn`. Socket I/O stays in the
+//! shell, and pool exhaustion is a counted drop.
 
 pub(crate) mod hysteria2;
 pub(crate) mod masque;
@@ -37,20 +35,17 @@ use crate::{
 
 /// Sans-IO egress for whole IP packets.
 ///
-/// Emissions append to the caller's vector. A call may produce multiple
-/// ordered destinations, such as a handshake response and a tunnel packet.
+/// Emissions append to the caller's vector and may contain multiple ordered
+/// destinations, such as a handshake response followed by a tunnel packet.
 pub trait PacketEgress: Send {
-    /// Path properties reported to the planner.
     fn properties(&self) -> PathProperties;
 
-    /// Encapsulates one IP packet from the tunnel side.
     fn handle_tun_packet(
         &mut self,
         packet: &[u8],
         out: &mut Vec<EgressEmit>,
     ) -> Result<(), EgressError>;
 
-    /// Decapsulates one peer datagram toward the tunnel.
     fn handle_network_packet(
         &mut self,
         datagram: &[u8],
@@ -66,19 +61,15 @@ pub trait PacketEgress: Send {
         usize::from(u16::MAX)
     }
 
-    /// Advances handshake, rekey, expiry, or keepalive timers.
     fn tick(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError>;
 
-    /// Default cadence for timer driving.
     fn tick_interval(&self) -> Duration;
 
-    /// More precise timer deadline, when the protocol has one.
     fn next_deadline(&self) -> Option<std::time::Instant> {
         None
     }
 }
 
-/// Forwards the packet-egress contract through dynamic dispatch.
 impl PacketEgress for Box<dyn PacketEgress> {
     fn properties(&self) -> PathProperties {
         (**self).properties()
@@ -117,7 +108,7 @@ impl PacketEgress for Box<dyn PacketEgress> {
     }
 }
 
-/// A lower-case, NUL-free domain name no longer than one wire length octet.
+/// A lowercase, NUL-free domain name no longer than one wire length octet.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DomainName(String);
 
@@ -125,7 +116,7 @@ pub struct DomainName(String);
 pub enum DomainNameError {
     Empty,
     TooLong(usize),
-    /// An interior NUL cannot be represented safely by downstream parsers.
+    /// An interior NUL cannot be represented by downstream parsers.
     Interior,
 }
 
@@ -162,9 +153,8 @@ impl std::fmt::Display for DomainName {
 
 /// A flow's IP or unresolved domain destination.
 ///
-/// Domain targets remain unresolved so the exit chooses its DNS view and the
-/// client does not expose the destination to its local resolver. Hashing lets
-/// multiplexed proxies index streams by target.
+/// Domain targets remain unresolved so the exit chooses its DNS view; the
+/// client's local resolver never sees them. Hashing supports proxy stream maps.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     Ip(std::net::SocketAddr),
@@ -196,15 +186,14 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> AsyncStream
 
 /// Replays handshake bytes read beyond the protocol boundary.
 ///
-/// TCP can coalesce proxy response bytes with the next application payload.
-/// Discarding that surplus truncates the flow, so decoders return it here.
+/// TCP can coalesce proxy response bytes with the next application payload;
+/// discarding that surplus truncates the flow.
 pub struct Prefixed<S> {
     prefix: bytes::Bytes,
     inner: S,
 }
 
 impl<S> Prefixed<S> {
-    /// Avoids the wrapper when no bytes need replaying.
     pub fn new(prefix: Vec<u8>, inner: S) -> Either<Prefixed<S>, S> {
         if prefix.is_empty() {
             Either::Right(inner)
@@ -259,7 +248,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prefixed<S> {
     }
 }
 
-/// Either a wrapped stream or the original stream, without boxing.
+/// Either a wrapped stream or the original stream without boxing.
 pub enum Either<L, R> {
     Left(L),
     Right(R),
@@ -319,7 +308,6 @@ where
     }
 }
 
-/// Boxed asynchronous operation used at flow boundaries.
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Shared sender for a proxy datagram association.
@@ -334,37 +322,28 @@ pub trait DatagramSink: Send + Sync {
     ) -> BoxFuture<'a, Result<(), EgressError>>;
 }
 
-/// Exclusive receiver for a proxy datagram association.
 pub trait DatagramSource: Send {
-    /// Writes one complete payload and returns its source target.
-    ///
-    /// An undersized buffer returns [`EgressError::DatagramTooLarge`] rather
-    /// than a truncated success.
+    /// Writes one complete payload and returns its source target. An undersized
+    /// buffer returns [`EgressError::DatagramTooLarge`] rather than truncating.
     fn recv_from<'a>(
         &'a mut self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, Result<(usize, Target), EgressError>>;
 }
 
-/// Shared sender and exclusive receiver for one datagram association.
 pub struct Association {
     pub sink: Arc<dyn DatagramSink>,
     pub source: Box<dyn DatagramSource>,
 }
 
-/// Sans-IO-facing egress for L4 streams and optional datagrams.
 pub trait StreamEgress: Send + Sync {
-    /// Path properties reported to the planner.
     fn properties(&self) -> PathProperties;
 
-    /// Opens a byte stream to `target`.
     fn connect<'a>(
         &'a self,
         target: &'a Target,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>>;
 
-    /// Opens a datagram association when the path supports one.
-    ///
     /// The default agrees with [`DatagramFidelity::None`](crate::DatagramFidelity::None).
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async { Err(EgressError::DatagramsUnsupported) })
@@ -377,7 +356,6 @@ pub trait StreamEgress: Send + Sync {
 /// and be intercepted again.
 pub struct DirectEgress<B> {
     bypass: B,
-    /// NAT behavior of the host path.
     nat_behavior: NatBehavior,
 }
 
@@ -393,9 +371,7 @@ impl<B: TunnelBypass> DirectEgress<B> {
 impl<B: TunnelBypass + 'static> StreamEgress for DirectEgress<B> {
     fn properties(&self) -> PathProperties {
         PathProperties {
-            // Direct UDP preserves datagram boundaries.
             datagram_fidelity: DatagramFidelity::Native,
-            // Direct transport adds no framing.
             overhead_bytes: 0,
             max_datagram_size: None,
             preserves_ecn: false,
@@ -416,10 +392,8 @@ impl<B: TunnelBypass + 'static> StreamEgress for DirectEgress<B> {
         })
     }
 
-    /// Opens one unbound socket for the entire client mapping.
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
-            // `send_to` must select the peer for each datagram.
             let relay = Arc::new(DirectRelay(self.bypass.unbound().await?));
             Ok(Association {
                 source: Box::new(DirectSource {
@@ -431,7 +405,6 @@ impl<B: TunnelBypass + 'static> StreamEgress for DirectEgress<B> {
     }
 }
 
-/// Unbound UDP socket shared by both association halves.
 struct DirectRelay(tokio::net::UdpSocket);
 
 impl DatagramSink for DirectRelay {
@@ -464,14 +437,12 @@ impl DatagramSource for DirectSource {
     }
 }
 
-/// Configured egress; the variant determines its accepted layer.
 pub enum Egress {
     Packet(Box<dyn PacketEgress>),
     Stream(Box<dyn StreamEgress>),
 }
 
 impl Egress {
-    /// Accepted input layer derived from the variant.
     pub fn accepts(&self) -> Accepts {
         match self {
             Self::Packet(_) => Accepts::IpPackets,
@@ -479,7 +450,6 @@ impl Egress {
         }
     }
 
-    /// Path properties of the implementation behind the variant.
     pub fn properties(&self) -> PathProperties {
         match self {
             Self::Packet(egress) => egress.properties(),
@@ -499,19 +469,14 @@ impl Egress {
 /// Worst-case WireGuard overhead over an IPv6 underlay.
 pub const WIREGUARD_OVERHEAD_BYTES: u16 = 80;
 
-/// GotaTun-compatible handshake rate limit per peer.
 const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
-/// GotaTun's timer cadence.
 const WIREGUARD_TICK: Duration = Duration::from_millis(250);
 
-/// WireGuard data-message header and authentication tag.
 const WIREGUARD_FRAMING_BYTES: usize = 32;
 
-/// WireGuard data-message alignment.
 const WIREGUARD_PADDING_ALIGNMENT: usize = 16;
 
-/// Initial capacity of GotaTun's recycled staging pool.
 const TUNNEL_BUFFERS: usize = 16;
 
 /// Static configuration for one WireGuard peer.
@@ -525,7 +490,6 @@ pub struct WireGuardConfig {
     pub inner_mtu: Mtu,
 }
 
-/// Sans-IO output for the shell to deliver.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EgressEmit {
     /// WireGuard UDP payload for the peer.
@@ -599,15 +563,15 @@ impl From<WireGuardError> for EgressError {
 pub struct WireGuardEgress {
     tunn: Tunn,
     mtu: MtuWatcher,
-    /// Copy of the watched MTU for shared read-only bounds.
+    /// Mirror of the watched MTU for shared read-only bounds.
     inner_mtu: Mtu,
     pool: Arc<BufferPool>,
     /// Reused scratch space for queued GotaTun outputs.
     queued: Vec<WgKind>,
     /// GotaTun-owned recycled buffers for tunnel input.
     ///
-    /// This pool has a different lifetime and buffer type from `BufferPool`,
-    /// which owns emissions leaving this crate.
+    /// Its lifetime and buffer type differ from `BufferPool`, which owns
+    /// emissions leaving this crate.
     packets: gotatun::packet::PacketBufPool,
     /// Count of packets sent through the packet fast path.
     fast_path_packets: u64,
@@ -636,15 +600,14 @@ impl WireGuardEgress {
         }
     }
 
-    /// Number of packets encapsulated without local termination.
     pub fn fast_path_packets(&self) -> u64 {
         self.fast_path_packets
     }
 
     /// Emits packets GotaTun queued during handshake establishment.
     ///
-    /// The scratch vector resolves the mutable-borrow split between GotaTun and
-    /// the emission pool while retaining capacity across calls.
+    /// The scratch vector separates GotaTun and pool borrows while retaining
+    /// capacity across calls.
     fn flush_queue(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
         let mut queued = std::mem::take(&mut self.queued);
         queued.clear();
@@ -656,7 +619,6 @@ impl WireGuardEgress {
         result
     }
 
-    /// Stages bytes in a recycled buffer, copying jumbo packets when required.
     fn stage(&self, bytes: &[u8]) -> Packet<[u8]> {
         let mut packet = self.packets.get();
         if packet.buf_mut().len() < bytes.len() {
@@ -684,12 +646,10 @@ impl PacketEgress for WireGuardEgress {
             max_datagram_size: None,
             // No verified outer-header ECN mapping exists.
             preserves_ecn: false,
-            // One peer and one endpoint have no varying mapping.
             nat_behavior: NatBehavior::EndpointIndependent,
         }
     }
 
-    /// Encapsulates one IP packet and emits its network-bound result.
     fn handle_tun_packet(
         &mut self,
         packet: &[u8],
@@ -706,7 +666,6 @@ impl PacketEgress for WireGuardEgress {
         Ok(())
     }
 
-    /// Processes one peer UDP payload and flushes post-handshake queued packets.
     fn handle_network_packet(
         &mut self,
         datagram: &[u8],
@@ -735,7 +694,6 @@ impl PacketEgress for WireGuardEgress {
         self.flush_queue(out)
     }
 
-    /// Advances WireGuard timers and emits resulting network packets.
     fn tick(&mut self, out: &mut Vec<EgressEmit>) -> Result<(), EgressError> {
         if let Some(kind) = self.tunn.update_timers()? {
             out.push(self.network_emit(kind)?);
@@ -780,7 +738,6 @@ mod tests {
     use super::*;
     use std::num::NonZeroUsize;
 
-    /// Test pool with enough capacity to avoid intentional exhaustion.
     fn pool() -> Arc<BufferPool> {
         BufferPool::new(
             NonZeroUsize::new(2048).unwrap(),
@@ -798,7 +755,6 @@ mod tests {
         }
     }
 
-    /// Deterministic X25519 test key pair.
     fn keypair(seed: u8) -> ([u8; 32], [u8; 32]) {
         let private = StaticSecret::from([seed; 32]);
         (private.to_bytes(), PublicKey::from(&private).to_bytes())
@@ -813,7 +769,6 @@ mod tests {
         )
     }
 
-    /// Exchanges emissions between two deterministic in-memory peers.
     fn exchange(
         client: &mut WireGuardEgress,
         server: &mut WireGuardEgress,
@@ -853,7 +808,6 @@ mod tests {
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
         ];
 
-        // The first packet waits behind handshake initiation.
         let mut first = Vec::new();
         client.handle_tun_packet(&ip_packet, &mut first).unwrap();
         assert!(
@@ -866,14 +820,12 @@ mod tests {
         assert_eq!(tunnelled, vec![ip_packet], "queued packet flushes intact");
         assert_eq!(client.fast_path_packets(), 1);
 
-        // Established sessions send directly.
         let mut second = Vec::new();
         client.handle_tun_packet(&ip_packet, &mut second).unwrap();
         let tunnelled = exchange(&mut client, &mut server, second);
         assert_eq!(tunnelled, vec![ip_packet]);
         assert_eq!(client.fast_path_packets(), 2);
 
-        // Emission buffers return to the shared pool.
         assert_eq!(pool.available(), 64);
     }
 
@@ -887,7 +839,6 @@ mod tests {
             Err(EgressError::MalformedNetworkPacket)
         ));
         assert!(out.is_empty());
-        // Malformed input does not poison the tunnel.
         client.handle_tun_packet(&[0x45; 28], &mut out).unwrap();
         assert!(!out.is_empty());
     }
@@ -910,13 +861,11 @@ mod tests {
         assert_eq!(pool.exhausted(), 1);
         drop(held);
 
-        // Restoring capacity permits a fresh egress to emit normally.
         let (mut fresh, _server) = pair(&pool);
         fresh.handle_tun_packet(&[0x45; 28], &mut out).unwrap();
         assert_eq!(out.len(), 1);
     }
 
-    /// Domain names normalize once at construction and retain wire limits.
     #[test]
     fn a_name_is_normalized_where_it_is_admitted() {
         assert_eq!(
@@ -928,14 +877,12 @@ mod tests {
             DomainName::new("example.com"),
             "one host is one value"
         );
-        // Empty, overlong, and NUL-containing names remain rejected.
         assert_eq!(DomainName::new(""), Err(DomainNameError::Empty));
         assert_eq!(
             DomainName::new("A".repeat(256)),
             Err(DomainNameError::TooLong(256))
         );
         assert_eq!(DomainName::new("A\0B"), Err(DomainNameError::Interior));
-        // Only ASCII case is normalized; IDNs arrive as punycode.
         assert_eq!(
             DomainName::new("xn--Bcher-kva.example").unwrap().as_str(),
             "xn--bcher-kva.example"
@@ -944,19 +891,16 @@ mod tests {
 
     #[test]
     fn padding_is_stripped_by_the_header_the_packet_declares() {
-        // IPv4 declared length removes four padding bytes.
         let mut padded = vec![0u8; 32];
         padded[0] = 0x45;
         padded[2..4].copy_from_slice(&28u16.to_be_bytes());
         assert_eq!(strip_padding(&padded).len(), 28);
 
-        // IPv6 declared payload length removes sixteen padding bytes.
         let mut padded = vec![0u8; 64];
         padded[0] = 0x60;
         padded[4..6].copy_from_slice(&8u16.to_be_bytes());
         assert_eq!(strip_padding(&padded).len(), 48);
 
-        // Invalid lengths and unsupported versions remain untouched.
         let mut broken = vec![0u8; 32];
         broken[0] = 0x45;
         broken[2..4].copy_from_slice(&8u16.to_be_bytes());
@@ -977,7 +921,6 @@ mod tests {
         assert_eq!(properties.datagram_fidelity, DatagramFidelity::Native);
         assert_eq!(properties.overhead_bytes, WIREGUARD_OVERHEAD_BYTES);
 
-        // Different accepted layers cannot form one chain.
         struct NoStreams;
         impl StreamEgress for NoStreams {
             fn connect<'a>(
@@ -985,7 +928,6 @@ mod tests {
                 _target: &'a crate::Target,
             ) -> crate::BoxFuture<'a, Result<Box<dyn crate::AsyncStream>, EgressError>>
             {
-                // Chaining is the only operation this fixture supports.
                 Box::pin(async { Err(EgressError::DatagramsUnsupported) })
             }
 

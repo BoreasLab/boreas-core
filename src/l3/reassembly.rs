@@ -316,7 +316,6 @@ impl Pending {
         self.received[block / 64] & (1 << (block % 64)) != 0
     }
 
-    /// Marks a previously vacant inclusive block range as received.
     fn mark_received(&mut self, first_block: usize, last_block: usize) {
         for block in first_block..=last_block {
             self.received[block / 64] |= 1 << (block % 64);
@@ -324,7 +323,6 @@ impl Pending {
         self.received_blocks += (last_block - first_block + 1) as u32;
     }
 
-    /// Whether the known total has all required blocks.
     fn is_complete(&self) -> bool {
         self.total
             .is_some_and(|total| usize::try_from(self.received_blocks) == Ok(total.div_ceil(8)))
@@ -481,7 +479,7 @@ impl Reassembler {
         let Some(mut pending) = self.pending.remove(&key) else {
             return PushOutcome::Discarded;
         };
-        // The *slot*, not the deadline: they diverge on every refresh, and
+        // The slot, not the deadline: they diverge on every refresh, and
         // unfiling under the wrong one leaves the index holding a key whose
         // entry is gone. See [`Expiry`].
         self.forget_slot(slot, &key);
@@ -694,7 +692,6 @@ mod tests {
 
     #[test]
     fn a_fragment_flood_does_not_grow_the_expiry_index() {
-        // Rejected overlaps must not add expiry slots.
         let start = NOW();
         let mut reassembler = fresh_reassembler();
         assert_eq!(
@@ -717,7 +714,6 @@ mod tests {
 
     #[test]
     fn a_completed_datagram_takes_its_index_slot_with_it() {
-        // Completion must remove the datagram's expiry slot.
         let now = NOW();
         let mut reassembler = fresh_reassembler();
         assert_eq!(
@@ -736,7 +732,6 @@ mod tests {
 
     #[test]
     fn a_refreshed_datagram_that_completes_leaves_no_slot_behind() {
-        // Completion after a refresh must remove the original bucket slot.
         let start = NOW();
         let mut reassembler = fresh_reassembler();
         assert_eq!(
@@ -838,7 +833,6 @@ mod tests {
 
     #[test]
     fn rejects_empty_payload_fragments() {
-        // Empty payloads must be rejected before block arithmetic.
         let mut reassembler = fresh_reassembler();
         assert_eq!(
             reassembler.push(fragment(0, false, b""), NOW()),

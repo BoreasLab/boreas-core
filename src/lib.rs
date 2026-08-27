@@ -30,6 +30,7 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
+
 /// Takes a lock and recovers from poisoning.
 ///
 /// These mutexes guard maps, queues, and options whose updates are whole
@@ -152,7 +153,6 @@ pub const HTTPS_PORT: u16 = 443;
 /// forwarding minimum is not sufficient for a tunnel that also carries IPv6.
 pub const MIN_IPV6_MTU: u16 = 1280;
 
-/// Validated MTU for a dual-stack IP tunnel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Mtu(u16);
 
@@ -596,7 +596,6 @@ mod tests {
         Mtu::new(bytes).expect("test MTU is valid")
     }
 
-    // Exercise the full finite input domains for each planning law.
     const FIDELITIES: [DatagramFidelity; 3] = [
         DatagramFidelity::None,
         DatagramFidelity::Emulated,
@@ -635,11 +634,8 @@ mod tests {
 
     #[test]
     fn plan_flow_never_passes_quic_below_native_or_below_floor() {
-        // **Both directions, and both transports.** The earlier form asserted
-        // only "must steer" and only under `Accepts::IpPackets`, which never
-        // reaches local termination -- so the arm that read an egress's
-        // datagram ceiling was never planned at all, and a ceiling it wrongly
-        // rejected could not be seen.
+        // Cover both directions, transports, and datagram ceilings so every
+        // planning branch is exercised.
         for fidelity in FIDELITIES {
             for &overhead in &OVERHEADS {
                 for &path in &MTUS {
@@ -742,8 +738,8 @@ mod tests {
             if fidelity == DatagramFidelity::Native {
                 assert_eq!(result, Ok(Replan::Unchanged));
             } else {
-                // Resteer carries the same replacement plan fresh planning
-                // would produce, so the caller need not derive it again.
+                // Resteer carries the replacement plan, so callers do not
+                // derive it again.
                 assert_eq!(
                     result,
                     Ok(Replan::Resteer {
@@ -774,7 +770,6 @@ mod tests {
         )
         .unwrap();
 
-        // The layer the flow runs on is gone: no live flow survives.
         assert_eq!(
             replan(
                 &packet_plan,
@@ -801,7 +796,6 @@ mod tests {
             Err(PlanError::InnerMtu(MtuError::BelowMinimum(1200)))
         );
 
-        // A shrunk datagram ceiling on a packet path does not move the plan.
         assert_eq!(
             replan(
                 &packet_plan,
@@ -830,7 +824,6 @@ mod tests {
             0xd2, 0x00, 0x35, 0x00, 0x08, 0, 0,
         ];
 
-        // Both fragment indicators require reassembly.
         for offset_units in [0_u16, 1, 8, 256, 0x1fff] {
             for more_fragments in [true, false] {
                 let mut packet = ipv4_udp;
@@ -897,19 +890,16 @@ mod tests {
             }
         );
 
-        // Active steering drops the QUIC attempt.
         assert_eq!(
             route_ingress(quic, plan, DnsPolicy::Intercept, Backstop::Active),
             IngressAction::DropSteered
         );
-        // An expired window forwards ordinary traffic.
         for dns in [DnsPolicy::Intercept, DnsPolicy::Forward] {
             assert_eq!(
                 route_ingress(quic, plan, dns, Backstop::Lapsed),
                 IngressAction::ForwardPacket(plan)
             );
         }
-        // TCP on the same port is never subject to the UDP backstop.
         let https = Transport::Tcp {
             source_port: 50_000,
             destination_port: HTTPS_PORT,
@@ -932,7 +922,6 @@ mod tests {
     #[test]
     fn mtu_rejects_paths_that_cannot_carry_ipv6() {
         assert_eq!(Mtu::new(0), Err(MtuError::BelowMinimum(0)));
-        // The IPv4 forwarding minimum is not a usable dual-stack tunnel MTU.
         assert_eq!(Mtu::new(68), Err(MtuError::BelowMinimum(68)));
         assert_eq!(
             Mtu::new(MIN_IPV6_MTU - 1),
@@ -940,7 +929,6 @@ mod tests {
         );
         assert_eq!(Mtu::new(MIN_IPV6_MTU).map(Mtu::get), Ok(MIN_IPV6_MTU));
 
-        // Every admitted packet MTU also clears QUIC's lower floor.
         const { assert!(MIN_IPV6_MTU > MIN_QUIC_MTU) };
         assert!(mtu(MIN_IPV6_MTU).admits_quic());
     }
@@ -1118,7 +1106,6 @@ mod tests {
             })
         );
 
-        // Bare claims do not validate implementation-layer agreement.
     }
 
     #[test]

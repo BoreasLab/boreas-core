@@ -45,7 +45,6 @@ pub struct Platform<D, B> {
 
 // ------------------------------------------------------ Configuration
 
-/// Complete tunnel configuration.
 pub struct TunnelConfig {
     pub egress: Egress,
     pub resolver: Resolver,
@@ -344,7 +343,6 @@ impl TunnelConfig {
             FilterPolicy::PassThrough
         };
 
-        // Reject configurations that enable inspection without observable DNS.
         if filter == FilterPolicy::InspectHttp
             && dns == DnsPolicy::Forward
             && accepts == Accepts::IpPackets
@@ -366,7 +364,6 @@ impl TunnelConfig {
 }
 
 impl Egress {
-    /// Returns the layer implied by the selected variant.
     fn accepts(&self) -> Accepts {
         match self {
             Self::WireGuard { .. } => Accepts::IpPackets,
@@ -474,7 +471,6 @@ impl Tunnel {
     }
 }
 
-/// Compiles filter-list text; malformed lines are skipped and counted.
 fn compile(lists: &[String]) -> HostPolicy {
     let mut policy = HostPolicy::new();
     for list in lists {
@@ -483,7 +479,6 @@ fn compile(lists: &[String]) -> HostPolicy {
     policy
 }
 
-/// Projects internal telemetry onto the host-visible event set.
 fn project(telemetry: crate::Telemetry) -> Option<Event> {
     use crate::Telemetry;
     Some(match telemetry {
@@ -533,13 +528,11 @@ fn project(telemetry: crate::Telemetry) -> Option<Event> {
 
 // ------------------------------------------------------ Composition
 
-/// Closed dispatch over the supported DNS upstream implementations.
 enum AnyUpstream<B> {
     Do53(crate::Do53Upstream<B>),
     Dot(crate::DotUpstream<B>),
     Doh(crate::DohUpstream<B>),
     Doq(crate::DoqUpstream<B>),
-    /// Placeholder for a tunnel whose DNS questions pass through.
     Unused,
 }
 
@@ -740,10 +733,8 @@ impl Tunnel {
     }
 }
 
-/// Capacity of channels joining tunnel tasks.
 const CHANNEL_DEPTH: usize = 256;
 
-/// Starts local termination and session handling, opening an authority only for interception.
 fn start_termination(
     filtering: Filtering,
     link: &Link,
@@ -859,7 +850,6 @@ fn build_sessions(
     Ok(Arc::new(sessions))
 }
 
-/// Converts host-facing ceilings into core limits.
 fn limits(link: &Link, ceilings: &Ceilings, plan: &Plan) -> Limits {
     Limits {
         reassembly_timeout: std::time::Duration::from_secs(30),
@@ -873,7 +863,6 @@ fn limits(link: &Link, ceilings: &Ceilings, plan: &Plan) -> Limits {
     }
 }
 
-/// Builds the configured egress and its packet underlay, if any.
 async fn build_egress<B: TunnelBypass + Clone + 'static>(
     choice: Egress,
     bypass: &B,
@@ -987,7 +976,6 @@ mod tests {
         }
     }
 
-    /// Device stub sufficient to start a tunnel without network I/O.
     struct Silent;
 
     impl AsyncDevice for Silent {
@@ -1019,7 +1007,6 @@ mod tests {
         }
     }
 
-    /// The complete component assembly starts and stops cleanly.
     #[tokio::test]
     async fn a_filtering_tunnel_over_a_direct_egress_starts_and_stops() {
         let tunnel = Tunnel::start(
@@ -1042,7 +1029,6 @@ mod tests {
         tunnel.stop().await.expect("and it stops in order");
     }
 
-    /// Flow termination without interception does not retain authority material.
     #[tokio::test]
     async fn a_tunnel_that_does_not_intercept_has_nothing_to_keep() {
         let tunnel = Tunnel::start(
@@ -1061,7 +1047,6 @@ mod tests {
         tunnel.stop().await.unwrap();
     }
 
-    /// Persisted authority material is reused after restart.
     #[tokio::test]
     async fn a_restarted_tunnel_keeps_the_root_the_user_trusted() {
         let first = Tunnel::start(
@@ -1102,7 +1087,6 @@ mod tests {
         second.stop().await.unwrap();
     }
 
-    /// Configurations that cannot apply filtering are refused before startup.
     #[test]
     fn a_configuration_that_would_filter_nothing_is_refused_before_anything_is_built() {
         let cases = [
@@ -1156,7 +1140,6 @@ mod tests {
         }
     }
 
-    /// Invalid host input is retained in the configuration error.
     #[test]
     fn an_intercepted_host_that_is_not_a_name_names_itself() {
         let config = config(
@@ -1175,7 +1158,6 @@ mod tests {
         );
     }
 
-    /// The egress variant determines accepted layer and derived decisions.
     #[test]
     fn the_layer_follows_from_the_egress_and_the_rest_follows_from_the_layer() {
         let packets = config(
