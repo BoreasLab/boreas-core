@@ -80,7 +80,6 @@ pub enum Coding {
 }
 
 impl Coding {
-    /// Parses one `Content-Encoding` token.
     fn from_token(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "" | "identity" => Some(Self::Identity),
@@ -101,14 +100,12 @@ pub struct Rewritable {
 }
 
 impl Rewritable {
-    /// Returns the content coding.
     #[must_use]
     pub fn coding(self) -> Coding {
         self.coding
     }
 }
 
-/// Parses response headers into a rewritable body description.
 pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable, NotRewritable> {
     if status.is_informational()
         || matches!(
@@ -153,7 +150,6 @@ pub fn rewritable(status: StatusCode, headers: &HeaderMap) -> Result<Rewritable,
     Ok(Rewritable { encoding, coding })
 }
 
-/// Splits a media type from its `charset` parameter.
 fn media_type(value: &str) -> (&str, Option<&str>) {
     let mut parts = value.split(';');
     let media = parts.next().unwrap_or_default().trim();
@@ -185,7 +181,6 @@ pub enum InlineStyle {
 const STYLE_DIRECTIVES: [&str; 2] = ["style-src-elem", "style-src"];
 const FALLBACK_DIRECTIVE: &str = "default-src";
 
-/// Adds `source` to the governing style directive when required.
 #[must_use]
 pub fn permit_inline_style(policy: &str, source: &str) -> InlineStyle {
     let directives: Vec<&str> = policy
@@ -241,7 +236,6 @@ pub fn permit_inline_style(policy: &str, source: &str) -> InlineStyle {
     InlineStyle::Widened(widened.join("; "))
 }
 
-/// Finds `name`, comparing only each directive's name token.
 fn position(directives: &[&str], name: &str) -> Option<usize> {
     directives.iter().position(|directive| {
         directive
@@ -301,19 +295,16 @@ impl HidingRules {
         })
     }
 
-    /// Returns the stylesheet text named by [`Self::source`].
     #[must_use]
     pub fn style(&self) -> &str {
         &self.style
     }
 
-    /// Returns the CSP source expression admitting [`Self::style`].
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
     }
 
-    /// Returns the number of compiled selectors.
     #[must_use]
     pub fn len(&self) -> usize {
         self.count
@@ -333,7 +324,6 @@ pub trait CosmeticSource: Send + Sync + 'static {
     fn rules(&self, host: &str) -> Option<Arc<HidingRules>>;
 }
 
-/// Rule source that hides nothing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoCosmetics;
 
@@ -481,7 +471,6 @@ const ZSTD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 /// Maximum decoded output for one input chunk.
 const MAX_DECODED_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Returns whether `ruzstd` reported incomplete input.
 fn incomplete(error: &ruzstd::decoding::errors::FrameDecoderError) -> bool {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = cause {
@@ -493,7 +482,6 @@ fn incomplete(error: &ruzstd::decoding::errors::FrameDecoderError) -> bool {
     false
 }
 
-/// Push adapter for `ruzstd`'s pull decoder.
 struct Zstd {
     frame: ruzstd::decoding::FrameDecoder,
     /// Compressed bytes waiting for a complete block.
@@ -562,7 +550,6 @@ impl Zstd {
     }
 }
 
-/// Push decoder for one response body.
 enum Decoder {
     Identity,
     Gzip(Box<flate2::write::GzDecoder<Vec<u8>>>),
@@ -918,7 +905,6 @@ impl Rewriting {
             .map(|rules| (rules, *budget, Arc::clone(failures)))
     }
 
-    /// Applies the tier to one response and updates its headers.
     pub fn apply<B>(&self, host: &str, response: Response<B>) -> Response<ProxyBody>
     where
         B: Body<Data = Bytes> + Unpin + Send + Sync + 'static,
@@ -1277,7 +1263,6 @@ mod tests {
         }
     }
 
-    /// The stylesheet hash is stable under selector reordering.
     #[test]
     fn the_hash_names_the_stylesheet_and_ignores_selector_order() {
         let one = HidingRules::compile(
@@ -1304,7 +1289,6 @@ mod tests {
         );
     }
 
-    /// Empty and invalid selector sets produce no rules.
     #[test]
     fn an_empty_or_unparseable_selector_set_compiles_to_nothing() {
         assert!(HidingRules::compile(std::iter::empty()).is_none());
@@ -1320,7 +1304,6 @@ mod streaming {
     const HOST: &str = "example.com";
     const HTML: &[(&str, &str)] = &[("content-type", "text/html; charset=utf-8")];
 
-    /// Body fixture yielding one supplied chunk per poll.
     struct Chunks(VecDeque<Bytes>);
 
     impl Chunks {
@@ -1360,7 +1343,6 @@ mod streaming {
         }
     }
 
-    /// Supplies compiled rules without exercising rule parsing.
     struct Fixture(Arc<HidingRules>);
 
     impl CosmeticSource for Fixture {
@@ -1402,7 +1384,6 @@ mod streaming {
         (parts.headers, collected)
     }
 
-    /// Removes a match whose tag spans two input chunks.
     #[tokio::test]
     async fn a_matching_element_is_removed_across_a_chunk_boundary() {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
@@ -1421,7 +1402,6 @@ mod streaming {
         assert!(body.contains("<p>also keep</p>"));
     }
 
-    /// Preserves a matching element protected by SRI.
     #[tokio::test]
     async fn an_integrity_bearing_element_survives_a_matching_rule() {
         let (rewriting, ..) = tier(&["script"], StreamBudget::default());
@@ -1444,7 +1424,6 @@ mod streaming {
         assert!(!body.contains("/b.js"), "an unsigned one was not removed");
     }
 
-    /// The CSP hash identifies the injected stylesheet.
     #[tokio::test]
     async fn the_injected_stylesheet_is_named_by_the_policy_it_widened() {
         let (rewriting, rules, _) = tier(&[".ad"], StreamBudget::default());
@@ -1471,7 +1450,6 @@ mod streaming {
         assert_eq!(policy_value, format!("style-src 'self' {source}"));
     }
 
-    /// A restrictive style policy suppresses injection but permits removal.
     #[tokio::test]
     async fn a_refusing_policy_suppresses_the_injection_but_not_the_removal() {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
@@ -1494,7 +1472,6 @@ mod streaming {
         );
     }
 
-    /// Bodies outside the tier pass through with headers intact.
     #[tokio::test]
     async fn a_body_the_tier_cannot_read_arrives_byte_for_byte() {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
@@ -1524,7 +1501,6 @@ mod streaming {
         assert_eq!(&body[..], document.as_bytes());
     }
 
-    /// A memory bail-out flushes held bytes and preserves the response.
     #[tokio::test]
     async fn an_exhausted_budget_costs_no_bytes_and_counts_the_failure() {
         let (rewriting, _, failures) =
@@ -1543,7 +1519,6 @@ mod streaming {
         assert_eq!(failures.count(), 1, "the failure must be counted, once");
     }
 
-    /// Ambiguous markup produces visible truncation instead of unsafe edits.
     #[tokio::test]
     async fn ambiguous_markup_ends_the_body_visibly_rather_than_silently_short() {
         let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());
@@ -1564,7 +1539,6 @@ mod streaming {
         encoder.finish().unwrap()
     }
 
-    /// Decodes and rewrites compressed HTML, then removes stale coding headers.
     #[tokio::test]
     async fn a_compressed_document_is_decoded_rewritten_and_emitted_plain() {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
@@ -1605,7 +1579,6 @@ mod streaming {
         )
     }
 
-    /// Decodes zstd input one byte at a time across frame boundaries.
     #[tokio::test]
     async fn a_zstd_document_is_decoded_one_byte_at_a_time() {
         let (rewriting, ..) = tier(&[".ad"], StreamBudget::default());
@@ -1631,7 +1604,6 @@ mod streaming {
         assert!(parts.headers.get("content-encoding").is_none());
     }
 
-    /// Refuses decoded output beyond the per-chunk ceiling.
     #[test]
     fn a_chunk_expanding_past_the_ceiling_is_refused() {
         let bomb = vec![b'a'; 2 * MAX_DECODED_CHUNK_BYTES];
@@ -1658,7 +1630,6 @@ mod streaming {
         }
     }
 
-    /// A truncated compressed stream reports an error instead of shortening.
     #[tokio::test]
     async fn a_truncated_compressed_body_ends_visibly() {
         let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());
@@ -1676,7 +1647,6 @@ mod streaming {
         assert_eq!(failures.count(), 1);
     }
 
-    /// A body that contradicts its declared coding reports an error.
     #[tokio::test]
     async fn a_body_that_is_not_the_coding_it_claims_is_reported() {
         let (rewriting, _, failures) = tier(&[".ad"], StreamBudget::default());

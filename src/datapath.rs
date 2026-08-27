@@ -27,7 +27,6 @@ pub enum Side {
 }
 
 impl Side {
-    /// Returns the opposite side.
     pub fn across(self) -> Self {
         match self {
             Self::Tunnel => Self::Egress,
@@ -146,7 +145,6 @@ pub struct Limits {
     pub origination_ports: Option<OriginationPorts>,
 }
 
-/// Default HTTP interception ports.
 pub const DEFAULT_INSPECTED_PORTS: &[u16] = &[80, 443];
 
 /// An intercepted DNS query waiting for shell resolution.
@@ -328,12 +326,10 @@ impl Datapath {
         })
     }
 
-    /// Returns the cached plan for an inspection verdict.
     fn plan(&self, inspection: Inspection) -> Result<FlowPlan, PlanError> {
         self.plans[inspection.index()]
     }
 
-    /// Classifies a TCP packet for local inspection.
     fn inspection(&self, packet: IngressPacket, from: Side, now: Instant) -> Inspection {
         let Transport::Tcp {
             source_port,
@@ -362,13 +358,11 @@ impl Datapath {
         Inspection::Candidate
     }
 
-    /// Handles a packet from the client TUN.
     pub fn on_tun_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
         self.dispatch(packet, buf, Side::Tunnel, now)
     }
 
-    /// Handles a decapsulated egress packet.
     pub fn on_egress_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
         // Egress input must already be reassembled.
@@ -492,12 +486,10 @@ impl Datapath {
         self.queries.pop_front()
     }
 
-    /// Returns the pool shared by the core and resolver.
     pub fn pool(&self) -> &Arc<BufferPool> {
         &self.pool
     }
 
-    /// Captures a whole packet for the local TCP stack.
     fn capture_for_termination(&mut self, buf: &[u8]) {
         match self.pool.take(buf) {
             Some(packet) => self.terminate.push_back(packet),
@@ -505,7 +497,6 @@ impl Datapath {
         }
     }
 
-    /// Queues a client datagram and peer for the egress association.
     fn capture_datagram(&mut self, packet: IngressPacket, buf: &[u8], client: InternalEndpoint) {
         let Transport::Udp {
             destination_port, ..
@@ -587,7 +578,6 @@ impl Datapath {
         Ok(SendOutcome::Buffered)
     }
 
-    /// Returns the next packet for the local TCP stack.
     pub fn poll_terminate(&mut self) -> Option<Pooled> {
         self.terminate.pop_front()
     }
@@ -619,7 +609,6 @@ impl Datapath {
         Ok(())
     }
 
-    /// Copies one packet into the pool and queues it for `to`.
     fn forward(&mut self, buf: &[u8], to: Side, clamp: Option<Mtu>) {
         let Some(mut bytes) = self.pool.take(buf) else {
             self.events.push_back(FlowEvent::TransmitDropped);
@@ -671,7 +660,6 @@ impl Datapath {
         }
     }
 
-    /// Opens or refreshes a flow and reports whether it was new.
     fn open_flow(
         &mut self,
         endpoint: InternalEndpoint,
@@ -747,7 +735,6 @@ impl Datapath {
         .min()
     }
 
-    /// Expires reassembly, inspection, and flow state at `now`.
     pub fn on_timeout(&mut self, now: Instant) {
         let _ = self.reassembler.expire(now);
         self.inspected.expire(now);
@@ -818,7 +805,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Builds a wire-valid IPv4 TCP SYN to port 443.
     fn tcp_syn() -> [u8; 40] {
         let mut packet = [0u8; 40];
         packet[0] = 0x45; // IPv4 with a five-word header
@@ -841,7 +827,6 @@ mod tests {
         ]
     }
 
-    /// Builds a wire-valid IPv4 packet for a destination, protocol, and port.
     fn ipv4(protocol: u8, destination: [u8; 4], destination_port: u16) -> [u8; 40] {
         let mut packet = [0u8; 40];
         packet[0] = 0x45;
@@ -861,7 +846,6 @@ mod tests {
         packet
     }
 
-    /// Only resolved TCP traffic on an intercepted port terminates.
     #[test]
     fn only_a_flow_selected_for_inspection_leaves_the_packet_fast_path() {
         const INSPECTED: [u8; 4] = [198, 51, 100, 2];
@@ -1281,7 +1265,6 @@ mod tests {
         assert_eq!(pool.available(), 8);
     }
 
-    /// Flow egress preserves each target and synthesizes replies.
     #[test]
     fn a_client_datagram_carries_its_target_out_and_its_reply_back() {
         let mut path = datapath(crate::DatagramFidelity::Native);
@@ -1331,7 +1314,6 @@ mod tests {
         );
     }
 
-    /// Round-robin draining prevents source starvation.
     #[test]
     fn queued_datagrams_drain_fairly_across_flows() {
         let mut path = datapath(crate::DatagramFidelity::Native);
@@ -1358,7 +1340,6 @@ mod tests {
         );
     }
 
-    /// Builds a wire-valid IPv4 ICMP packet with `kind`, `code`, and `body`.
     fn icmpv4(source: [u8; 4], destination: [u8; 4], kind: u8, body: &[u8]) -> Vec<u8> {
         let total = 28 + body.len();
         let mut packet = vec![0u8; total];
@@ -1374,7 +1355,6 @@ mod tests {
         packet
     }
 
-    /// Builds a UDP datagram of exactly `total` bytes with optional DF.
     fn sized_udp(total: usize, dont_fragment: bool) -> Vec<u8> {
         let mut packet = vec![0u8; total];
         packet[0] = 0x45;
@@ -1392,7 +1372,6 @@ mod tests {
         packet
     }
 
-    /// Builds a packet-native session for ICMP and MTU tests.
     fn fast_path() -> Datapath {
         Datapath::new(
             FilterPolicy::PassThrough,
@@ -1406,7 +1385,6 @@ mod tests {
         .unwrap()
     }
 
-    /// ICMP uses the same packet-forwarding path in both directions.
     #[test]
     fn icmp_crosses_a_packet_egress_in_both_directions() {
         let mut path = fast_path();
@@ -1425,8 +1403,6 @@ mod tests {
         assert_eq!(&back.bytes[..], &reply[..]);
     }
 
-    /// An oversized non-fragmentable client packet receives a local PTB instead
-    /// of being forwarded beyond the smaller tunnel MTU.
     #[test]
     fn an_oversized_packet_that_forbids_fragmentation_is_answered_not_dropped() {
         let mut path = fast_path();
@@ -1465,7 +1441,6 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))
     }
 
-    /// Only oversized non-fragmentable packets receive a local report.
     #[test]
     fn a_packet_that_fits_or_permits_fragmenting_is_forwarded_as_before() {
         let now = Instant::now();
@@ -1484,8 +1459,6 @@ mod tests {
         }
     }
 
-    /// Only client packets receive local reports; an oversized egress packet is
-    /// the far side's path problem.
     #[test]
     fn nothing_arriving_from_the_egress_is_reported_on() {
         let mut path = fast_path();

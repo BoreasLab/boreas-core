@@ -86,7 +86,6 @@ pub struct Name {
 }
 
 impl Name {
-    /// Root name.
     pub const ROOT: Self = Self {
         bytes: [0; MAX_NAME_CHARS],
         len: 0,
@@ -210,7 +209,6 @@ impl Name {
         ))
     }
 
-    /// Writes an uncompressed wire encoding at `at`.
     fn write(&self, out: &mut [u8], at: usize) -> Result<usize, DnsError> {
         let mut writer = Bounded::at(out, at).ok_or(DnsError::OutputTooSmall)?;
         if !self.is_root() {
@@ -292,20 +290,17 @@ impl RecordType {
         }
     }
 
-    /// Whether this record carries SvcParams.
     pub fn carries_svc_params(self) -> bool {
         matches!(self, Self::Https | Self::Svcb)
     }
 }
 
-/// Header flags used by this module.
 const FLAG_RESPONSE: u16 = 0x8000;
 const FLAG_RECURSION_DESIRED: u16 = 0x0100;
 const FLAG_RECURSION_AVAILABLE: u16 = 0x0080;
 const FLAG_TRUNCATED: u16 = 0x0200;
 const RCODE_MASK: u16 = 0x000f;
 
-/// Response codes produced by this module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rcode {
     NoError,
@@ -665,7 +660,6 @@ impl HostPolicy {
         Self::insert(&mut self.inspected, name)
     }
 
-    /// Returns counts by rule kind.
     pub fn len(&self) -> RuleCounts {
         RuleCounts {
             allowed: self.allowed.len(),
@@ -729,7 +723,6 @@ impl HostPolicy {
     }
 }
 
-/// Rule counts by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuleCounts {
     pub allowed: usize,
@@ -771,7 +764,6 @@ pub fn alpn_policy(verdict: HostVerdict) -> AlpnPolicy {
     }
 }
 
-/// ECH and ALPN rewrites derived from one host verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnswerPolicy {
     pub ech: EchPolicy,
@@ -785,7 +777,6 @@ impl AnswerPolicy {
     }
 }
 
-/// Derives both response rewrites from one verdict.
 pub fn answer_policy(verdict: HostVerdict) -> AnswerPolicy {
     AnswerPolicy {
         ech: ech_policy(verdict),

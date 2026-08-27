@@ -105,7 +105,6 @@ impl Demotion {
 
     const COUNT: usize = Self::ALL.len();
 
-    /// Expiry-array slot for this cause.
     const fn slot(self) -> usize {
         match self {
             Self::LeafRejected => 0,
@@ -167,7 +166,6 @@ pub enum Standing {
 }
 
 impl Standing {
-    /// Returns the current tier cap.
     #[must_use]
     pub fn tier(self) -> Tier {
         match self {
@@ -176,7 +174,6 @@ impl Standing {
         }
     }
 
-    /// Returns the permitted terminated tier or the cause requiring a splice.
     pub fn permits(self) -> Result<InterceptedTier, Demotion> {
         match self {
             Self::Unrestricted => Ok(InterceptedTier::TOP),
@@ -184,7 +181,6 @@ impl Standing {
         }
     }
 
-    /// Returns the active cause, if any.
     #[must_use]
     pub fn cause(self) -> Option<Demotion> {
         match self {
@@ -241,12 +237,10 @@ fn originating(refusal: Refusal) -> Option<Demotion> {
     }
 }
 
-/// TLS alert descriptions used by the raw upstream error path.
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 const ALERT_USER_CANCELED: u8 = 90;
 const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
-/// Whether an alert is evidence likely to recur.
 fn conclusive(alert: AlertDescription) -> bool {
     !matches!(
         alert,
@@ -254,15 +248,12 @@ fn conclusive(alert: AlertDescription) -> bool {
     )
 }
 
-/// Applies the same recurrence rule to a raw BoringSSL alert byte.
 fn conclusive_alert(alert: u8) -> bool {
     !matches!(alert, ALERT_CLOSE_NOTIFY | ALERT_USER_CANCELED)
 }
 
-/// Expiry for each recorded cause on one host.
 type Expiries = [Option<Instant>; Demotion::COUNT];
 
-/// Host count at which the next pruning sweep starts.
 const PRUNE_AT: usize = 1024;
 
 struct Table {
@@ -343,7 +334,6 @@ impl Demotions {
             .map_or(Standing::Unrestricted, Standing::Limited)
     }
 
-    /// Number of hosts with table entries, including expired entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.table
@@ -509,7 +499,6 @@ mod tests {
         io::Error::new(io::ErrorKind::InvalidData, error)
     }
 
-    /// Wraps an upstream refusal in the production error shape.
     fn boring_error(refusal: Refusal) -> io::Error {
         io::Error::other(HandshakeFailure::new(Some(refusal), "synthesized"))
     }

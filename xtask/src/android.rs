@@ -105,7 +105,6 @@ impl Abi {
         ABIS.iter().find(|abi| abi.gradle.as_str() == name)
     }
 
-    /// Returns the lower-case target spelling used in compiler variable names.
     fn env_suffix(self) -> String {
         self.rust.as_str().replace('-', "_")
     }
@@ -188,7 +187,6 @@ impl Ndk {
         }
     }
 
-    /// Returns the NDK-owned CMake toolchain file included by the wrapper.
     #[must_use]
     pub fn toolchain_file(&self) -> PathBuf {
         self.root.join("build/cmake/android.toolchain.cmake")
@@ -337,7 +335,6 @@ mod tests {
         assert!(Abi::find("armeabi-v7a").is_none(), "dropped, not hidden");
     }
 
-    /// The table is the complete ABI domain.
     #[test]
     fn only_the_shipped_abis_exist() {
         assert_eq!(ABIS.len(), 3);
@@ -373,7 +370,6 @@ mod tests {
         }
     }
 
-    /// Every ABI yields six variables, NDK-local tools, and a test-free wrapper.
     #[test]
     fn every_abi_yields_a_complete_environment_from_one_ndk() {
         let root = fake_ndk("complete", &[Half::C, Half::Cxx]);
@@ -415,7 +411,6 @@ mod tests {
         }
     }
 
-    /// The wrapper passes the Gradle ABI to the NDK, not either compiler triple.
     #[test]
     fn the_wrapper_names_the_gradle_abi() {
         let root = fake_ndk("wrapper", &[Half::C, Half::Cxx]);
@@ -440,8 +435,6 @@ mod tests {
         path
     }
 
-    /// NDK-shaped fixture with empty tool files.
-    ///
     /// The test checks path validation and emitted configuration, not compilation.
     fn fake_ndk(label: &str, halves: &[Half]) -> PathBuf {
         let root = tempdir(label);
