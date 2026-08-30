@@ -56,8 +56,11 @@ expects, so unpacking is a copy and never a rename.
 ```
 boreas-0.4.2-android.tar.gz
   jniLibs/arm64-v8a/libboreas.so
+  jniLibs/arm64-v8a/libc++_shared.so
   jniLibs/x86/libboreas.so
+  jniLibs/x86/libc++_shared.so
   jniLibs/x86_64/libboreas.so
+  jniLibs/x86_64/libc++_shared.so
   include/boreas.h
 
 boreas-0.4.2-windows.zip
@@ -67,6 +70,15 @@ boreas-0.4.2-windows.zip
 ```
 
 `jniLibs/<abi>/` is Gradle's source set: copy it over `src/main/jniLibs/`.
+
+**Copy `libc++_shared.so` too.** It is not optional and it is not a duplicate
+of anything you already have. `libboreas.so` records it as a `NEEDED` entry
+because BoringSSL is C++ and `boring-sys` links the shared C++ runtime, so a
+device without it fails at `dlopen` with `library "libc++_shared.so" not
+found` — at load time, not at build time. You do not need to load it
+explicitly: the dynamic linker resolves it from the same directory. If your
+app already ships its own `libc++_shared.so` from another dependency, one copy
+in `jniLibs/<abi>/` is enough and the newer of the two should win.
 There is no `armeabi-v7a`, deliberately —
 [android.md](android.md#no-32-bit-arm) says why.
 `runtimes/<rid>/native/` is the layout .NET resolves a native dependency from.

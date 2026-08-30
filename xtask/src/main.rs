@@ -38,6 +38,7 @@ fn main() -> ExitCode {
         ["abis"] => Ok(abis()),
         ["android-target", abi] => android_target(abi),
         ["android-env", abi] => android_env(abi),
+        ["android-stage", abi, into] => android_stage(abi, Path::new(into)),
         ["resolve"] => resolve(),
         other => Err(usage(other).into()),
     };
@@ -60,6 +61,7 @@ fn usage(given: &[&str]) -> String {
          usage: cargo xtask abis\n\
          \x20      cargo xtask android-target <abi>\n\
          \x20      cargo xtask android-env <abi>\n\
+         \x20      cargo xtask android-stage <abi> <dir>\n\
          \x20      cargo xtask resolve"
     )
 }
@@ -114,6 +116,71 @@ fn android_env(name: &str) -> Fallible {
     Ok(assignments(
         &BuildEnvironment::new(abi, compiler, &ndk, wrapper).assignments(),
     ))
+}
+
+/// Assembles the shippable `jniLibs/<abi>/` and verifies it can load.
+///
+/// Staging and verification are one command because they were briefly two
+/// steps and only the first ran. The archive shipped `libboreas.so` alone
+/// while the shared object recorded `libc++_shared.so` as `NEEDED`, so every
+/// build was green and every device failed at `dlopen`. A directory this
+/// returns has had every `NEEDED` entry resolved against the platform set or
+/// against a file sitting beside the library.
+fn android_stage(name: &str, into: &Path) -> Fallible {
+    let abi = named(name)?;
+    let ndk = Ndk::open(ndk_root()?, HostTag::current()?)?;
+
+    let directory = into.join("jniLibs").join(abi.gradle.as_str());
+    std::fs::create_dir_all(&directory)?;
+
+    let built = repo_root()
+        .join("target")
+        .join(abi.rust.as_str())
+        .join("release/libboreas.so");
+    for source in [&built, &ndk.runtime_library(abi)?] {
+        let name = source.file_name().expect("a library has a file name");
+        std::fs::copy(source, directory.join(name))?;
+    }
+
+    let shipped: Vec<String> = std::fs::read_dir(&directory)?
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_str()?.to_owned()))
+        .collect();
+
+    // Read the built object rather than the copy: identical bytes, and naming
+    // the source makes a failure point at what to rebuild.
+    let dynamic = Command::new(ndk.readelf()?)
+        .args(["--dynamic".as_ref(), built.as_os_str()])
+        .output()?;
+    if !dynamic.status.success() {
+        return Err(format!(
+            "llvm-readelf could not read {}: {}",
+            built.display(),
+            String::from_utf8_lossy(&dynamic.stderr).trim()
+        )
+        .into());
+    }
+    let dynamic = String::from_utf8(dynamic.stdout)?;
+
+    let needed = android::needed(&dynamic);
+    let missing = android::unsatisfied(&needed, &shipped);
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} needs {}, which neither Android provides nor this archive ships.\n\
+             Every NEEDED entry: {}\n\
+             Ship the library beside it, or add it to `PLATFORM_LIBRARIES` if a \
+             device really does provide it.",
+            built.display(),
+            missing.join(", "),
+            needed.join(", "),
+        )
+        .into());
+    }
+
+    let mut rendered = String::new();
+    for library in &shipped {
+        let _ = writeln!(rendered, "{}/{library}", directory.display());
+    }
+    Ok(rendered)
 }
 
 /// Selects the newest NDK path available in runner variables.

@@ -153,14 +153,16 @@ jobs:
 
       # Laid out as Gradle's `jniLibs` source set expects it, so unpacking the
       # archive downstream is a copy rather than a rename.
+      #
+      # This also reads the shared object's `NEEDED` entries and fails when one
+      # is neither an Android platform library nor a file staged beside it.
+      # `libc++_shared.so` shipped missing once, which no build-time check
+      # could catch: the link succeeds and the failure arrives at `dlopen` on a
+      # device. Staging and checking are one command so they cannot come apart.
       - name: Stage
         env:
           ABI: ${{ matrix.abi }}
-          RUST: ${{ steps.target.outputs.rust }}
-        run: |
-          set -euo pipefail
-          mkdir -p "staging/jniLibs/$ABI"
-          cp "target/$RUST/release/libboreas.so" "staging/jniLibs/$ABI/"
+        run: cargo xtask android-stage "$ABI" staging
 
       - uses: actions/upload-artifact@v4
         with:

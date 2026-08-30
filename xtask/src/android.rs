@@ -164,6 +164,8 @@ pub enum NdkError {
     NotAnNdk(PathBuf),
     #[error("the NDK has no {0}; it may be too old for API level {1}")]
     NoCompiler(PathBuf, ApiLevel),
+    #[error("the NDK has no {0}")]
+    NoRuntime(PathBuf),
 }
 
 /// NDK installation with a present CMake toolchain file.
@@ -240,6 +242,87 @@ impl Ndk {
             toolchain = toolchain.display(),
         )
     }
+
+    /// Returns the C++ runtime this ABI's `libboreas.so` links against.
+    ///
+    /// `boring-sys` builds BoringSSL with `CMAKE_ANDROID_STL_TYPE=c++_shared`
+    /// and emits a bare `cargo:rustc-link-lib=c++`, both hard-coded with no
+    /// environment override (`build/main.rs` lines 305 and 729 of 5.2.0). On
+    /// the NDK a dynamic `-lc++` resolves to `libc++_shared.so`, so the shared
+    /// object records it as `NEEDED` and a device that lacks it cannot load the
+    /// library at all.
+    ///
+    /// The sysroot directory is named after the NDK triple. That holds for the
+    /// three shipped ABIs; 32-bit ARM put its libraries under
+    /// `arm-linux-androideabi` while naming its compiler `armv7a-`, which is
+    /// the divergence [`NdkTriple`] exists to keep visible.
+    pub fn runtime_library(&self, abi: &Abi) -> Result<PathBuf, NdkError> {
+        let path = self
+            .root
+            .join("toolchains/llvm/prebuilt")
+            .join(self.host.as_str())
+            .join("sysroot/usr/lib")
+            .join(abi.ndk.as_str())
+            .join(RUNTIME_LIBRARY);
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(NdkError::NoRuntime(path))
+        }
+    }
+
+    /// Returns the path to `llvm-readelf`, which reads the `NEEDED` entries.
+    pub fn readelf(&self) -> Result<PathBuf, NdkError> {
+        let path = self.bin().join("llvm-readelf");
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(NdkError::NoRuntime(path))
+        }
+    }
+}
+
+/// The C++ runtime shipped beside `libboreas.so`.
+pub const RUNTIME_LIBRARY: &str = "libc++_shared.so";
+
+/// Libraries every Android device provides, which are never shipped.
+///
+/// Deliberately short. It lists what this project's own shared object is
+/// expected to need, so an entry appearing for the first time fails the build
+/// rather than reaching a device. Extend it only with a library documented as
+/// part of the NDK stable ABI.
+pub const PLATFORM_LIBRARIES: [&str; 5] =
+    ["libc.so", "libm.so", "libdl.so", "liblog.so", "libz.so"];
+
+/// Extracts the `NEEDED` entries from `llvm-readelf --dynamic` output.
+///
+/// Lines look like:
+///
+/// ```text
+///  0x0000000000000001 (NEEDED)  Shared library: [libc++_shared.so]
+/// ```
+#[must_use]
+pub fn needed(readelf: &str) -> Vec<&str> {
+    readelf
+        .lines()
+        .filter(|line| line.contains("(NEEDED)"))
+        .filter_map(|line| {
+            let start = line.find('[')? + 1;
+            let end = line[start..].find(']')? + start;
+            Some(&line[start..end])
+        })
+        .collect()
+}
+
+/// Returns the `NEEDED` entries that neither the platform nor the archive
+/// provides, which are exactly the ones that fail at `dlopen`.
+#[must_use]
+pub fn unsatisfied<'a>(needed: &[&'a str], shipped: &[String]) -> Vec<&'a str> {
+    needed
+        .iter()
+        .copied()
+        .filter(|name| !PLATFORM_LIBRARIES.contains(name) && !shipped.iter().any(|s| s == name))
+        .collect()
 }
 
 /// Existing compiler paths for one ABI.
@@ -455,5 +538,74 @@ mod tests {
             }
         }
         root
+    }
+
+    /// Fixture: real `llvm-readelf --dynamic` output for an arm64 `libboreas.so`.
+    const READELF: &str = "\
+Dynamic section at offset 0x2d1000 contains 29 entries:
+  Tag                Type       Name/Value
+ 0x0000000000000001 (NEEDED)    Shared library: [libc++_shared.so]
+ 0x0000000000000001 (NEEDED)    Shared library: [libdl.so]
+ 0x0000000000000001 (NEEDED)    Shared library: [liblog.so]
+ 0x0000000000000001 (NEEDED)    Shared library: [libm.so]
+ 0x0000000000000001 (NEEDED)    Shared library: [libc.so]
+ 0x000000000000000e (SONAME)    Library soname: [libboreas.so]
+ 0x0000000000000019 (INIT_ARRAY) 0x2b8f10
+";
+
+    #[test]
+    fn needed_reads_only_the_needed_entries() {
+        assert_eq!(
+            needed(READELF),
+            [
+                "libc++_shared.so",
+                "libdl.so",
+                "liblog.so",
+                "libm.so",
+                "libc.so"
+            ]
+        );
+    }
+
+    /// SONAME also carries a bracketed name, and counting it would report the
+    /// library as depending on itself.
+    #[test]
+    fn needed_ignores_soname() {
+        assert!(!needed(READELF).contains(&"libboreas.so"));
+    }
+
+    #[test]
+    fn needed_of_nothing_is_nothing() {
+        assert!(needed("").is_empty());
+    }
+
+    /// The defect this check exists for: the archive shipped `libboreas.so`
+    /// alone, so `libc++_shared.so` resolved to nothing on a device.
+    #[test]
+    fn shipping_the_library_alone_is_unsatisfied() {
+        let shipped = vec!["libboreas.so".to_owned()];
+        assert_eq!(
+            unsatisfied(&needed(READELF), &shipped),
+            ["libc++_shared.so"]
+        );
+    }
+
+    #[test]
+    fn shipping_the_runtime_beside_it_satisfies_every_entry() {
+        let shipped = vec!["libboreas.so".to_owned(), RUNTIME_LIBRARY.to_owned()];
+        assert!(unsatisfied(&needed(READELF), &shipped).is_empty());
+    }
+
+    /// A platform library is present on every device, so requiring it in the
+    /// archive would fail a build that is correct.
+    #[test]
+    fn platform_libraries_need_no_shipping() {
+        assert!(unsatisfied(&["libc.so", "libm.so"], &[]).is_empty());
+    }
+
+    /// An entry in neither list is a new dependency nobody decided to take.
+    #[test]
+    fn an_unknown_dependency_is_reported() {
+        assert_eq!(unsatisfied(&["libssl.so"], &[]), ["libssl.so"]);
     }
 }
