@@ -31,7 +31,9 @@ APK:
 > — [Android ABIs](https://developer.android.com/ndk/guides/abis)
 
 Gradle's `jniLibs` source set maps onto that, so build one `libboreas.so` per
-ABI you ship and place each at `src/main/jniLibs/<abi>/libboreas.so`.
+ABI you ship and place each at `src/main/jniLibs/<abi>/libboreas.so`. The
+release archive ships `libc++_shared.so` beside it; copy that too, and
+[artifacts.md](artifacts.md#what-is-in-them) says why.
 
 Ship `arm64-v8a` at minimum. `x86_64` is worth it for the emulator.
 
@@ -451,7 +453,8 @@ installer.
 
 ## Checklist
 
-- [ ] One `libboreas.so` per shipped ABI at `src/main/jniLibs/<abi>/`
+- [ ] One `libboreas.so` per shipped ABI at `src/main/jniLibs/<abi>/`, with the
+      archive's `libc++_shared.so` beside it
 - [ ] Built with NDK r28+, or with the 16 KB linker flags
 - [ ] `minSdk >= 23`, `useLegacyPackaging` unset
 - [ ] `Builder.setMtu(n)` and `BoreasConfig.mtu = n` — the same `n`
