@@ -1558,7 +1558,7 @@ mod tests {
     fn an_oversized_icmp_error_is_not_answered_but_an_oversized_echo_is() {
         let now = Instant::now();
         let mut body = vec![0u8; 1472];
-            body[0] = 0x45; // quoted IPv4 header marker
+        body[0] = 0x45; // quoted IPv4 header marker
 
         for (label, kind, answered) in [
             ("v4 destination unreachable", 3, false),

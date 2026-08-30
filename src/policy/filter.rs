@@ -228,8 +228,8 @@ fn hosts_entry(line: &str) -> Option<Result<Rule, RuleError>> {
 }
 
 impl HostPolicy {
-        /// Compiles `list` into this policy and reports every classification.
-        ///
+    /// Compiles `list` into this policy and reports every classification.
+    ///
     /// Runs in one pass over `list`; the index grows with distinct enforceable
     /// hosts. The result is built off the datapath and swapped through the
     /// shell's `watch` channel.

@@ -30,7 +30,6 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-
 /// Takes a lock and recovers from poisoning.
 ///
 /// These mutexes guard maps, queues, and options whose updates are whole
@@ -827,7 +826,7 @@ mod tests {
         for offset_units in [0_u16, 1, 8, 256, 0x1fff] {
             for more_fragments in [true, false] {
                 let mut packet = ipv4_udp;
-                    if offset_units == 0 && !more_fragments {
+                if offset_units == 0 && !more_fragments {
                     continue; // This is an unfragmented packet.
                 }
                 let flags_offset = offset_units | if more_fragments { 0x2000 } else { 0 };
@@ -1105,7 +1104,6 @@ mod tests {
                 nat_behavior: NatBehavior::EndpointIndependent,
             })
         );
-
     }
 
     #[test]

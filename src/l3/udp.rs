@@ -152,7 +152,7 @@ impl<T> DatagramBuffer<T> {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             capacity,
-                    // Idle flows pay nothing; the queue allocates on first datagram.
+            // Idle flows pay nothing; the queue allocates on first datagram.
             datagrams: VecDeque::new(),
             dropped: 0,
         }
