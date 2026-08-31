@@ -32,7 +32,12 @@ jobs:
       # scripts/vendor.py carries its own PEP 723 environment — an interpreter
       # floor and an empty dependency set — and uv is what honours it, so CI
       # and a contributor's checkout execute the same interpreter.
-      - uses: astral-sh/setup-uv@v9.0.0
+      #
+      # **Exact version, and it has to be.** Every other action here is pinned
+      # to a moving major; setup-uv publishes no such tag, so `@v10` names
+      # nothing and the job fails while resolving actions, before a step runs.
+      # sync-vendor.yml carried `@v9` and failed that way every week.
+      - uses: astral-sh/setup-uv@v10.0.1
 
       # vendor/<name>/ is generated from vendor/patches/<name>.patch, and these
       # are what prove it still is. No network and no build, so they run first

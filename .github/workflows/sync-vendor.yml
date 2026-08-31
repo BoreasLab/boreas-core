@@ -82,7 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # scripts/vendor.py carries its own PEP 723 environment; uv honours it,
       # so this job runs the interpreter the script asks for.
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - name: Check the tool's own pure core
         run: uv run scripts/vendor.py --selftest
