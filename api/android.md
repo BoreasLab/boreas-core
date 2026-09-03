@@ -174,6 +174,22 @@ This decides whether you get a double close.
 Either works. Pick one and close exactly once, **after** your `release` callback
 has run — see [obligations.md](obligations.md#teardown).
 
+### Hand the descriptor over instead
+
+`boreas_tunnel_start_fd(config, fd, mtu, &bypass, &out)` takes the descriptor
+and runs it on the core's own reactor: no `BoreasDevice`, no callback per
+packet, no JNA trampoline on the packet path, one syscall per direction. It
+owns `fd` from that call on, failure included, and closes it at `free`. Use
+`detachFd()` and pass the number:
+
+```kotlin
+val pfd = builder.setMtu(MTU).establish() ?: return START_NOT_STICKY
+val status = lib.boreas_tunnel_start_fd(config, pfd.detachFd(), MTU.toShort(), bypass, out)
+```
+
+Everything below about the vtable device still applies if you cannot hand the
+descriptor over. Nothing else in this page changes.
+
 ### Unblocking a blocked read
 
 Your `close` callback must make an in-flight `recv` return. There is an obvious

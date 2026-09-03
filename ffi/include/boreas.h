@@ -379,6 +379,24 @@ BOREAS_MUST_USE BoreasStatus boreas_tunnel_start(const BoreasConfig *config,
                                  const BoreasBypass *bypass,
                                  BoreasTunnel **out);
 
+#if !defined(_WIN32)
+/*
+ * Starts a tunnel over a raw IP descriptor — a VpnService's, on Android — with
+ * no device callbacks: the core reads and writes it on its own reactor, one
+ * syscall per packet and nothing crossing into managed code. Prefer this to a
+ * BoreasDevice wherever you hold a descriptor; android.md shows the call.
+ *
+ * Takes ownership of `fd` on every path, failure included, and sets it
+ * non-blocking. `mtu` is the interface's, the same number as BoreasConfig.mtu.
+ * As with boreas_tunnel_start, the bypass `release` is always called.
+ */
+BOREAS_MUST_USE BoreasStatus boreas_tunnel_start_fd(const BoreasConfig *config,
+                                    int fd,
+                                    uint16_t mtu,
+                                    const BoreasBypass *bypass,
+                                    BoreasTunnel **out);
+#endif
+
 /*
  * Blocks until the next event, or BOREAS_STOPPED once none can arrive.
  *

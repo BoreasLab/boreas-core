@@ -228,31 +228,114 @@ pub unsafe extern "C" fn boreas_tunnel_start(
             Err(status) => return status,
         };
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(_) => return Status::Io,
+        let Some(runtime) = runtime() else {
+            return Status::Io;
         };
-        let started = runtime.block_on(Tunnel::start(parsed, Platform { device, bypass }));
-        let tunnel = match started {
-            Ok(tunnel) => tunnel,
-            Err(error) => return Status::from(error),
-        };
-
-        let (commands_tx, commands_rx) = mpsc::channel(EVENT_DEPTH);
-        let (events_tx, events_rx) = mpsc::channel(EVENT_DEPTH);
-        runtime.spawn(drive(tunnel, commands_rx, events_tx));
-
-        *out = Box::into_raw(Box::new(BoreasTunnel {
-            runtime,
-            events: Mutex::new(events_rx),
-            commands: commands_tx,
-            _bypass: guard,
-        }));
-        Status::Ok
+        launch(runtime, parsed, device, bypass, guard, out)
     })
+}
+
+/// Starts a tunnel over a raw IP descriptor, with no device callbacks: the
+/// reactor reads and writes it directly. Takes ownership of `fd` on every
+/// path, failure included, and makes it non-blocking.
+///
+/// # Safety
+///
+/// `config`, `bypass`, and `out` must be valid pointers, every pointer
+/// reachable from `config` must be live for the duration of the call, and
+/// `fd` must be an open descriptor nothing else will close.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn boreas_tunnel_start_fd(
+    config: *const BoreasConfig,
+    fd: std::ffi::c_int,
+    mtu: u16,
+    bypass: *const BoreasBypass,
+    out: *mut *mut BoreasTunnel,
+) -> Status {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    crate::boundary(|| {
+        if fd < 0 {
+            return Status::NullArgument;
+        }
+        // Owned before any check, so a refused start still closes it.
+        // SAFETY: the caller's contract hands the descriptor over.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let config = *borrow!(config);
+        let bypass_ops = *borrow!(bypass);
+        let out = borrow_mut!(out);
+
+        let guard = BypassGuard::new(bypass_ops);
+        let Some(bypass) = Bypass::new(bypass_ops) else {
+            return Status::Config;
+        };
+        let Ok(mtu) = boreas_core::Mtu::new(mtu) else {
+            return Status::Config;
+        };
+        // SAFETY: fcntl on a descriptor this function owns.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return Status::Io;
+        }
+        // SAFETY: the caller's contract covers every pointer in `config`.
+        let parsed = match unsafe { config.parse() } {
+            Ok(parsed) => parsed,
+            Err(status) => return status,
+        };
+
+        let Some(runtime) = runtime() else {
+            return Status::Io;
+        };
+        // `AsyncFd` registers with the reactor it is created on.
+        let device =
+            match runtime.block_on(async { boreas_core::AndroidTun::from_owned_fd(fd, mtu) }) {
+                Ok(device) => device,
+                Err(_) => return Status::Io,
+            };
+        launch(runtime, parsed, device, bypass, guard, out)
+    })
+}
+
+fn runtime() -> Option<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .ok()
+}
+
+/// Everything after the device exists: start on `runtime`, spawn the driver,
+/// and hand the handle back.
+fn launch<D>(
+    runtime: tokio::runtime::Runtime,
+    parsed: boreas_core::api::TunnelConfig,
+    device: D,
+    bypass: Bypass,
+    guard: BypassGuard,
+    out: &mut *mut BoreasTunnel,
+) -> Status
+where
+    D: boreas_core::AsyncDevice + Send + 'static,
+{
+    let started = runtime.block_on(Tunnel::start(parsed, Platform { device, bypass }));
+    let tunnel = match started {
+        Ok(tunnel) => tunnel,
+        Err(error) => return Status::from(error),
+    };
+
+    let (commands_tx, commands_rx) = mpsc::channel(EVENT_DEPTH);
+    let (events_tx, events_rx) = mpsc::channel(EVENT_DEPTH);
+    runtime.spawn(drive(tunnel, commands_rx, events_tx));
+
+    *out = Box::into_raw(Box::new(BoreasTunnel {
+        runtime,
+        events: Mutex::new(events_rx),
+        commands: commands_tx,
+        _bypass: guard,
+    }));
+    Status::Ok
 }
 
 /// Blocks until the next event or tunnel shutdown.

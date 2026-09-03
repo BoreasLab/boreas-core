@@ -54,6 +54,8 @@ pub mod android;
 pub use config::{BoreasCeilings, BoreasConfig, BoreasEgress, BoreasNat, BoreasWireGuard};
 pub use seam::{BoreasBypass, BoreasDevice, BoreasSocket, Device};
 pub use status::{Status, boundary};
+#[cfg(unix)]
+pub use tunnel::boreas_tunnel_start_fd;
 pub use tunnel::{
     BoreasCounters, BoreasEvent, BoreasEventKind, BoreasTunnel, boreas_tunnel_authority,
     boreas_tunnel_free, boreas_tunnel_next_event, boreas_tunnel_reload, boreas_tunnel_shutdown,

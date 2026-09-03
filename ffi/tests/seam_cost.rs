@@ -151,3 +151,57 @@ fn a_packet_crosses_the_seam_within_its_allocation_budget() {
         "{per_packet:.2} allocations per packet exceeds the budget of {BUDGET}"
     );
 }
+
+/// The descriptor device, as Android hands it over: no callbacks, the reactor
+/// reads the descriptor itself. Same budget, and the time is what one syscall
+/// per direction costs.
+#[cfg(unix)]
+#[test]
+fn a_packet_crosses_the_descriptor_device_within_its_allocation_budget() {
+    use std::os::unix::net::UnixDatagram;
+
+    let (ours, theirs) = UnixDatagram::pair().expect("a socket pair");
+    theirs.set_nonblocking(true).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let packet = vec![0x45u8; PACKET];
+
+    let (allocations, elapsed) = runtime.block_on(async {
+        let mut device = boreas_core::AndroidTun::from_owned_fd(
+            theirs.into(),
+            boreas_core::Mtu::new(MTU).unwrap(),
+        )
+        .expect("registers with the reactor");
+        let mut buf = vec![0u8; usize::from(MTU)];
+        // The far end echoes: every packet sent comes back to be received.
+        for _ in 0..WARM_UP {
+            ours.send(&packet).unwrap();
+            let len = device.recv(&mut buf).await.expect("a packet");
+            device.send(&buf[..len]).await.expect("a write");
+            ours.recv(&mut buf).unwrap();
+        }
+
+        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        let start = Instant::now();
+        for _ in 0..PACKETS {
+            ours.send(&packet).unwrap();
+            let len = device.recv(&mut buf).await.expect("a packet");
+            device.send(&buf[..len]).await.expect("a write");
+            ours.recv(&mut buf).unwrap();
+        }
+        (
+            ALLOCATIONS.load(Ordering::Relaxed) - before,
+            start.elapsed(),
+        )
+    });
+
+    let per_packet = allocations as f64 / PACKETS as f64;
+    let nanos = elapsed.as_nanos() as f64 / PACKETS as f64;
+    println!("descriptor: {nanos:.0} ns/packet, {per_packet:.2} allocations/packet");
+    assert!(
+        allocations <= BUDGET * PACKETS + PACKETS / 2,
+        "{per_packet:.2} allocations per packet exceeds the budget of {BUDGET}"
+    );
+}

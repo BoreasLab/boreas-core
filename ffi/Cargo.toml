@@ -16,6 +16,9 @@ boreas-core = { path = ".." }
 # The runtime lives on this side of the boundary: a C caller has no executor,
 # so every entry point that awaits blocks on one owned by the handle.
 tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread"] }
+# `fcntl(O_NONBLOCK)` on a descriptor handed over raw. Already in the graph
+# through tokio.
+libc = "0.2"
 
 # Only Android needs to call *back* into a managed runtime, and it is the one
 # platform where the bypass obligation is a method on a Java object rather than
