@@ -52,7 +52,7 @@ mod tunnel;
 pub mod android;
 
 pub use config::{BoreasCeilings, BoreasConfig, BoreasEgress, BoreasNat, BoreasWireGuard};
-pub use seam::{BoreasBypass, BoreasDevice, BoreasSocket};
+pub use seam::{BoreasBypass, BoreasDevice, BoreasSocket, Device};
 pub use status::{Status, boundary};
 pub use tunnel::{
     BoreasCounters, BoreasEvent, BoreasEventKind, BoreasTunnel, boreas_tunnel_authority,
