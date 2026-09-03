@@ -179,6 +179,44 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
     assert_eq!(returning, vec![(boreas_core::Side::Tunnel, frame)]);
 }
 
+/// Whitepaper section 5.4: mac1 is checked before any asymmetric work. An
+/// initiation with a valid body and a wrong mac1 is refused, not answered.
+#[test]
+fn a_handshake_with_a_bad_mac1_is_refused_before_it_is_processed() {
+    use boreas_core::PacketEgress;
+
+    let pool = pool();
+    let mut client = client_egress(Arc::clone(&pool));
+    let mut server = server_egress(Arc::clone(&pool));
+    let mut first = Vec::new();
+    client
+        .handle_tun_packet(&udp_frame(Ipv4Addr::new(192, 0, 2, 1), 1234), &mut first)
+        .expect("within the pool budget");
+    let Some(EgressEmit::ToNetwork(initiation)) = first.pop() else {
+        panic!("the first packet starts a handshake");
+    };
+    // Message type 1, 148 bytes; mac1 is the 16 bytes at 116.
+    assert_eq!(initiation.len(), 148);
+    let mut forged = initiation.to_vec();
+    forged[116] ^= 0xff;
+
+    let mut out = Vec::new();
+    let refused = server.handle_network_packet(&forged, &mut out);
+    assert!(
+        matches!(refused, Err(boreas_core::EgressError::WireGuard(_))),
+        "{refused:?}"
+    );
+    assert!(out.is_empty(), "no response to an initiation nobody keyed");
+
+    server
+        .handle_network_packet(&initiation, &mut out)
+        .expect("the untouched initiation");
+    assert!(
+        matches!(out.as_slice(), [EgressEmit::ToNetwork(_)]),
+        "and it is answered"
+    );
+}
+
 #[test]
 fn wireguard_properties_plan_the_packet_fast_path() {
     let plan = boreas_core::plan_flow(

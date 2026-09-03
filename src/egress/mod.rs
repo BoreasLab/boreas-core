@@ -473,6 +473,10 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
 const WIREGUARD_TICK: Duration = Duration::from_millis(250);
 
+/// Source the limiter accounts handshakes to: the connected socket's one peer.
+const PEER: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+
 const TUNNEL_BUFFERS: usize = 16;
 
 /// Static configuration for one WireGuard peer.
@@ -558,6 +562,9 @@ impl From<WireGuardError> for EgressError {
 /// Sans-IO WireGuard packet egress.
 pub struct WireGuardEgress {
     tunn: Tunn,
+    /// Checks handshake MACs and hands out cookies under load, before any
+    /// asymmetric work (whitepaper section 5.4).
+    limiter: Arc<RateLimiter>,
     mtu: MtuWatcher,
     pool: Arc<BufferPool>,
     /// Reused scratch space for queued GotaTun outputs.
@@ -576,6 +583,7 @@ impl WireGuardEgress {
     pub fn new(config: WireGuardConfig, pool: Arc<BufferPool>) -> Self {
         let private_key = StaticSecret::from(config.private_key);
         let our_public = PublicKey::from(&private_key);
+        let limiter = Arc::new(RateLimiter::new(&our_public, HANDSHAKE_RATE_LIMIT));
         Self {
             tunn: Tunn::new(
                 private_key,
@@ -583,8 +591,9 @@ impl WireGuardEgress {
                 config.preshared_key,
                 config.persistent_keepalive,
                 IndexTable::from_os_rng(),
-                Arc::new(RateLimiter::new(&our_public, HANDSHAKE_RATE_LIMIT)),
+                Arc::clone(&limiter),
             ),
+            limiter,
             mtu: MtuWatcher::new(config.inner_mtu.get()),
             pool,
             queued: Vec::new(),
@@ -664,10 +673,22 @@ impl PacketEgress for WireGuardEgress {
         datagram: &[u8],
         out: &mut Vec<EgressEmit>,
     ) -> Result<(), EgressError> {
-        let kind = self
-            .stage(datagram)
-            .try_into_wg()
-            .map_err(|_| EgressError::MalformedNetworkPacket)?;
+        // The socket is connected to the one peer, so the limiter's
+        // per-source accounting needs no real address; a cookie is bound to
+        // whatever we say and echoed back as is.
+        let kind = match self.limiter.verify_packet(PEER, self.stage(datagram)) {
+            Ok(kind) => kind,
+            // Under load: a cookie the peer must echo before we do the DH.
+            Err(TunnResult::WriteToNetwork(cookie)) => {
+                out.push(self.network_emit(cookie)?);
+                return Ok(());
+            }
+            Err(TunnResult::Err(WireGuardError::InvalidPacket)) => {
+                return Err(EgressError::MalformedNetworkPacket);
+            }
+            Err(TunnResult::Err(error)) => return Err(error.into()),
+            Err(TunnResult::Done | TunnResult::WriteToTunnel(_)) => return Ok(()),
+        };
 
         match self.tunn.handle_incoming_packet(kind) {
             TunnResult::Done => {}

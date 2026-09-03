@@ -166,6 +166,7 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
 # channels, a timer, and the `select!`/`pin!` macros, and nothing else. Boreas
 # cross-compiles to Android, where every unused tokio driver is dead weight in
 # the shipped artefact.
+time = "0.3"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # The WebSocket VLESS transport. `default-features = false` drops `connect` and

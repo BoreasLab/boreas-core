@@ -21,14 +21,16 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use crate::fifo::BoundedFifo;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, date_time_ymd,
+    KeyUsagePurpose, SerialNumber, date_time_ymd,
 };
+use ring::rand::SecureRandom;
 use rustls::{
     crypto::ring::sign::any_supported_type,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -77,9 +79,16 @@ impl std::error::Error for CaError {
     }
 }
 
-/// Fixed validity window used by the root and leaves.
+/// Fixed validity window of the root, which lives in the trust store.
 const NOT_BEFORE: (i32, u8, u8) = (2020, 1, 1);
 const NOT_AFTER: (i32, u8, u8) = (2100, 1, 1);
+
+/// A leaf is minted on demand and held in memory, so it can be short-lived:
+/// an hour back for clock skew, and well inside the 398 days platforms allow.
+const LEAF_BACKDATE: time::Duration = time::Duration::hours(1);
+const LEAF_LIFETIME: time::Duration = time::Duration::days(30);
+/// A cached leaf is minted again after this, long before it expires.
+const LEAF_REFRESH: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 fn root_params() -> Result<CertificateParams, CaError> {
     let mut params = CertificateParams::new(Vec::<String>::new()).map_err(CaError::Signing)?;
@@ -292,8 +301,13 @@ impl CertificateAuthority {
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = date_time_ymd(NOT_BEFORE.0, NOT_BEFORE.1, NOT_BEFORE.2);
-        params.not_after = date_time_ymd(NOT_AFTER.0, NOT_AFTER.1, NOT_AFTER.2);
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - LEAF_BACKDATE;
+        params.not_after = now + LEAF_LIFETIME;
+        // Every leaf shares the issuer and the key; the serial is what makes
+        // it a distinct certificate (RFC 5280 s4.1.2.2). rcgen would derive
+        // it from the shared key, so browsers saw one serial for every host.
+        params.serial_number = Some(serial()?);
         let leaf = params
             .signed_by(&self.leaf_key_pair, &self.issuer)
             .map_err(CaError::Signing)?;
@@ -304,6 +318,16 @@ impl CertificateAuthority {
     }
 }
 
+/// A positive 128-bit random serial.
+fn serial() -> Result<SerialNumber, CaError> {
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| CaError::Material)?;
+    bytes[0] &= 0x7f;
+    Ok(SerialNumber::from_slice(&bytes))
+}
+
 impl fmt::Debug for CertificateAuthority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CertificateAuthority")
@@ -311,11 +335,17 @@ impl fmt::Debug for CertificateAuthority {
     }
 }
 
+#[derive(Clone)]
+struct Minted {
+    at: Instant,
+    leaf: Arc<CertifiedKey>,
+}
+
 /// rustls resolver that maps SNI to a cached forged leaf.
 pub struct MitmResolver {
     authority: Arc<CertificateAuthority>,
     /// Bounded: a busy session forges one leaf per host it intercepts.
-    cache: Mutex<BoundedFifo<String, Arc<CertifiedKey>>>,
+    cache: Mutex<BoundedFifo<String, Minted>>,
 }
 
 impl MitmResolver {
@@ -328,12 +358,19 @@ impl MitmResolver {
 
     /// A failed mint is not memoized, so a transient failure is retried.
     pub fn leaf(&self, host: &str) -> Option<Arc<CertifiedKey>> {
-        let mut cache = crate::locked(&self.cache);
-        if let Some(hit) = cache.get(host) {
-            return Some(hit);
+        if let Some(minted) = crate::locked(&self.cache).get(host)
+            && minted.at.elapsed() < LEAF_REFRESH
+        {
+            return Some(minted.leaf);
         }
+        // Signed outside the lock: one handshake does not queue the rest.
         let leaf = self.authority.leaf_for(host).ok()?;
-        Some(cache.get_or_insert_with(host.to_owned(), || leaf))
+        let minted = Minted {
+            at: Instant::now(),
+            leaf: Arc::clone(&leaf),
+        };
+        crate::locked(&self.cache).insert(host.to_owned(), minted);
+        Some(leaf)
     }
 }
 
@@ -410,7 +447,8 @@ mod tests {
         let before = original.leaf_for("example.com").unwrap();
         let after = restored.leaf_for("example.com").unwrap();
         assert_ne!(
-            before.cert[0], after.cert[0],
+            serial_of(&before.cert[0]),
+            serial_of(&after.cert[0]),
             "a fresh leaf, since each carries its own serial"
         );
         assert_eq!(
@@ -423,6 +461,31 @@ mod tests {
             before.key.public_key(),
             "and over the same leaf key, so a pin survives the restart too"
         );
+    }
+
+    fn parsed(der: &rustls::pki_types::CertificateDer<'_>) -> boring::x509::X509 {
+        boring::x509::X509::from_der(der.as_ref()).expect("a leaf is DER")
+    }
+
+    fn serial_of(der: &rustls::pki_types::CertificateDer<'_>) -> Vec<u8> {
+        parsed(der).serial_number().to_bn().unwrap().to_vec()
+    }
+
+    /// RFC 5280 section 4.1.2.2: one issuer never signs two certificates
+    /// under one serial. Firefox refuses the second host when it does.
+    #[test]
+    fn two_hosts_get_two_serials_and_a_leaf_is_valid_now_and_not_for_long() {
+        let authority = authority();
+        let a = authority.leaf_for("a.example").unwrap();
+        let b = authority.leaf_for("b.example").unwrap();
+        assert_ne!(serial_of(&a.cert[0]), serial_of(&b.cert[0]));
+
+        let leaf = parsed(&a.cert[0]);
+        let today = boring::asn1::Asn1Time::days_from_now(0).unwrap();
+        let next_year = boring::asn1::Asn1Time::days_from_now(398).unwrap();
+        assert!(leaf.not_before() < today, "valid already");
+        assert!(leaf.not_after() > today, "valid still");
+        assert!(leaf.not_after() < next_year, "inside what platforms accept");
     }
 
     fn issuer_of(der: &rustls::pki_types::CertificateDer<'_>) -> Vec<u8> {

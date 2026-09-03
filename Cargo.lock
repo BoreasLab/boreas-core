@@ -277,6 +277,7 @@ dependencies = [
  "rustls",
  "ruzstd",
  "smoltcp",
+ "time",
  "tokio",
  "tokio-boring",
  "tokio-rustls",
