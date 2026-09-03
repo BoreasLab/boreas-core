@@ -35,6 +35,30 @@ impl Side {
     }
 }
 
+/// Packet bytes as dispatched. Owned bytes already sit in a pool slice, so a
+/// forward moves them; borrowed bytes are copied into one at that point.
+enum Ingress<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Pooled),
+}
+
+impl Ingress<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(pooled) => pooled,
+        }
+    }
+
+    /// The bytes in a pool slice: the one they came in, or a copy.
+    fn into_pooled(self, pool: &Arc<BufferPool>) -> Option<Pooled> {
+        match self {
+            Self::Borrowed(bytes) => pool.take(bytes),
+            Self::Owned(pooled) => Some(pooled),
+        }
+    }
+}
+
 /// A packet queued for one side of the datapath.
 ///
 /// [`Pooled`] owns a pool slot, so a transmit is intentionally not `Clone`.
@@ -360,26 +384,49 @@ impl Datapath {
 
     pub fn on_tun_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
-        self.dispatch(packet, buf, Side::Tunnel, now)
+        self.dispatch(packet, Ingress::Borrowed(buf), Side::Tunnel, now)
+    }
+
+    /// As [`Self::on_tun_packet`], but the bytes already sit in a pool slice
+    /// and a forward moves them instead of copying.
+    pub fn on_tun_owned(&mut self, packet: Pooled, now: Instant) -> Result<(), DatapathError> {
+        let parsed = IngressPacket::parse(&packet)?;
+        self.dispatch(parsed, Ingress::Owned(packet), Side::Tunnel, now)
     }
 
     pub fn on_egress_packet(&mut self, buf: &[u8], now: Instant) -> Result<(), DatapathError> {
         let packet = IngressPacket::parse(buf)?;
+        self.dispatch_from_egress(packet, Ingress::Borrowed(buf), now)
+    }
+
+    /// As [`Self::on_egress_packet`], moving the slice through a forward.
+    pub fn on_egress_owned(&mut self, packet: Pooled, now: Instant) -> Result<(), DatapathError> {
+        let parsed = IngressPacket::parse(&packet)?;
+        self.dispatch_from_egress(parsed, Ingress::Owned(packet), now)
+    }
+
+    fn dispatch_from_egress(
+        &mut self,
+        packet: IngressPacket,
+        ingress: Ingress<'_>,
+        now: Instant,
+    ) -> Result<(), DatapathError> {
         // Egress input must already be reassembled.
         if packet.transport == Transport::Fragment {
             self.events.push_back(FlowEvent::ReassemblyDiscarded);
             return Ok(());
         }
-        self.dispatch(packet, buf, Side::Egress, now)
+        self.dispatch(packet, ingress, Side::Egress, now)
     }
 
     fn dispatch(
         &mut self,
         packet: IngressPacket,
-        buf: &[u8],
+        ingress: Ingress<'_>,
         from: Side,
         now: Instant,
     ) -> Result<(), DatapathError> {
+        let buf = ingress.bytes();
         // Apply steering only to outbound attempts.
         let backstop = match from {
             Side::Tunnel if self.inspected.live(&packet.destination, now) => Backstop::Active,
@@ -422,7 +469,7 @@ impl Datapath {
                     }
                     TransportPath::LocalTermination => None,
                 };
-                self.forward(buf, from.across(), clamp);
+                self.forward(ingress, from.across(), clamp);
                 Ok(())
             }
             IngressAction::OpenStream(plan) => {
@@ -432,7 +479,7 @@ impl Datapath {
                 }
                 // The shell owns TCP; capture only the client-facing packet.
                 if from == Side::Tunnel {
-                    self.capture_for_termination(buf);
+                    self.capture_for_termination(ingress);
                 }
                 Ok(())
             }
@@ -449,7 +496,7 @@ impl Datapath {
             }
             IngressAction::HandleIcmp(_) => {
                 // The effect shell owns client-facing PTB generation.
-                self.forward(buf, from.across(), None);
+                self.forward(ingress, from.across(), None);
                 Ok(())
             }
             IngressAction::DropUnsupported => Ok(()),
@@ -490,8 +537,8 @@ impl Datapath {
         &self.pool
     }
 
-    fn capture_for_termination(&mut self, buf: &[u8]) {
-        match self.pool.take(buf) {
+    fn capture_for_termination(&mut self, ingress: Ingress<'_>) {
+        match ingress.into_pooled(&self.pool) {
             Some(packet) => self.terminate.push_back(packet),
             None => self.events.push_back(FlowEvent::TransmitDropped),
         }
@@ -609,8 +656,8 @@ impl Datapath {
         Ok(())
     }
 
-    fn forward(&mut self, buf: &[u8], to: Side, clamp: Option<Mtu>) {
-        let Some(mut bytes) = self.pool.take(buf) else {
+    fn forward(&mut self, ingress: Ingress<'_>, to: Side, clamp: Option<Mtu>) {
+        let Some(mut bytes) = ingress.into_pooled(&self.pool) else {
             self.events.push_back(FlowEvent::TransmitDropped);
             return;
         };
@@ -655,7 +702,7 @@ impl Datapath {
             PushOutcome::Complete(datagram) => {
                 // Plan from the completed datagram's actual header.
                 let packet = IngressPacket::parse(&datagram)?;
-                self.dispatch(packet, &datagram, from, now)
+                self.dispatch(packet, Ingress::Borrowed(&datagram), from, now)
             }
         }
     }
@@ -1338,6 +1385,27 @@ mod tests {
             vec![1234, 5678, 1234, 5678],
             "one datagram per flow per turn"
         );
+    }
+
+    /// A packet that arrives in a pool slice leaves in that slice.
+    #[test]
+    fn an_owned_packet_is_forwarded_in_the_slice_it_arrived_in() {
+        let mut path = fast_path();
+        let now = Instant::now();
+
+        let inbound = path.pool().take(&udp_packet()).unwrap();
+        let arrived = inbound.as_ptr();
+        path.on_tun_owned(inbound, now).unwrap();
+        let out = path.poll_transmit().expect("forwarded");
+        assert_eq!(out.to, Side::Egress);
+        assert_eq!(out.bytes.as_ptr(), arrived, "moved, not copied");
+
+        let reply = path.pool().take(&udp_packet()).unwrap();
+        let arrived = reply.as_ptr();
+        path.on_egress_owned(reply, now).unwrap();
+        let out = path.poll_transmit().expect("forwarded back");
+        assert_eq!(out.to, Side::Tunnel);
+        assert_eq!(out.bytes.as_ptr(), arrived);
     }
 
     fn icmpv4(source: [u8; 4], destination: [u8; 4], kind: u8, body: &[u8]) -> Vec<u8> {

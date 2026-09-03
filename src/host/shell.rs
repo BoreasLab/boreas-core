@@ -607,8 +607,12 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     shutdown: CancellationToken,
     panics: Panics,
 ) -> io::Result<()> {
-    // Size buffers from the device MTU and egress datagram limit.
-    let mut tun_buf = vec![0u8; usize::from(device.mtu().get())];
+    // Size buffers from the device MTU and egress datagram limit. The device
+    // reads into a pool slice when one is free, so a forward moves the slice;
+    // `tun_buf` is the fallback when the pool is exhausted.
+    let mtu = usize::from(device.mtu().get());
+    let mut tun_buf = vec![0u8; mtu];
+    let mut slot: Option<Pooled> = None;
     let mut net_buf = vec![0u8; egress.max_network_datagram()];
     // Reuse one emission container for the reactor lifetime.
     let mut emits: Vec<EgressEmit> = Vec::new();
@@ -635,6 +639,10 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             .min()
             .unwrap_or(next_flush);
         sleep.as_mut().reset(wake);
+        if slot.is_none() {
+            slot = datapath.pool().take_zeroed(mtu);
+        }
+        let landing: &mut [u8] = slot.as_deref_mut().unwrap_or(&mut tun_buf);
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -654,9 +662,16 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 }
             }
 
-            result = device.recv(&mut tun_buf) => match result {
+            result = device.recv(landing) => match result {
                 Ok(len) => {
-                    if datapath.on_tun_packet(&tun_buf[..len], Instant::now()).is_err() {
+                    let accepted = match slot.take() {
+                        Some(mut packet) => {
+                            let _ = packet.resize(len);
+                            datapath.on_tun_owned(packet, Instant::now())
+                        }
+                        None => datapath.on_tun_packet(&tun_buf[..len], Instant::now()),
+                    };
+                    if accepted.is_err() {
                         counters.packets_rejected += 1;
                     }
                 }
@@ -774,7 +789,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                     network.send(&bytes).await?;
                 }
                 EgressEmit::ToTunnel(bytes) => {
-                    if datapath.on_egress_packet(&bytes, Instant::now()).is_err() {
+                    if datapath.on_egress_owned(bytes, Instant::now()).is_err() {
                         counters.packets_rejected += 1;
                     }
                 }
