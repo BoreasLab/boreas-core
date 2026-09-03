@@ -123,6 +123,9 @@ pub struct Framed<S, C> {
     inner: S,
     codec: C,
     coded: Vec<u8>,
+    /// Consumed prefix of `coded`. A cursor, so decoding many small frames
+    /// from one chunk moves the remainder once, not once per frame.
+    coded_at: usize,
     plain: Vec<u8>,
     plain_at: usize,
     transparent: bool,
@@ -138,6 +141,7 @@ impl<S, C: Codec> Framed<S, C> {
             writes: codec.writes(),
             inner,
             coded: Vec::new(),
+            coded_at: 0,
             plain: Vec::new(),
             plain_at: 0,
             transparent: false,
@@ -185,26 +189,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Codec + Unpin> AsyncRead for Framed<S
                 return Poll::Ready(Ok(()));
             }
             // Transparent mode avoids another copy.
-            if this.transparent && this.coded.is_empty() {
+            if this.transparent && this.coded_at == this.coded.len() {
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
 
-            if !this.coded.is_empty() {
-                let outcome = this
-                    .codec
-                    .decode(&this.coded, &mut this.plain)
-                    .map_err(fatal)?;
+            if this.coded_at < this.coded.len() {
+                let held = &this.coded[this.coded_at..];
+                let outcome = this.codec.decode(held, &mut this.plain).map_err(fatal)?;
                 match outcome {
                     Decode::Transparent { rest } => {
                         // Retain surplus so small caller buffers cannot lose it.
                         this.plain.extend_from_slice(rest);
                         this.coded.clear();
+                        this.coded_at = 0;
                         this.transparent = true;
                         continue;
                     }
                     Decode::Framed { .. } => {
-                        let consumed = outcome.consumed(&this.coded);
-                        this.coded.drain(..consumed);
+                        let consumed = outcome.consumed(held);
+                        this.coded_at += consumed;
+                        // Compact once half is consumed: amortized O(1) per byte.
+                        if this.coded_at * 2 >= this.coded.len() {
+                            this.coded.drain(..this.coded_at);
+                            this.coded_at = 0;
+                        }
                         // Otherwise the codec needs more input.
                         if consumed > 0 || !this.plain.is_empty() {
                             continue;
@@ -525,6 +533,41 @@ mod tests {
         fn max_payload(&self) -> usize {
             255
         }
+    }
+
+    /// Decoding n frames from one chunk moves the remainder O(log n) times,
+    /// not n times: the cursor advances and the buffer compacts at half.
+    #[tokio::test]
+    async fn small_frames_advance_a_cursor_rather_than_moving_the_chunk() {
+        const FRAMES: usize = 4000;
+        let (mut peer, ours) = tokio::io::duplex(FRAMED_CHUNK);
+        let wire: Vec<u8> = (0..FRAMES).flat_map(|_| [1u8, b'x']).collect();
+        peer.write_all(&wire).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let mut framed = Framed::new(ours, LengthPrefixed);
+        let mut compactions = 0usize;
+        let mut was_at = 0usize;
+        let mut buf = [0u8; 1];
+        assert_eq!(framed.read(&mut buf).await.unwrap(), 1);
+        assert_eq!(
+            (framed.coded_at, framed.coded.len()),
+            (2, wire.len()),
+            "the first frame moved the cursor, not the chunk"
+        );
+        for _ in 1..FRAMES {
+            assert_eq!(framed.read(&mut buf).await.unwrap(), 1);
+            let (at, len) = (framed.coded_at, framed.coded.len());
+            assert!(at == 0 || at * 2 < len, "at most half of {len} is consumed");
+            if at == 0 && was_at != 0 {
+                compactions += 1;
+            }
+            was_at = at;
+        }
+        assert!(
+            compactions <= 16,
+            "{compactions} compactions for {FRAMES} frames is not logarithmic"
+        );
     }
 
     #[tokio::test]
