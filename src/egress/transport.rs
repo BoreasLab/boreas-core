@@ -12,18 +12,62 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_core::Stream;
 use futures_sink::Sink;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::Mutex,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     AsyncStream, BoxFuture, ClientProfile, EgressError, Originator, Prefixed, ProxyError,
     TunnelBypass,
     egress::quic::{Handshake, QuicConnection, client_config},
+    live::Live,
     wire::Writer,
 };
+
+/// An HTTP/2 request sender and whether its connection has ended.
+#[derive(Clone)]
+pub(crate) struct H2Sender {
+    pub(crate) sender: h2::client::SendRequest<bytes::Bytes>,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl H2Sender {
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.ended.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Opens HTTP/2 on `io` and drives the connection on its own task.
+pub(crate) async fn h2_over<S>(io: S) -> std::io::Result<H2Sender>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, connection) = h2::client::handshake(io).await.map_err(h2_failed)?;
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn({
+        let ended = Arc::clone(&ended);
+        async move {
+            let _ = connection.await;
+            ended.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    Ok(H2Sender { sender, ended })
+}
+
+/// A stream or connection error: the one kind a caller may retry once.
+pub(crate) fn h2_failed(error: h2::Error) -> std::io::Error {
+    match error.into_io() {
+        Some(error) => error,
+        None => std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "the HTTP/2 connection failed",
+        ),
+    }
+}
+
+/// An egress failure carried through `Live`, which speaks `io::Error`.
+fn dial_failed(error: EgressError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
 
 pub trait ProxyTransport: Send + Sync {
     fn dial(&self) -> BoxFuture<'_, Result<Box<dyn AsyncStream>, EgressError>>;
@@ -475,22 +519,22 @@ pub struct HttpConfig {
 
 pub struct GrpcTransport<T> {
     config: GrpcConfig,
-    inner: T,
-    connection: Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
+    inner: Arc<T>,
+    connection: Live<H2Sender>,
 }
 
 pub struct HttpTransport<T> {
     config: HttpConfig,
-    inner: T,
-    connection: Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
+    inner: Arc<T>,
+    connection: Live<H2Sender>,
 }
 
 impl<T: ProxyTransport> GrpcTransport<T> {
     pub fn new(config: GrpcConfig, inner: T) -> Self {
         Self {
             config,
-            inner,
-            connection: Mutex::new(None),
+            inner: Arc::new(inner),
+            connection: Live::new(),
         }
     }
 }
@@ -502,40 +546,31 @@ impl<T: ProxyTransport> HttpTransport<T> {
                 path: normalise_path(&config.path),
                 ..config
             },
-            inner,
-            connection: Mutex::new(None),
+            inner: Arc::new(inner),
+            connection: Live::new(),
         }
     }
 }
 
-/// Obtains or reuses an HTTP/2 request sender. The lock covers the handshake so
-/// concurrent first flows share one connection.
-async fn h2_sender<T: ProxyTransport>(
-    held: &Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
-    inner: &T,
+/// The shared HTTP/2 request sender, dialled once on its own task, with
+/// capacity for one more stream. Waiting for capacity holds no lock.
+async fn h2_sender<T: ProxyTransport + 'static>(
+    live: &Live<H2Sender>,
+    inner: &Arc<T>,
 ) -> Result<h2::client::SendRequest<bytes::Bytes>, EgressError> {
-    let mut held = held.lock().await;
-    if let Some(sender) = held.as_ref()
-        && let Ok(ready) = sender.clone().ready().await
-    {
-        *held = Some(ready.clone());
-        return Ok(ready);
-    }
-
-    let stream = inner.dial().await?;
-    let (sender, connection) = h2::client::handshake(stream)
+    let inner = Arc::clone(inner);
+    let sender = live
+        .get(H2Sender::is_alive, async move {
+            let stream = inner.dial().await.map_err(dial_failed)?;
+            h2_over(stream).await
+        })
         .await
         .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
-    // HTTP/2 streams progress only while their connection future is polled.
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let ready = sender
+    sender
+        .sender
         .ready()
         .await
-        .map_err(|_| EgressError::Proxy(ProxyError::Header))?;
-    *held = Some(ready.clone());
-    Ok(ready)
+        .map_err(|_| EgressError::Proxy(ProxyError::Header))
 }
 
 /// The server needs request-body data before replying, so refusal is reported
@@ -843,9 +878,9 @@ pub struct QuicTransportConfig {
 }
 
 pub struct QuicTransport<B> {
-    config: QuicTransportConfig,
-    bypass: B,
-    connection: Mutex<Option<QuicConnection>>,
+    config: Arc<QuicTransportConfig>,
+    bypass: Arc<B>,
+    connection: Live<QuicConnection>,
     shutdown: CancellationToken,
 }
 
@@ -858,9 +893,9 @@ impl<B> Drop for QuicTransport<B> {
 impl<B: TunnelBypass> QuicTransport<B> {
     pub fn new(config: QuicTransportConfig, bypass: B) -> Self {
         Self {
-            config,
-            bypass,
-            connection: Mutex::new(None),
+            config: Arc::new(config),
+            bypass: Arc::new(bypass),
+            connection: Live::new(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -872,23 +907,23 @@ impl<B: TunnelBypass> QuicTransport<B> {
 
 impl<B: TunnelBypass + 'static> QuicTransport<B> {
     async fn connection(&self) -> Result<QuicConnection, EgressError> {
-        let mut held = self.connection.lock().await;
-        if let Some(connection) = held.as_ref()
-            && connection.is_alive()
-        {
-            return Ok(connection.clone());
-        }
-        let socket = self.bypass.udp(self.config.server).await?;
-        let handshake = Handshake::establish(
-            socket,
-            self.config.server,
-            &self.config.server_name,
-            Self::quic_config(self.config.idle_timeout)?,
-        )
-        .await?;
-        let connection = handshake.drive(self.shutdown.clone());
-        *held = Some(connection.clone());
-        Ok(connection)
+        let (config, bypass) = (Arc::clone(&self.config), Arc::clone(&self.bypass));
+        let shutdown = self.shutdown.clone();
+        self.connection
+            .get(QuicConnection::is_alive, async move {
+                let socket = bypass.udp(config.server).await?;
+                let handshake = Handshake::establish(
+                    socket,
+                    config.server,
+                    &config.server_name,
+                    Self::quic_config(config.idle_timeout).map_err(dial_failed)?,
+                )
+                .await
+                .map_err(dial_failed)?;
+                Ok(handshake.drive(shutdown))
+            })
+            .await
+            .map_err(EgressError::from)
     }
 }
 

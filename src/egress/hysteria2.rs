@@ -11,7 +11,7 @@
 use std::{net::SocketAddr, ops::Range, sync::Arc, time::Duration};
 
 use ring::rand::SecureRandom;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -19,6 +19,7 @@ use crate::{
     EgressError, NatBehavior, PathProperties, Prefixed, ProxyError, StreamEgress, Target,
     TunnelBypass,
     egress::quic::{DATAGRAM_DEPTH, Handshake, QuicConnection, client_config},
+    live::Live,
     wire::{Reader, Writer, varint_len},
 };
 
@@ -311,13 +312,13 @@ impl Defragmenter {
 }
 
 pub struct Hysteria2Egress<B> {
-    config: Hysteria2Config,
-    bypass: B,
-    quic: QuicConfigFactory,
-    /// Shared authenticated connection.
-    connection: Mutex<Option<QuicConnection>>,
+    config: Arc<Hysteria2Config>,
+    bypass: Arc<B>,
+    quic: Arc<QuicConfigFactory>,
+    /// Shared authenticated connection, dialled on its own task.
+    connection: Live<QuicConnection>,
     /// Datagram routes for the current connection, if supported.
-    datagrams: Mutex<Option<Arc<Sessions>>>,
+    datagrams: Arc<std::sync::Mutex<Option<Arc<Sessions>>>>,
     /// Cancels the connection driver on drop.
     shutdown: CancellationToken,
 }
@@ -328,14 +329,19 @@ impl<B> Drop for Hysteria2Egress<B> {
     }
 }
 
-impl<B: TunnelBypass> Hysteria2Egress<B> {
+/// An egress failure carried through `Live`, which speaks `io::Error`.
+fn failed(error: EgressError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
+impl<B: TunnelBypass + 'static> Hysteria2Egress<B> {
     pub fn new(config: Hysteria2Config, bypass: B, quic: QuicConfigFactory) -> Self {
         Self {
-            config,
-            bypass,
-            quic,
-            connection: Mutex::new(None),
-            datagrams: Mutex::new(None),
+            config: Arc::new(config),
+            bypass: Arc::new(bypass),
+            quic: Arc::new(quic),
+            connection: Live::new(),
+            datagrams: Arc::new(std::sync::Mutex::new(None)),
             shutdown: CancellationToken::new(),
         }
     }
@@ -349,56 +355,65 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
     }
 
     async fn connection(&self) -> Result<QuicConnection, EgressError> {
-        let mut held = self.connection.lock().await;
-        if let Some(connection) = held.as_ref()
-            && connection.is_alive()
-        {
-            return Ok(connection.clone());
-        }
+        let (config, bypass, quic) = (
+            Arc::clone(&self.config),
+            Arc::clone(&self.bypass),
+            Arc::clone(&self.quic),
+        );
+        let (datagrams, shutdown) = (Arc::clone(&self.datagrams), self.shutdown.clone());
+        self.connection
+            .get(QuicConnection::is_alive, async move {
+                let socket = bypass.udp(config.server).await?;
+                let mut handshake = Handshake::establish(
+                    socket,
+                    config.server,
+                    &config.server_name,
+                    quic().map_err(failed)?,
+                )
+                .await
+                .map_err(failed)?;
 
-        let socket = self.bypass.udp(self.config.server).await?;
-        let mut handshake = Handshake::establish(
-            socket,
-            self.config.server,
-            &self.config.server_name,
-            (self.quic)()?,
-        )
-        .await?;
+                let pad = padding(AUTH_PADDING).map_err(|error| failed(error.into()))?;
+                let response = handshake
+                    .http3(&[
+                        quiche::h3::Header::new(b":method", b"POST"),
+                        quiche::h3::Header::new(b":scheme", b"https"),
+                        quiche::h3::Header::new(b":authority", AUTH_AUTHORITY.as_bytes()),
+                        quiche::h3::Header::new(b":path", AUTH_PATH.as_bytes()),
+                        quiche::h3::Header::new(HEADER_AUTH, config.password.as_bytes()),
+                        // Zero selects congestion control instead of a claimed
+                        // receive rate.
+                        quiche::h3::Header::new(HEADER_CC_RX, b"0"),
+                        quiche::h3::Header::new(HEADER_PADDING, &pad),
+                    ])
+                    .await
+                    .map_err(failed)?;
 
-        let pad = padding(AUTH_PADDING)?;
-        let response = handshake
-            .http3(&[
-                quiche::h3::Header::new(b":method", b"POST"),
-                quiche::h3::Header::new(b":scheme", b"https"),
-                quiche::h3::Header::new(b":authority", AUTH_AUTHORITY.as_bytes()),
-                quiche::h3::Header::new(b":path", AUTH_PATH.as_bytes()),
-                quiche::h3::Header::new(HEADER_AUTH, self.config.password.as_bytes()),
-                // Zero selects congestion control instead of a claimed receive rate.
-                quiche::h3::Header::new(HEADER_CC_RX, b"0"),
-                quiche::h3::Header::new(HEADER_PADDING, &pad),
-            ])
-            .await?;
+                if response.status != STATUS_AUTH_OK {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                // Datagram support is a server-declared capability.
+                let carries_datagrams = response.header(HEADER_UDP).is_some_and(|value| {
+                    matches!(value, "true" | "1" | "t" | "T" | "TRUE" | "True")
+                });
 
-        if response.status != STATUS_AUTH_OK {
-            return Err(ProxyError::AuthFailed.into());
-        }
-        // Datagram support is a server-declared capability.
-        let carries_datagrams = response
-            .header(HEADER_UDP)
-            .is_some_and(|value| matches!(value, "true" | "1" | "t" | "T" | "TRUE" | "True"));
-
-        let connection = handshake.drive(self.shutdown.clone());
-        // Start routing before allowing sessions to register.
-        let hub = if carries_datagrams {
-            let hub = Sessions::new();
-            hub.serve(&connection, self.shutdown.clone()).await;
-            Some(hub)
-        } else {
-            None
-        };
-        *self.datagrams.lock().await = hub;
-        *held = Some(connection.clone());
-        Ok(connection)
+                let connection = handshake.drive(shutdown.clone());
+                // Start routing before allowing sessions to register.
+                let hub = if carries_datagrams {
+                    let hub = Sessions::new();
+                    hub.serve(&connection, shutdown).await;
+                    Some(hub)
+                } else {
+                    None
+                };
+                *crate::locked(&datagrams) = hub;
+                Ok(connection)
+            })
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::PermissionDenied => ProxyError::AuthFailed.into(),
+                _ => EgressError::from(error),
+            })
     }
 
     /// Response header reporting datagram support.
@@ -557,7 +572,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for Hysteria2Egress<B> {
     fn associate(&self) -> BoxFuture<'_, Result<Association, EgressError>> {
         Box::pin(async move {
             let connection = self.connection().await?;
-            let Some(hub) = self.datagrams.lock().await.clone() else {
+            let Some(hub) = crate::locked(&self.datagrams).clone() else {
                 // Do not emulate unsupported datagrams with silent loss.
                 return Err(EgressError::DatagramsUnsupported);
             };

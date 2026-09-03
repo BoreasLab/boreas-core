@@ -25,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     ClientProfile, Message, Originator, Upstream,
+    egress::transport::{H2Sender, h2_over},
     live::Live,
     policy::demux::{Demux, Transport, bounded},
 };
@@ -448,36 +449,6 @@ enum DohConnection {
     H1,
 }
 
-/// An HTTP/2 request sender and whether its connection has ended.
-#[derive(Clone)]
-struct H2Sender {
-    sender: h2::client::SendRequest<bytes::Bytes>,
-    ended: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl H2Sender {
-    fn is_alive(&self) -> bool {
-        !self.ended.load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
-/// Opens HTTP/2 on `io` and drives the connection on its own task.
-async fn h2_over<S>(io: S) -> io::Result<H2Sender>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (sender, connection) = h2::client::handshake(io).await.map_err(h2_failed)?;
-    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    tokio::spawn({
-        let ended = Arc::clone(&ended);
-        async move {
-            let _ = connection.await;
-            ended.store(true, std::sync::atomic::Ordering::Release);
-        }
-    });
-    Ok(H2Sender { sender, ended })
-}
-
 /// One query as one HTTP/2 stream: a POST of the message, its reply the body.
 async fn exchange_h2(
     sender: H2Sender,
@@ -518,16 +489,7 @@ async fn exchange_h2(
     Ok(reply)
 }
 
-/// A stream or connection error: the one kind a caller may retry once.
-fn h2_failed(error: h2::Error) -> io::Error {
-    match error.into_io() {
-        Some(error) => error,
-        None => io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "the HTTP/2 connection failed",
-        ),
-    }
-}
+use crate::egress::transport::h2_failed;
 
 /// Connections kept after a reusable response. More than a burst of this size
 /// pays a handshake, which is what it paid on every query before.
