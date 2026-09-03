@@ -197,8 +197,11 @@ async fn serve_association(
         return counts;
     };
 
-    // Reuse one maximum-sized receive buffer for the association's lifetime.
-    let mut buf = vec![0u8; usize::from(u16::MAX)];
+    // One receive buffer for the association's lifetime, sized to what can be
+    // delivered: a reply is written into one pool slice or dropped, so bytes
+    // beyond that are dropped here as `DatagramTooLarge` instead. 64 KiB per
+    // association was 32 MiB at the ceiling.
+    let mut buf = vec![0u8; pool.slice_size().get()];
 
     loop {
         tokio::select! {
