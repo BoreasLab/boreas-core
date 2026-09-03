@@ -77,7 +77,10 @@ pub async fn run_terminator(
             _ = shutdown.cancelled() => break,
             packet = packets.recv() => match packet {
                 // Move the shared-budget buffer into the stack until consumed.
-                Some(packet) => stack.push(packet),
+                Some(packet) => {
+                    stack.push(packet);
+                    take_pending(&mut stack, &mut packets);
+                }
                 None => break,
             },
             () = wake.notified() => {}
@@ -90,6 +93,19 @@ pub async fn run_terminator(
     // Flush decisions already made so cancellation cannot strand a FIN or final
     // segment.
     service(&mut stack, &mut conns, &wake, &mut buf, &replies, &accepted).await;
+}
+
+/// Moves every packet already queued into the stack, so a burst costs one
+/// `service` pass rather than one per packet. `service` walks every socket,
+/// so with s connections and a burst of k segments this is O(s) rather than
+/// O(k · s). Bounded by the channel's depth.
+fn take_pending(stack: &mut LocalStack, packets: &mut mpsc::Receiver<Pooled>) -> usize {
+    let mut taken = 0;
+    while let Ok(packet) = packets.try_recv() {
+        stack.push(packet);
+        taken += 1;
+    }
+    taken
 }
 
 /// Advances the stack, publishes connections, pumps streams, and drains output.
@@ -270,6 +286,40 @@ mod tests {
             self.shutdown.cancel();
             let _ = self.handle.await;
         }
+    }
+
+    /// A queued burst enters the stack in one move: `service` is then one pass
+    /// over the sockets for the whole burst, not one per segment.
+    #[tokio::test]
+    async fn a_burst_already_queued_is_taken_before_the_stack_is_serviced() {
+        let pool = BufferPool::new(
+            NonZeroUsize::new(2048).unwrap(),
+            NonZeroUsize::new(64).unwrap(),
+        );
+        let mut stack = LocalStack::new(
+            Mtu::new(1500).unwrap(),
+            &[443],
+            TerminationLimits {
+                max_sockets: NonZeroUsize::new(4).unwrap(),
+                backlog: NonZeroUsize::new(1).unwrap(),
+                socket_buffer: NonZeroUsize::new(4096).unwrap(),
+            },
+            Arc::clone(&pool),
+            Instant::now(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        for n in 0..10u8 {
+            tx.send(pool.take(&[0x45, n]).unwrap()).await.unwrap();
+        }
+
+        assert_eq!(take_pending(&mut stack, &mut rx), 10);
+        assert_eq!(take_pending(&mut stack, &mut rx), 0, "nothing left behind");
+        assert_eq!(
+            pool.available(),
+            64 - 10,
+            "the burst now lives in the stack"
+        );
     }
 
     #[tokio::test]
