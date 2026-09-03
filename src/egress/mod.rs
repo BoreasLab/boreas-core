@@ -473,10 +473,6 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
 const WIREGUARD_TICK: Duration = Duration::from_millis(250);
 
-const WIREGUARD_FRAMING_BYTES: usize = 32;
-
-const WIREGUARD_PADDING_ALIGNMENT: usize = 16;
-
 const TUNNEL_BUFFERS: usize = 16;
 
 /// Static configuration for one WireGuard peer.
@@ -563,8 +559,6 @@ impl From<WireGuardError> for EgressError {
 pub struct WireGuardEgress {
     tunn: Tunn,
     mtu: MtuWatcher,
-    /// Mirror of the watched MTU for shared read-only bounds.
-    inner_mtu: Mtu,
     pool: Arc<BufferPool>,
     /// Reused scratch space for queued GotaTun outputs.
     queued: Vec<WgKind>,
@@ -592,7 +586,6 @@ impl WireGuardEgress {
                 Arc::new(RateLimiter::new(&our_public, HANDSHAKE_RATE_LIMIT)),
             ),
             mtu: MtuWatcher::new(config.inner_mtu.get()),
-            inner_mtu: config.inner_mtu,
             pool,
             queued: Vec::new(),
             packets: gotatun::packet::PacketBufPool::new(TUNNEL_BUFFERS),
@@ -705,11 +698,9 @@ impl PacketEgress for WireGuardEgress {
         WIREGUARD_TICK
     }
 
-    /// Maximum peer datagram from the configured MTU and WireGuard framing.
-    fn max_network_datagram(&self) -> usize {
-        usize::from(self.inner_mtu.get()).next_multiple_of(WIREGUARD_PADDING_ALIGNMENT)
-            + WIREGUARD_FRAMING_BYTES
-    }
+    // WireGuard negotiates no MTU: the peer sends up to its own interface's
+    // MTU plus framing, which our inner MTU says nothing about. The trait's
+    // default, every UDP length, is the only bound that never truncates.
 }
 
 /// Removes WireGuard padding using the IP header's declared length.

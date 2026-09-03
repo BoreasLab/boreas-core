@@ -18,7 +18,7 @@ use crate::{
     Association, AsyncStream, BoxFuture, DatagramFidelity, DatagramSink, DatagramSource, Decoded,
     EgressError, NatBehavior, PathProperties, Prefixed, ProxyError, StreamEgress, Target,
     TunnelBypass,
-    egress::quic::{Handshake, QuicConnection, client_config},
+    egress::quic::{DATAGRAM_DEPTH, Handshake, QuicConnection, client_config},
     wire::{Reader, Writer, varint_len},
 };
 
@@ -341,7 +341,11 @@ impl<B: TunnelBypass> Hysteria2Egress<B> {
     }
 
     pub fn quic_config() -> Result<quiche::Config, EgressError> {
-        client_config(quiche::h3::APPLICATION_PROTOCOL, IDLE_TIMEOUT)
+        let mut config = client_config(quiche::h3::APPLICATION_PROTOCOL, IDLE_TIMEOUT)?;
+        // The UDP relay rides DATAGRAM frames, sent only to a client that
+        // advertised them (RFC 9221 section 3).
+        config.enable_dgram(true, DATAGRAM_DEPTH, DATAGRAM_DEPTH);
+        Ok(config)
     }
 
     async fn connection(&self) -> Result<QuicConnection, EgressError> {

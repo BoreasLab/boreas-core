@@ -38,7 +38,7 @@ const COMMAND_DEPTH: usize = 16;
 
 /// Bounded inbound datagram queue. A slow claimant loses packets rather than
 /// blocking other flows on the connection.
-const DATAGRAM_DEPTH: usize = 256;
+pub(crate) const DATAGRAM_DEPTH: usize = 256;
 
 /// Builds a QUIC client configuration for stream traffic.
 ///
@@ -54,8 +54,11 @@ pub fn client_config(
         .set_application_protos(alpn)
         .map_err(|_| EgressError::Quic)?;
     config.set_max_idle_timeout(idle_timeout.as_millis() as u64);
+    // Accept up to an Ethernet frame; send at the 1200-byte floor until a
+    // probe proves the path takes more (RFC 9000 section 14). A fixed 1500
+    // stalled after the handshake on every path with a smaller MTU.
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM);
+    config.discover_pmtu(true);
     // Set connection and stream flow-control windows for bulk transfer.
     config.set_initial_max_data(16 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_local(4 * 1024 * 1024);
@@ -720,6 +723,33 @@ mod tests {
             .expect("the echo returns")
             .expect("the channel is open");
         assert_eq!(back, b"one datagram");
+    }
+
+    /// RFC 9221: a peer sends DATAGRAM frames only to a client that advertised
+    /// them. Hysteria2's UDP relay is that client.
+    #[tokio::test]
+    async fn the_hysteria2_configuration_advertises_datagrams() {
+        let echo = Echo::start(true).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(echo.address).await.unwrap();
+        let mut config = crate::Hysteria2Egress::<crate::DirectSockets>::quic_config().unwrap();
+        config.verify_peer(false);
+        config.set_application_protos(&[b"echo"]).unwrap();
+        let connection = Handshake::establish(socket, echo.address, "quic.example", config)
+            .await
+            .expect("the handshake completes")
+            .drive(CancellationToken::new());
+
+        let mut inbound = connection.receive_datagrams().await.unwrap();
+        connection
+            .send_datagram(b"relayed".to_vec())
+            .await
+            .expect("datagrams were negotiated");
+        let back = tokio::time::timeout(Duration::from_secs(10), inbound.recv())
+            .await
+            .expect("the echo returns")
+            .expect("the channel is open");
+        assert_eq!(back, b"relayed");
     }
 
     #[tokio::test]
