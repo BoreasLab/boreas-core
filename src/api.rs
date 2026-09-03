@@ -522,7 +522,9 @@ fn project(telemetry: crate::Telemetry) -> Option<Event> {
         | Telemetry::TransmitsDropped(_)
         | Telemetry::EgressRejected(_)
         | Telemetry::QueriesDropped(_)
-        | Telemetry::TerminationDropped(_) => return None,
+        | Telemetry::TerminationDropped(_)
+        | Telemetry::DeviceErrors(_)
+        | Telemetry::NetworkErrors(_) => return None,
     })
 }
 

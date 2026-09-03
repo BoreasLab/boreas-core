@@ -117,6 +117,8 @@ struct Wire {
 struct MockNetwork {
     inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     sent: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Errors the next receive reports, as a connected socket would.
+    faults: tokio::sync::mpsc::Receiver<std::io::Error>,
 }
 
 impl AsyncNetwork for MockNetwork {
@@ -126,6 +128,9 @@ impl AsyncNetwork for MockNetwork {
         buf: &'a mut [u8],
     ) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
         async move {
+            if let Ok(fault) = self.faults.try_recv() {
+                return Err(fault);
+            }
             match self.inbound.recv().await {
                 Some(datagram) if datagram.len() <= buf.len() => {
                     buf[..datagram.len()].copy_from_slice(&datagram);
@@ -156,19 +161,23 @@ impl AsyncNetwork for MockNetwork {
 struct Peer {
     inbound: tokio::sync::mpsc::Sender<Vec<u8>>,
     sent: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    faults: tokio::sync::mpsc::Sender<std::io::Error>,
 }
 
 fn network() -> (MockNetwork, Peer) {
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(64);
     let (sent_tx, sent_rx) = tokio::sync::mpsc::channel(64);
+    let (faults_tx, faults_rx) = tokio::sync::mpsc::channel(8);
     (
         MockNetwork {
             inbound: inbound_rx,
             sent: sent_tx,
+            faults: faults_rx,
         },
         Peer {
             inbound: inbound_tx,
             sent: sent_rx,
+            faults: faults_tx,
         },
     )
 }
@@ -389,6 +398,56 @@ async fn a_malformed_packet_is_counted_not_fatal() {
     .await
     .expect("a rejection report");
     assert!(rejected >= 1);
+
+    shell.shutdown().await.expect("clean shutdown");
+}
+
+/// A connected UDP socket reports an ICMP unreachable as an error on its next
+/// call. That is one lost datagram, not the end of the tunnel.
+#[tokio::test]
+async fn an_icmp_unreachable_on_the_network_socket_is_counted_not_fatal() {
+    let (device, mut wire) = wire();
+    let (net, peer) = network();
+    let pool = pool(64);
+    let mut shell = Shell::start(
+        datapath_on(Accepts::IpPackets, 8, Arc::clone(&pool)),
+        Session {
+            panics: boreas_core::Panics::new(),
+            device,
+            network: net,
+            egress: PassThroughEgress { pool },
+            upstream: NoUpstream,
+            policy: tokio::sync::watch::channel(Arc::new(HostPolicy::new())).1,
+            termination: None,
+            relay: None,
+        },
+    );
+
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::HostUnreachable,
+    ] {
+        peer.faults.send(std::io::Error::from(kind)).await.unwrap();
+    }
+    peer.inbound.send(udp_frame()).await.unwrap();
+    let inbound = tokio::time::timeout(Duration::from_secs(2), wire.sent.recv())
+        .await
+        .expect("the reactor outlived the errors")
+        .expect("channel open");
+    assert_eq!(inbound, udp_frame());
+
+    let errors = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match shell.next_telemetry().await {
+                Some(Telemetry::NetworkErrors(count)) => return count,
+                Some(_) => continue,
+                None => panic!("telemetry closed"),
+            }
+        }
+    })
+    .await
+    .expect("the errors were reported");
+    assert_eq!(errors, 2);
 
     shell.shutdown().await.expect("clean shutdown");
 }

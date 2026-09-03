@@ -201,7 +201,12 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
                 break;
             }
             Ok(_) => {}
-            Err(_) => break,
+            // The send buffer is full: the chunk waits for the next sweep.
+            Err(StreamError::WouldBlock) => {
+                plumbing.pending_out = Some(chunk);
+                break;
+            }
+            Err(StreamError::Closed | StreamError::Unknown) => break,
         }
     }
 }
@@ -376,6 +381,61 @@ mod tests {
             }
         }
         assert_eq!(echoed, b"ping", "the bytes crossed the bridge and returned");
+
+        rig.stop().await;
+    }
+
+    /// A client slower than the task fills the send buffer; every byte the
+    /// task wrote still arrives, in order.
+    #[tokio::test]
+    async fn a_slow_client_receives_every_byte_the_task_wrote() {
+        let mut rig = Rig::start(&[443]);
+        let mut client = crate::l4::stream::tests::Client::connect(
+            Ipv4Addr::new(192, 0, 2, 10),
+            49153,
+            Ipv4Addr::new(198, 51, 100, 5),
+            443,
+        );
+        let mut accepted = None;
+        for _ in 0..12 {
+            for packet in client.take_outbound() {
+                rig.feed(&packet).await;
+            }
+            for packet in rig.drain().await {
+                client.deliver(&packet);
+            }
+            client.tick();
+            if let Ok(next) = rig.accepted.try_recv() {
+                accepted = Some(next);
+                break;
+            }
+        }
+        let mut stream = accepted.expect("the connection is published").stream;
+
+        // Eight times the 8 KiB socket buffer, in one write.
+        let body: Vec<u8> = (0..65536u32).map(|n| (n % 251) as u8).collect();
+        let written = body.clone();
+        tokio::spawn(async move {
+            stream.write_all(&written).await.expect("write");
+            stream.flush().await.unwrap();
+        });
+
+        let mut received = Vec::new();
+        for _ in 0..400 {
+            for packet in client.take_outbound() {
+                rig.feed(&packet).await;
+            }
+            for packet in rig.drain().await {
+                client.deliver(&packet);
+            }
+            client.tick();
+            received.extend(client.take_received());
+            if received.len() >= body.len() {
+                break;
+            }
+        }
+        assert_eq!(received.len(), body.len(), "every byte arrived");
+        assert!(received == body, "in order and uncorrupted");
 
         rig.stop().await;
     }

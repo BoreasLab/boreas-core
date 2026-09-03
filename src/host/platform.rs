@@ -25,10 +25,10 @@ mod android {
         /// **Must be called on a Tokio runtime.** `AsyncFd` registers with the
         /// reactor during construction, including for sync-only callers.
         ///
-        /// The descriptor must already be non-blocking. Set `O_NONBLOCK` on
-        /// the descriptor from `VpnService.establish` before handing it over;
-        /// a blocking descriptor would stall the reactor on its first read.
+        /// The descriptor is made non-blocking here; a blocking one would
+        /// stall the reactor on its first read.
         pub fn from_owned_fd(fd: std::os::fd::OwnedFd, mtu: Mtu) -> io::Result<Self> {
+            nonblocking(&fd)?;
             Ok(Self {
                 fd: tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))?,
                 mtu,
@@ -36,9 +36,32 @@ mod android {
         }
     }
 
+    fn nonblocking(fd: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+        let raw = fd.as_raw_fd();
+        // SAFETY: `fd` is open and owned by the caller for the call.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK == 0
+            && unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// A read of nothing is the descriptor closing under us, not a packet.
+    fn read(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
+        match std::io::Read::read(file, buf)? {
+            0 => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            len => Ok(len),
+        }
+    }
+
     impl Device for AndroidTun {
         fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            std::io::Read::read(&mut self.fd.get_mut(), buf)
+            read(self.fd.get_mut(), buf)
         }
 
         fn send(&mut self, buf: &[u8]) -> io::Result<()> {
@@ -66,7 +89,7 @@ mod android {
             async move {
                 loop {
                     let mut guard = self.fd.readable_mut().await?;
-                    match guard.try_io(|inner| std::io::Read::read(&mut inner.get_mut(), buf)) {
+                    match guard.try_io(|inner| read(inner.get_mut(), buf)) {
                         Ok(result) => return result,
                         Err(_would_block) => continue,
                     }
@@ -191,6 +214,24 @@ mod android {
             .expect("the packet is still there")
             .unwrap();
             assert_eq!(&buf[..read], b"one");
+        }
+
+        /// The platform revoking the descriptor is the end of the device, not
+        /// an empty packet the reactor would spin on.
+        #[tokio::test]
+        async fn a_closed_descriptor_ends_reads_with_an_error() {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut tun = AndroidTun::from_owned_fd(ours.into(), Mtu::new(1500).unwrap())
+                .expect("made non-blocking on entry");
+            drop(theirs);
+            let mut buf = [0u8; 1500];
+            assert_eq!(
+                AsyncDevice::recv(&mut tun, &mut buf)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
         }
 
         /// The sync seam uses the same descriptor as the async seam.

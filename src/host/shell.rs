@@ -86,6 +86,11 @@ pub enum Telemetry {
     PolicyReloaded(RuleCounts),
     /// Termination packets refused by the local stack.
     TerminationDropped(u64),
+    /// Packets the device refused for a moment, such as a full queue.
+    DeviceErrors(u64),
+    /// Datagrams the network refused for a moment, such as an ICMP
+    /// unreachable relayed by a connected socket.
+    NetworkErrors(u64),
     /// Tasks that ended by unwinding; this indicates an internal defect.
     TasksPanicked(u64),
     /// Telemetry observations lost to channel saturation.
@@ -456,6 +461,55 @@ async fn resolve<U: DnsUpstream>(
     })
 }
 
+/// Whether an error is about one packet rather than the socket or device.
+///
+/// A connected UDP socket relays an ICMP unreachable as `ConnectionRefused`
+/// on its next call; a tun refuses a write with `ENOBUFS` when its queue is
+/// full. Both pass; the tunnel does not end over them.
+fn transient(error: &io::Error) -> bool {
+    use io::ErrorKind::{
+        ConnectionRefused, ConnectionReset, HostUnreachable, Interrupted, NetworkDown,
+        NetworkUnreachable, WouldBlock,
+    };
+    matches!(
+        error.kind(),
+        Interrupted
+            | WouldBlock
+            | ConnectionRefused
+            | ConnectionReset
+            | HostUnreachable
+            | NetworkUnreachable
+            | NetworkDown
+    ) || momentary(error)
+}
+
+#[cfg(unix)]
+fn momentary(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| [libc::ENOBUFS, libc::ENOMEM, libc::EMSGSIZE].contains(&code))
+}
+
+#[cfg(not(unix))]
+fn momentary(_: &io::Error) -> bool {
+    false
+}
+
+/// Writes to the device; a packet it refuses for the moment is counted.
+async fn to_device<D: AsyncDevice>(
+    device: &mut D,
+    bytes: &[u8],
+    counters: &mut Counters,
+) -> io::Result<()> {
+    match device.send(bytes).await {
+        Err(error) if transient(&error) => {
+            counters.device_errors += 1;
+            Ok(())
+        }
+        outcome => outcome,
+    }
+}
+
 /// Shared count of tasks that ended by unwinding.
 #[derive(Clone, Debug, Default)]
 pub struct Panics(Arc<AtomicU64>);
@@ -546,6 +600,8 @@ struct Counters {
     quic_steered: u64,
     paths_reported: u64,
     termination_dropped: u64,
+    device_errors: u64,
+    network_errors: u64,
     /// Read from the shared counter at flush time.
     panics: Panics,
 }
@@ -571,6 +627,8 @@ impl Counters {
         report(&mut self.quic_steered, Telemetry::QuicSteered);
         report(&mut self.paths_reported, Telemetry::PathsReported);
         report(&mut self.termination_dropped, Telemetry::TerminationDropped);
+        report(&mut self.device_errors, Telemetry::DeviceErrors);
+        report(&mut self.network_errors, Telemetry::NetworkErrors);
         let mut panicked = self.panics.take();
         report(&mut panicked, Telemetry::TasksPanicked);
     }
@@ -675,7 +733,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                         counters.packets_rejected += 1;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if transient(&error) => counters.device_errors += 1,
                 Err(error) => return Err(error),
             },
 
@@ -701,7 +759,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                         counters.egress_rejected += 1;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if transient(&error) => counters.network_errors += 1,
                 Err(error) => return Err(error),
             },
 
@@ -713,7 +771,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
         }
 
         if let Some(segment) = reply.take() {
-            device.send(&segment).await?;
+            to_device(&mut device, &segment, &mut counters).await?;
         }
 
         let now = Instant::now();
@@ -785,9 +843,10 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     loop {
         for emit in emits.drain(..) {
             match emit {
-                EgressEmit::ToNetwork(bytes) => {
-                    network.send(&bytes).await?;
-                }
+                EgressEmit::ToNetwork(bytes) => match network.send(&bytes).await {
+                    Err(error) if transient(&error) => counters.network_errors += 1,
+                    outcome => outcome?,
+                },
                 EgressEmit::ToTunnel(bytes) => {
                     if datapath.on_egress_owned(bytes, Instant::now()).is_err() {
                         counters.packets_rejected += 1;
@@ -798,9 +857,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 
         while let Some(Transmit { to, bytes }) = datapath.poll_transmit() {
             match to {
-                Side::Tunnel => {
-                    device.send(&bytes).await?;
-                }
+                Side::Tunnel => to_device(device, &bytes, counters).await?,
                 Side::Egress => {
                     if egress.handle_tun_packet(&bytes, emits).is_err() {
                         counters.egress_rejected += 1;
@@ -847,7 +904,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
 
     if let Some(termination) = termination {
         while let Ok(segment) = termination.replies.try_recv() {
-            device.send(&segment).await?;
+            to_device(device, &segment, counters).await?;
         }
     }
 
