@@ -67,11 +67,18 @@ pub async fn run_terminator(
 
     loop {
         // Arm one timer for the stack's next retransmit, delayed ACK, or
-        // TIME-WAIT deadline.
+        // TIME-WAIT deadline. With the pool exhausted the stack cannot
+        // transmit and its deadline is now; wait a moment for a slice instead
+        // of spinning.
         let deadline = stack
             .poll_at(Instant::now())
             .map(TokioInstant::from_std)
             .unwrap_or_else(|| TokioInstant::now() + std::time::Duration::from_millis(250));
+        let deadline = if stack.pool().available() == 0 {
+            deadline.max(TokioInstant::now() + std::time::Duration::from_millis(5))
+        } else {
+            deadline
+        };
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -146,8 +153,12 @@ async fn service(
         }
     }
 
-    while let Some(closed) = stack.poll_closed() {
-        conns.remove(&closed);
+    while let Some(ended) = stack.poll_closed() {
+        if let Some(mut plumbing) = conns.remove(&ended.id)
+            && ended.reset
+        {
+            plumbing.reset();
+        }
     }
 }
 
@@ -157,6 +168,7 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
     // Reserve capacity before reading so the TCP receive window closes when
     // the task cannot accept more bytes.
     let mut peer_finished = false;
+    let mut peer_reset = false;
     while let Some(sender) = plumbing.to_task.as_ref() {
         let Ok(permit) = sender.try_reserve() else {
             break;
@@ -169,11 +181,16 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
                 peer_finished = true;
                 break;
             }
+            Err(StreamError::Reset) => {
+                peer_reset = true;
+                break;
+            }
         }
     }
-    if peer_finished {
-        // Drop the sender outside the loop because the reserved permit borrows
-        // the field being cleared.
+    // Outside the loop because the reserved permit borrows the field cleared.
+    if peer_reset {
+        plumbing.reset();
+    } else if peer_finished {
         plumbing.to_task = None;
     }
 
@@ -206,7 +223,7 @@ fn pump(stack: &mut LocalStack, id: StreamId, plumbing: &mut Plumbing, buf: &mut
                 plumbing.pending_out = Some(chunk);
                 break;
             }
-            Err(StreamError::Closed | StreamError::Unknown) => break,
+            Err(StreamError::Closed | StreamError::Unknown | StreamError::Reset) => break,
         }
     }
 }

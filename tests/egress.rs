@@ -132,6 +132,11 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
     use boreas_core::PacketEgress;
 
     let frame = udp_frame(Ipv4Addr::new(192, 0, 2, 1), 1234);
+    // Each crossing of the datapath spends a hop.
+    let mut outward = frame.clone();
+    boreas_core::spend_hop(&mut outward);
+    let mut back = outward.clone();
+    boreas_core::spend_hop(&mut back);
     let base = std::time::Instant::now();
     let pool = pool();
 
@@ -143,8 +148,8 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
     // Fast path preserves bytes, targets egress, and opens no smoltcp flow.
     assert_eq!(
         harness.to_egress(),
-        std::slice::from_ref(&frame),
-        "forwarded unmodified"
+        std::slice::from_ref(&outward),
+        "forwarded whole but for the hop"
     );
     assert!(
         harness.device.sent().is_empty(),
@@ -164,7 +169,7 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
         .handle_tun_packet(&harness.to_egress()[0], &mut first)
         .expect("within the pool budget");
     let tunnelled = pump(&mut client, &mut server, first);
-    assert_eq!(tunnelled, vec![frame.clone()], "wire payload survives");
+    assert_eq!(tunnelled, vec![outward.clone()], "wire payload survives");
     assert_eq!(client.fast_path_packets(), 1);
 
     // Decapsulation re-enters the datapath and returns the packet byte-identically
@@ -177,7 +182,7 @@ fn tun_to_wireguard_and_back_is_byte_exact() {
         std::iter::from_fn(|| harness.datapath.poll_transmit())
             .map(|transmit| (transmit.to, transmit.bytes.to_vec()))
             .collect();
-    assert_eq!(returning, vec![(boreas_core::Side::Tunnel, frame)]);
+    assert_eq!(returning, vec![(boreas_core::Side::Tunnel, back)]);
 }
 
 /// Whitepaper section 5.4: mac1 is checked before any asymmetric work. An

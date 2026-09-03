@@ -11,7 +11,7 @@
 //! available for another SYN and `smoltcp` refuses the connection.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     num::NonZeroUsize,
     sync::Arc,
@@ -54,6 +54,8 @@ pub enum StreamError {
     WouldBlock,
     /// The peer has closed this direction.
     Closed,
+    /// The peer reset the connection: bytes in flight are lost.
+    Reset,
 }
 
 /// Memory and socket bounds for the terminator.
@@ -203,8 +205,11 @@ pub struct LocalStack {
     listeners: Vec<Listener>,
     limits: TerminationLimits,
     established: HashMap<SocketHandle, (InternalEndpoint, InternalEndpoint)>,
+    /// Connections this side closed or aborted, so a CLOSED socket not in
+    /// here was reset by the peer.
+    closing: HashSet<SocketHandle>,
     accepted: VecDeque<Terminated>,
-    closed: VecDeque<StreamId>,
+    closed: VecDeque<Ended>,
     base: Instant,
 }
 
@@ -262,6 +267,7 @@ impl LocalStack {
             listeners: Vec::new(),
             limits,
             established: HashMap::new(),
+            closing: HashSet::new(),
             accepted: VecDeque::new(),
             closed: VecDeque::new(),
             base,
@@ -304,7 +310,7 @@ impl LocalStack {
         self.accepted.pop_front()
     }
 
-    pub fn poll_closed(&mut self) -> Option<StreamId> {
+    pub fn poll_closed(&mut self) -> Option<Ended> {
         self.closed.pop_front()
     }
 
@@ -346,7 +352,7 @@ impl LocalStack {
         if socket.may_recv() || handshaking(socket.state()) {
             Err(StreamError::WouldBlock)
         } else {
-            Err(StreamError::Closed)
+            Err(ended(socket.state()))
         }
     }
 
@@ -356,7 +362,7 @@ impl LocalStack {
             return Err(if handshaking(socket.state()) {
                 StreamError::WouldBlock
             } else {
-                StreamError::Closed
+                ended(socket.state())
             });
         }
         match socket.send_slice(buf) {
@@ -377,12 +383,14 @@ impl LocalStack {
     pub fn close(&mut self, id: StreamId) {
         if let Ok(socket) = self.socket_mut(id) {
             socket.close();
+            self.closing.insert(id.0);
         }
     }
 
     pub fn abort(&mut self, id: StreamId) {
         if let Ok(socket) = self.socket_mut(id) {
             socket.abort();
+            self.closing.insert(id.0);
         }
     }
 
@@ -435,17 +443,23 @@ impl LocalStack {
             self.accepted.push_back(terminated);
         }
 
-        // Remove inactive sockets so their buffers and budget are released.
+        // Remove closed sockets so their buffers and budget are released.
+        // TIME-WAIT stays until smoltcp closes it, so a retransmitted FIN
+        // meets the socket and not an RST (RFC 9293 section 3.6.1).
         let mut finished = Vec::new();
         for &handle in self.established.keys() {
-            if !self.sockets.get::<Socket>(handle).is_active() {
+            if self.sockets.get::<Socket>(handle).state() == State::Closed {
                 finished.push(handle);
             }
         }
         for handle in finished {
             self.established.remove(&handle);
             self.sockets.remove(handle);
-            self.closed.push_back(StreamId(handle));
+            let reset = !self.closing.remove(&handle);
+            self.closed.push_back(Ended {
+                id: StreamId(handle),
+                reset,
+            });
         }
     }
 
@@ -505,6 +519,24 @@ fn syn_destination(packet: &[u8]) -> Option<u16> {
 
 fn endpoint(address: IpAddr, port: u16) -> InternalEndpoint {
     InternalEndpoint { address, port }
+}
+
+/// A reaped connection: closed by both sides, or reset by the peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ended {
+    pub id: StreamId,
+    pub reset: bool,
+}
+
+/// How a connection that can no longer carry bytes ended. A socket in
+/// CLOSED that was never closed by us was reset or timed out; every orderly
+/// end passes through a FIN state first.
+fn ended(state: State) -> StreamError {
+    if state == State::Closed {
+        StreamError::Reset
+    } else {
+        StreamError::Closed
+    }
 }
 
 /// Whether the connection is still before `ESTABLISHED`.
@@ -799,7 +831,7 @@ pub(crate) mod tests {
         // Closing the local half lets the connection finish and be reaped.
         server.close(id);
         pump(&mut server, &mut client, base, ms, 8);
-        assert_eq!(server.poll_closed(), Some(id));
+        assert_eq!(server.poll_closed(), Some(Ended { id, reset: false }));
         assert_eq!(
             server.recv(id, &mut buf),
             Err(StreamError::Unknown),
@@ -810,6 +842,20 @@ pub(crate) mod tests {
             4,
             "only the listener backlog remains"
         );
+    }
+
+    /// RFC 9293 section 3.6.1: a reset is not a close. The task learns which.
+    #[test]
+    fn a_reset_from_the_peer_is_reported_as_one() {
+        let base = Instant::now();
+        let mut server = stack(&[HTTPS], limits(64, 4), base);
+        let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49154, SERVER, HTTPS);
+        let ms = pump(&mut server, &mut client, base, 0, 6);
+        let id = server.poll_accept().expect("accepted").id;
+
+        client.socket().abort();
+        pump(&mut server, &mut client, base, ms, 4);
+        assert_eq!(server.poll_closed(), Some(Ended { id, reset: true }));
     }
 
     #[test]

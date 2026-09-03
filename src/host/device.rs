@@ -307,13 +307,12 @@ mod tests {
         harness.step(0).unwrap();
 
         // This packet is egress-bound, so the device sees nothing and the
-        // egress log receives it once.
-        assert_eq!(
-            direct_transmits,
-            vec![(crate::Side::Egress, packet.clone())]
-        );
+        // egress log receives it once, one hop spent.
+        let mut spent = packet.clone();
+        crate::spend_hop(&mut spent);
+        assert_eq!(direct_transmits, vec![(crate::Side::Egress, spent.clone())]);
         assert!(harness.device.sent().is_empty());
-        assert_eq!(harness.to_egress(), &[packet]);
+        assert_eq!(harness.to_egress(), &[spent]);
     }
 
     #[test]

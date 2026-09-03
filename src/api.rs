@@ -524,7 +524,8 @@ fn project(telemetry: crate::Telemetry) -> Option<Event> {
         | Telemetry::QueriesDropped(_)
         | Telemetry::TerminationDropped(_)
         | Telemetry::DeviceErrors(_)
-        | Telemetry::NetworkErrors(_) => return None,
+        | Telemetry::NetworkErrors(_)
+        | Telemetry::PoolExhausted(_) => return None,
     })
 }
 

@@ -478,6 +478,7 @@ impl Driver {
 fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf: &mut [u8]) {
     let mut finished = false;
     let mut abandoned = false;
+    let mut reset = false;
     while let Some(sender) = plumbing.to_task.as_ref() {
         let permit = match sender.try_reserve() {
             Ok(permit) => permit,
@@ -499,9 +500,9 @@ fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf:
                 }
             }
             Err(quiche::Error::Done) => break,
-            // AsyncRead exposes a reset as end of stream.
+            // A reset stream: the consumer's next read is an error.
             Err(_) => {
-                finished = true;
+                reset = true;
                 break;
             }
         }
@@ -509,8 +510,10 @@ fn pump_in(conn: &mut quiche::Connection, id: u64, plumbing: &mut Plumbing, buf:
     if abandoned {
         let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
     }
-    if finished || abandoned {
-        // Drop the sender after any reserved permit is released.
+    // Drop the sender after any reserved permit is released.
+    if reset {
+        plumbing.reset();
+    } else if finished || abandoned {
         plumbing.to_task = None;
     }
 }

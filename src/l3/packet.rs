@@ -239,47 +239,108 @@ const MAX_ICMPV6_ERROR: usize = 1280;
 /// A packet can fit the device-facing MTU while exceeding the tunnel's inner
 /// path MTU. TCP is constrained earlier by SYN MSS clamping; this error gives
 /// datagram transports such as QUIC feedback to reduce their size.
-///
+pub fn write_too_big(
+    out: &mut [u8],
+    quoted: &[u8],
+    next_hop_mtu: u16,
+) -> Result<usize, WriteError> {
+    write_icmp_error(out, quoted, IcmpError::TooBig { next_hop_mtu })
+}
+
+/// Writes an ICMP Time Exceeded message quoting `quoted`, whose hop count
+/// ran out here (RFC 792, RFC 4443 section 3.3).
+pub fn write_time_exceeded(out: &mut [u8], quoted: &[u8]) -> Result<usize, WriteError> {
+    write_icmp_error(out, quoted, IcmpError::TimeExceeded)
+}
+
+/// The ICMP errors this hop generates.
+#[derive(Clone, Copy)]
+enum IcmpError {
+    TooBig { next_hop_mtu: u16 },
+    TimeExceeded,
+}
+
 /// The generated source is the quoted packet's destination. That is the peer
 /// the client already knows, since the device-facing side has no router
 /// address of its own to advertise.
 ///
 /// Work is proportional to the bounded quoted length and uses no allocation
 /// beyond the builder's own state.
-pub fn write_too_big(
-    out: &mut [u8],
-    quoted: &[u8],
-    next_hop_mtu: u16,
-) -> Result<usize, WriteError> {
+fn write_icmp_error(out: &mut [u8], quoted: &[u8], error: IcmpError) -> Result<usize, WriteError> {
     let parsed = IngressPacket::parse(quoted).map_err(|_| WriteError::Unquotable)?;
     // IPv4 and IPv6 builders expose different concrete types, so finish each
     // family in its own match arm.
     match (parsed.destination, parsed.source) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            let builder =
-                etherparse::PacketBuilder::ipv4(source.octets(), destination.octets(), ICMP_TTL)
-                    .icmpv4(etherparse::Icmpv4Type::DestinationUnreachable(
+            let kind = match error {
+                IcmpError::TooBig { next_hop_mtu } => {
+                    etherparse::Icmpv4Type::DestinationUnreachable(
                         etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded {
                             next_hop_mtu,
                         },
-                    ));
+                    )
+                }
+                IcmpError::TimeExceeded => etherparse::Icmpv4Type::TimeExceeded(
+                    etherparse::icmpv4::TimeExceededCode::TtlExceededInTransit,
+                ),
+            };
+            let builder =
+                etherparse::PacketBuilder::ipv4(source.octets(), destination.octets(), ICMP_TTL)
+                    .icmpv4(kind);
             let quote = &quoted[..quoted.len().min(MAX_ICMPV4_ERROR - builder.size(0))];
             emit(out, builder.size(quote.len()), |mut into| {
                 builder.write(&mut into, quote)
             })
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            let kind = match error {
+                IcmpError::TooBig { next_hop_mtu } => etherparse::Icmpv6Type::PacketTooBig {
+                    mtu: u32::from(next_hop_mtu),
+                },
+                IcmpError::TimeExceeded => etherparse::Icmpv6Type::TimeExceeded(
+                    etherparse::icmpv6::TimeExceededCode::HopLimitExceeded,
+                ),
+            };
             let builder =
                 etherparse::PacketBuilder::ipv6(source.octets(), destination.octets(), ICMP_TTL)
-                    .icmpv6(etherparse::Icmpv6Type::PacketTooBig {
-                        mtu: u32::from(next_hop_mtu),
-                    });
+                    .icmpv6(kind);
             let quote = &quoted[..quoted.len().min(MAX_ICMPV6_ERROR - builder.size(0))];
             emit(out, builder.size(quote.len()), |mut into| {
                 builder.write(&mut into, quote)
             })
         }
         _ => Err(WriteError::MixedFamilies),
+    }
+}
+
+/// Spends one hop (RFC 791 section 3.2, RFC 8200 section 3): the hops left
+/// after this one, or `None` for a packet that is not IP. A packet arriving
+/// with one hop is spent here, and `Some(0)` tells the caller to drop it and
+/// say so (RFC 1812 section 4.2.2.9). The IPv4 header checksum is updated
+/// in place (RFC 1624).
+pub fn spend_hop(packet: &mut [u8]) -> Option<u8> {
+    match packet.first()? >> 4 {
+        4 if packet.len() >= 20 => {
+            let left = packet[8].saturating_sub(1);
+            if left == 0 {
+                return Some(0);
+            }
+            packet[8] = left;
+            // The (TTL, protocol) word fell by 0x0100: the complement sum
+            // rises by the same, carried end around.
+            let check = u32::from(u16::from_be_bytes([packet[10], packet[11]])) + 0x0100;
+            let check = (check & 0xffff) + (check >> 16);
+            packet[10..12].copy_from_slice(&(check as u16).to_be_bytes());
+            Some(left)
+        }
+        6 if packet.len() >= 40 => {
+            let left = packet[7].saturating_sub(1);
+            if left > 0 {
+                packet[7] = left;
+            }
+            Some(left)
+        }
+        _ => None,
     }
 }
 

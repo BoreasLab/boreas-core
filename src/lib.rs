@@ -101,14 +101,14 @@ pub use intercept::session::{
     run_sessions, serve_session,
 };
 pub use l3::packet::{
-    IcmpClass, IngressPacket, PacketError, Transport, WriteError, forbids_fragmentation,
-    udp_datagram_len, write_too_big, write_udp,
+    IcmpClass, IngressPacket, PacketError, Transport, WriteError, forbids_fragmentation, spend_hop,
+    udp_datagram_len, write_time_exceeded, write_too_big, write_udp,
 };
 pub use l3::path::{PathUpdate, clamp_mss, validate_ptb};
 pub use l3::reassembly::{Fragment, PushOutcome, ReassembledPacket, Reassembler};
 pub use l4::relay::{Inbound, Relay, RelayCounts, RelayLimits, run_relay};
 pub use l4::stream::{
-    LocalStack, StreamError, StreamId, Terminated, TerminationError, TerminationLimits,
+    Ended, LocalStack, StreamError, StreamId, Terminated, TerminationError, TerminationLimits,
 };
 pub use l4::terminate::{Accepted, TerminatedStream, run_terminator};
 pub use policy::demote::{Demotion, Demotions, InterceptedTier, Leg, Standing, Tier, classify};

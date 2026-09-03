@@ -93,6 +93,8 @@ pub enum Telemetry {
     /// Datagrams the network refused for a moment, such as an ICMP
     /// unreachable relayed by a connected socket.
     NetworkErrors(u64),
+    /// Packets refused for want of a pool slice.
+    PoolExhausted(u64),
     /// Tasks that ended by unwinding; this indicates an internal defect.
     TasksPanicked(u64),
     /// Telemetry observations lost to channel saturation.
@@ -647,6 +649,9 @@ struct Counters {
     network_errors: u64,
     /// Read from the shared counter at flush time.
     panics: Panics,
+    /// The pool's own running count, reported as a delta.
+    pool: Option<Arc<crate::BufferPool>>,
+    pool_reported: u64,
 }
 
 impl Counters {
@@ -672,6 +677,11 @@ impl Counters {
         report(&mut self.termination_dropped, Telemetry::TerminationDropped);
         report(&mut self.device_errors, Telemetry::DeviceErrors);
         report(&mut self.network_errors, Telemetry::NetworkErrors);
+        if let Some(pool) = &self.pool {
+            let mut exhausted = pool.exhausted().saturating_sub(self.pool_reported);
+            self.pool_reported += exhausted;
+            report(&mut exhausted, Telemetry::PoolExhausted);
+        }
         let mut panicked = self.panics.take();
         report(&mut panicked, Telemetry::TasksPanicked);
     }
@@ -719,6 +729,7 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     let mut emits: Vec<EgressEmit> = Vec::new();
     let mut counters = Counters {
         panics,
+        pool: Some(Arc::clone(datapath.pool())),
         ..Counters::default()
     };
     let mut next_flush = TokioInstant::now() + TELEMETRY_INTERVAL;
@@ -960,6 +971,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
             FlowEvent::TransmitDropped => counters.transmits_dropped += 1,
             FlowEvent::QuicSteered => counters.quic_steered += 1,
             FlowEvent::PathReported(_) => counters.paths_reported += 1,
+            FlowEvent::HopsExhausted => counters.packets_rejected += 1,
             event @ (FlowEvent::StreamOpened(_)
             | FlowEvent::DatagramOpened(_)
             | FlowEvent::Resteered(_)

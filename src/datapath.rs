@@ -16,7 +16,7 @@ use crate::{
     InternalEndpoint, Mtu, OriginationPorts, PacketError, PathProperties, PlanError, Pooled,
     PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
     UdpFlowTable, WriteError, admit, clamp_mss, forbids_fragmentation, plan_flow, replan,
-    route_planned, udp_datagram_len, write_too_big, write_udp,
+    route_planned, spend_hop, udp_datagram_len, write_time_exceeded, write_too_big, write_udp,
 };
 
 /// Packet source or transmit destination side.
@@ -82,6 +82,40 @@ pub enum FlowEvent {
     QuicSteered,
     /// An oversized packet received an ICMP Packet Too Big for this MTU.
     PathReported(Mtu),
+    /// A packet's hop count ran out here.
+    HopsExhausted,
+}
+
+/// ICMP errors this hop may generate per second, and the burst it may hold
+/// (RFC 4443 section 2.4(f), RFC 1812 section 4.3.2.8).
+const ICMP_ERRORS_PER_SECOND: u32 = 100;
+
+/// A token bucket for generated ICMP errors.
+struct IcmpBudget {
+    tokens: u32,
+    refilled: Instant,
+}
+
+impl IcmpBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: ICMP_ERRORS_PER_SECOND,
+            refilled: now,
+        }
+    }
+
+    /// One error's worth, if the second's budget allows.
+    fn take(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.refilled) >= Duration::from_secs(1) {
+            self.tokens = ICMP_ERRORS_PER_SECOND;
+            self.refilled = now;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /// Resolved inspection addresses and expiry deadlines.
@@ -295,6 +329,7 @@ pub struct Datapath {
     /// Non-empty flows in round-robin order. Stale entries are skipped; each
     /// receive and requeue is amortized O(1).
     ready: VecDeque<FlowKey>,
+    icmp: IcmpBudget,
 }
 
 impl Datapath {
@@ -350,6 +385,7 @@ impl Datapath {
             queries: VecDeque::new(),
             terminate: VecDeque::new(),
             ready: VecDeque::new(),
+            icmp: IcmpBudget::new(Instant::now()),
         })
     }
 
@@ -475,14 +511,16 @@ impl Datapath {
                             && buf.len() > usize::from(inner_mtu.get())
                             && forbids_fragmentation(buf)
                         {
-                            self.report_too_big(buf, inner_mtu);
+                            self.report_too_big(buf, inner_mtu, now);
                             return Ok(());
                         }
                         Some(inner_mtu)
                     }
                     TransportPath::LocalTermination => None,
                 };
-                self.forward(ingress, from.across(), clamp);
+                // RFC 1122 s3.2.2: an ICMP error is never answered with one.
+                let quoting_allowed = packet.transport != Transport::Icmp(IcmpClass::Error);
+                self.forward(ingress, from.across(), clamp, quoting_allowed, now);
                 Ok(())
             }
             IngressAction::OpenStream(plan) => {
@@ -514,7 +552,7 @@ impl Datapath {
             }
             IngressAction::HandleIcmp(_) => {
                 // The effect shell owns client-facing PTB generation.
-                self.forward(ingress, from.across(), None);
+                self.forward(ingress, from.across(), None, false, now);
                 Ok(())
             }
             IngressAction::DropUnsupported => Ok(()),
@@ -676,11 +714,28 @@ impl Datapath {
         Ok(())
     }
 
-    fn forward(&mut self, ingress: Ingress<'_>, to: Side, clamp: Option<Mtu>) {
+    /// Forwards a packet across, spending one hop. A packet whose hops ran
+    /// out is dropped; from the client it is told so, when an error may be
+    /// answered (`quoting_allowed`) and the budget allows.
+    fn forward(
+        &mut self,
+        ingress: Ingress<'_>,
+        to: Side,
+        clamp: Option<Mtu>,
+        quoting_allowed: bool,
+        now: Instant,
+    ) {
         let Some(mut bytes) = ingress.into_pooled(&self.pool) else {
             self.events.push_back(FlowEvent::TransmitDropped);
             return;
         };
+        if spend_hop(&mut bytes) == Some(0) {
+            self.events.push_back(FlowEvent::HopsExhausted);
+            if to == Side::Egress && quoting_allowed && self.icmp.take(now) {
+                self.answer_with(|reply| write_time_exceeded(reply, &bytes));
+            }
+            return;
+        }
         if let Some(inner_mtu) = clamp {
             let _ = clamp_mss(&mut bytes, inner_mtu);
         }
@@ -688,24 +743,37 @@ impl Datapath {
     }
 
     /// Answers an oversized packet with a client-facing ICMP Packet Too Big.
-    fn report_too_big(&mut self, buf: &[u8], inner_mtu: Mtu) {
+    fn report_too_big(&mut self, buf: &[u8], inner_mtu: Mtu, now: Instant) {
+        if !self.icmp.take(now) {
+            return;
+        }
+        if self.answer_with(|reply| write_too_big(reply, buf, inner_mtu.get())) {
+            self.events.push_back(FlowEvent::PathReported(inner_mtu));
+        }
+    }
+
+    /// Queues one generated packet for the client. `false` when nothing was
+    /// queued, which is counted; the sender can retry.
+    fn answer_with(&mut self, write: impl FnOnce(&mut [u8]) -> Result<usize, WriteError>) -> bool {
         let Some(mut reply) = self.pool.take_zeroed(self.pool.slice_size().get()) else {
             self.events.push_back(FlowEvent::TransmitDropped);
-            return;
+            return false;
         };
-        match write_too_big(&mut reply, buf, inner_mtu.get()) {
+        match write(&mut reply) {
             Ok(len) => {
-                // ICMP output is shorter than a full pool slice.
+                // Generated packets are shorter than a full pool slice.
                 let shrunk = reply.resize(len);
                 debug_assert!(shrunk, "an ICMP error is shorter than a slice");
                 self.transmits.push_back(Transmit {
                     to: Side::Tunnel,
                     bytes: reply,
                 });
-                self.events.push_back(FlowEvent::PathReported(inner_mtu));
+                true
             }
-            // Count a failed report; the sender can retry.
-            Err(_) => self.events.push_back(FlowEvent::TransmitDropped),
+            Err(_) => {
+                self.events.push_back(FlowEvent::TransmitDropped);
+                false
+            }
         }
     }
 
@@ -896,6 +964,13 @@ mod tests {
         packet
     }
 
+    /// `packet` as it leaves a hop: TTL down one, checksum kept true.
+    fn spent(packet: &[u8]) -> Vec<u8> {
+        let mut out = packet.to_vec();
+        spend_hop(&mut out);
+        out
+    }
+
     fn udp_packet() -> [u8; 28] {
         [
             0x45, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
@@ -988,6 +1063,49 @@ mod tests {
             path.poll_transmit().map(|transmit| transmit.to),
             Some(Side::Egress)
         );
+    }
+
+    /// RFC 1812 section 4.2.2.9: a forwarded packet spends one hop, and one
+    /// with none left is dropped and the sender told, at a bounded rate.
+    #[test]
+    fn a_forwarded_packet_spends_a_hop_and_an_expired_one_is_answered() {
+        let mut path = fast_path();
+        let now = Instant::now();
+        // A packet whose header checksum is true, so the update can be checked.
+        let mut packet = udp_packet();
+        let sum = crate::wire::checksum(&[&packet[..20]]);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        assert_eq!(crate::wire::checksum(&[&packet[..20]]), 0);
+        path.on_tun_packet(&packet, now).unwrap();
+        let sent = path.poll_transmit().expect("forwarded").bytes;
+        assert_eq!(sent[8], 63, "one hop spent");
+        assert_eq!(
+            crate::wire::checksum(&[&sent[..20]]),
+            0,
+            "the header checksum was updated with the TTL"
+        );
+
+        let mut last_hop = udp_packet();
+        last_hop[8] = 1;
+        for _ in 0..ICMP_ERRORS_PER_SECOND {
+            path.on_tun_packet(&last_hop, now).unwrap();
+            let reply = path
+                .poll_transmit()
+                .expect("a Time Exceeded for the client");
+            assert_eq!(reply.to, Side::Tunnel);
+            assert_eq!(reply.bytes[9], 1, "ICMP");
+            assert_eq!(reply.bytes[20], 11, "type 11: time exceeded");
+            assert_eq!(&reply.bytes[16..20], &[192, 0, 2, 1], "back to the sender");
+        }
+        // The budget for this second is spent: dropped, counted, unanswered.
+        path.on_tun_packet(&last_hop, now).unwrap();
+        assert!(path.poll_transmit().is_none());
+        assert!(
+            std::iter::from_fn(|| path.poll_event()).any(|event| event == FlowEvent::HopsExhausted)
+        );
+        path.on_tun_packet(&last_hop, now + Duration::from_secs(1))
+            .unwrap();
+        assert!(path.poll_transmit().is_some(), "a new second, a new budget");
     }
 
     /// RFC 4787 section 4.1: a mapping is per transport. A TCP connection
@@ -1280,7 +1398,7 @@ mod tests {
         path.on_tun_packet(&udp_packet(), now).unwrap();
         let transmit = path.poll_transmit().expect("the fast path forwards");
         assert_eq!(transmit.to, Side::Egress, "a tun packet is bound outward");
-        assert_eq!(*transmit.bytes, udp_packet()[..]);
+        assert_eq!(*transmit.bytes, spent(&udp_packet())[..]);
 
         path.on_egress_packet(&udp_packet(), now).unwrap();
         let transmit = path.poll_transmit().expect("the fast path forwards");
@@ -1549,13 +1667,17 @@ mod tests {
         path.on_tun_packet(&request, now).unwrap();
         let out = path.poll_transmit().expect("the echo request is forwarded");
         assert_eq!(out.to, Side::Egress);
-        assert_eq!(&out.bytes[..], &request[..], "whole, byte for byte");
+        assert_eq!(
+            &out.bytes[..],
+            &spent(&request)[..],
+            "whole but for the hop"
+        );
 
         let reply = icmpv4([198, 51, 100, 2], [192, 0, 2, 1], 0, b"ping payload");
         path.on_egress_packet(&reply, now).unwrap();
         let back = path.poll_transmit().expect("the echo reply is forwarded");
         assert_eq!(back.to, Side::Tunnel);
-        assert_eq!(&back.bytes[..], &reply[..]);
+        assert_eq!(&back.bytes[..], &spent(&reply)[..]);
     }
 
     #[test]

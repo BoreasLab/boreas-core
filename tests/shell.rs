@@ -261,6 +261,12 @@ fn wire() -> (MockDevice, Wire) {
     )
 }
 
+/// `packet` after one hop through the datapath.
+fn spent(mut packet: Vec<u8>) -> Vec<u8> {
+    boreas_core::spend_hop(&mut packet);
+    packet
+}
+
 fn udp_frame() -> Vec<u8> {
     vec![
         0x45, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 198, 51, 100, 2, 0x04,
@@ -294,7 +300,7 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
         .await
         .expect("the packet reached the network")
         .expect("channel open");
-    assert_eq!(outbound, udp_frame());
+    assert_eq!(outbound, spent(udp_frame()));
     assert!(
         wire.sent.try_recv().is_err(),
         "a tun-side packet must not be looped back down the tun"
@@ -305,7 +311,7 @@ async fn a_fast_path_packet_leaves_by_the_egress_and_returns_by_the_device() {
         .await
         .expect("the datagram reached the device")
         .expect("channel open");
-    assert_eq!(inbound, udp_frame());
+    assert_eq!(inbound, spent(udp_frame()));
 
     // Shutdown waits for the reactor task.
     shell.shutdown().await.expect("clean shutdown");
@@ -385,7 +391,10 @@ async fn a_malformed_packet_is_counted_not_fatal() {
     }
     // The invalid packet is dropped; the malformed option passes through
     // unclamped and byte-identical.
-    assert_eq!(forwarded, vec![truncated_mss_syn(), udp_frame()]);
+    assert_eq!(
+        forwarded,
+        vec![spent(truncated_mss_syn()), spent(udp_frame())]
+    );
 
     let rejected = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -435,7 +444,7 @@ async fn an_icmp_unreachable_on_the_network_socket_is_counted_not_fatal() {
         .await
         .expect("the reactor outlived the errors")
         .expect("channel open");
-    assert_eq!(inbound, udp_frame());
+    assert_eq!(inbound, spent(udp_frame()));
 
     let errors = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

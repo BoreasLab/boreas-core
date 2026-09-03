@@ -18,6 +18,7 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
 };
 
@@ -44,6 +45,8 @@ pub(crate) const DEPTH: usize = 8;
 #[derive(Debug)]
 pub struct BridgedStream {
     inbound: mpsc::Receiver<Bytes>,
+    /// Set by the driver when the peer reset rather than closed.
+    reset: Arc<AtomicBool>,
     /// Absent after the write half is shut down.
     outbound: Option<PollSender<Bytes>>,
     /// Wakes the driver after a write so queued bytes are delivered promptly.
@@ -56,6 +59,7 @@ pub struct BridgedStream {
 pub(crate) struct Plumbing {
     /// Peer bytes toward the task; absent after peer FIN is delivered.
     pub(crate) to_task: Option<mpsc::Sender<Bytes>>,
+    reset: Arc<AtomicBool>,
     pub(crate) from_task: mpsc::Receiver<Bytes>,
     /// A chunk not fully accepted by the transport. Retaining it makes partial
     /// writes lossless.
@@ -69,20 +73,32 @@ pub(crate) struct Plumbing {
 pub(crate) fn pair(wake: Arc<Notify>) -> (BridgedStream, Plumbing) {
     let (to_task, inbound) = mpsc::channel(DEPTH);
     let (outbound, from_task) = mpsc::channel(DEPTH);
+    let reset = Arc::new(AtomicBool::new(false));
     (
         BridgedStream {
             inbound,
+            reset: Arc::clone(&reset),
             outbound: Some(PollSender::new(outbound)),
             wake,
             pending: Bytes::new(),
         },
         Plumbing {
             to_task: Some(to_task),
+            reset,
             from_task,
             pending_out: None,
             finished: false,
         },
     )
+}
+
+impl Plumbing {
+    /// The peer reset the connection: what the task has not read is lost,
+    /// and its next read is an error, not a clean end.
+    pub(crate) fn reset(&mut self) {
+        self.reset.store(true, Ordering::Release);
+        self.to_task = None;
+    }
 }
 
 /// Creates two directly connected streams for consumer tests.
@@ -97,12 +113,14 @@ pub(crate) fn duplex() -> (BridgedStream, BridgedStream) {
     (
         BridgedStream {
             inbound: left_out,
+            reset: Arc::new(AtomicBool::new(false)),
             outbound: Some(PollSender::new(right_in)),
             wake: Arc::clone(&wake),
             pending: Bytes::new(),
         },
         BridgedStream {
             inbound: right_out,
+            reset: Arc::new(AtomicBool::new(false)),
             outbound: Some(PollSender::new(left_in)),
             wake,
             pending: Bytes::new(),
@@ -127,8 +145,14 @@ impl AsyncRead for BridgedStream {
                     this.wake.notify_one();
                 }
                 // Dropping the driver sender is the bridge's end-of-stream
-                // signal.
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                // signal, unless the driver said the peer reset.
+                Poll::Ready(None) => {
+                    return Poll::Ready(if this.reset.load(Ordering::Acquire) {
+                        Err(io::Error::from(io::ErrorKind::ConnectionReset))
+                    } else {
+                        Ok(())
+                    });
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -222,6 +246,27 @@ mod tests {
 
     /// A chunk larger than the reader's buffer is delivered across successive
     /// reads; the pending tail prevents truncation.
+    /// A reset is not a clean end: a body cut short by RST must not parse as
+    /// complete.
+    #[tokio::test]
+    async fn a_reset_is_an_error_not_a_clean_end() {
+        let (mut stream, mut plumbing) = pair(Arc::new(Notify::new()));
+        plumbing
+            .to_task
+            .as_ref()
+            .unwrap()
+            .send(Bytes::from_static(b"part"))
+            .await
+            .unwrap();
+        plumbing.reset();
+        let mut buf = [0u8; 8];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 4);
+        assert_eq!(
+            stream.read(&mut buf).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    }
+
     /// An empty chunk is not the end of the stream, and writing nothing
     /// sends nothing.
     #[tokio::test]
