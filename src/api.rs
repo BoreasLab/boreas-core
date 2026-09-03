@@ -536,7 +536,7 @@ enum AnyUpstream<B> {
     Unused,
 }
 
-impl<B: TunnelBypass> crate::DnsUpstream for AnyUpstream<B> {
+impl<B: TunnelBypass + 'static> crate::DnsUpstream for AnyUpstream<B> {
     fn kind(&self) -> crate::Upstream {
         match self {
             Self::Do53(upstream) => upstream.kind(),

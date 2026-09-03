@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     ClientProfile, Originator, Upstream,
+    live::Live,
     policy::demux::{Demux, Transport, bounded},
 };
 
@@ -89,9 +90,9 @@ impl TunnelBypass for DirectSockets {
 /// Plain DNS over UDP to one resolver, on one socket for as long as it answers.
 pub struct Do53Upstream<B> {
     resolver: SocketAddr,
-    bypass: B,
+    bypass: Arc<B>,
     timeout: Duration,
-    live: tokio::sync::Mutex<Option<Demux>>,
+    live: Live<Demux>,
 }
 
 /// Default query timeout.
@@ -101,13 +102,13 @@ pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// idle DoT sessions themselves at about this age.
 const UPSTREAM_IDLE: Duration = Duration::from_secs(30);
 
-impl<B: TunnelBypass> Do53Upstream<B> {
+impl<B: TunnelBypass + 'static> Do53Upstream<B> {
     pub fn new(resolver: SocketAddr, bypass: B) -> Self {
         Self {
             resolver,
-            bypass,
+            bypass: Arc::new(bypass),
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
-            live: tokio::sync::Mutex::new(None),
+            live: Live::new(),
         }
     }
 
@@ -117,7 +118,7 @@ impl<B: TunnelBypass> Do53Upstream<B> {
     }
 }
 
-impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
+impl<B: TunnelBypass + 'static> DnsUpstream for Do53Upstream<B> {
     fn kind(&self) -> Upstream {
         Upstream::Do53
     }
@@ -125,16 +126,14 @@ impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
     #[allow(clippy::manual_async_fn)]
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         async move {
-            tokio::time::timeout(
-                self.timeout,
-                on_connection(
-                    &self.live,
-                    || async { self.bypass.udp(self.resolver).await.map(Datagrams) },
-                    message,
-                ),
-            )
-            .await
-            .map_err(timed_out)?
+            let resolver = self.resolver;
+            let connect = || {
+                let bypass = Arc::clone(&self.bypass);
+                async move { bypass.udp(resolver).await.map(Datagrams) }
+            };
+            tokio::time::timeout(self.timeout, on_connection(&self.live, connect, message))
+                .await
+                .map_err(timed_out)?
         }
     }
 }
@@ -142,31 +141,24 @@ impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
 /// Queries over the live connection, opening one when there is none. A
 /// connection that ends under a query is replaced and the query sent once
 /// more; a second failure is the caller's.
-///
-/// The lock is held while connecting, so concurrent queries share one
-/// handshake, and released before the query so they share the connection.
 async fn on_connection<T, F>(
-    live: &tokio::sync::Mutex<Option<Demux>>,
+    live: &Live<Demux>,
     connect: impl Fn() -> F,
     message: &[u8],
 ) -> io::Result<Vec<u8>>
 where
     T: Transport,
-    F: Future<Output = io::Result<T>>,
+    F: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut retried = false;
     loop {
-        let demux = {
-            let mut held = live.lock().await;
-            match held.as_ref().filter(|demux| demux.is_alive()) {
-                Some(demux) => demux.clone(),
-                None => {
-                    let demux = Demux::spawn(connect().await?, UPSTREAM_IDLE);
-                    *held = Some(demux.clone());
-                    demux
-                }
-            }
-        };
+        let open = connect();
+        let demux = live
+            .get(Demux::is_alive, async move {
+                open.await
+                    .map(|transport| Demux::spawn(transport, UPSTREAM_IDLE))
+            })
+            .await?;
         match demux.query(message).await {
             Err(error) if error.kind() == io::ErrorKind::ConnectionAborted && !retried => {
                 retried = true;
@@ -247,7 +239,6 @@ struct TlsDialer<B> {
     /// ALPN list in wire format.
     alpn: Vec<u8>,
     bypass: B,
-    timeout: Duration,
 }
 
 /// TLS-upstream configuration failure.
@@ -290,7 +281,6 @@ impl<B: TunnelBypass> TlsDialer<B> {
             originator: Arc::new(Originator::new()),
             alpn: crate::alpn_list(alpn),
             bypass,
-            timeout: DEFAULT_UPSTREAM_TIMEOUT,
         })
     }
 
@@ -311,29 +301,31 @@ impl<B: TunnelBypass> TlsDialer<B> {
 
 /// DNS over TLS, RFC 7858: one session, queries pipelined on it by id.
 pub struct DotUpstream<B> {
-    dialer: TlsDialer<B>,
-    live: tokio::sync::Mutex<Option<Demux>>,
+    dialer: Arc<TlsDialer<B>>,
+    timeout: Duration,
+    live: Live<Demux>,
 }
 
 /// The IANA-assigned port for DNS over TLS.
 pub const DOT_PORT: u16 = 853;
 
-impl<B: TunnelBypass> DotUpstream<B> {
+impl<B: TunnelBypass + 'static> DotUpstream<B> {
     /// Configures the resolver address and certificate name separately.
     pub fn new(resolver: SocketAddr, server_name: &str, bypass: B) -> Result<Self, UpstreamError> {
         Ok(Self {
-            dialer: TlsDialer::new(resolver, server_name, &[b"dot"], bypass)?,
-            live: tokio::sync::Mutex::new(None),
+            dialer: Arc::new(TlsDialer::new(resolver, server_name, &[b"dot"], bypass)?),
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
+            live: Live::new(),
         })
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.dialer.timeout = timeout;
+        self.timeout = timeout;
         self
     }
 }
 
-impl<B: TunnelBypass> DnsUpstream for DotUpstream<B> {
+impl<B: TunnelBypass + 'static> DnsUpstream for DotUpstream<B> {
     fn kind(&self) -> Upstream {
         Upstream::DoT
     }
@@ -341,21 +333,18 @@ impl<B: TunnelBypass> DnsUpstream for DotUpstream<B> {
     #[allow(clippy::manual_async_fn)]
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         async move {
-            tokio::time::timeout(
-                self.dialer.timeout,
-                on_connection(
-                    &self.live,
-                    || async {
-                        self.dialer.connect().await.map(|io| Frames {
-                            io,
-                            buffer: Vec::new(),
-                        })
-                    },
-                    message,
-                ),
-            )
-            .await
-            .map_err(timed_out)?
+            let connect = || {
+                let dialer = Arc::clone(&self.dialer);
+                async move {
+                    dialer.connect().await.map(|io| Frames {
+                        io,
+                        buffer: Vec::new(),
+                    })
+                }
+            };
+            tokio::time::timeout(self.timeout, on_connection(&self.live, connect, message))
+                .await
+                .map_err(timed_out)?
         }
     }
 }
@@ -385,6 +374,7 @@ where
 /// a burst uses several, and up to [`DOH_IDLE_CONNECTIONS`] wait for the next.
 pub struct DohUpstream<B> {
     dialer: TlsDialer<B>,
+    timeout: Duration,
     /// Request authority and path.
     authority: String,
     path: String,
@@ -418,6 +408,7 @@ impl<B: TunnelBypass> DohUpstream<B> {
 
         Ok(Self {
             dialer: TlsDialer::new(resolver, host, &[b"http/1.1"], bypass)?,
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
             authority: authority.as_str().to_owned(),
             path: path.to_owned(),
             idle: std::sync::Mutex::new(Vec::new()),
@@ -425,7 +416,7 @@ impl<B: TunnelBypass> DohUpstream<B> {
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.dialer.timeout = timeout;
+        self.timeout = timeout;
         self
     }
 
@@ -470,7 +461,7 @@ impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
                 self.authority,
                 message.len(),
             );
-            tokio::time::timeout(self.dialer.timeout, async {
+            tokio::time::timeout(self.timeout, async {
                 let parked = crate::locked(&self.idle).pop();
                 let (mut stream, reused) = match parked {
                     Some(stream) => (stream, true),
@@ -501,11 +492,10 @@ impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
 /// DNS over QUIC, RFC 9250. Each query uses its own stream and a zero message ID.
 pub struct DoqUpstream<B> {
     resolver: SocketAddr,
-    server_name: String,
-    bypass: B,
-    quic: crate::QuicConfigFactory,
-    /// Shared live connection.
-    connection: tokio::sync::Mutex<Option<crate::QuicConnection>>,
+    server_name: Arc<str>,
+    bypass: Arc<B>,
+    quic: Arc<crate::QuicConfigFactory>,
+    connection: Live<crate::QuicConnection>,
     /// Cancels the connection driver on drop.
     shutdown: tokio_util::sync::CancellationToken,
     timeout: Duration,
@@ -526,7 +516,7 @@ impl<B> Drop for DoqUpstream<B> {
     }
 }
 
-impl<B: TunnelBypass> DoqUpstream<B> {
+impl<B: TunnelBypass + 'static> DoqUpstream<B> {
     /// Configures the resolver address, certificate name, and QUIC factory.
     pub fn new(
         resolver: SocketAddr,
@@ -536,10 +526,10 @@ impl<B: TunnelBypass> DoqUpstream<B> {
     ) -> Self {
         Self {
             resolver,
-            server_name: server_name.to_owned(),
-            bypass,
-            quic,
-            connection: tokio::sync::Mutex::new(None),
+            server_name: server_name.into(),
+            bypass: Arc::new(bypass),
+            quic: Arc::new(quic),
+            connection: Live::new(),
             shutdown: tokio_util::sync::CancellationToken::new(),
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         }
@@ -557,19 +547,19 @@ impl<B: TunnelBypass> DoqUpstream<B> {
 
     /// Returns the live connection, establishing one if needed.
     async fn connection(&self) -> io::Result<crate::QuicConnection> {
-        let mut held = self.connection.lock().await;
-        if let Some(live) = held.as_ref().filter(|live| live.is_alive()) {
-            return Ok(live.clone());
-        }
-        let socket = self.bypass.udp(self.resolver).await?;
-        let config = (self.quic)().map_err(quic_failed)?;
-        let handshake =
-            crate::Handshake::establish(socket, self.resolver, &self.server_name, config)
-                .await
-                .map_err(quic_failed)?;
-        let live = handshake.drive(self.shutdown.clone());
-        *held = Some(live.clone());
-        Ok(live)
+        let (bypass, quic) = (Arc::clone(&self.bypass), Arc::clone(&self.quic));
+        let (resolver, server_name) = (self.resolver, Arc::clone(&self.server_name));
+        let shutdown = self.shutdown.clone();
+        self.connection
+            .get(crate::QuicConnection::is_alive, async move {
+                let socket = bypass.udp(resolver).await?;
+                let config = quic().map_err(quic_failed)?;
+                let handshake = crate::Handshake::establish(socket, resolver, &server_name, config)
+                    .await
+                    .map_err(quic_failed)?;
+                Ok(handshake.drive(shutdown))
+            })
+            .await
     }
 }
 
@@ -580,7 +570,7 @@ fn quic_failed(_: crate::EgressError) -> io::Error {
     )
 }
 
-impl<B: TunnelBypass> DnsUpstream for DoqUpstream<B> {
+impl<B: TunnelBypass + 'static> DnsUpstream for DoqUpstream<B> {
     fn kind(&self) -> Upstream {
         Upstream::DoQ
     }

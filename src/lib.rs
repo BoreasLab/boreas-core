@@ -19,6 +19,7 @@ mod bridge;
 mod datapath;
 mod deadline;
 mod fifo;
+mod live;
 mod pool;
 mod sansio;
 #[cfg(test)]
