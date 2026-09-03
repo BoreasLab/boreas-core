@@ -11,7 +11,7 @@ use std::{
     io,
     num::NonZeroU64,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -27,7 +27,9 @@ use crate::{
     Accepts, AlpnOutcome, Datapath, DnsQuery, EchOutcome, EgressEmit, FlowEvent, HostPolicy,
     Inbound, InternalEndpoint, Message, PacketEgress, PathProperties, Pooled, Provenance,
     QueryPlan, Rcode, Relay, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses,
-    plan_query, policy::upstream::DnsUpstream, write_failure, write_refusal, write_response,
+    plan_query,
+    policy::{cache::DnsCache, upstream::DnsUpstream},
+    write_failure, write_refusal, write_response,
 };
 
 /// Capacity of reactor channels.
@@ -39,6 +41,11 @@ const MAX_INFLIGHT_QUERIES: usize = 64;
 /// Largest DNS response built by the shell. This stays below the IPv6 MTU;
 /// oversized rewritten responses become `SERVFAIL`.
 const MAX_DNS_RESPONSE: usize = 1232;
+
+/// Remembered upstream replies. A constant rather than a ceiling because a
+/// field on `BoreasCeilings` is an ABI change.
+const DNS_CACHE_ENTRIES: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(2048).expect("nonzero");
 
 /// Telemetry reporting interval.
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -297,7 +304,7 @@ struct Queries {
 async fn resolver_loop<U: DnsUpstream + 'static>(
     upstream: Arc<U>,
     pool: Arc<crate::BufferPool>,
-    policy: watch::Receiver<Arc<HostPolicy>>,
+    mut policy: watch::Receiver<Arc<HostPolicy>>,
     mut queries: mpsc::Receiver<DnsQuery>,
     answers: mpsc::Sender<Answer>,
     shutdown: CancellationToken,
@@ -305,6 +312,7 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
 ) {
     let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_QUERIES));
     let tracker = TaskTracker::new();
+    let cache = Arc::new(Mutex::new(DnsCache::new(DNS_CACHE_ENTRIES)));
 
     loop {
         let query = tokio::select! {
@@ -319,12 +327,19 @@ async fn resolver_loop<U: DnsUpstream + 'static>(
         };
         let upstream = Arc::clone(&upstream);
         let pool = Arc::clone(&pool);
+        // A reload may change a name's verdict; remembered replies go with it.
+        if policy.has_changed().unwrap_or(false) {
+            crate::locked(&cache).clear();
+        }
         // Snapshot policy before spawning; no borrow crosses an await.
-        let policy = Arc::clone(&policy.borrow());
+        let policy = Arc::clone(&policy.borrow_and_update());
+        let cache = Arc::clone(&cache);
         let answers = answers.clone();
         tracker.spawn(panics.watch(async move {
             let _permit = permit;
-            if let Some(answer) = resolve(upstream.as_ref(), &pool, policy.as_ref(), query).await {
+            if let Some(answer) =
+                resolve(upstream.as_ref(), &pool, policy.as_ref(), &cache, query).await
+            {
                 // A saturated reactor means the client can retry the query.
                 let _ = answers.try_send(answer);
             }
@@ -341,6 +356,7 @@ async fn resolve<U: DnsUpstream>(
     upstream: &U,
     pool: &Arc<crate::BufferPool>,
     policy: &HostPolicy,
+    cache: &Mutex<DnsCache>,
     query: DnsQuery,
 ) -> Option<Answer> {
     let DnsQuery {
@@ -370,7 +386,22 @@ async fn resolve<U: DnsUpstream>(
         ),
         QueryPlan::Forward { policy } => {
             let kind = upstream.kind();
-            let rewritten = match upstream.query(&payload).await {
+            let now = Instant::now();
+            // The cache answers with the upstream's own bytes, so the rewrite
+            // below is the same either way and the client's id is applied there.
+            let remembered = crate::locked(cache).get(question.name, question.qtype, now);
+            let (reply, provenance) = match remembered {
+                Some(reply) => (Ok(reply), Provenance::Cached(kind)),
+                None => match upstream.query(&payload).await {
+                    Ok(reply) => {
+                        let reply: Arc<[u8]> = reply.into();
+                        crate::locked(cache).admit(question.name, question.qtype, &reply, now);
+                        (Ok(reply), Provenance::Upstream(kind))
+                    }
+                    Err(error) => (Err(error), Provenance::Upstream(kind)),
+                },
+            };
+            let rewritten = match reply {
                 Ok(reply) => Message::parse(&reply).and_then(|reply| {
                     if policy.steers() {
                         answer_addresses(&reply, &mut steered)?;
@@ -388,7 +419,7 @@ async fn resolve<U: DnsUpstream>(
                         qtype: question.qtype,
                         rcode,
                         answers: rewritten.answers,
-                        provenance: Provenance::Upstream(kind),
+                        provenance,
                         rule: None,
                         ech: rewritten.ech,
                         alpn: rewritten.alpn,
@@ -404,7 +435,7 @@ async fn resolve<U: DnsUpstream>(
                             qtype: question.qtype,
                             rcode: Rcode::ServerFailure,
                             answers: 0,
-                            provenance: Provenance::Upstream(kind),
+                            provenance,
                             rule: None,
                             ech: EchOutcome::Absent,
                             alpn: AlpnOutcome::Absent,

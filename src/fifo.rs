@@ -40,14 +40,28 @@ impl<K: Clone + Eq + Hash, V: Clone> BoundedFifo<K, V> {
             return existing.clone();
         }
         let value = make();
+        self.insert(key, value.clone());
+        value
+    }
+
+    /// Stores or replaces. A replaced key keeps its place in the eviction order.
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        if let Some(slot) = self.entries.get_mut(&key) {
+            *slot = value;
+            return;
+        }
         if self.entries.len() >= self.capacity.get()
             && let Some(oldest) = self.order.pop_front()
         {
             self.entries.remove(&oldest);
         }
-        self.entries.insert(key.clone(), value.clone());
+        self.entries.insert(key.clone(), value);
         self.order.push_back(key);
-        value
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
     }
 
     #[cfg(test)]

@@ -4,6 +4,7 @@
 //! text into rules, the engine that answers with them, and the demotion state
 //! that records where interception stopped working.
 
+pub(crate) mod cache;
 pub(crate) mod demote;
 pub(crate) mod dns;
 pub(crate) mod filter;

@@ -293,6 +293,86 @@ fn dns_answer(packet: &[u8]) -> Vec<u8> {
 
 // -------------------------------------------------------------------- tests --
 
+/// A name asked twice reaches the upstream once, and a policy change forgets
+/// what was remembered.
+#[tokio::test]
+async fn a_repeated_query_is_answered_from_memory_until_policy_changes() {
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
+    let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(16);
+    let consulted = Arc::new(AtomicU64::new(0));
+    let (policy_tx, policy_rx) = tokio::sync::watch::channel(Arc::new(HostPolicy::new()));
+
+    let mut shell = Shell::start(
+        datapath(pool()),
+        Session {
+            panics: boreas_core::Panics::new(),
+            device: MockDevice {
+                inbound: inbound_rx,
+                sent: sent_tx,
+            },
+            network: SilentNetwork,
+            egress: NullEgress,
+            upstream: ScriptedUpstream {
+                consulted: Arc::clone(&consulted),
+            },
+            policy: policy_rx,
+            termination: None,
+            relay: None,
+        },
+    );
+
+    let mut ask = async |id: u16| {
+        inbound_tx
+            .send(dns_packet(&query(id, "www.other.example", RecordType::A)))
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(5), sent_rx.recv())
+            .await
+            .expect("the shell answered")
+            .expect("device channel open");
+        let message = dns_answer(&packet);
+        let parsed = Message::parse(&message).expect("a well-formed answer");
+        assert_eq!(parsed.id(), id, "the client's id, whatever the source");
+        assert_eq!(parsed.rcode(), Rcode::NoError);
+        assert_eq!(parsed.answers().count(), 1);
+    };
+
+    ask(0x0010).await;
+    ask(0x0011).await;
+    assert_eq!(
+        consulted.load(Ordering::Relaxed),
+        1,
+        "the second was remembered"
+    );
+
+    // Nothing about the policy matters here except that it changed.
+    policy_tx.send(Arc::new(HostPolicy::new())).unwrap();
+    ask(0x0012).await;
+    assert_eq!(consulted.load(Ordering::Relaxed), 2, "a reload forgets");
+
+    let mut provenance = Vec::new();
+    while provenance.len() < 3 {
+        match tokio::time::timeout(Duration::from_secs(5), shell.next_telemetry())
+            .await
+            .expect("telemetry flowed")
+            .expect("telemetry open")
+        {
+            Telemetry::Resolved(resolution) => provenance.push(resolution.provenance),
+            _ => continue,
+        }
+    }
+    assert_eq!(
+        provenance,
+        [
+            Provenance::Upstream(Upstream::DoH),
+            Provenance::Cached(Upstream::DoH),
+            Provenance::Upstream(Upstream::DoH),
+        ]
+    );
+
+    shell.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn host_policy_decides_dns_and_every_verdict_explains_itself() {
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);

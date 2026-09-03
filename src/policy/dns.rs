@@ -258,7 +258,7 @@ impl fmt::Debug for Name {
 }
 
 /// Record types relevant to policy, plus an open `Other` case.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordType {
     A,
     Aaaa,
@@ -834,6 +834,8 @@ pub enum Provenance {
     Policy,
     /// Resolved upstream.
     Upstream(Upstream),
+    /// Served from a reply this upstream gave earlier, within its TTL.
+    Cached(Upstream),
 }
 
 /// ECH outcome for one response.
