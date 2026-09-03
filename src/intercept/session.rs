@@ -11,10 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{
-    io::{AsyncReadExt, copy_bidirectional},
-    sync::mpsc,
-};
+use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_util::task::TaskTracker;
 
 use crate::{
@@ -309,20 +306,28 @@ pub async fn serve_session(
                     });
                 }
             };
-            (Either::Left(client), Either::Left(upstream), wire)
+            // The client leg speaks what the client accepted, which is the
+            // origin's wire unless the client offered no ALPN at all.
+            let client_wire = Wire::from_alpn(client.get_ref().1.alpn_protocol());
+            (
+                Either::Left(client),
+                Either::Left(upstream),
+                (client_wire, wire),
+            )
         }
         // Cleartext has no handshake and uses HTTP/1.x.
         Approach::Cleartext => (
             Either::Right(Prefixed::new(peeked, stream)),
             Either::Right(transport),
-            Wire::Http1,
+            (Wire::Http1, Wire::Http1),
         ),
     };
 
     let failures = Arc::new(RewriteFailures::new());
     let _ = run_exchange(
         host.as_str(),
-        wire,
+        wire.0,
+        wire.1,
         client,
         upstream,
         Arc::clone(&sessions.filter),
@@ -336,7 +341,11 @@ pub async fn serve_session(
             .demotions
             .record(host.as_str(), Demotion::RewriteExhausted, Instant::now());
     }
-    Ok(Handling::Intercepted { host, wire, tier })
+    Ok(Handling::Intercepted {
+        host,
+        wire: wire.0,
+        tier,
+    })
 }
 
 /// Records a demotion when a failed handshake proves a repeatable cause.
@@ -406,7 +415,7 @@ async fn splice(
         .await
         .map_err(SessionError::Upstream)?;
     let mut client = Prefixed::new(peeked, stream);
-    copy_bidirectional(&mut client, &mut upstream)
+    crate::idle::copy_until_idle(&mut client, &mut upstream, crate::idle::TCP_IDLE)
         .await
         .map_err(SessionError::Transfer)?;
     Ok(Handling::Spliced { reason })
@@ -957,6 +966,30 @@ mod end_to_end {
                 tier: InterceptedTier::TOP,
             }
         );
+    }
+
+    /// A second connection to an origin resumes the first's session rather
+    /// than paying a full handshake.
+    #[tokio::test]
+    async fn a_reconnect_to_an_origin_resumes_its_session() {
+        let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
+        let originator = Originator::new().with_extra_roots(&[origin_ca]);
+        let profile = crate::ClientProfile::chrome();
+        let alpn = crate::alpn_list(&[b"http/1.1"]);
+        let mut reused = Vec::new();
+        for _ in 0..2 {
+            let tcp = tokio::net::TcpStream::connect(origin).await.unwrap();
+            let mut upstream = originator
+                .connect(ALLOWED, &profile, &alpn, tcp)
+                .await
+                .expect("the origin is trusted");
+            reused.push(upstream.ssl().session_reused());
+            // The ticket arrives after the handshake; a read takes it in.
+            let mut byte = [0u8; 1];
+            let _ =
+                tokio::time::timeout(Duration::from_millis(300), upstream.read(&mut byte)).await;
+        }
+        assert_eq!(reused, [false, true]);
     }
 
     /// Origin handshake runs first. One leaf rejection is a lost connection;

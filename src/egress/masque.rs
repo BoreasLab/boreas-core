@@ -267,6 +267,15 @@ impl MasqueEgress {
                 Ok((_, quiche::h3::Event::Finished)) => {
                     self.state = TunnelState::Closed(CloseReason::ConnectionClosed);
                 }
+                // Capsules (RFC 9484 section 4.7) ride the request stream.
+                // None is acted on yet, but unread bytes would close the
+                // stream's flow-control window and stall the proxy.
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    while h3
+                        .recv_body(&mut self.conn, stream_id, &mut self.scratch)
+                        .is_ok()
+                    {}
+                }
                 Ok(_) => {}
                 Err(quiche::h3::Error::Done) => return Ok(()),
                 Err(_) => {

@@ -17,9 +17,10 @@ use std::{
 
 use boring::{
     error::ErrorStack,
+    ex_data::Index,
     ssl::{
-        CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslMethod,
-        SslSignatureAlgorithm, SslVersion,
+        CertificateCompressionAlgorithm, CertificateCompressor, Ssl, SslConnector, SslMethod,
+        SslSession, SslSessionCacheMode, SslSignatureAlgorithm, SslVersion,
     },
     x509::{
         X509,
@@ -298,6 +299,9 @@ struct Key {
     alpn: Vec<u8>,
 }
 
+/// Sessions remembered for resumption, one per host, before the oldest go.
+const MAX_SESSIONS: usize = 256;
+
 /// Opens TLS with a mirrored ClientHello and caches connectors by profile.
 pub struct Originator {
     extra: Vec<Vec<u8>>,
@@ -305,6 +309,11 @@ pub struct Originator {
     /// was not a certificate, which every connect then reports.
     store: Option<X509Store>,
     connectors: Mutex<HashMap<Key, Arc<SslConnector>>>,
+    /// The last session each host issued, offered on the next connect so a
+    /// reconnect resumes instead of paying a full handshake.
+    sessions: Arc<Mutex<HashMap<String, SslSession>>>,
+    /// Where a connection's host name rides, for the new-session callback.
+    host_index: Option<Index<Ssl, String>>,
 }
 
 impl Originator {
@@ -314,6 +323,8 @@ impl Originator {
             extra: Vec::new(),
             store: trust(&[]).ok(),
             connectors: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            host_index: Ssl::new_ex_index().ok(),
         }
     }
 
@@ -351,6 +362,21 @@ impl Originator {
         let mut builder = SslConnector::builder(SslMethod::tls())?;
         builder.set_cert_store_ref(self.store.as_ref().ok_or(MirrorError::Anchor)?);
 
+        // Remember what each host issues; `connect` offers it next time.
+        builder.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+        if let Some(index) = self.host_index {
+            let sessions = Arc::clone(&self.sessions);
+            builder.set_new_session_callback(move |ssl, session| {
+                if let Some(host) = ssl.ex_data(index) {
+                    let mut sessions = crate::locked(&sessions);
+                    if sessions.len() >= MAX_SESSIONS {
+                        sessions.clear();
+                    }
+                    sessions.insert(host.clone(), session);
+                }
+            });
+        }
+
         builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_alpn_protos(alpn)?;
@@ -372,8 +398,9 @@ impl Originator {
             builder.add_certificate_compression_algorithm(Brotli)?;
         }
         builder.set_grease_enabled(profile.grease);
-        // Chrome permutes extensions per connection.
-        builder.set_permute_extensions(true);
+        // Chrome permutes extensions per connection; a hello with Chrome's
+        // other traits gets that too, one without does not.
+        builder.set_permute_extensions(profile.grease && profile.compresses_certificates());
 
         Ok(builder.build())
     }
@@ -392,9 +419,17 @@ impl Originator {
         let connector = self
             .connector(profile, alpn)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let configuration = connector
+        let mut configuration = connector
             .configure()
             .map_err(|error| io::Error::other(error.to_string()))?;
+        if let Some(index) = self.host_index {
+            configuration.set_ex_data(index, host.to_owned());
+            if let Some(session) = crate::locked(&self.sessions).get(host) {
+                // SAFETY: the session came from this host through a connector
+                // with the same roots, and is offered once per connection.
+                let _ = unsafe { configuration.set_session(session) };
+            }
+        }
         // Bound every originating TLS handshake.
         crate::within(crate::Wait::TlsHandshake, async {
             tokio_boring::connect(configuration, host, Opaque(stream))

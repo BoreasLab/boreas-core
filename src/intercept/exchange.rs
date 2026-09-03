@@ -336,7 +336,8 @@ struct Proxy {
     upstream: Upstream,
     filter: Arc<dyn RequestFilter>,
     crossings: Arc<VersionCrossings>,
-    wire: Wire,
+    /// The client's wire and the origin's.
+    wires: (Wire, Wire),
     rewriting: Rewriting,
     upgrade: StdMutex<Option<Pending>>,
     /// Whether the upstream has answered once. After that, its failure is
@@ -362,7 +363,7 @@ impl Proxy {
 
         strip_hop_by_hop(request.headers_mut(), handling);
 
-        self.crossings.record(self.wire, self.wire);
+        self.crossings.record(self.wires.0, self.wires.1);
 
         let mut response = match self.upstream.send(request).await {
             Ok(response) => response,
@@ -398,15 +399,16 @@ async fn splice_upgrade(pending: Pending) -> io::Result<()> {
         tokio::try_join!(pending.client, pending.upstream).map_err(io::Error::other)?;
     let mut client = TokioIo::new(client);
     let mut upstream = TokioIo::new(upstream);
-    tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .map(drop)
+    crate::idle::copy_until_idle(&mut client, &mut upstream, crate::idle::TCP_IDLE).await
 }
 
-/// Runs one terminated connection with the same HTTP wire on both legs.
+/// Runs one terminated connection: the client's HTTP wire on its leg, the
+/// origin's on the other. The two may differ; requests cross between them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_exchange<C, U>(
     host: impl Into<Arc<str>>,
-    wire: Wire,
+    client_wire: Wire,
+    upstream_wire: Wire,
     client: C,
     upstream: U,
     filter: Arc<dyn RequestFilter>,
@@ -418,35 +420,38 @@ where
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let host = host.into();
-    match wire {
-        Wire::Http1 => serve_h1(host, client, upstream, filter, crossings, rewriting).await,
-        Wire::Http2 => serve_h2(host, client, upstream, filter, crossings, rewriting).await,
-    }
-}
-
-async fn serve_h1<C, U>(
-    host: Arc<str>,
-    client: C,
-    upstream: U,
-    filter: Arc<dyn RequestFilter>,
-    crossings: Arc<VersionCrossings>,
-    rewriting: Rewriting,
-) -> io::Result<()>
-where
-    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(upstream))
-        .await
-        .map_err(io::Error::other)?;
-    // Both legs must retain upgrade ownership after a 101 response.
-    let driver = tokio::spawn(connection.with_upgrades());
+    let (upstream, driver) = match upstream_wire {
+        Wire::Http1 => {
+            let (sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(upstream))
+                    .await
+                    .map_err(io::Error::other)?;
+            // Both legs must retain upgrade ownership after a 101 response.
+            let driver = tokio::spawn(async move {
+                let _ = connection.with_upgrades().await;
+            });
+            (Upstream::H1(Arc::new(Mutex::new(sender))), driver)
+        }
+        Wire::Http2 => {
+            // Apply the browser-shaped upstream HTTP/2 profile.
+            let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+            let (sender, connection) = H2Profile::CHROME
+                .apply(&mut builder)
+                .handshake(TokioIo::new(upstream))
+                .await
+                .map_err(io::Error::other)?;
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (Upstream::H2(sender), driver)
+        }
+    };
     let proxy = Arc::new(Proxy {
         host,
-        upstream: Upstream::H1(Arc::new(Mutex::new(sender))),
+        upstream,
         filter,
         crossings,
-        wire: Wire::Http1,
+        wires: (client_wire, upstream_wire),
         rewriting,
         upgrade: StdMutex::new(None),
         served: AtomicBool::new(false),
@@ -460,70 +465,33 @@ where
         })
     };
 
-    let result = hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(client), service)
-        .with_upgrades()
-        .await;
-
-    match proxy.take_upgrade() {
-        None => {
+    match client_wire {
+        Wire::Http1 => {
+            let result = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(client), service)
+                .with_upgrades()
+                .await;
+            match proxy.take_upgrade() {
+                None => {
+                    driver.abort();
+                    result.map_err(io::Error::other)
+                }
+                Some(pending) => {
+                    result.map_err(io::Error::other)?;
+                    splice_upgrade(pending).await
+                }
+            }
+        }
+        Wire::Http2 => {
+            // Match Chrome's larger request-header limit for cookie-heavy requests.
+            let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .max_header_list_size(H2Profile::CHROME.max_header_list_size)
+                .serve_connection(TokioIo::new(client), service)
+                .await;
             driver.abort();
             result.map_err(io::Error::other)
         }
-        Some(pending) => {
-            result.map_err(io::Error::other)?;
-            splice_upgrade(pending).await
-        }
     }
-}
-
-async fn serve_h2<C, U>(
-    host: Arc<str>,
-    client: C,
-    upstream: U,
-    filter: Arc<dyn RequestFilter>,
-    crossings: Arc<VersionCrossings>,
-    rewriting: Rewriting,
-) -> io::Result<()>
-where
-    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // Apply the browser-shaped upstream HTTP/2 profile.
-    let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
-    let (sender, connection) = H2Profile::CHROME
-        .apply(&mut builder)
-        .handshake(TokioIo::new(upstream))
-        .await
-        .map_err(io::Error::other)?;
-    let driver = tokio::spawn(connection);
-    let proxy = Arc::new(Proxy {
-        host,
-        upstream: Upstream::H2(sender),
-        filter,
-        crossings,
-        wire: Wire::Http2,
-        rewriting,
-        // h2 cannot populate this h1-only upgrade slot.
-        upgrade: StdMutex::new(None),
-        served: AtomicBool::new(false),
-    });
-
-    let service = {
-        let proxy = Arc::clone(&proxy);
-        service_fn(move |request| {
-            let proxy = Arc::clone(&proxy);
-            async move { proxy.forward(request).await }
-        })
-    };
-
-    // Match Chrome's larger request-header limit for cookie-heavy requests.
-    let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-        .max_header_list_size(H2Profile::CHROME.max_header_list_size)
-        .serve_connection(TokioIo::new(client), service)
-        .await;
-    driver.abort();
-    result.map_err(io::Error::other)
 }
 
 #[cfg(test)]
@@ -654,6 +622,7 @@ mod tests {
             run_exchange(
                 HOST_NAME,
                 wire,
+                wire,
                 server_tls,
                 upstream_client,
                 Arc::new(BlockPrefix("/ads/")),
@@ -745,6 +714,7 @@ mod tests {
 
         let exchange = tokio::spawn(run_exchange(
             HOST_NAME,
+            Wire::Http1,
             Wire::Http1,
             server_io,
             upstream_client,
@@ -875,6 +845,7 @@ mod tests {
             let _ = run_exchange(
                 HOST_NAME,
                 wire,
+                wire,
                 server_tls,
                 upstream_client,
                 Arc::new(AllowAll),
@@ -971,6 +942,7 @@ mod tests {
             run_exchange(
                 HOST_NAME,
                 wire,
+                wire,
                 server_tls,
                 upstream_client,
                 Arc::new(AllowAll),
@@ -1015,6 +987,7 @@ mod tests {
         tokio::spawn(fake_upstream_h1(upstream_server));
         tokio::spawn(run_exchange(
             HOST_NAME,
+            Wire::Http1,
             Wire::Http1,
             server_io,
             upstream_client,
@@ -1064,6 +1037,7 @@ mod tests {
         tokio::spawn(run_exchange(
             HOST_NAME,
             Wire::Http1,
+            Wire::Http1,
             server_io,
             upstream_client,
             Arc::new(AllowAll),
@@ -1102,6 +1076,7 @@ mod tests {
         tokio::spawn(fake_upstream_reflecting_head(upstream_server));
         tokio::spawn(run_exchange(
             HOST_NAME,
+            Wire::Http1,
             Wire::Http1,
             server_io,
             upstream_client,
@@ -1261,6 +1236,7 @@ mod tests {
 
         tokio::spawn(run_exchange(
             HOST_NAME,
+            Wire::Http2,
             Wire::Http2,
             client_far,
             upstream_near,

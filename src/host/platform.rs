@@ -381,7 +381,23 @@ mod windows {
             &'a mut self,
             buf: &'a [u8],
         ) -> impl Future<Output = io::Result<()>> + Send + 'a {
-            async move { Device::send(self, buf) }
+            // A driver call of unknown latency, like the read: not on the
+            // runtime thread.
+            async move {
+                let session = std::sync::Arc::clone(&self.session);
+                let bytes = buf.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    let mut packet =
+                        session.allocate_send_packet(bytes.len().try_into().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "packet too large")
+                        })?)?;
+                    packet.bytes_mut().copy_from_slice(&bytes);
+                    session.send_packet(packet);
+                    Ok(())
+                })
+                .await
+                .map_err(io::Error::other)?
+            }
         }
     }
 }

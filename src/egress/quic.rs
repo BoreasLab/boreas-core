@@ -262,6 +262,11 @@ impl Handshake {
 /// Datagrams sent per pass before receives get a turn.
 const FLUSH_BURST: usize = 64;
 
+/// A connection with streams or a datagram claimant sends an ack-eliciting
+/// packet after this much silence, so a NAT keeps its mapping and the idle
+/// timer does not fire between a user's clicks.
+const KEEPALIVE: Duration = Duration::from_secs(15);
+
 /// Sends what the connection has ready, at most a burst. `Ok(true)` when it
 /// is drained; `Ok(false)` when more waits, so the caller comes straight back.
 /// A datagram the socket refuses (an ICMP unreachable relayed as
@@ -364,6 +369,7 @@ impl Driver {
         let mut chunk = vec![0u8; CHUNK];
         // Stop accepting streams after the last connection handle is dropped.
         let mut closing = false;
+        let mut quiet_since = TokioInstant::now();
 
         loop {
             self.service(&mut chunk);
@@ -386,20 +392,29 @@ impl Driver {
                 .map(|timeout| TokioInstant::now() + timeout)
                 .unwrap_or_else(no_deadline);
 
+            let in_use = !self.streams.is_empty() || self.datagrams.is_some();
             tokio::select! {
                 () = self.shutdown.cancelled() => break,
                 result = self.socket.recv(&mut inbound) => {
                     let Ok(read) = result else { break };
                     let info = quiche::RecvInfo { from: self.peer, to: self.local };
                     let _ = self.conn.recv(&mut inbound[..read], info);
+                    quiet_since = TokioInstant::now();
                 }
                 command = self.commands.recv(), if !closing => match command {
-                    Some(command) => self.dispatch(command),
+                    Some(command) => {
+                        self.dispatch(command);
+                        quiet_since = TokioInstant::now();
+                    }
                     // Keep existing streams alive after all handles disappear.
                     None => closing = true,
                 },
                 () = self.wake.notified() => {}
                 () = sleep_until(timer) => self.conn.on_timeout(),
+                () = sleep_until(quiet_since + KEEPALIVE), if in_use => {
+                    let _ = self.conn.send_ack_eliciting();
+                    quiet_since = TokioInstant::now();
+                }
             }
         }
 
