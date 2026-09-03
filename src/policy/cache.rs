@@ -23,6 +23,7 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 struct Cached {
     reply: Arc<[u8]>,
+    admitted: Instant,
     expires: Instant,
 }
 
@@ -37,12 +38,18 @@ impl DnsCache {
         }
     }
 
-    /// The remembered reply, while its answers are still live.
-    pub fn get(&self, name: Name, qtype: RecordType, now: Instant) -> Option<Arc<[u8]>> {
+    /// The remembered reply and its age, while its answers are still live.
+    /// TTLs served from it count down by the age (RFC 2181 section 8).
+    pub fn get(
+        &self,
+        name: Name,
+        qtype: RecordType,
+        now: Instant,
+    ) -> Option<(Arc<[u8]>, Duration)> {
         self.entries
             .get(&(name, qtype))
             .filter(|cached| cached.expires > now)
-            .map(|cached| cached.reply)
+            .map(|cached| (cached.reply, now.saturating_duration_since(cached.admitted)))
     }
 
     /// Remembers a reply for as long as its shortest answer allows. Replies
@@ -56,6 +63,7 @@ impl DnsCache {
         };
         let cached = Cached {
             reply: reply.into(),
+            admitted: now,
             expires: now + lifetime,
         };
         self.entries.insert((name, qtype), cached);
@@ -134,12 +142,15 @@ mod tests {
         let reply = response("a.example", Rcode::NoError, &[300, 120]);
         cache.admit(name("a.example"), RecordType::A, &reply, t0);
 
-        let hit = cache.get(
-            name("a.example"),
-            RecordType::A,
-            t0 + Duration::from_secs(119),
-        );
-        assert_eq!(hit.as_deref(), Some(reply.as_slice()));
+        let (hit, age) = cache
+            .get(
+                name("a.example"),
+                RecordType::A,
+                t0 + Duration::from_secs(119),
+            )
+            .expect("still live");
+        assert_eq!(&*hit, reply.as_slice());
+        assert_eq!(age, Duration::from_secs(119), "served with its age");
         assert!(
             cache
                 .get(
@@ -242,6 +253,7 @@ mod tests {
                     RecordType::A,
                     t0 + Duration::from_secs(69)
                 )
+                .map(|(reply, _)| reply)
                 .as_deref(),
             Some(second.as_slice()),
             "the newer reply and its newer expiry win"

@@ -302,7 +302,11 @@ const FLAG_RESPONSE: u16 = 0x8000;
 const FLAG_RECURSION_DESIRED: u16 = 0x0100;
 const FLAG_RECURSION_AVAILABLE: u16 = 0x0080;
 const FLAG_TRUNCATED: u16 = 0x0200;
+const FLAG_AUTHENTIC_DATA: u16 = 0x0020;
+const FLAG_CHECKING_DISABLED: u16 = 0x0010;
 const OPCODE_MASK: u16 = 0x7800;
+/// RFC 6891 OPT pseudo-record type.
+const OPT: u16 = 41;
 const RCODE_MASK: u16 = 0x000f;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,6 +364,8 @@ pub struct Message<'a> {
     id: u16,
     flags: u16,
     answer_count: u16,
+    authority_count: u16,
+    additional_count: u16,
     question: Question,
     /// Original question bytes; compressed questions are refused before copying.
     question_bytes: &'a [u8],
@@ -374,9 +380,9 @@ impl<'a> Message<'a> {
         else {
             return Err(DnsError::Truncated);
         };
-        reader
-            .skip(HEADER_BYTES - reader.position())
-            .ok_or(DnsError::Truncated)?;
+        let (Some(authority_count), Some(additional_count)) = (reader.u16(), reader.u16()) else {
+            return Err(DnsError::Truncated);
+        };
         if flags & OPCODE_MASK != 0 {
             return Err(DnsError::NotAQuery);
         }
@@ -401,6 +407,8 @@ impl<'a> Message<'a> {
             id,
             flags,
             answer_count,
+            authority_count,
+            additional_count,
             question: Question {
                 name,
                 qtype: RecordType::from_wire(qtype),
@@ -435,6 +443,16 @@ impl<'a> Message<'a> {
         self.flags & FLAG_RECURSION_DESIRED != 0
     }
 
+    /// RFC 4035 section 3.2.3: the resolver validated the answer.
+    pub fn authentic_data(&self) -> bool {
+        self.flags & FLAG_AUTHENTIC_DATA != 0
+    }
+
+    /// RFC 4035 section 3.2.2: the client wants no validation done for it.
+    pub fn checking_disabled(&self) -> bool {
+        self.flags & FLAG_CHECKING_DISABLED != 0
+    }
+
     /// Lazily walks borrowed answer records; malformed records yield errors.
     pub fn answers(&self) -> Answers<'a> {
         Answers {
@@ -442,6 +460,29 @@ impl<'a> Message<'a> {
             cursor: self.answers_at,
             remaining: self.answer_count,
         }
+    }
+
+    /// The UDP payload size the sender's OPT record advertises (RFC 6891
+    /// section 6.2.3), or `None` without one. O(records).
+    pub fn udp_payload_size(&self) -> Option<u16> {
+        let additional_at = Answers {
+            message: self.bytes,
+            cursor: self.answers_at,
+            remaining: self.answer_count.checked_add(self.authority_count)?,
+        }
+        .end()
+        .ok()?;
+        Answers {
+            message: self.bytes,
+            cursor: additional_at,
+            remaining: self.additional_count,
+        }
+        .find_map(|record| {
+            record
+                .ok()
+                .filter(|record| record.rtype.to_wire() == OPT)
+                .map(|record| record.class)
+        })
     }
 }
 
@@ -464,6 +505,15 @@ impl<'a> Iterator for Answers<'a> {
 }
 
 impl<'a> Answers<'a> {
+    /// The offset just past the last record.
+    fn end(mut self) -> Result<usize, DnsError> {
+        while self.remaining > 0 {
+            self.remaining -= 1;
+            self.read()?;
+        }
+        Ok(self.cursor)
+    }
+
     fn read(&mut self) -> Result<ResourceRecord<'a>, DnsError> {
         let (name, name_len) = Name::read(self.message, self.cursor)?;
         let mut reader =
@@ -965,9 +1015,27 @@ pub fn write_response(
     upstream: &Message<'_>,
     policy: AnswerPolicy,
 ) -> Result<Rewritten, DnsError> {
+    write_response_aged(out, query, upstream, policy, 0)
+}
+
+/// As [`write_response`], for an upstream reply remembered `age` seconds:
+/// every TTL counts down by that much (RFC 2181 section 8).
+pub fn write_response_aged(
+    out: &mut [u8],
+    query: &Message<'_>,
+    upstream: &Message<'_>,
+    policy: AnswerPolicy,
+    age: u32,
+) -> Result<Rewritten, DnsError> {
     let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | upstream.rcode().to_wire();
     if query.recursion_desired() {
         flags |= FLAG_RECURSION_DESIRED;
+    }
+    if query.checking_disabled() {
+        flags |= FLAG_CHECKING_DISABLED;
+    }
+    if upstream.authentic_data() {
+        flags |= FLAG_AUTHENTIC_DATA;
     }
     if upstream.is_truncated() {
         flags |= FLAG_TRUNCATED;
@@ -995,7 +1063,11 @@ pub fn write_response(
         h3_stripped += u16::from(h3_cut.is_some());
         let rdata = Rdata::without_all(answer.rdata, h3_cut, ech_cut).ok_or(DnsError::Truncated)?;
 
-        cursor = write_record(out, cursor, &answer, rdata)?;
+        let aged = ResourceRecord {
+            ttl: answer.ttl.saturating_sub(age),
+            ..answer
+        };
+        cursor = write_record(out, cursor, &aged, rdata)?;
         answers += 1;
     }
 
@@ -1040,6 +1112,17 @@ pub fn answer_addresses(message: &Message<'_>, out: &mut Vec<IpAddr>) -> Result<
     Ok(())
 }
 
+/// Writes the header and question with TC set and no answers: the whole
+/// answer did not fit the client's payload size, so it asks again over TCP
+/// (RFC 1035 section 4.2.1).
+pub fn write_truncated(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsError> {
+    let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | FLAG_TRUNCATED;
+    if query.recursion_desired() {
+        flags |= FLAG_RECURSION_DESIRED;
+    }
+    write_header_and_question(out, query, flags)
+}
+
 /// Writes an `NXDOMAIN` response with no answers.
 pub fn write_refusal(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsError> {
     let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | Rcode::NameError.to_wire();
@@ -1059,7 +1142,7 @@ pub fn write_format_error(out: &mut [u8], query: &[u8]) -> Result<usize, DnsErro
         | FLAG_RESPONSE
         | Rcode::FormatError.to_wire();
     let mut writer = Bounded::at(out, 0).ok_or(DnsError::OutputTooSmall)?;
-    writer.bytes(id).u16(flags).zeros(8);
+    writer.bytes(id).u16(flags).zeros(HEADER_BYTES - 4);
     writer.finish().ok_or(DnsError::OutputTooSmall)
 }
 
@@ -1134,6 +1217,96 @@ mod tests {
         out.extend_from_slice(&qtype.to_wire().to_be_bytes());
         out.extend_from_slice(&1u16.to_be_bytes()); // IN
         out
+    }
+
+    /// RFC 2181 section 8: a remembered answer's TTLs count down. RFC 4035:
+    /// AD comes from the resolver, CD from the client.
+    #[test]
+    fn a_remembered_answer_ages_and_the_dnssec_bits_pass_through() {
+        let mut query = query("a.example", RecordType::A, 1);
+        query[3] |= FLAG_CHECKING_DISABLED as u8;
+        let query = Message::parse(&query).unwrap();
+        let mut upstream = response(
+            "a.example",
+            RecordType::A,
+            &[("a.example", RecordType::A, vec![192, 0, 2, 1])],
+        );
+        upstream[3] |= FLAG_AUTHENTIC_DATA as u8;
+        let upstream = Message::parse(&upstream).unwrap();
+        let mut out = [0u8; 256];
+
+        for (age, expected) in [(0, 300), (100, 200), (301, 0)] {
+            let written = write_response_aged(
+                &mut out,
+                &query,
+                &upstream,
+                answer_policy(HostVerdict::Allowed),
+                age,
+            )
+            .unwrap();
+            let reply = Message::parse(&out[..written.len]).unwrap();
+            let ttl = reply.answers().next().unwrap().unwrap().ttl;
+            assert_eq!(ttl, expected, "age {age}");
+            assert!(reply.authentic_data());
+            assert!(reply.checking_disabled());
+        }
+    }
+
+    /// RFC 6891 section 6.2.3: the OPT record's class is the sender's UDP
+    /// payload size; it lives in the additional section after the rest.
+    #[test]
+    fn the_client_s_payload_size_is_read_from_its_opt_record() {
+        let plain = query("a.example", RecordType::A, 1);
+        assert_eq!(Message::parse(&plain).unwrap().udp_payload_size(), None);
+
+        let mut with_opt = plain.clone();
+        with_opt[10..12].copy_from_slice(&1u16.to_be_bytes()); // arcount
+        with_opt.push(0); // root name
+        with_opt.extend_from_slice(&OPT.to_be_bytes());
+        with_opt.extend_from_slice(&1232u16.to_be_bytes()); // class: payload size
+        with_opt.extend_from_slice(&[0; 4]); // ttl: extended rcode and flags
+        with_opt.extend_from_slice(&0u16.to_be_bytes()); // no options
+        assert_eq!(
+            Message::parse(&with_opt).unwrap().udp_payload_size(),
+            Some(1232)
+        );
+
+        with_opt.truncate(with_opt.len() - 1);
+        assert_eq!(
+            Message::parse(&with_opt).unwrap().udp_payload_size(),
+            None,
+            "a torn record is no record"
+        );
+    }
+
+    /// RFC 1035 section 4.2.1: what does not fit is truncated, not failed.
+    #[test]
+    fn an_answer_that_does_not_fit_is_truncated_not_failed() {
+        let asked = query("a.example", RecordType::A, 1);
+        let query = Message::parse(&asked).unwrap();
+        let upstream = response(
+            "a.example",
+            RecordType::A,
+            &[("a.example", RecordType::A, vec![192, 0, 2, 1])],
+        );
+        let upstream = Message::parse(&upstream).unwrap();
+        let mut small = [0u8; 40];
+        assert_eq!(
+            write_response(
+                &mut small,
+                &query,
+                &upstream,
+                answer_policy(HostVerdict::Allowed)
+            )
+            .err(),
+            Some(DnsError::OutputTooSmall)
+        );
+        let len = write_truncated(&mut small, &query).unwrap();
+        let reply = Message::parse(&small[..len]).unwrap();
+        assert!(reply.is_truncated());
+        assert_eq!(reply.rcode(), Rcode::NoError);
+        assert_eq!(reply.answers().count(), 0);
+        assert_eq!(reply.question(), query.question());
     }
 
     /// RFC 2136 UPDATE and RFC 1996 NOTIFY share the header; neither is a

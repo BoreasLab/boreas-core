@@ -29,7 +29,7 @@ use crate::{
     QueryPlan, Rcode, Relay, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses,
     plan_query,
     policy::{cache::DnsCache, upstream::DnsUpstream},
-    write_failure, write_format_error, write_refusal, write_response,
+    write_failure, write_format_error, write_refusal, write_response_aged, write_truncated,
 };
 
 /// Capacity of reactor channels.
@@ -38,9 +38,11 @@ const CHANNEL_DEPTH: usize = 256;
 /// Maximum concurrent upstream resolutions.
 const MAX_INFLIGHT_QUERIES: usize = 64;
 
-/// Largest DNS response built by the shell. This stays below the IPv6 MTU;
-/// oversized rewritten responses become `SERVFAIL`.
+/// Largest DNS response built by the shell, the payload size EDNS clients
+/// commonly advertise and the IPv6 minimum MTU leaves room for. A client
+/// advertising less gets less; one advertising nothing gets RFC 1035's 512.
 const MAX_DNS_RESPONSE: usize = 1232;
+const MIN_DNS_RESPONSE: usize = 512;
 
 /// Remembered upstream replies. A constant rather than a ceiling because a
 /// field on `BoreasCeilings` is an ABI change.
@@ -411,24 +413,49 @@ async fn resolve<U: DnsUpstream>(
             // The cache answers with the upstream's own bytes, so the rewrite
             // below is the same either way and the client's id is applied there.
             let remembered = crate::locked(cache).get(question.name, question.qtype, now);
-            let (reply, provenance) = match remembered {
-                Some(reply) => (Ok(reply), Provenance::Cached(kind)),
+            let (reply, age, provenance) = match remembered {
+                Some((reply, age)) => (Ok(reply), age, Provenance::Cached(kind)),
                 None => match upstream.query(&payload).await {
                     Ok(reply) => {
                         let reply: Arc<[u8]> = reply.into();
                         crate::locked(cache).admit(question.name, question.qtype, &reply, now);
-                        (Ok(reply), Provenance::Upstream(kind))
+                        (Ok(reply), Duration::ZERO, Provenance::Upstream(kind))
                     }
-                    Err(error) => (Err(error), Provenance::Upstream(kind)),
+                    Err(error) => (Err(error), Duration::ZERO, Provenance::Upstream(kind)),
                 },
             };
+            let age = u32::try_from(age.as_secs()).unwrap_or(u32::MAX);
+            // The client's own payload size bounds the reply (RFC 6891).
+            let limit = request
+                .udp_payload_size()
+                .map_or(MIN_DNS_RESPONSE, usize::from)
+                .clamp(MIN_DNS_RESPONSE, MAX_DNS_RESPONSE);
             let rewritten = match reply {
                 Ok(reply) => Message::parse(&reply).and_then(|reply| {
                     if policy.steers() {
                         answer_addresses(&reply, &mut steered)?;
                     }
-                    write_response(&mut message, &request, &reply, policy)
-                        .map(|rewritten| (rewritten, reply.rcode()))
+                    let fitted =
+                        write_response_aged(&mut message[..limit], &request, &reply, policy, age);
+                    match fitted {
+                        // Too big for the client's datagram: TC, and it asks
+                        // again over TCP (RFC 1035 section 4.2.1).
+                        Err(crate::DnsError::OutputTooSmall) => {
+                            steered.clear();
+                            write_truncated(&mut message, &request).map(|len| {
+                                (
+                                    crate::Rewritten {
+                                        len,
+                                        answers: 0,
+                                        ech: EchOutcome::Absent,
+                                        alpn: AlpnOutcome::Absent,
+                                    },
+                                    reply.rcode(),
+                                )
+                            })
+                        }
+                        other => other.map(|rewritten| (rewritten, reply.rcode())),
+                    }
                 }),
                 Err(_) => Err(crate::DnsError::Truncated),
             };
