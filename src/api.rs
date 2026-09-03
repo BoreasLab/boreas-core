@@ -738,6 +738,11 @@ impl Tunnel {
 
 const CHANNEL_DEPTH: usize = 256;
 
+/// Live flows across every transport. A constant rather than a ceiling because
+/// a field on `BoreasCeilings` is an ABI change; conntrack tables on phones
+/// default to a few thousand.
+const MAX_FLOWS: NonZeroUsize = NonZeroUsize::new(4096).expect("nonzero");
+
 #[allow(clippy::too_many_arguments)]
 fn start_termination(
     filtering: Filtering,
@@ -864,6 +869,7 @@ fn limits(link: &Link, ceilings: &Ceilings, plan: &Plan) -> Limits {
         reassembly_timeout: std::time::Duration::from_secs(30),
         max_pending_reassemblies: ceilings.pending_reassemblies,
         flow_idle_timeout: std::time::Duration::from_secs(120),
+        max_flows: MAX_FLOWS,
         datagram_buffer_capacity: ceilings.datagrams_per_flow,
         inspection_window: std::time::Duration::from_secs(60),
         max_inspected_addresses: ceilings.inspected_addresses,

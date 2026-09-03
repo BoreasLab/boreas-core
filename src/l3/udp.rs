@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     error::Error,
     fmt,
+    hash::Hash,
     net::IpAddr,
     num::NonZeroUsize,
     time::{Duration, Instant},
@@ -115,10 +116,33 @@ pub struct InternalEndpoint {
     pub port: u16,
 }
 
+/// What a flow is keyed by. A TCP connection is its four-tuple; a UDP
+/// mapping is its client endpoint whatever it addresses (RFC 4787 REQ-1).
+/// A mapping is per transport (section 4.1): a connection and a mapping on
+/// one port are two flows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FlowKey {
+    Connection {
+        client: InternalEndpoint,
+        server: InternalEndpoint,
+    },
+    Mapping(InternalEndpoint),
+}
+
+impl FlowKey {
+    pub fn client(&self) -> InternalEndpoint {
+        match self {
+            Self::Connection { client, .. } | Self::Mapping(client) => *client,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowTableError {
     IdleTimeoutTooShort,
     DeadlineOverflow,
+    /// The table holds its ceiling of live flows; a new one is refused.
+    AtCeiling,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +160,7 @@ impl fmt::Display for FlowTableError {
                 MIN_IDLE_TIMEOUT.as_secs()
             ),
             Self::DeadlineOverflow => f.write_str("mapping deadline overflows the clock"),
+            Self::AtCeiling => f.write_str("the flow table is at its ceiling"),
         }
     }
 }
@@ -190,25 +215,33 @@ struct EntryState<V> {
     deadline: Instant,
 }
 
-pub struct UdpFlowTable<V> {
+/// Live flows keyed by `K`, each expiring `idle_timeout` after its last
+/// refresh, at most `ceiling` of them.
+pub struct UdpFlowTable<K, V> {
     idle_timeout: Duration,
-    flows: HashMap<InternalEndpoint, EntryState<V>>,
-    wheel: TimerWheel<InternalEndpoint>,
+    ceiling: NonZeroUsize,
+    flows: HashMap<K, EntryState<V>>,
+    wheel: TimerWheel<K>,
     /// Scratch reused across `expire` calls. The reactor arms a timer against
     /// `next_deadline` and calls `expire` on every fire, so a per-call
     /// allocation would be a steady-state cost with no steady-state work.
-    surfaced: Vec<InternalEndpoint>,
+    surfaced: Vec<K>,
 }
 
-impl<V> UdpFlowTable<V> {
+impl<K: Copy + Eq + Hash, V> UdpFlowTable<K, V> {
     /// Constructs a flow table whose timer wheel uses `epoch` as its origin.
-    pub fn new(idle_timeout: Duration, epoch: Instant) -> Result<Self, FlowTableError> {
+    pub fn new(
+        idle_timeout: Duration,
+        ceiling: NonZeroUsize,
+        epoch: Instant,
+    ) -> Result<Self, FlowTableError> {
         if idle_timeout < MIN_IDLE_TIMEOUT {
             return Err(FlowTableError::IdleTimeoutTooShort);
         }
 
         Ok(Self {
             idle_timeout,
+            ceiling,
             flows: HashMap::new(),
             wheel: TimerWheel::new(epoch),
             surfaced: Vec::new(),
@@ -223,8 +256,8 @@ impl<V> UdpFlowTable<V> {
         self.flows.is_empty()
     }
 
-    pub fn contains(&self, endpoint: &InternalEndpoint) -> bool {
-        self.flows.contains_key(endpoint)
+    pub fn contains(&self, key: &K) -> bool {
+        self.flows.contains_key(key)
     }
 
     /// Returns the live value without refreshing its deadline.
@@ -232,8 +265,8 @@ impl<V> UdpFlowTable<V> {
     /// Callers refresh through [`get_or_insert_with`](Self::get_or_insert_with)
     /// once per packet; refreshing again during lookup would make expiry
     /// depend on how often the path inspected the flow.
-    pub fn get_mut(&mut self, endpoint: &InternalEndpoint) -> Option<&mut V> {
-        self.flows.get_mut(endpoint).map(|state| &mut state.value)
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.flows.get_mut(key).map(|state| &mut state.value)
     }
 
     /// Returns a conservative earliest expiry instant. Wheel slots are hints,
@@ -246,16 +279,16 @@ impl<V> UdpFlowTable<V> {
 
     /// Removes flows rejected by `keep`, returning the number removed.
     /// Stale wheel entries are ignored during the next expiry pass.
-    pub fn retain(&mut self, mut keep: impl FnMut(&InternalEndpoint, &mut V) -> bool) -> usize {
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) -> usize {
         let before = self.flows.len();
-        self.flows
-            .retain(|endpoint, state| keep(endpoint, &mut state.value));
+        self.flows.retain(|key, state| keep(key, &mut state.value));
         before - self.flows.len()
     }
 
+    /// Refreshes the flow under `key`, or opens it; refused at the ceiling.
     pub fn get_or_insert_with(
         &mut self,
-        endpoint: InternalEndpoint,
+        key: K,
         now: Instant,
         create: impl FnOnce() -> V,
     ) -> Result<&mut V, FlowTableError> {
@@ -263,14 +296,16 @@ impl<V> UdpFlowTable<V> {
             .checked_add(self.idle_timeout)
             .ok_or(FlowTableError::DeadlineOverflow)?;
 
-        let state = match self.flows.entry(endpoint) {
+        let full = self.flows.len() >= self.ceiling.get();
+        let state = match self.flows.entry(key) {
             Entry::Occupied(mut occupied) => {
                 // Refreshing the deadline does not add another wheel entry.
                 occupied.get_mut().deadline = deadline;
                 occupied.into_mut()
             }
+            Entry::Vacant(_) if full => return Err(FlowTableError::AtCeiling),
             Entry::Vacant(vacant) => {
-                self.wheel.insert(deadline, endpoint);
+                self.wheel.insert(deadline, key);
                 vacant.insert(EntryState {
                     value: create(),
                     deadline,
@@ -290,15 +325,15 @@ impl<V> UdpFlowTable<V> {
         self.wheel.take_due(now, &mut surfaced);
 
         let mut expired = Vec::new();
-        for endpoint in surfaced.drain(..) {
-            match self.flows.entry(endpoint) {
+        for key in surfaced.drain(..) {
+            match self.flows.entry(key) {
                 Entry::Occupied(occupied) if occupied.get().deadline <= now => {
                     expired.push(occupied.remove().value);
                 }
                 // A stale slot is harmless; the exact deadline governs.
                 Entry::Occupied(occupied) => {
                     let deadline = occupied.get().deadline;
-                    self.wheel.insert(deadline, endpoint);
+                    self.wheel.insert(deadline, key);
                 }
                 Entry::Vacant(_) => {}
             }
@@ -313,6 +348,25 @@ impl<V> UdpFlowTable<V> {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// One past the ceiling is refused; a refresh of a live flow is not.
+    #[test]
+    fn the_ceiling_refuses_a_new_flow_and_admits_a_refresh() {
+        let start = Instant::now();
+        let mut table = UdpFlowTable::new(
+            Duration::from_secs(120),
+            NonZeroUsize::new(1).unwrap(),
+            start,
+        )
+        .unwrap();
+        assert!(table.get_or_insert_with(1u16, start, || ()).is_ok());
+        assert_eq!(
+            table.get_or_insert_with(2u16, start, || ()).err(),
+            Some(FlowTableError::AtCeiling)
+        );
+        assert!(table.get_or_insert_with(1u16, start, || ()).is_ok());
+        assert_eq!(table.len(), 1);
+    }
 
     #[test]
     fn datagram_buffer_drops_instead_of_waiting() {
@@ -334,7 +388,12 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 12_345,
         };
-        let mut table = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
+        let mut table = UdpFlowTable::new(
+            Duration::from_secs(120),
+            NonZeroUsize::new(1 << 16).unwrap(),
+            start,
+        )
+        .unwrap();
         for tick in 0..10_000 {
             let now = start + Duration::from_millis(tick);
             let _ = table.get_or_insert_with(endpoint, now, || 1_u16);
@@ -357,7 +416,12 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 12_345,
         };
-        let mut table = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
+        let mut table = UdpFlowTable::new(
+            Duration::from_secs(120),
+            NonZeroUsize::new(1 << 16).unwrap(),
+            start,
+        )
+        .unwrap();
         let _ = table.get_or_insert_with(endpoint, start, || 7_u16);
         // Refresh one second before the deadline; the original slot surfaces
         // at second 120 and must be re-bucketed, not evicted.
@@ -375,8 +439,18 @@ mod tests {
         // table holding one flow and a table holding ten thousand, all in the
         // same second, must agree exactly.
         let start = Instant::now();
-        let mut one = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
-        let mut many = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
+        let mut one = UdpFlowTable::new(
+            Duration::from_secs(120),
+            NonZeroUsize::new(1 << 16).unwrap(),
+            start,
+        )
+        .unwrap();
+        let mut many = UdpFlowTable::new(
+            Duration::from_secs(120),
+            NonZeroUsize::new(1 << 16).unwrap(),
+            start,
+        )
+        .unwrap();
 
         let endpoint = |index: u32| InternalEndpoint {
             address: IpAddr::V4(Ipv4Addr::from(index)),
@@ -397,7 +471,12 @@ mod tests {
         // answer early; the caller re-checks the real deadline, but it must
         // never answer late, or a flow would outlive its mapping.
         let start = Instant::now();
-        let mut table = UdpFlowTable::new(Duration::from_secs(600), start).unwrap();
+        let mut table = UdpFlowTable::new(
+            Duration::from_secs(600),
+            NonZeroUsize::new(1 << 16).unwrap(),
+            start,
+        )
+        .unwrap();
         let near = InternalEndpoint {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 1,
@@ -431,7 +510,12 @@ mod tests {
     #[test]
     fn next_deadline_tracks_the_earliest_flow() {
         let start = Instant::now();
-        let mut table = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
+        let mut table = UdpFlowTable::new(
+            Duration::from_secs(120),
+            NonZeroUsize::new(1 << 16).unwrap(),
+            start,
+        )
+        .unwrap();
         assert_eq!(table.next_deadline(), None);
         let endpoint = InternalEndpoint {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),

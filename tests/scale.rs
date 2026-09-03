@@ -40,6 +40,7 @@ fn ten_thousand_flows_expire_on_flow_count_not_packet_count() {
             reassembly_timeout: Duration::from_secs(30),
             max_pending_reassemblies: NonZeroUsize::new(1024).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
+            max_flows: std::num::NonZeroUsize::new(1 << 15).unwrap(),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.

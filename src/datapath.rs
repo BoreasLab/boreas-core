@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::{
-    Accepts, Admission, Backstop, BufferPool, DatagramBuffer, DnsPolicy, FilterPolicy, FlowPlan,
-    FlowTableError, Fragment, IcmpClass, IngressAction, IngressPacket, Inspection,
+    Accepts, Admission, Backstop, BufferPool, DatagramBuffer, DnsPolicy, FilterPolicy, FlowKey,
+    FlowPlan, FlowTableError, Fragment, IcmpClass, IngressAction, IngressPacket, Inspection,
     InternalEndpoint, Mtu, OriginationPorts, PacketError, PathProperties, PlanError, Pooled,
     PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
     UdpFlowTable, WriteError, admit, clamp_mss, forbids_fragmentation, plan_flow, replan,
@@ -154,6 +154,9 @@ pub struct Limits {
     pub max_pending_reassemblies: NonZeroUsize,
     /// RFC 4787 REQ-5 minimum mapping lifetime.
     pub flow_idle_timeout: std::time::Duration,
+    /// Live flows of every transport. Past it a new flow's first packet is
+    /// refused and counted as rejected.
+    pub max_flows: NonZeroUsize,
     /// Per-flow datagram queue capacity and fairness bound.
     pub datagram_buffer_capacity: NonZeroUsize,
     /// Inspection-address lifetime for QUIC backstop and TCP candidacy.
@@ -283,7 +286,7 @@ pub struct Datapath {
     datagram_buffer_capacity: NonZeroUsize,
     reassembler: Reassembler,
     inspected: InspectedAddresses,
-    flows: UdpFlowTable<FlowState>,
+    flows: UdpFlowTable<FlowKey, FlowState>,
     events: VecDeque<FlowEvent>,
     transmits: VecDeque<Transmit>,
     queries: VecDeque<DnsQuery>,
@@ -291,7 +294,7 @@ pub struct Datapath {
     terminate: VecDeque<Pooled>,
     /// Non-empty flows in round-robin order. Stale entries are skipped; each
     /// receive and requeue is amortized O(1).
-    ready: VecDeque<InternalEndpoint>,
+    ready: VecDeque<FlowKey>,
 }
 
 impl Datapath {
@@ -341,7 +344,7 @@ impl Datapath {
                 limits.inspection_window,
                 limits.max_inspected_addresses,
             ),
-            flows: UdpFlowTable::new(limits.flow_idle_timeout, Instant::now())?,
+            flows: UdpFlowTable::new(limits.flow_idle_timeout, limits.max_flows, Instant::now())?,
             events: VecDeque::new(),
             transmits: VecDeque::new(),
             queries: VecDeque::new(),
@@ -436,8 +439,18 @@ impl Datapath {
         let action = match admit(packet.transport, self.dns, backstop) {
             Admission::Settled(action) => action,
             Admission::Planned => {
-                let inspection = self.inspection(packet, from, now);
-                route_planned(packet.transport, self.plan(inspection)?)
+                // A live flow keeps the plan it opened with; the inspection
+                // window decides new flows only. Re-planning a connection
+                // mid-way hands its segments to a host that never saw it.
+                let kept = (from == Side::Tunnel)
+                    .then(|| key_of(packet))
+                    .flatten()
+                    .and_then(|key| self.flows.get_mut(&key).map(|flow| flow.plan));
+                let plan = match kept {
+                    Some(plan) => plan,
+                    None => self.plan(self.inspection(packet, from, now))?,
+                };
+                route_planned(packet.transport, plan)
             }
         };
         match action {
@@ -473,9 +486,11 @@ impl Datapath {
                 Ok(())
             }
             IngressAction::OpenStream(plan) => {
-                let endpoint = endpoint_of(packet);
-                if self.open_flow(endpoint, plan, now)? {
-                    self.events.push_back(FlowEvent::StreamOpened(endpoint));
+                let Some(key) = key_of(packet) else {
+                    return Ok(());
+                };
+                if self.open_flow(key, plan, now)? {
+                    self.events.push_back(FlowEvent::StreamOpened(key.client()));
                 }
                 // The shell owns TCP; capture only the client-facing packet.
                 if from == Side::Tunnel {
@@ -484,13 +499,16 @@ impl Datapath {
                 Ok(())
             }
             IngressAction::OpenDatagram(plan) => {
-                let endpoint = endpoint_of(packet);
-                if self.open_flow(endpoint, plan, now)? {
-                    self.events.push_back(FlowEvent::DatagramOpened(endpoint));
+                let Some(key) = key_of(packet) else {
+                    return Ok(());
+                };
+                if self.open_flow(key, plan, now)? {
+                    self.events
+                        .push_back(FlowEvent::DatagramOpened(key.client()));
                 }
                 // Capture client datagrams; replies use the association.
                 if from == Side::Tunnel {
-                    self.capture_datagram(packet, buf, endpoint);
+                    self.capture_datagram(packet, buf, key);
                 }
                 Ok(())
             }
@@ -544,7 +562,7 @@ impl Datapath {
         }
     }
 
-    fn capture_datagram(&mut self, packet: IngressPacket, buf: &[u8], client: InternalEndpoint) {
+    fn capture_datagram(&mut self, packet: IngressPacket, buf: &[u8], client: FlowKey) {
         let Transport::Udp {
             destination_port, ..
         } = packet.transport
@@ -564,7 +582,8 @@ impl Datapath {
         // Add one ready-list entry per empty-to-non-empty transition.
         let was_idle = flow.buffer.is_empty();
         if flow.buffer.try_send((target, payload)) == SendOutcome::Dropped {
-            self.events.push_back(FlowEvent::DatagramDropped(client));
+            self.events
+                .push_back(FlowEvent::DatagramDropped(client.client()));
             return;
         }
         if was_idle {
@@ -585,7 +604,7 @@ impl Datapath {
                 self.ready.push_back(client);
             }
             return Some(Outbound {
-                client,
+                client: client.client(),
                 target,
                 payload,
             });
@@ -602,12 +621,13 @@ impl Datapath {
         payload: &[u8],
         now: Instant,
     ) -> Result<SendOutcome, DatapathError> {
-        if !self.flows.contains(&client) {
+        let key = FlowKey::Mapping(client);
+        if !self.flows.contains(&key) {
             return Ok(SendOutcome::Dropped);
         }
         let plan = self.plan(Inspection::Excluded)?;
         let capacity = self.datagram_buffer_capacity;
-        self.flows.get_or_insert_with(client, now, || FlowState {
+        self.flows.get_or_insert_with(key, now, || FlowState {
             plan,
             buffer: DatagramBuffer::new(capacity),
         })?;
@@ -709,13 +729,13 @@ impl Datapath {
 
     fn open_flow(
         &mut self,
-        endpoint: InternalEndpoint,
+        key: FlowKey,
         plan: FlowPlan,
         now: Instant,
     ) -> Result<bool, DatapathError> {
-        let existed = self.flows.contains(&endpoint);
+        let existed = self.flows.contains(&key);
         let capacity = self.datagram_buffer_capacity;
-        self.flows.get_or_insert_with(endpoint, now, || FlowState {
+        self.flows.get_or_insert_with(key, now, || FlowState {
             plan,
             buffer: DatagramBuffer::new(capacity),
         })?;
@@ -738,7 +758,7 @@ impl Datapath {
         } = self;
         let (filter, path_mtu) = (*filter, *path_mtu);
 
-        flows.retain(|endpoint, state| {
+        flows.retain(|key, state| {
             match replan(
                 &state.plan,
                 filter,
@@ -755,7 +775,7 @@ impl Datapath {
                     true
                 }
                 Ok(Replan::Teardown) | Err(_) => {
-                    events.push_back(FlowEvent::FlowTornDown(*endpoint));
+                    events.push_back(FlowEvent::FlowTornDown(key.client()));
                     false
                 }
             }
@@ -789,14 +809,22 @@ impl Datapath {
     }
 }
 
-fn endpoint_of(packet: IngressPacket) -> InternalEndpoint {
-    InternalEndpoint {
-        address: packet.source,
-        port: match packet.transport {
-            Transport::Tcp { source_port, .. } | Transport::Udp { source_port, .. } => source_port,
-            Transport::Icmp(_) | Transport::Other | Transport::Fragment => 0,
+/// The flow a packet belongs to; ICMP and the rest open none.
+fn key_of(packet: IngressPacket) -> Option<FlowKey> {
+    let endpoint = |address, port| InternalEndpoint { address, port };
+    Some(match packet.transport {
+        Transport::Tcp {
+            source_port,
+            destination_port,
+        } => FlowKey::Connection {
+            client: endpoint(packet.source, source_port),
+            server: endpoint(packet.destination, destination_port),
         },
-    }
+        Transport::Udp { source_port, .. } => {
+            FlowKey::Mapping(endpoint(packet.source, source_port))
+        }
+        Transport::Icmp(_) | Transport::Other | Transport::Fragment => return None,
+    })
 }
 
 #[cfg(test)]
@@ -821,6 +849,7 @@ mod tests {
             reassembly_timeout: Duration::from_secs(30),
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
+            max_flows: std::num::NonZeroUsize::new(1024).unwrap(),
             datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
             inspection_window: Duration::from_secs(60),
             max_inspected_addresses: NonZeroUsize::new(256).unwrap(),
@@ -943,14 +972,72 @@ mod tests {
             assert!(path.poll_terminate().is_none(), "{label}");
         }
 
-        // Expiry returns the flow to packet forwarding.
+        // The inspection window lapsing does not move a live connection: its
+        // later segments still go where its SYN went.
         path.on_timeout(now + Duration::from_secs(61));
         path.on_tun_packet(&ipv4(6, INSPECTED, 443), now + Duration::from_secs(61))
+            .unwrap();
+        assert!(path.poll_transmit().is_none(), "a live flow keeps its plan");
+        assert!(path.poll_terminate().is_some());
+
+        // Only once the flow itself has idled out does a new one plan afresh.
+        path.on_timeout(now + Duration::from_secs(182));
+        path.on_tun_packet(&ipv4(6, INSPECTED, 443), now + Duration::from_secs(182))
             .unwrap();
         assert_eq!(
             path.poll_transmit().map(|transmit| transmit.to),
             Some(Side::Egress)
         );
+    }
+
+    /// RFC 4787 section 4.1: a mapping is per transport. A TCP connection
+    /// from a port says nothing about UDP on that port.
+    #[test]
+    fn a_tcp_flow_does_not_admit_datagrams_for_the_same_port() {
+        let mut path = datapath(crate::DatagramFidelity::Native);
+        let now = Instant::now();
+        path.on_tun_packet(&tcp_syn(), now).unwrap();
+        let client = InternalEndpoint {
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            port: 49152,
+        };
+        let peer = InternalEndpoint {
+            address: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            port: 443,
+        };
+        assert_eq!(
+            path.deliver_datagram(client, peer, b"unsolicited", now)
+                .unwrap(),
+            SendOutcome::Dropped,
+            "no UDP flow was opened from that port"
+        );
+    }
+
+    /// One flow past the ceiling is refused and counted, not admitted.
+    #[test]
+    fn the_flow_ceiling_refuses_the_next_flow() {
+        let mut limits = limits(64);
+        limits.max_flows = NonZeroUsize::new(1).unwrap();
+        let mut path = Datapath::new(
+            FilterPolicy::PassThrough,
+            DnsPolicy::Forward,
+            Accepts::Flows,
+            egress(crate::DatagramFidelity::Native),
+            Mtu::new(1500).unwrap(),
+            limits,
+            pool(),
+        )
+        .unwrap();
+        let now = Instant::now();
+        path.on_tun_packet(&tcp_syn(), now).unwrap();
+        let mut another = tcp_syn();
+        another[20..22].copy_from_slice(&49153u16.to_be_bytes());
+        assert_eq!(
+            path.on_tun_packet(&another, now).unwrap_err(),
+            DatapathError::FlowTable(FlowTableError::AtCeiling)
+        );
+        // The first flow is still served.
+        path.on_tun_packet(&tcp_syn(), now).unwrap();
     }
 
     /// Re-originated connections are excluded by source port.

@@ -41,6 +41,7 @@ fn datapath_on(accepts: Accepts, queue_depth: usize, pool: Arc<BufferPool>) -> D
             reassembly_timeout: Duration::from_secs(30),
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
+            max_flows: std::num::NonZeroUsize::new(1024).unwrap(),
             datagram_buffer_capacity: NonZeroUsize::new(queue_depth).unwrap(),
             // Covers a browser's cached Alt-Svc window.
             inspection_window: Duration::from_secs(60),

@@ -81,6 +81,7 @@ fn packet_datapath(pool: Arc<BufferPool>) -> Datapath {
             reassembly_timeout: Duration::from_secs(30),
             max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
             flow_idle_timeout: Duration::from_secs(120),
+            max_flows: std::num::NonZeroUsize::new(1024).unwrap(),
             datagram_buffer_capacity: NonZeroUsize::new(8).unwrap(),
             // Long enough to outlast a browser's cached Alt-Svc entry for
             // an origin, which is what the DNS rewrite alone cannot reach.

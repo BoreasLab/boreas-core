@@ -2,7 +2,7 @@
 //! Too Big messages against known flows.
 
 use crate::{
-    IngressPacket, InternalEndpoint, MIN_QUIC_MTU, Mtu, Transport, UdpFlowTable,
+    FlowKey, IngressPacket, InternalEndpoint, MIN_QUIC_MTU, Mtu, Transport, UdpFlowTable,
     wire::{Reader, checksum},
 };
 
@@ -17,25 +17,30 @@ pub struct PathUpdate {
 pub fn validate_ptb<V>(
     quoted: &IngressPacket,
     offered_mtu: u16,
-    flows: &UdpFlowTable<V>,
+    flows: &UdpFlowTable<FlowKey, V>,
 ) -> Option<PathUpdate> {
     if offered_mtu < MIN_QUIC_MTU {
         return None;
     }
 
-    let source_port = match quoted.transport {
-        Transport::Udp { source_port, .. } | Transport::Tcp { source_port, .. } => source_port,
+    let endpoint = |address, port| InternalEndpoint { address, port };
+    let key = match quoted.transport {
+        Transport::Udp { source_port, .. } => {
+            FlowKey::Mapping(endpoint(quoted.source, source_port))
+        }
+        Transport::Tcp {
+            source_port,
+            destination_port,
+        } => FlowKey::Connection {
+            client: endpoint(quoted.source, source_port),
+            server: endpoint(quoted.destination, destination_port),
+        },
         Transport::Icmp(_) | Transport::Other | Transport::Fragment => return None,
     };
 
-    flows
-        .contains(&InternalEndpoint {
-            address: quoted.source,
-            port: source_port,
-        })
-        .then_some(PathUpdate {
-            next_hop_mtu: offered_mtu,
-        })
+    flows.contains(&key).then_some(PathUpdate {
+        next_hop_mtu: offered_mtu,
+    })
 }
 
 /// Clamps a TCP SYN's MSS to the tunnel's packet budget.
@@ -270,8 +275,13 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             port: 12_345,
         };
-        let mut flows = UdpFlowTable::new(Duration::from_secs(120), start).unwrap();
-        let _ = flows.get_or_insert_with(endpoint, start, || ());
+        let mut flows = UdpFlowTable::new(
+            Duration::from_secs(120),
+            std::num::NonZeroUsize::new(16).unwrap(),
+            start,
+        )
+        .unwrap();
+        let _ = flows.get_or_insert_with(FlowKey::Mapping(endpoint), start, || ());
 
         let quoted = IngressPacket {
             source: endpoint.address,
@@ -295,6 +305,16 @@ mod tests {
             ..quoted
         };
         assert_eq!(validate_ptb(&unmatched, 1400, &flows), None);
+
+        // A TCP connection on the same port is not this UDP flow.
+        let other_transport = IngressPacket {
+            transport: Transport::Tcp {
+                source_port: endpoint.port,
+                destination_port: 443,
+            },
+            ..quoted
+        };
+        assert_eq!(validate_ptb(&other_transport, 1400, &flows), None);
 
         // Non-TCP/UDP quoted transports are not flows at all.
         let icmp = IngressPacket {

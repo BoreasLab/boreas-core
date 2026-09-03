@@ -140,7 +140,9 @@ pub use egress::vless::{
     encode_addr_port, encode_request,
 };
 
-pub use l3::udp::{DatagramBuffer, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable};
+pub use l3::udp::{
+    DatagramBuffer, FlowKey, FlowTableError, InternalEndpoint, SendOutcome, UdpFlowTable,
+};
 
 pub const MIN_QUIC_MTU: u16 = 1200;
 

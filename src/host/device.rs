@@ -276,6 +276,7 @@ mod tests {
                 reassembly_timeout: Duration::from_secs(30),
                 max_pending_reassemblies: NonZeroUsize::new(8).unwrap(),
                 flow_idle_timeout: Duration::from_secs(120),
+                max_flows: std::num::NonZeroUsize::new(1024).unwrap(),
                 datagram_buffer_capacity: NonZeroUsize::new(64).unwrap(),
                 // Long enough to cover the DNS steering backstop in the fixture.
                 inspection_window: Duration::from_secs(60),
