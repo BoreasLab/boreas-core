@@ -17,8 +17,11 @@ use crate::{Message, Name, Rcode, RecordType, fifo::BoundedFifo};
 const MIN_TTL: Duration = Duration::from_secs(30);
 /// Above this, a TTL is treated as this. Bounds how stale a rebound can be.
 const MAX_TTL: Duration = Duration::from_secs(3600);
-/// RFC 2308 negative caching, without reading the SOA minimum.
+/// RFC 2308 section 5 negative caching when the reply carries no SOA to say.
 const NEGATIVE_TTL: Duration = Duration::from_secs(60);
+
+/// RFC 1035 SOA record type; its last four RDATA bytes are MINIMUM.
+const SOA: u16 = 6;
 
 #[derive(Clone)]
 struct Cached {
@@ -84,12 +87,29 @@ fn lifetime(message: &Message<'_>) -> Option<Duration> {
                 let record = record.ok()?;
                 shortest = Some(shortest.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
             }
-            shortest.map_or(NEGATIVE_TTL, |ttl| Duration::from_secs(u64::from(ttl)))
+            shortest.map_or_else(
+                || negative_lifetime(message),
+                |ttl| Duration::from_secs(u64::from(ttl)),
+            )
         }
-        Rcode::NameError => NEGATIVE_TTL,
+        Rcode::NameError => negative_lifetime(message),
         _ => return None,
     };
     Some(raw.clamp(MIN_TTL, MAX_TTL))
+}
+
+/// RFC 2308 section 5: a negative answer lives for the lesser of its SOA's
+/// TTL and MINIMUM, or a fixed while when the reply carries no SOA.
+fn negative_lifetime(message: &Message<'_>) -> Duration {
+    message
+        .authority()
+        .filter_map(Result::ok)
+        .find(|record| record.rtype.to_wire() == SOA)
+        .and_then(|soa| {
+            let minimum = u32::from_be_bytes(*soa.rdata.last_chunk::<4>()?);
+            Some(Duration::from_secs(u64::from(soa.ttl.min(minimum))))
+        })
+        .unwrap_or(NEGATIVE_TTL)
 }
 
 #[cfg(test)]
@@ -218,6 +238,47 @@ mod tests {
         assert!(
             cache
                 .get(name("gone.example"), RecordType::A, t0 + NEGATIVE_TTL)
+                .is_none()
+        );
+    }
+
+    /// RFC 2308 section 5: the SOA in the authority section decides how
+    /// long a negative answer lives.
+    #[test]
+    fn a_negative_answer_lives_as_long_as_its_soa_says() {
+        let mut cache = cache();
+        let t0 = Instant::now();
+        let mut reply = response("none.example", Rcode::NameError, &[]);
+        reply[8..10].copy_from_slice(&1u16.to_be_bytes()); // nscount
+        reply.extend_from_slice(&wire_name("example"));
+        reply.extend_from_slice(&SOA.to_be_bytes());
+        reply.extend_from_slice(&1u16.to_be_bytes());
+        reply.extend_from_slice(&3600u32.to_be_bytes()); // ttl
+        let mut rdata = wire_name("ns.example");
+        rdata.extend_from_slice(&wire_name("hostmaster.example"));
+        rdata.extend_from_slice(&[0u8; 16]); // serial, refresh, retry, expire
+        rdata.extend_from_slice(&600u32.to_be_bytes()); // minimum
+        reply.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        reply.extend_from_slice(&rdata);
+
+        cache.admit(name("none.example"), RecordType::A, &reply, t0);
+        assert!(
+            cache
+                .get(
+                    name("none.example"),
+                    RecordType::A,
+                    t0 + Duration::from_secs(599)
+                )
+                .is_some(),
+            "MINIMUM, not the fixed fallback"
+        );
+        assert!(
+            cache
+                .get(
+                    name("none.example"),
+                    RecordType::A,
+                    t0 + Duration::from_secs(600)
+                )
                 .is_none()
         );
     }

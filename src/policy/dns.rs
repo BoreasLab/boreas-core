@@ -462,6 +462,16 @@ impl<'a> Message<'a> {
         }
     }
 
+    /// Lazily walks the authority section's records.
+    pub fn authority(&self) -> Answers<'a> {
+        let at = self.answers().end().unwrap_or(self.bytes.len());
+        Answers {
+            message: self.bytes,
+            cursor: at,
+            remaining: self.authority_count,
+        }
+    }
+
     /// The UDP payload size the sender's OPT record advertises (RFC 6891
     /// section 6.2.3), or `None` without one. O(records).
     pub fn udp_payload_size(&self) -> Option<u16> {

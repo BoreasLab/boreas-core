@@ -128,12 +128,10 @@ async fn service(
 
     while let Some(terminated) = stack.poll_accept() {
         let (stream, plumbing) = pair(Arc::clone(wake));
-        // No consumer remains to serve this connection.
-        if accepted
-            .send(Accepted { terminated, stream })
-            .await
-            .is_err()
-        {
+        // Offered, never awaited: a consumer slow to take connections must
+        // not stall every established one's ACKs and retransmits. A full
+        // queue, or no consumer, is a refused connection.
+        if accepted.try_send(Accepted { terminated, stream }).is_err() {
             stack.abort(terminated.id);
             continue;
         }
