@@ -4,10 +4,11 @@
 //! provenance and performs only the selected protocol exchange. Mozilla's
 //! trust bundle is independent of the user-installed interception root.
 //!
-//! Do53, DoT, and DoH use one connection per query because a shared byte stream
-//! needs transaction-ID demultiplexing. DoQ uses one persistent connection:
-//! RFC 9250 gives each query its own stream and requires a zero message ID.
-//! [`TunnelBypass`] keeps resolver sockets outside the tunnel.
+//! Every transport keeps its connection. Do53 and DoT pipeline queries on one
+//! by transaction id ([`crate::policy::demux`]); DoH answers in order, so it
+//! keeps a few idle connections and uses one per query in flight; DoQ gives
+//! each query its own stream over one connection, with a zero message id as
+//! RFC 9250 requires. [`TunnelBypass`] keeps resolver sockets outside the tunnel.
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -375,13 +376,21 @@ where
     Ok(reply)
 }
 
-/// DNS over HTTPS, RFC 8484, over HTTP/1.1 with connection-close framing.
+/// DNS over HTTPS, RFC 8484, over HTTP/1.1 with connections kept alive.
+///
+/// HTTP/1.1 answers in order, so one connection serves one query at a time;
+/// a burst uses several, and up to [`DOH_IDLE_CONNECTIONS`] wait for the next.
 pub struct DohUpstream<B> {
     dialer: TlsDialer<B>,
     /// Request authority and path.
     authority: String,
     path: String,
+    idle: std::sync::Mutex<Vec<UpstreamTls>>,
 }
+
+/// Connections kept after a reusable response. More than a burst of this size
+/// pays a handshake, which is what it paid on every query before.
+const DOH_IDLE_CONNECTIONS: usize = 4;
 
 impl<B: TunnelBypass> DohUpstream<B> {
     /// Configures an absolute `https://` endpoint and its already-known address.
@@ -408,12 +417,35 @@ impl<B: TunnelBypass> DohUpstream<B> {
             dialer: TlsDialer::new(resolver, host, &[b"http/1.1"], bypass)?,
             authority: authority.as_str().to_owned(),
             path: path.to_owned(),
+            idle: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.dialer.timeout = timeout;
         self
+    }
+
+    /// Keeps a connection for the next query, up to the idle ceiling.
+    fn park(&self, stream: UpstreamTls) {
+        let mut idle = crate::locked(&self.idle);
+        if idle.len() < DOH_IDLE_CONNECTIONS {
+            idle.push(stream);
+        }
+    }
+
+    /// One request on one connection. Reusable when the response framed its
+    /// body by length and did not ask to close.
+    async fn exchange(
+        &self,
+        stream: &mut UpstreamTls,
+        head: &str,
+        message: &[u8],
+    ) -> io::Result<(Vec<u8>, bool)> {
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(message).await?;
+        stream.flush().await?;
+        read_http_response(stream).await
     }
 }
 
@@ -430,18 +462,32 @@ impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
                  host: {}\r\n\
                  accept: application/dns-message\r\n\
                  content-type: application/dns-message\r\n\
-                 content-length: {}\r\n\
-                 connection: close\r\n\r\n",
+                 content-length: {}\r\n\r\n",
                 self.path,
                 self.authority,
                 message.len(),
             );
             tokio::time::timeout(self.dialer.timeout, async {
-                let mut stream = self.dialer.connect().await?;
-                stream.write_all(head.as_bytes()).await?;
-                stream.write_all(message).await?;
-                stream.flush().await?;
-                read_http_body(&mut stream).await
+                let parked = crate::locked(&self.idle).pop();
+                let (mut stream, reused) = match parked {
+                    Some(stream) => (stream, true),
+                    None => (self.dialer.connect().await?, false),
+                };
+                let outcome = self.exchange(&mut stream, &head, message).await;
+                let (body, reusable) = match outcome {
+                    Ok(answered) => answered,
+                    // A kept connection the resolver closed meanwhile: once
+                    // more on a fresh one, which is what every query cost before.
+                    Err(_) if reused => {
+                        stream = self.dialer.connect().await?;
+                        self.exchange(&mut stream, &head, message).await?
+                    }
+                    Err(error) => return Err(error),
+                };
+                if reusable {
+                    self.park(stream);
+                }
+                Ok(body)
             })
             .await
             .map_err(timed_out)?
@@ -573,8 +619,10 @@ impl<B: TunnelBypass> DnsUpstream for DoqUpstream<B> {
 /// Maximum HTTP response-head size.
 const MAX_HTTP_HEAD: usize = 8 * 1024;
 
-/// Reads a `200` HTTP/1.1 response body with bounded connection-close framing.
-async fn read_http_body<S>(stream: &mut S) -> io::Result<Vec<u8>>
+/// Reads a `200` HTTP/1.1 response body, and whether the connection can carry
+/// another request: a `content-length` frames the body and nothing asked to
+/// close; otherwise the body runs to the close and the connection is spent.
+async fn read_http_response<S>(stream: &mut S) -> io::Result<(Vec<u8>, bool)>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -607,21 +655,67 @@ where
         ));
     }
 
+    let head = &buffer[..body_at];
+    let length = header(head, b"content-length").and_then(|value| {
+        std::str::from_utf8(value)
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+    });
+    let closing = header(head, b"connection").is_some_and(|value| {
+        value
+            .split(|byte| *byte == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
+    });
+
     let mut body = buffer.split_off(body_at);
-    loop {
-        if body.len() > MAX_DNS_MESSAGE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "reply exceeds the accepted message size",
-            ));
+    match length {
+        Some(length) => {
+            bounded(length)?;
+            if body.len() > length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "more body than the content-length",
+                ));
+            }
+            let have = body.len();
+            body.resize(length, 0);
+            stream.read_exact(&mut body[have..]).await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed inside the body",
+                )
+            })?;
+            Ok((body, !closing))
         }
-        let mut chunk = [0u8; 512];
-        match stream.read(&mut chunk).await? {
-            0 => break,
-            read => body.extend_from_slice(&chunk[..read]),
+        None => {
+            loop {
+                if body.len() > MAX_DNS_MESSAGE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reply exceeds the accepted message size",
+                    ));
+                }
+                let mut chunk = [0u8; 512];
+                match stream.read(&mut chunk).await? {
+                    0 => break,
+                    read => body.extend_from_slice(&chunk[..read]),
+                }
+            }
+            Ok((body, false))
         }
     }
-    Ok(body)
+}
+
+/// The value of the first header named `name`, case-insensitively.
+fn header<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    head.split(|byte| *byte == b'\n').skip(1).find_map(|line| {
+        let colon = line.iter().position(|byte| *byte == b':')?;
+        line[..colon]
+            .eq_ignore_ascii_case(name)
+            .then(|| line[colon + 1..].trim_ascii())
+    })
 }
 
 /// Finds the offset just past an HTTP head.
@@ -823,10 +917,41 @@ mod tests {
             "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\n\r\n",
             b"\x00\x01dns",
         );
-        assert_eq!(read_http_body(&mut ok).await.unwrap(), b"\x00\x01dns");
+        assert_eq!(
+            read_http_response(&mut ok).await.unwrap(),
+            (b"\x00\x01dns".to_vec(), false),
+            "no length: the body ran to the close, and the connection is spent"
+        );
 
         let mut old = response("HTTP/1.0 200 OK\r\n\r\n", b"dns");
-        assert_eq!(read_http_body(&mut old).await.unwrap(), b"dns");
+        assert_eq!(read_http_response(&mut old).await.unwrap().0, b"dns");
+
+        // A length frames the body, and the connection stays usable unless
+        // the resolver said otherwise. Bytes past the length are not a next
+        // response, since nothing was asked yet: they are a malformed one.
+        let mut framed = response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n", b"dns");
+        assert_eq!(
+            read_http_response(&mut framed).await.unwrap(),
+            (b"dns".to_vec(), true)
+        );
+        let mut surplus = response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n", b"dnsNEXT");
+        assert_eq!(
+            read_http_response(&mut surplus).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut closing = response(
+            "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nConnection: keep-alive, Close\r\n\r\n",
+            b"dns",
+        );
+        assert_eq!(
+            read_http_response(&mut closing).await.unwrap(),
+            (b"dns".to_vec(), false)
+        );
+        let mut short = response("HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\n", b"dns");
+        assert_eq!(
+            read_http_response(&mut short).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
 
         for head in [
             "HTTP/1.1 404 Not Found\r\n\r\n",
@@ -836,7 +961,7 @@ mod tests {
         ] {
             let mut bad = response(head, b"body");
             assert_eq!(
-                read_http_body(&mut bad).await.unwrap_err().kind(),
+                read_http_response(&mut bad).await.unwrap_err().kind(),
                 io::ErrorKind::InvalidData,
                 "{head:?}"
             );
@@ -845,13 +970,13 @@ mod tests {
         let endless = vec![b'x'; MAX_HTTP_HEAD + 1024];
         let mut cursor = std::io::Cursor::new(endless);
         assert_eq!(
-            read_http_body(&mut cursor).await.unwrap_err().kind(),
+            read_http_response(&mut cursor).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         let mut huge = response("HTTP/1.1 200 OK\r\n\r\n", &vec![b'x'; MAX_DNS_MESSAGE + 1]);
         assert_eq!(
-            read_http_body(&mut huge).await.unwrap_err().kind(),
+            read_http_response(&mut huge).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }
