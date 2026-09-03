@@ -38,6 +38,14 @@ default-members = [".", "ffi"]
 # cargo from adopting it because it happens to sit in this directory.
 exclude = ["fuzz"]
 
+# The packet path crosses crate boundaries on every packet: this crate into
+# gotatun, quiche, and boring. Fat LTO is what lets those calls inline.
+# Unwinding stays on because `boreas_ffi::boundary` catches panics at the C
+# edge and reports them as a status; `panic = "abort"` would take the process.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [patch.crates-io]
 h2 = { path = "vendor/h2" }
 quiche = { path = "vendor/quiche" }
