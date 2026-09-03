@@ -117,7 +117,8 @@ impl AsyncRead for BridgedStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.pending.is_empty() {
+        // An empty chunk carries nothing and must not read as end of stream.
+        while this.pending.is_empty() {
             match this.inbound.poll_recv(cx) {
                 Poll::Ready(Some(chunk)) => {
                     this.pending = chunk;
@@ -151,6 +152,10 @@ impl AsyncWrite for BridgedStream {
                 "the write half is shut down",
             )));
         };
+        // Nothing to queue; an empty chunk would read as EOF at the far end.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         match sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
                 let moved = buf.len().min(CHUNK);
@@ -217,6 +222,25 @@ mod tests {
 
     /// A chunk larger than the reader's buffer is delivered across successive
     /// reads; the pending tail prevents truncation.
+    /// An empty chunk is not the end of the stream, and writing nothing
+    /// sends nothing.
+    #[tokio::test]
+    async fn an_empty_chunk_is_skipped_rather_than_read_as_eof() {
+        let (mut stream, mut plumbing) = pair(Arc::new(Notify::new()));
+        let to_task = plumbing.to_task.as_ref().unwrap();
+        to_task.send(Bytes::new()).await.unwrap();
+        to_task.send(Bytes::from_static(b"data")).await.unwrap();
+        let mut buf = [0u8; 8];
+        let read = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..read], b"data");
+
+        assert_eq!(stream.write(&[]).await.unwrap(), 0);
+        assert!(
+            plumbing.from_task.try_recv().is_err(),
+            "nothing was queued for the driver"
+        );
+    }
+
     #[tokio::test]
     async fn a_chunk_larger_than_the_read_buffer_is_delivered_whole() {
         let (mut stream, mut plumbing) = pair(Arc::new(Notify::new()));

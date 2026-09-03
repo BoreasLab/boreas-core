@@ -21,7 +21,10 @@ use boring::{
         CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslMethod,
         SslSignatureAlgorithm, SslVersion,
     },
-    x509::{X509, store::X509StoreBuilder},
+    x509::{
+        X509,
+        store::{X509Store, X509StoreBuilder},
+    },
 };
 use hyper::client::conn::http2::Builder as H2Builder;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -298,6 +301,9 @@ struct Key {
 /// Opens TLS with a mirrored ClientHello and caches connectors by profile.
 pub struct Originator {
     extra: Vec<Vec<u8>>,
+    /// The bundled roots plus the extras, parsed once. `None` when an extra
+    /// was not a certificate, which every connect then reports.
+    store: Option<X509Store>,
     connectors: Mutex<HashMap<Key, Arc<SslConnector>>>,
 }
 
@@ -306,6 +312,7 @@ impl Originator {
     pub fn new() -> Self {
         Self {
             extra: Vec::new(),
+            store: trust(&[]).ok(),
             connectors: Mutex::new(HashMap::new()),
         }
     }
@@ -314,6 +321,7 @@ impl Originator {
     #[must_use]
     pub fn with_extra_roots(mut self, extra: &[Vec<u8>]) -> Self {
         self.extra = extra.to_vec();
+        self.store = trust(extra).ok();
         self
     }
 
@@ -326,31 +334,22 @@ impl Originator {
             profile: profile.clone(),
             alpn: alpn.to_vec(),
         };
-        // Serialize cache misses; this section contains no await.
-        let mut connectors = crate::locked(&self.connectors);
-        if let Some(existing) = connectors.get(&key) {
+        if let Some(existing) = crate::locked(&self.connectors).get(&key) {
             return Ok(Arc::clone(existing));
         }
+        // Built outside the lock: a miss, which a client can force by varying
+        // its hello, holds nobody else up.
         let built = Arc::new(self.build(profile, alpn)?);
+        let mut connectors = crate::locked(&self.connectors);
         if connectors.len() >= MAX_CACHED_CONNECTORS {
             connectors.clear();
         }
-        connectors.insert(key, Arc::clone(&built));
-        Ok(built)
+        Ok(Arc::clone(connectors.entry(key).or_insert(built)))
     }
 
     fn build(&self, profile: &ClientProfile, alpn: &[u8]) -> Result<SslConnector, MirrorError> {
         let mut builder = SslConnector::builder(SslMethod::tls())?;
-
-        // Use the bundled roots plus explicit extras, not the platform store.
-        let mut store = X509StoreBuilder::new()?;
-        for anchor in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-            store.add_cert(X509::from_der(anchor).map_err(|_| MirrorError::Anchor)?)?;
-        }
-        for anchor in &self.extra {
-            store.add_cert(X509::from_der(anchor).map_err(|_| MirrorError::Anchor)?)?;
-        }
-        builder.set_cert_store_ref(&store.build());
+        builder.set_cert_store_ref(self.store.as_ref().ok_or(MirrorError::Anchor)?);
 
         builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -404,6 +403,18 @@ impl Originator {
         })
         .await
     }
+}
+
+/// The bundled roots plus `extra`, not the platform store.
+fn trust(extra: &[Vec<u8>]) -> Result<X509Store, MirrorError> {
+    let mut store = X509StoreBuilder::new()?;
+    for anchor in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        store.add_cert(X509::from_der(anchor).map_err(|_| MirrorError::Anchor)?)?;
+    }
+    for anchor in extra {
+        store.add_cert(X509::from_der(anchor).map_err(|_| MirrorError::Anchor)?)?;
+    }
+    Ok(store.build())
 }
 
 impl Default for Originator {

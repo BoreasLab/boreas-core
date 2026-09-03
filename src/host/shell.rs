@@ -509,7 +509,7 @@ async fn resolve<U: DnsUpstream>(
 /// A connected UDP socket relays an ICMP unreachable as `ConnectionRefused`
 /// on its next call; a tun refuses a write with `ENOBUFS` when its queue is
 /// full. Both pass; the tunnel does not end over them.
-fn transient(error: &io::Error) -> bool {
+pub(crate) fn transient(error: &io::Error) -> bool {
     use io::ErrorKind::{
         ConnectionRefused, ConnectionReset, HostUnreachable, Interrupted, NetworkDown,
         NetworkUnreachable, WouldBlock,

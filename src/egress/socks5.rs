@@ -461,6 +461,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
             let Target::Ip(relay) = relay else {
                 return Err(ProxyError::Address.into());
             };
+            let relay = relay_address(relay, self.config.proxy);
             let socket = self.bypass.udp(relay).await?;
             // RFC 1928 section 7 ties association lifetime to the control stream.
             let shared = Arc::new(Relay {
@@ -481,6 +482,17 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
 
 /// Largest payload representable by a UDP length field.
 const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
+
+/// Where the relay is: BND.ADDR, or the proxy's own address when BND.ADDR is
+/// unspecified, which RFC 1928 section 7 allows and most proxies send.
+/// Connecting to 0.0.0.0 would relay to this host.
+fn relay_address(bound: SocketAddr, proxy: SocketAddr) -> SocketAddr {
+    if bound.ip().is_unspecified() {
+        SocketAddr::new(proxy.ip(), bound.port())
+    } else {
+        bound
+    }
+}
 
 /// UDP relay and its lifetime-bound control connection.
 struct Relay {
@@ -543,6 +555,22 @@ impl DatagramSource for Socks5Source {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unspecified_relay_address_means_the_proxy_itself() {
+        let proxy: SocketAddr = "198.51.100.7:1080".parse().unwrap();
+        let unspecified: SocketAddr = "0.0.0.0:4000".parse().unwrap();
+        let named: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        assert_eq!(
+            relay_address(unspecified, proxy),
+            "198.51.100.7:4000".parse().unwrap()
+        );
+        assert_eq!(relay_address(named, proxy), named);
+        assert_eq!(
+            relay_address("[::]:4000".parse().unwrap(), proxy),
+            "198.51.100.7:4000".parse().unwrap()
+        );
+    }
 
     fn domain(name: &str, port: u16) -> Target {
         Target::Domain {

@@ -254,23 +254,37 @@ impl Handshake {
     }
 
     async fn flush(&mut self, scratch: &mut [u8]) -> Result<(), EgressError> {
-        flush(&mut self.conn, &self.socket, scratch).await
+        while !flush(&mut self.conn, &self.socket, scratch).await? {}
+        Ok(())
     }
 }
 
+/// Datagrams sent per pass before receives get a turn.
+const FLUSH_BURST: usize = 64;
+
+/// Sends what the connection has ready, at most a burst. `Ok(true)` when it
+/// is drained; `Ok(false)` when more waits, so the caller comes straight back.
+/// A datagram the socket refuses (an ICMP unreachable relayed as
+/// ConnectionRefused, a full queue) is one lost packet QUIC recovers from,
+/// not the end of every stream on the connection.
 async fn flush(
     conn: &mut quiche::Connection,
     socket: &UdpSocket,
     scratch: &mut [u8],
-) -> Result<(), EgressError> {
-    loop {
+) -> Result<bool, EgressError> {
+    for _ in 0..FLUSH_BURST {
         let (written, _info) = match conn.send(scratch) {
             Ok(sent) => sent,
-            Err(quiche::Error::Done) => return Ok(()),
+            Err(quiche::Error::Done) => return Ok(true),
             Err(_) => return Err(EgressError::Quic),
         };
-        socket.send(&scratch[..written]).await?;
+        match socket.send(&scratch[..written]).await {
+            Ok(_) => {}
+            Err(error) if crate::host::shell::transient(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
+    Ok(false)
 }
 
 /// Cloneable handle for opening streams and using datagrams on one connection.
@@ -353,11 +367,13 @@ impl Driver {
 
         loop {
             self.service(&mut chunk);
-            if flush(&mut self.conn, &self.socket, &mut outbound)
-                .await
-                .is_err()
-                || self.conn.is_closed()
-            {
+            match flush(&mut self.conn, &self.socket, &mut outbound).await {
+                Ok(true) => {}
+                // More to send: take the receive turn, then come back.
+                Ok(false) => self.wake.notify_one(),
+                Err(_) => break,
+            }
+            if self.conn.is_closed() {
                 break;
             }
             if closing && self.streams.is_empty() {

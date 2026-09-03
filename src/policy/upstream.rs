@@ -91,9 +91,28 @@ impl TunnelBypass for DirectSockets {
 
     #[allow(clippy::manual_async_fn)]
     fn unbound(&self) -> impl Future<Output = io::Result<tokio::net::UdpSocket>> + Send {
-        // One IPv6 socket serves both address families where supported.
-        async move { tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).await }
+        async move { tokio::net::UdpSocket::from_std(dual_stack_udp()?) }
     }
+}
+
+/// An unbound UDP socket that reaches both address families: IPv6 with
+/// v6-only off, which Windows defaults on; or IPv4 where IPv6 is disabled.
+pub fn dual_stack_udp() -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(socket) => {
+            socket.set_only_v6(false)?;
+            socket.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+            socket
+        }
+        Err(_) => {
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.bind(&SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)).into())?;
+            socket
+        }
+    };
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 
 /// Plain DNS to one resolver: UDP (RFC 1035 section 4.2.1), and TCP for a

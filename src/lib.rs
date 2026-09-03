@@ -125,7 +125,7 @@ pub use policy::filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse
 pub use policy::rules::RuleEngine;
 pub use policy::upstream::{
     DEFAULT_UPSTREAM_TIMEOUT, DOT_PORT, DirectSockets, DnsUpstream, Do53Upstream, DohUpstream,
-    DoqUpstream, DotUpstream, TunnelBypass, UpstreamError,
+    DoqUpstream, DotUpstream, TunnelBypass, UpstreamError, dual_stack_udp,
 };
 pub use pool::{BufferPool, Pooled};
 pub use sansio::{Codec, Decode, Decoded, Framed, Negotiation, Writes, negotiate};

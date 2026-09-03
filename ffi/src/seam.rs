@@ -449,7 +449,13 @@ impl TunnelBypass for Bypass {
     #[allow(clippy::manual_async_fn)]
     fn unbound(&self) -> impl Future<Output = io::Result<UdpSocket>> + Send {
         let bypass = *self;
-        async move { bypass.bind(SocketAddr::from(([0, 0, 0, 0], 0))) }
+        async move {
+            // Both families, as on the direct path: an IPv4-only socket
+            // could relay nothing to an IPv6 peer.
+            let socket = boreas_core::dual_stack_udp()?;
+            bypass.protect(raw(&socket))?;
+            UdpSocket::from_std(socket)
+        }
     }
 }
 
