@@ -9,9 +9,11 @@
 //! `Connection` and `Upgrade` fields and splice the resulting byte streams.
 
 use std::{
-    convert::Infallible,
     io,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -58,15 +60,16 @@ impl RequestFilter for AllowAll {
 
 /// RFC 9110 section 7.6.1 fields that must not cross an ordinary hop.
 /// `Connection` and `Upgrade` are handled separately because h1 upgrades need
-/// them.
-const HOP_BY_HOP: [&str; 7] = [
+/// them. `Content-Length` is not hop-by-hop: a HEAD or 304 reply carries the
+/// length of the body it does not send (section 8.6), and hyper re-frames a
+/// body it forwards whole; a rewrite drops the field itself.
+const HOP_BY_HOP: [&str; 6] = [
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
     "te",
     "trailer",
     "transfer-encoding",
-    "content-length",
 ];
 
 /// RFC 7838 field name and withdrawal value.
@@ -275,6 +278,29 @@ fn bad_gateway() -> Response<ProxyBody> {
     response
 }
 
+/// RFC 9110 section 15.5.20: the request names a host this connection was
+/// not opened for.
+fn misdirected() -> Response<ProxyBody> {
+    let mut response = Response::new(boxed_full(b""));
+    *response.status_mut() = StatusCode::MISDIRECTED_REQUEST;
+    response
+}
+
+/// The host a request is for: the authority of its target, else its `Host`
+/// field, without a port. `None` when it names neither.
+fn requested_host(request: &Request<Incoming>) -> Option<&str> {
+    let named = match request.uri().host() {
+        Some(host) => host,
+        None => request.headers().get(http::header::HOST)?.to_str().ok()?,
+    };
+    // A bracketed IPv6 literal keeps its colons; a name loses its port.
+    let host = match named.strip_prefix('[') {
+        Some(literal) => literal.split(']').next()?,
+        None => named.rsplit_once(':').map_or(named, |(host, _)| host),
+    };
+    Some(host.trim_end_matches('.'))
+}
+
 /// Upstream sender with h1 serialization and h2 multiplexing.
 #[derive(Clone)]
 enum Upstream {
@@ -313,14 +339,21 @@ struct Proxy {
     wire: Wire,
     rewriting: Rewriting,
     upgrade: StdMutex<Option<Pending>>,
+    /// Whether the upstream has answered once. After that, its failure is
+    /// the connection ending, which the client is told by closing its own.
+    served: AtomicBool,
 }
 
 impl Proxy {
-    /// Filters, forwards, and shapes one request without failing the connection.
-    async fn forward(
-        &self,
-        mut request: Request<Incoming>,
-    ) -> Result<Response<ProxyBody>, Infallible> {
+    /// Filters, forwards, and shapes one request. The only error is an
+    /// upstream that ended after serving: it closes the client connection so
+    /// the client opens another, instead of a 502 for every later request.
+    async fn forward(&self, mut request: Request<Incoming>) -> io::Result<Response<ProxyBody>> {
+        // The target is per request (RFC 9112 section 3.3), the upstream per
+        // connection: a request for another host must not reach this one.
+        if requested_host(&request).is_some_and(|host| !host.eq_ignore_ascii_case(&self.host)) {
+            return Ok(misdirected());
+        }
         if self.filter.decide(&self.host, &request) == FilterVerdict::Block {
             return Ok(blocked());
         }
@@ -331,9 +364,17 @@ impl Proxy {
 
         self.crossings.record(self.wire, self.wire);
 
-        let Ok(mut response) = self.upstream.send(request).await else {
-            return Ok(bad_gateway());
+        let mut response = match self.upstream.send(request).await {
+            Ok(response) => response,
+            Err(_) if self.served.load(Ordering::Relaxed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the upstream connection ended",
+                ));
+            }
+            Err(_) => return Ok(bad_gateway()),
         };
+        self.served.store(true, Ordering::Relaxed);
         if let Some(client) = client
             && response.status() == StatusCode::SWITCHING_PROTOCOLS
         {
@@ -408,6 +449,7 @@ where
         wire: Wire::Http1,
         rewriting,
         upgrade: StdMutex::new(None),
+        served: AtomicBool::new(false),
     });
 
     let service = {
@@ -464,6 +506,7 @@ where
         rewriting,
         // h2 cannot populate this h1-only upgrade slot.
         upgrade: StdMutex::new(None),
+        served: AtomicBool::new(false),
     });
 
     let service = {
@@ -487,7 +530,7 @@ where
 mod tests {
     use super::*;
     use crate::wire::Reader;
-    use std::num::NonZeroUsize;
+    use std::{convert::Infallible, num::NonZeroUsize};
 
     use http_body_util::Empty;
     use hyper::{Method, header::HOST};
@@ -538,6 +581,21 @@ mod tests {
             Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!(
                 "origin:{path}"
             )))))
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(io), service)
+            .await;
+    }
+
+    /// Answers once with `Connection: close`, as an origin at its keep-alive
+    /// limit does, then is gone.
+    async fn fake_upstream_closing(io: DuplexStream) {
+        let service = service_fn(|_: Request<Incoming>| async move {
+            let mut response = Response::new(Full::new(Bytes::from_static(b"once")));
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+            Ok::<_, Infallible>(response)
         });
         let _ = hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(io), service)
@@ -947,6 +1005,96 @@ mod tests {
         assert_eq!(crossings.count(), 0, "h2 to h2 crosses nothing");
     }
 
+    /// RFC 9112 section 3.3: the target is per request. A request for another
+    /// host on this connection is 421, and the connection goes on serving.
+    /// RFC 9110 section 8.6: a HEAD reply keeps the length it does not send.
+    #[tokio::test]
+    async fn a_request_for_another_host_is_misdirected_and_a_head_keeps_its_length() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (upstream_client, upstream_server) = tokio::io::duplex(4096);
+        tokio::spawn(fake_upstream_h1(upstream_server));
+        tokio::spawn(run_exchange(
+            HOST_NAME,
+            Wire::Http1,
+            server_io,
+            upstream_client,
+            Arc::new(AllowAll),
+            Arc::new(VersionCrossings::new()),
+            Rewriting::Off,
+        ));
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+
+        let elsewhere = Request::builder()
+            .uri("/x")
+            .header(HOST, "tracker.example")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(elsewhere).await.unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+
+        let head = Request::builder()
+            .method(Method::HEAD)
+            .uri("/large")
+            .header(HOST, format!("{HOST_NAME}:443"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(head).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "13",
+            "the length of the body a GET would carry"
+        );
+    }
+
+    /// An origin that closes after one reply is not a 502 for every reply
+    /// after: the client connection ends too, and the client opens another.
+    #[tokio::test]
+    async fn a_spent_upstream_ends_the_client_connection_instead_of_answering_502() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (upstream_client, upstream_server) = tokio::io::duplex(4096);
+        tokio::spawn(fake_upstream_closing(upstream_server));
+        tokio::spawn(run_exchange(
+            HOST_NAME,
+            Wire::Http1,
+            server_io,
+            upstream_client,
+            Arc::new(AllowAll),
+            Arc::new(VersionCrossings::new()),
+            Rewriting::Off,
+        ));
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+
+        let request = || {
+            Request::builder()
+                .uri("/")
+                .header(HOST, HOST_NAME)
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let first = sender.send_request(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = first.into_body().collect().await;
+
+        let second = sender.send_request(request()).await;
+        assert!(
+            second.is_err(),
+            "the connection ended rather than answer {:?}",
+            second.map(|response| response.status())
+        );
+    }
+
     #[tokio::test]
     async fn a_relayed_request_keeps_its_field_order_and_encodings() {
         let (client_io, server_io) = tokio::io::duplex(4096);
@@ -994,7 +1142,7 @@ mod tests {
         for (name, value) in [
             ("host", "example.test"),
             ("user-agent", "boreas-test"),
-            ("content-length", "4"),
+            ("transfer-encoding", "chunked"),
             ("accept", "text/html"),
             ("cookie", "a=1"),
         ] {

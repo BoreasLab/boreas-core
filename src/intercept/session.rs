@@ -350,18 +350,20 @@ fn learn(
     error: std::io::Error,
     otherwise: impl FnOnce(std::io::Error) -> SessionError,
 ) -> Result<Handling, SessionError> {
-    match classify(leg, &error) {
-        Some(cause) => {
-            sessions
-                .demotions
-                .record(host.as_str(), cause, Instant::now());
-            Ok(Handling::Demoted {
-                host: host.clone(),
-                cause,
-            })
-        }
-        None => Err(otherwise(error)),
+    // One strike is evidence, not a verdict: the host is demoted only once
+    // the table says so.
+    if let Some(cause) = classify(leg, &error)
+        && let Err(cause) = sessions
+            .demotions
+            .record(host.as_str(), cause, Instant::now())
+            .permits()
+    {
+        return Ok(Handling::Demoted {
+            host: host.clone(),
+            cause,
+        });
     }
+    Err(otherwise(error))
 }
 
 /// Returns the bytes needed to replay the stream for splicing or termination.
@@ -957,10 +959,10 @@ mod end_to_end {
         );
     }
 
-    /// Origin handshake runs first; a leaf rejection demotes the next
-    /// connection to a byte-exact splice.
+    /// Origin handshake runs first. One leaf rejection is a lost connection;
+    /// the third demotes the next connection to a byte-exact splice.
     #[tokio::test]
-    async fn a_client_that_refuses_the_forged_leaf_demotes_the_host() {
+    async fn a_client_that_refuses_the_forged_leaf_three_times_demotes_the_host() {
         let (origin, origin_ca) = start_tls_origin(ALLOWED).await;
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
         let sessions = sessions_for(authority, &[ALLOWED], origin, &[origin_ca]);
@@ -981,27 +983,41 @@ mod end_to_end {
             .with_no_client_auth(),
         );
 
-        let (client_side, terminated) = bridge::duplex();
-        let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
-        let refused = tokio_rustls::TlsConnector::from(Arc::clone(&config))
-            .connect(
-                rustls::pki_types::ServerName::try_from(ALLOWED).unwrap(),
-                client_side,
-            )
-            .await;
-        assert!(refused.is_err(), "the client must reject an unknown root");
+        let mut handling = None;
+        for attempt in 1..=3 {
+            let (client_side, terminated) = bridge::duplex();
+            let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));
+            let refused = tokio_rustls::TlsConnector::from(Arc::clone(&config))
+                .connect(
+                    rustls::pki_types::ServerName::try_from(ALLOWED).unwrap(),
+                    client_side,
+                )
+                .await;
+            assert!(refused.is_err(), "the client must reject an unknown root");
 
-        let handling = tokio::time::timeout(Duration::from_secs(5), served)
-            .await
-            .expect("the session finishes")
-            .unwrap()
-            .expect("a refusal is a handling, not a failure of the session");
+            let outcome = tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .expect("the session finishes")
+                .unwrap();
+            if attempt < 3 {
+                assert!(
+                    matches!(outcome, Err(SessionError::ClientHandshake(_))),
+                    "attempt {attempt}: one refusal is a lost connection, not a verdict"
+                );
+                assert_eq!(
+                    sessions.demotions.standing(ALLOWED, Instant::now()),
+                    Standing::Unrestricted
+                );
+            } else {
+                handling = Some(outcome.expect("the third refusal is a handling"));
+            }
+        }
         assert_eq!(
             handling,
-            Handling::Demoted {
+            Some(Handling::Demoted {
                 host: DomainName::new(ALLOWED).unwrap(),
                 cause: Demotion::LeafRejected,
-            }
+            })
         );
         assert_eq!(
             sessions
@@ -1020,9 +1036,11 @@ mod end_to_end {
         let (origin, seen) = start_recording_origin().await;
         let authority = Arc::new(CertificateAuthority::generate().unwrap());
         let sessions = sessions_for(authority, &[ALLOWED], origin, &[]);
-        sessions
-            .demotions
-            .record(ALLOWED, Demotion::LeafRejected, Instant::now());
+        for _ in 0..3 {
+            sessions
+                .demotions
+                .record(ALLOWED, Demotion::LeafRejected, Instant::now());
+        }
 
         let (mut client_side, terminated) = bridge::duplex();
         let served = tokio::spawn(serve_session(terminated, origin, Arc::clone(&sessions)));

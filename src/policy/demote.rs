@@ -252,7 +252,19 @@ fn conclusive_alert(alert: u8) -> bool {
     !matches!(alert, ALERT_CLOSE_NOTIFY | ALERT_USER_CANCELED)
 }
 
-type Expiries = [Option<Instant>; Demotion::COUNT];
+/// Conclusive failures of one cause, within one TTL of each other, before
+/// the cause counts. One is what any app on the device can stage by sending
+/// an alert; three from separate connections is a host that really refuses.
+const STRIKES: u8 = 3;
+
+/// One cause's evidence for a host: how many times, and until when.
+#[derive(Clone, Copy, Default)]
+struct Strike {
+    count: u8,
+    expiry: Option<Instant>,
+}
+
+type Expiries = [Strike; Demotion::COUNT];
 
 const PRUNE_AT: usize = 1024;
 
@@ -321,11 +333,17 @@ impl Demotions {
         if table.hosts.len() >= table.prune_at && !table.hosts.contains_key(host) {
             table
                 .hosts
-                .retain(|_, expiries| expiries.iter().any(|slot| live(*slot, now)));
+                .retain(|_, expiries| expiries.iter().any(|strike| unlapsed(*strike, now)));
             table.prune_at = PRUNE_AT.max(table.hosts.len().saturating_mul(2));
         }
         let expiries = table.hosts.entry(host.to_owned()).or_default();
-        expiries[cause.slot()] = expiry;
+        let strike = &mut expiries[cause.slot()];
+        // Strikes older than one TTL are forgotten; a fresh one starts over.
+        if !unlapsed(*strike, now) {
+            strike.count = 0;
+        }
+        strike.count = strike.count.saturating_add(1);
+        strike.expiry = expiry;
 
         Demotion::ALL
             .into_iter()
@@ -349,11 +367,16 @@ impl Demotions {
     }
 }
 
-/// A recorded expiry that has not passed. An absent expiry is a cause never
-/// observed; a saturated one is an interval past the end of the clock, which
-/// cannot arrive and so is treated as expired.
-fn live(expiry: Option<Instant>, now: Instant) -> bool {
-    expiry.is_some_and(|expiry| expiry > now)
+/// A strike within its TTL, however few there are: evidence worth keeping.
+fn unlapsed(strike: Strike, now: Instant) -> bool {
+    strike.expiry.is_some_and(|expiry| expiry > now)
+}
+
+/// Enough strikes, the latest not yet lapsed. An absent expiry is a cause
+/// never observed; a saturated one is an interval past the end of the clock,
+/// which cannot arrive and so is treated as expired.
+fn live(strike: Strike, now: Instant) -> bool {
+    strike.count >= STRIKES && unlapsed(strike, now)
 }
 
 #[cfg(test)]
@@ -401,12 +424,29 @@ mod tests {
         assert!(demotions.is_empty());
     }
 
-    /// The observable P15 behaviour: one conclusive failure is enough, and the
-    /// host stops being intercepted from the next connection onward.
+    /// Records `cause` enough times to count.
+    fn demote(demotions: &Demotions, host: &str, cause: Demotion, now: Instant) -> Standing {
+        (1..STRIKES).for_each(|_| {
+            demotions.record(host, cause, now);
+        });
+        demotions.record(host, cause, now)
+    }
+
+    /// One conclusive failure is what any app can stage; three within a TTL
+    /// demote the host from the next connection onward, and strikes older
+    /// than a TTL do not add up.
     #[test]
-    fn one_conclusive_failure_demotes_the_host_to_splice() {
+    fn three_conclusive_failures_demote_the_host_and_one_does_not() {
         let now = epoch();
         let demotions = Demotions::new();
+        assert_eq!(
+            demotions.record(HOST, Demotion::LeafRejected, now),
+            Standing::Unrestricted
+        );
+        assert_eq!(
+            demotions.record(HOST, Demotion::LeafRejected, now),
+            Standing::Unrestricted
+        );
         let standing = demotions.record(HOST, Demotion::LeafRejected, now);
         assert_eq!(standing, Standing::Limited(Demotion::LeafRejected));
         assert_eq!(standing.tier(), Tier::Splice);
@@ -416,6 +456,16 @@ mod tests {
             demotions.standing("other.example", now),
             Standing::Unrestricted
         );
+
+        let stale = Demotions::new();
+        let gap = Demotion::LeafRejected.ttl() + Duration::from_secs(1);
+        stale.record(HOST, Demotion::LeafRejected, now);
+        stale.record(HOST, Demotion::LeafRejected, now + gap);
+        assert_eq!(
+            stale.record(HOST, Demotion::LeafRejected, now + gap + gap),
+            Standing::Unrestricted,
+            "a strike per TTL never adds up"
+        );
     }
 
     /// Rewrite exhaustion removes rewriting but preserves URL filtering.
@@ -424,9 +474,7 @@ mod tests {
         let now = epoch();
         let demotions = Demotions::new();
         assert_eq!(
-            demotions
-                .record(HOST, Demotion::RewriteExhausted, now)
-                .tier(),
+            demote(&demotions, HOST, Demotion::RewriteExhausted, now).tier(),
             Tier::Inspect
         );
     }
@@ -436,13 +484,13 @@ mod tests {
     fn recording_is_idempotent_and_order_independent() {
         let now = epoch();
         let ordered = Demotions::new();
-        ordered.record(HOST, Demotion::RewriteExhausted, now);
-        ordered.record(HOST, Demotion::LeafRejected, now);
+        demote(&ordered, HOST, Demotion::RewriteExhausted, now);
+        demote(&ordered, HOST, Demotion::LeafRejected, now);
 
         let reversed = Demotions::new();
-        reversed.record(HOST, Demotion::LeafRejected, now);
-        reversed.record(HOST, Demotion::RewriteExhausted, now);
-        reversed.record(HOST, Demotion::LeafRejected, now);
+        demote(&reversed, HOST, Demotion::LeafRejected, now);
+        demote(&reversed, HOST, Demotion::RewriteExhausted, now);
+        demote(&reversed, HOST, Demotion::LeafRejected, now);
 
         assert_eq!(ordered.standing(HOST, now), reversed.standing(HOST, now));
         assert_eq!(ordered.standing(HOST, now).tier(), Tier::Splice);
@@ -459,8 +507,8 @@ mod tests {
     fn a_lapsed_cause_stops_applying_without_hiding_a_live_one() {
         let now = epoch();
         let demotions = Demotions::new();
-        demotions.record(HOST, Demotion::UpstreamUntrusted, now);
-        demotions.record(HOST, Demotion::RewriteExhausted, now);
+        demote(&demotions, HOST, Demotion::UpstreamUntrusted, now);
+        demote(&demotions, HOST, Demotion::RewriteExhausted, now);
         assert_eq!(demotions.standing(HOST, now).tier(), Tier::Splice);
 
         // Only the longer-lived rewrite demotion remains.
@@ -490,7 +538,7 @@ mod tests {
 
         // A fresh record triggers pruning after the entries expire.
         let later = now + Demotion::LeafRejected.ttl() + Duration::from_secs(1);
-        demotions.record(HOST, Demotion::LeafRejected, later);
+        demote(&demotions, HOST, Demotion::LeafRejected, later);
         assert_eq!(demotions.len(), 1, "the sweep reclaimed the lapsed hosts");
         assert_eq!(demotions.standing(HOST, later).tier(), Tier::Splice);
     }

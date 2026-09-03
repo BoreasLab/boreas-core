@@ -921,11 +921,11 @@ impl Rewriting {
 
         let inject = relax_policy(&mut parts.headers, &rules.source);
         let decoder = Decoder::new(rewritable.coding);
+        // The rewrite changes the length; hyper frames the result itself.
+        parts.headers.remove(http::header::CONTENT_LENGTH);
         if !decoder.is_identity() {
-            // Decoding invalidates coding and length headers; recompression is
-            // unnecessary on the terminated leg.
+            // Decoded once; recompression is unnecessary on the terminated leg.
             parts.headers.remove(CONTENT_ENCODING);
-            parts.headers.remove(http::header::CONTENT_LENGTH);
         }
         let sink = Arc::new(Mutex::new(Vec::new()));
         let rewriter = build(&rules, rewritable, budget, inject, Sink(Arc::clone(&sink)));
