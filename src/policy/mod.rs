@@ -6,6 +6,7 @@
 
 pub(crate) mod cache;
 pub(crate) mod demote;
+pub(crate) mod demux;
 pub(crate) mod dns;
 pub(crate) mod filter;
 pub(crate) mod rules;

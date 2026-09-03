@@ -14,7 +14,10 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{ClientProfile, Originator, Upstream};
+use crate::{
+    ClientProfile, Originator, Upstream,
+    policy::demux::{Demux, Transport, bounded},
+};
 
 /// Maximum DNS message accepted from an upstream.
 pub(crate) const MAX_DNS_MESSAGE: usize = 4096;
@@ -82,15 +85,20 @@ impl TunnelBypass for DirectSockets {
     }
 }
 
-/// Plain DNS over UDP to one resolver.
+/// Plain DNS over UDP to one resolver, on one socket for as long as it answers.
 pub struct Do53Upstream<B> {
     resolver: SocketAddr,
     bypass: B,
     timeout: Duration,
+    live: tokio::sync::Mutex<Option<Demux>>,
 }
 
 /// Default query timeout.
 pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A connection with nothing in flight is closed after this. Resolvers close
+/// idle DoT sessions themselves at about this age.
+const UPSTREAM_IDLE: Duration = Duration::from_secs(30);
 
 impl<B: TunnelBypass> Do53Upstream<B> {
     pub fn new(resolver: SocketAddr, bypass: B) -> Self {
@@ -98,6 +106,7 @@ impl<B: TunnelBypass> Do53Upstream<B> {
             resolver,
             bypass,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
+            live: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -115,14 +124,109 @@ impl<B: TunnelBypass> DnsUpstream for Do53Upstream<B> {
     #[allow(clippy::manual_async_fn)]
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         async move {
-            let socket = self.bypass.udp(self.resolver).await?;
-            socket.send(message).await?;
-            let mut reply = vec![0u8; MAX_DNS_MESSAGE];
-            let len = tokio::time::timeout(self.timeout, socket.recv(&mut reply))
-                .await
-                .map_err(timed_out)??;
-            reply.truncate(len);
-            Ok(reply)
+            tokio::time::timeout(
+                self.timeout,
+                on_connection(
+                    &self.live,
+                    || async { self.bypass.udp(self.resolver).await.map(Datagrams) },
+                    message,
+                ),
+            )
+            .await
+            .map_err(timed_out)?
+        }
+    }
+}
+
+/// Queries over the live connection, opening one when there is none. A
+/// connection that ends under a query is replaced and the query sent once
+/// more; a second failure is the caller's.
+///
+/// The lock is held while connecting, so concurrent queries share one
+/// handshake, and released before the query so they share the connection.
+async fn on_connection<T, F>(
+    live: &tokio::sync::Mutex<Option<Demux>>,
+    connect: impl Fn() -> F,
+    message: &[u8],
+) -> io::Result<Vec<u8>>
+where
+    T: Transport,
+    F: Future<Output = io::Result<T>>,
+{
+    let mut retried = false;
+    loop {
+        let demux = {
+            let mut held = live.lock().await;
+            match held.as_ref().filter(|demux| demux.is_alive()) {
+                Some(demux) => demux.clone(),
+                None => {
+                    let demux = Demux::spawn(connect().await?, UPSTREAM_IDLE);
+                    *held = Some(demux.clone());
+                    demux
+                }
+            }
+        };
+        match demux.query(message).await {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionAborted && !retried => {
+                retried = true;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// One connected UDP socket: a datagram each way.
+struct Datagrams(tokio::net::UdpSocket);
+
+impl Transport for Datagrams {
+    async fn send(&mut self, message: &[u8]) -> io::Result<()> {
+        self.0.send(message).await.map(drop)
+    }
+
+    async fn recv(&mut self) -> io::Result<Vec<u8>> {
+        let mut reply = vec![0u8; MAX_DNS_MESSAGE];
+        let len = self.0.recv(&mut reply).await?;
+        reply.truncate(len);
+        Ok(reply)
+    }
+}
+
+/// Length-prefixed messages on a byte stream, RFC 7766 framing.
+///
+/// `recv` is cancel-safe: bytes land in `buffer` in the poll that read them,
+/// so a dropped call loses nothing. The drain moves at most a reply or two.
+struct Frames<S> {
+    io: S,
+    buffer: Vec<u8>,
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> Transport
+    for Frames<S>
+{
+    async fn send(&mut self, message: &[u8]) -> io::Result<()> {
+        let length = u16::try_from(message.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "query exceeds 65535"))?;
+        self.io.write_all(&length.to_be_bytes()).await?;
+        self.io.write_all(message).await?;
+        self.io.flush().await
+    }
+
+    async fn recv(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            if let Some(&[high, low]) = self.buffer.first_chunk::<2>() {
+                let length = bounded(usize::from(u16::from_be_bytes([high, low])))?;
+                if self.buffer.len() >= 2 + length {
+                    let message = self.buffer[2..2 + length].to_vec();
+                    self.buffer.drain(..2 + length);
+                    return Ok(message);
+                }
+            }
+            let mut chunk = [0u8; 2048];
+            let read = self.io.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
         }
     }
 }
@@ -201,9 +305,10 @@ impl<B: TunnelBypass> TlsDialer<B> {
     }
 }
 
-/// DNS over TLS, RFC 7858, using DNS-over-TCP framing.
+/// DNS over TLS, RFC 7858: one session, queries pipelined on it by id.
 pub struct DotUpstream<B> {
     dialer: TlsDialer<B>,
+    live: tokio::sync::Mutex<Option<Demux>>,
 }
 
 /// The IANA-assigned port for DNS over TLS.
@@ -214,6 +319,7 @@ impl<B: TunnelBypass> DotUpstream<B> {
     pub fn new(resolver: SocketAddr, server_name: &str, bypass: B) -> Result<Self, UpstreamError> {
         Ok(Self {
             dialer: TlsDialer::new(resolver, server_name, &[b"dot"], bypass)?,
+            live: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -231,15 +337,19 @@ impl<B: TunnelBypass> DnsUpstream for DotUpstream<B> {
     #[allow(clippy::manual_async_fn)]
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         async move {
-            let length = u16::try_from(message.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "query exceeds 65535"))?;
-            tokio::time::timeout(self.dialer.timeout, async {
-                let mut stream = self.dialer.connect().await?;
-                stream.write_all(&length.to_be_bytes()).await?;
-                stream.write_all(message).await?;
-                stream.flush().await?;
-                read_length_prefixed(&mut stream).await
-            })
+            tokio::time::timeout(
+                self.dialer.timeout,
+                on_connection(
+                    &self.live,
+                    || async {
+                        self.dialer.connect().await.map(|io| Frames {
+                            io,
+                            buffer: Vec::new(),
+                        })
+                    },
+                    message,
+                ),
+            )
             .await
             .map_err(timed_out)?
         }
@@ -670,6 +780,34 @@ mod tests {
         assert_eq!(
             read_length_prefixed(&mut cursor).await.unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    /// Two replies in one read and one reply over several reads both come out
+    /// whole, and a length past the bound is refused before it is read.
+    #[tokio::test]
+    async fn frames_come_out_whole_however_the_bytes_arrive() {
+        let (mut peer, ours) = tokio::io::duplex(4096);
+        let mut frames = Frames {
+            io: ours,
+            buffer: Vec::new(),
+        };
+        peer.write_all(&[0, 2, 1, 1, 0, 3, 2, 2, 2]).await.unwrap();
+        assert_eq!(frames.recv().await.unwrap(), [1, 1]);
+        assert_eq!(frames.recv().await.unwrap(), [2, 2, 2]);
+
+        tokio::spawn(async move {
+            for byte in [0u8, 4, 9, 9, 9, 9] {
+                peer.write_all(&[byte]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            peer.write_all(&0xFFFFu16.to_be_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        assert_eq!(frames.recv().await.unwrap(), [9, 9, 9, 9]);
+        assert_eq!(
+            frames.recv().await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 
