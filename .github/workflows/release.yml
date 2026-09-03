@@ -156,7 +156,11 @@ jobs:
           set -o pipefail
           cargo build --release --target "$RUST" -p boreas-ffi 2>&1 | tee build.log || {
             df -h . | tail -1
-            grep -E '^error|LLVM ERROR|error:|No space' build.log | head -20 | sed 's/^/::error::/'
+            # Colour codes off, then whatever explains it: rustc and cargo
+            # errors, the linker, a full disk, or just the last lines.
+            sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' build.log > plain.log
+            { grep -E 'error|LLVM|space|panick|failed' plain.log | tail -25; tail -15 plain.log; } \
+              | sed 's/^/::error::/'
             exit 1
           }
 
