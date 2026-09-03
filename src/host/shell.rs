@@ -29,7 +29,7 @@ use crate::{
     QueryPlan, Rcode, Relay, Resolution, RuleCounts, SendOutcome, Side, Transmit, answer_addresses,
     plan_query,
     policy::{cache::DnsCache, upstream::DnsUpstream},
-    write_failure, write_refusal, write_response,
+    write_failure, write_format_error, write_refusal, write_response,
 };
 
 /// Capacity of reactor channels.
@@ -294,7 +294,8 @@ struct Answer {
     resolver: InternalEndpoint,
     /// Response bytes charged to the shared pool.
     message: Pooled,
-    resolution: Resolution,
+    /// `None` for a FORMERR: nothing was resolved.
+    resolution: Option<Resolution>,
     /// Resolved addresses used by inspection steering.
     steered: Vec<std::net::IpAddr>,
 }
@@ -369,9 +370,24 @@ async fn resolve<U: DnsUpstream>(
         resolver,
         payload,
     } = query;
-    let request = Message::parse(&payload).ok()?;
-    let question = *request.question();
     let mut message = pool.take_zeroed(MAX_DNS_RESPONSE)?;
+    let request = match Message::parse(&payload) {
+        Ok(request) if !request.is_response() => request,
+        // A header we can read and a body we cannot is answered, not
+        // dropped, so the client learns at once (RFC 1035 section 4.1.1).
+        _ => {
+            let len = write_format_error(&mut message, &payload).ok()?;
+            let _ = message.resize(len);
+            return Some(Answer {
+                client,
+                resolver,
+                message,
+                resolution: None,
+                steered: Vec::new(),
+            });
+        }
+    };
+    let question = *request.question();
     let mut steered = Vec::new();
 
     let (len, resolution) = match plan_query(&question, policy) {
@@ -456,7 +472,7 @@ async fn resolve<U: DnsUpstream>(
         client,
         resolver,
         message,
-        resolution,
+        resolution: Some(resolution),
         steered,
     })
 }
@@ -750,7 +766,9 @@ async fn reactor_loop<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
                 if datapath.answer_dns(client, resolver, &message).is_err() {
                     counters.packets_rejected += 1;
                 }
-                telemetry.emit(Telemetry::Resolved(Box::new(resolution)));
+                if let Some(resolution) = resolution {
+                    telemetry.emit(Telemetry::Resolved(Box::new(resolution)));
+                }
             }
 
             result = network.recv(&mut net_buf) => match result {

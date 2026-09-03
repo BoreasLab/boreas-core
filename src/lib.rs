@@ -118,7 +118,7 @@ pub use policy::dns::{
     Rdata, RecordType, Resolution, ResourceRecord, Rewritten, RuleCounts, SVCPARAM_ALPN,
     SVCPARAM_ECH, SVCPARAM_NO_DEFAULT_ALPN, SvcParam, SvcParams, Upstream, alpn_policy,
     answer_addresses, answer_policy, ech_param, ech_policy, h3_alpn_param, plan_query, svc_params,
-    write_failure, write_refusal, write_response,
+    write_failure, write_format_error, write_refusal, write_response,
 };
 pub use policy::filter::{Deferrals, Deferred, ListReport, Rule, RuleError, parse_rule};
 pub use policy::rules::RuleEngine;

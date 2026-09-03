@@ -151,6 +151,9 @@ impl Pending {
     /// is late, forged, or malformed, and stays unclaimed.
     fn claim(&mut self, reply: &[u8]) -> Option<Waiter> {
         let parsed = Message::parse(reply).ok()?;
+        if !parsed.is_response() {
+            return None;
+        }
         let id = parsed.id();
         if self.by_id.get(&id)?.question != *parsed.question() {
             return None;
@@ -328,6 +331,8 @@ mod tests {
         forged[2] |= 0x80;
         replies.send(Ok(forged)).unwrap();
         replies.send(Ok(b"junk".to_vec())).unwrap();
+        // The query itself echoed back: not a response.
+        replies.send(Ok(on_wire.clone())).unwrap();
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished(), "the forged reply was not accepted");
 

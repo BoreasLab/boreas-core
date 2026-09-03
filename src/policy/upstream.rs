@@ -10,13 +10,21 @@
 //! each query its own stream over one connection, with a zero message id as
 //! RFC 9250 requires. [`TunnelBypass`] keeps resolver sockets outside the tunnel.
 
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
-    ClientProfile, Originator, Upstream,
+    ClientProfile, Message, Originator, Upstream,
     live::Live,
     policy::demux::{Demux, Transport, bounded},
 };
@@ -87,16 +95,28 @@ impl TunnelBypass for DirectSockets {
     }
 }
 
-/// Plain DNS over UDP to one resolver, on one socket for as long as it answers.
+/// Plain DNS to one resolver: UDP (RFC 1035 section 4.2.1), and TCP for a
+/// reply UDP truncated (RFC 7766 section 5).
 pub struct Do53Upstream<B> {
     resolver: SocketAddr,
     bypass: Arc<B>,
     timeout: Duration,
-    live: Live<Demux>,
+    /// Sockets on distinct source ports, taken in turn, so a forger must
+    /// guess the port as well as the id (RFC 5452 section 9.2).
+    sockets: [Live<Demux>; SOURCE_PORTS],
+    next: AtomicUsize,
+    stream: Live<Demux>,
 }
 
-/// Default query timeout.
-pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default query timeout: two UDP attempts and a TCP retry fit inside it.
+pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// UDP sockets a Do53 upstream rotates through. Each costs a descriptor, and
+/// on Android one `protect` call, once.
+const SOURCE_PORTS: usize = 8;
+
+/// A datagram unanswered for this long is sent again, from the next port.
+const UDP_RETRANSMIT: Duration = Duration::from_secs(1);
 
 /// A connection with nothing in flight is closed after this. Resolvers close
 /// idle DoT sessions themselves at about this age.
@@ -108,13 +128,49 @@ impl<B: TunnelBypass + 'static> Do53Upstream<B> {
             resolver,
             bypass: Arc::new(bypass),
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
-            live: Live::new(),
+            sockets: std::array::from_fn(|_| Live::new()),
+            next: AtomicUsize::new(0),
+            stream: Live::new(),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Over the next socket in turn; unanswered, once more from the one after.
+    async fn over_udp(&self, message: &[u8]) -> io::Result<Vec<u8>> {
+        match tokio::time::timeout(UDP_RETRANSMIT, self.over_socket(message)).await {
+            Ok(outcome) => outcome,
+            Err(_) => self.over_socket(message).await,
+        }
+    }
+
+    async fn over_socket(&self, message: &[u8]) -> io::Result<Vec<u8>> {
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % SOURCE_PORTS;
+        let resolver = self.resolver;
+        let connect = || {
+            let bypass = Arc::clone(&self.bypass);
+            async move { bypass.udp(resolver).await.map(Datagrams) }
+        };
+        on_connection(&self.sockets[slot], connect, message).await
+    }
+
+    async fn over_tcp(&self, message: &[u8]) -> io::Result<Vec<u8>> {
+        let resolver = self.resolver;
+        let connect = || {
+            let bypass = Arc::clone(&self.bypass);
+            async move {
+                let io = bypass.tcp(resolver).await?;
+                io.set_nodelay(true)?;
+                Ok(Frames {
+                    io,
+                    buffer: Vec::new(),
+                })
+            }
+        };
+        on_connection(&self.stream, connect, message).await
     }
 }
 
@@ -126,14 +182,18 @@ impl<B: TunnelBypass + 'static> DnsUpstream for Do53Upstream<B> {
     #[allow(clippy::manual_async_fn)]
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         async move {
-            let resolver = self.resolver;
-            let connect = || {
-                let bypass = Arc::clone(&self.bypass);
-                async move { bypass.udp(resolver).await.map(Datagrams) }
-            };
-            tokio::time::timeout(self.timeout, on_connection(&self.live, connect, message))
-                .await
-                .map_err(timed_out)?
+            tokio::time::timeout(self.timeout, async {
+                let reply = self.over_udp(message).await?;
+                if Message::parse(&reply).is_ok_and(|parsed| parsed.is_truncated())
+                    && let Ok(whole) = self.over_tcp(message).await
+                {
+                    return Ok(whole);
+                }
+                // Truncated and TCP failed: the client sees TC and decides.
+                Ok(reply)
+            })
+            .await
+            .map_err(timed_out)?
         }
     }
 }
@@ -845,6 +905,97 @@ mod tests {
             assert_eq!(upstream.authority, authority, "{url}");
             assert_eq!(upstream.path, "/dns-query", "{url}");
         }
+    }
+
+    /// A resolver on loopback: UDP answers as told, TCP answers whole.
+    struct FakeResolver {
+        address: SocketAddr,
+        /// Source ports the UDP queries came from, in order.
+        sources: Arc<std::sync::Mutex<Vec<u16>>>,
+    }
+
+    impl FakeResolver {
+        /// `udp` maps a query to its datagram reply, or `None` to drop it.
+        async fn start(udp: impl Fn(&[u8], usize) -> Option<Vec<u8>> + Send + 'static) -> Self {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let sources = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&sources);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let mut count = 0;
+                loop {
+                    let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    seen.lock().unwrap().push(from.port());
+                    if let Some(reply) = udp(&buf[..len], count) {
+                        socket.send_to(&reply, from).await.unwrap();
+                    }
+                    count += 1;
+                }
+            });
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut head = [0u8; 2];
+                    stream.read_exact(&mut head).await.unwrap();
+                    let mut query = vec![0u8; usize::from(u16::from_be_bytes(head))];
+                    stream.read_exact(&mut query).await.unwrap();
+                    let mut reply = query;
+                    reply[2] |= 0x80;
+                    reply.push(b'W');
+                    let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
+                    framed.extend_from_slice(&reply);
+                    stream.write_all(&framed).await.unwrap();
+                }
+            });
+            Self { address, sources }
+        }
+    }
+
+    /// RFC 7766 section 5: a truncated UDP reply is asked again over TCP,
+    /// and the client gets the whole answer.
+    #[tokio::test]
+    async fn a_truncated_udp_reply_is_asked_again_over_tcp() {
+        let resolver = FakeResolver::start(|query, _| {
+            let mut reply = query.to_vec();
+            reply[2] |= 0x82; // response, truncated
+            Some(reply)
+        })
+        .await;
+        let upstream = Do53Upstream::new(resolver.address, DirectSockets);
+        let reply = upstream
+            .query(&crate::testing::dns::query("big.example", 5))
+            .await
+            .unwrap();
+        assert_eq!(*reply.last().unwrap(), b'W', "the TCP answer");
+        assert!(!Message::parse(&reply).unwrap().is_truncated());
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), 5);
+    }
+
+    /// RFC 1035 section 4.2.1: a lost datagram is sent again; RFC 5452
+    /// section 9.2: from a different source port.
+    #[tokio::test]
+    async fn a_lost_datagram_is_sent_again_from_another_port() {
+        let resolver = FakeResolver::start(|query, count| {
+            (count > 0).then(|| {
+                let mut reply = query.to_vec();
+                reply[2] |= 0x80;
+                reply
+            })
+        })
+        .await;
+        let upstream = Do53Upstream::new(resolver.address, DirectSockets);
+        let started = std::time::Instant::now();
+        upstream
+            .query(&crate::testing::dns::query("slow.example", 6))
+            .await
+            .expect("the second attempt was answered");
+        assert!(started.elapsed() >= UDP_RETRANSMIT);
+        let sources = resolver.sources.lock().unwrap().clone();
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0], sources[1], "another port for the retry");
     }
 
     #[tokio::test]

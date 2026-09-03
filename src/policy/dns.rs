@@ -39,6 +39,8 @@ pub enum DnsError {
     NameTooLong,
     /// A label contains `.`, making normalized suffix matching ambiguous.
     SeparatorInLabel,
+    /// OPCODE is not QUERY; an UPDATE or NOTIFY is not a question to plan.
+    NotAQuery,
     /// The message carries no question.
     NoQuestion,
     /// More than one question; RFC 9619 section 4 forbids this for `OPCODE=0`.
@@ -58,6 +60,7 @@ impl fmt::Display for DnsError {
         f.write_str(match self {
             Self::Truncated => "message ended inside a field",
             Self::ReservedLabel => "reserved label length prefix",
+            Self::NotAQuery => "opcode is not a standard query",
             Self::ForwardPointer => "compression pointer does not point backwards",
             Self::NameTooLong => "name exceeds 253 characters",
             Self::SeparatorInLabel => "label contains the presentation separator",
@@ -299,11 +302,13 @@ const FLAG_RESPONSE: u16 = 0x8000;
 const FLAG_RECURSION_DESIRED: u16 = 0x0100;
 const FLAG_RECURSION_AVAILABLE: u16 = 0x0080;
 const FLAG_TRUNCATED: u16 = 0x0200;
+const OPCODE_MASK: u16 = 0x7800;
 const RCODE_MASK: u16 = 0x000f;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rcode {
     NoError,
+    FormatError,
     ServerFailure,
     NameError,
     Other(u16),
@@ -313,6 +318,7 @@ impl Rcode {
     pub fn from_wire(value: u16) -> Self {
         match value & RCODE_MASK {
             0 => Self::NoError,
+            1 => Self::FormatError,
             2 => Self::ServerFailure,
             3 => Self::NameError,
             other => Self::Other(other),
@@ -322,6 +328,7 @@ impl Rcode {
     pub fn to_wire(self) -> u16 {
         match self {
             Self::NoError => 0,
+            Self::FormatError => 1,
             Self::ServerFailure => 2,
             Self::NameError => 3,
             Self::Other(other) => other & RCODE_MASK,
@@ -370,6 +377,9 @@ impl<'a> Message<'a> {
         reader
             .skip(HEADER_BYTES - reader.position())
             .ok_or(DnsError::Truncated)?;
+        if flags & OPCODE_MASK != 0 {
+            return Err(DnsError::NotAQuery);
+        }
         match question_count {
             0 => return Err(DnsError::NoQuestion),
             1 => {}
@@ -1039,6 +1049,20 @@ pub fn write_refusal(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsEr
     write_header_and_question(out, query, flags)
 }
 
+/// Writes a `FORMERR` for a query whose header could be read and whose rest
+/// could not (RFC 1035 section 4.1.1). No question is echoed: none parsed.
+pub fn write_format_error(out: &mut [u8], query: &[u8]) -> Result<usize, DnsError> {
+    let (Some(id), Some(flags)) = (query.first_chunk::<2>(), query.get(2..4)) else {
+        return Err(DnsError::Truncated);
+    };
+    let flags = (u16::from_be_bytes([flags[0], flags[1]]) & FLAG_RECURSION_DESIRED)
+        | FLAG_RESPONSE
+        | Rcode::FormatError.to_wire();
+    let mut writer = Bounded::at(out, 0).ok_or(DnsError::OutputTooSmall)?;
+    writer.bytes(id).u16(flags).zeros(8);
+    writer.finish().ok_or(DnsError::OutputTooSmall)
+}
+
 /// Writes a visible `SERVFAIL` response for an upstream failure.
 pub fn write_failure(out: &mut [u8], query: &Message<'_>) -> Result<usize, DnsError> {
     let mut flags = FLAG_RESPONSE | FLAG_RECURSION_AVAILABLE | Rcode::ServerFailure.to_wire();
@@ -1110,6 +1134,33 @@ mod tests {
         out.extend_from_slice(&qtype.to_wire().to_be_bytes());
         out.extend_from_slice(&1u16.to_be_bytes()); // IN
         out
+    }
+
+    /// RFC 2136 UPDATE and RFC 1996 NOTIFY share the header; neither is a
+    /// question to forward, and a header we can read still earns a FORMERR.
+    #[test]
+    fn an_update_is_not_a_query_and_a_broken_query_gets_a_format_error() {
+        let mut update = query("example.com", RecordType::A, 0x1234);
+        update[2] |= 5 << 3; // OPCODE UPDATE
+        assert_eq!(Message::parse(&update).err(), Some(DnsError::NotAQuery));
+
+        let mut out = [0u8; 64];
+        let len = write_format_error(&mut out, &update).unwrap();
+        assert_eq!(len, HEADER_BYTES);
+        assert_eq!(&out[..2], &[0x12, 0x34]);
+        let flags = u16::from_be_bytes([out[2], out[3]]);
+        assert_eq!(flags & FLAG_RESPONSE, FLAG_RESPONSE);
+        assert_eq!(
+            flags & FLAG_RECURSION_DESIRED,
+            FLAG_RECURSION_DESIRED,
+            "RD is echoed"
+        );
+        assert_eq!(Rcode::from_wire(flags), Rcode::FormatError);
+        assert_eq!(&out[4..12], &[0; 8], "no sections: nothing parsed");
+        assert_eq!(
+            write_format_error(&mut out, &[1, 2, 3]),
+            Err(DnsError::Truncated)
+        );
     }
 
     /// RFC 9619 section 4 requires at most one question for `OPCODE = 0`.
