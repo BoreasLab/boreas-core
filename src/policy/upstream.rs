@@ -428,24 +428,112 @@ where
     Ok(reply)
 }
 
-/// DNS over HTTPS, RFC 8484, over HTTP/1.1 with connections kept alive.
-///
-/// HTTP/1.1 answers in order, so one connection serves one query at a time;
-/// a burst uses several, and up to [`DOH_IDLE_CONNECTIONS`] wait for the next.
+/// DNS over HTTPS, RFC 8484: one HTTP/2 connection, a stream per query
+/// (section 5.2). A resolver that only speaks HTTP/1.1 answers in order, so
+/// it gets one connection per query in flight, [`DOH_IDLE_CONNECTIONS`] kept.
 pub struct DohUpstream<B> {
-    dialer: TlsDialer<B>,
+    dialer: Arc<TlsDialer<B>>,
     timeout: Duration,
     /// Request authority and path.
-    authority: String,
-    path: String,
-    idle: std::sync::Mutex<Vec<UpstreamTls>>,
+    authority: Arc<str>,
+    path: Arc<str>,
+    live: Live<DohConnection>,
+    idle: Arc<std::sync::Mutex<Vec<UpstreamTls>>>,
+}
+
+/// What the resolver negotiated: HTTP/2, or HTTP/1.1 served from the pool.
+#[derive(Clone)]
+enum DohConnection {
+    H2(H2Sender),
+    H1,
+}
+
+/// An HTTP/2 request sender and whether its connection has ended.
+#[derive(Clone)]
+struct H2Sender {
+    sender: h2::client::SendRequest<bytes::Bytes>,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl H2Sender {
+    fn is_alive(&self) -> bool {
+        !self.ended.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Opens HTTP/2 on `io` and drives the connection on its own task.
+async fn h2_over<S>(io: S) -> io::Result<H2Sender>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, connection) = h2::client::handshake(io).await.map_err(h2_failed)?;
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn({
+        let ended = Arc::clone(&ended);
+        async move {
+            let _ = connection.await;
+            ended.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    Ok(H2Sender { sender, ended })
+}
+
+/// One query as one HTTP/2 stream: a POST of the message, its reply the body.
+async fn exchange_h2(
+    sender: H2Sender,
+    authority: &str,
+    path: &str,
+    message: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut sender = sender.sender.ready().await.map_err(h2_failed)?;
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("https://{authority}{path}"))
+        .header("accept", "application/dns-message")
+        .header("content-type", "application/dns-message")
+        .header("content-length", message.len())
+        .body(())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a request"))?;
+    let (response, mut body) = sender.send_request(request, false).map_err(h2_failed)?;
+    body.send_data(bytes::Bytes::copy_from_slice(message), true)
+        .map_err(h2_failed)?;
+    let response = response.await.map_err(h2_failed)?;
+    if response.status() != http::StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resolver did not answer with 200",
+        ));
+    }
+    let mut incoming = response.into_body();
+    let mut reply = Vec::new();
+    while let Some(chunk) = incoming.data().await {
+        let chunk = chunk.map_err(h2_failed)?;
+        bounded(reply.len() + chunk.len())?;
+        reply.extend_from_slice(&chunk);
+        incoming
+            .flow_control()
+            .release_capacity(chunk.len())
+            .map_err(h2_failed)?;
+    }
+    Ok(reply)
+}
+
+/// A stream or connection error: the one kind a caller may retry once.
+fn h2_failed(error: h2::Error) -> io::Error {
+    match error.into_io() {
+        Some(error) => error,
+        None => io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "the HTTP/2 connection failed",
+        ),
+    }
 }
 
 /// Connections kept after a reusable response. More than a burst of this size
 /// pays a handshake, which is what it paid on every query before.
 const DOH_IDLE_CONNECTIONS: usize = 4;
 
-impl<B: TunnelBypass> DohUpstream<B> {
+impl<B: TunnelBypass + 'static> DohUpstream<B> {
     /// Configures an absolute `https://` endpoint and its already-known address.
     pub fn new(url: &str, resolver: SocketAddr, bypass: B) -> Result<Self, UpstreamError> {
         // URI parsing preserves bracketed IPv6 authorities.
@@ -467,11 +555,17 @@ impl<B: TunnelBypass> DohUpstream<B> {
             .map_or("/", http::uri::PathAndQuery::as_str);
 
         Ok(Self {
-            dialer: TlsDialer::new(resolver, host, &[b"http/1.1"], bypass)?,
+            dialer: Arc::new(TlsDialer::new(
+                resolver,
+                host,
+                &[b"h2", b"http/1.1"],
+                bypass,
+            )?),
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
-            authority: authority.as_str().to_owned(),
-            path: path.to_owned(),
-            idle: std::sync::Mutex::new(Vec::new()),
+            authority: authority.as_str().into(),
+            path: path.into(),
+            live: Live::new(),
+            idle: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -480,12 +574,59 @@ impl<B: TunnelBypass> DohUpstream<B> {
         self
     }
 
-    /// Keeps a connection for the next query, up to the idle ceiling.
-    fn park(&self, stream: UpstreamTls) {
-        let mut idle = crate::locked(&self.idle);
-        if idle.len() < DOH_IDLE_CONNECTIONS {
-            idle.push(stream);
+    /// The negotiated connection. An HTTP/1.1 resolver's first stream goes
+    /// to the pool, and the pool serves it from then on.
+    async fn connection(&self) -> io::Result<DohConnection> {
+        let (dialer, idle) = (Arc::clone(&self.dialer), Arc::clone(&self.idle));
+        self.live
+            .get(
+                |connection| match connection {
+                    DohConnection::H2(sender) => sender.is_alive(),
+                    DohConnection::H1 => true,
+                },
+                async move {
+                    let stream = dialer.connect().await?;
+                    if stream.ssl().selected_alpn_protocol() == Some(b"h2") {
+                        return h2_over(stream).await.map(DohConnection::H2);
+                    }
+                    park(&idle, stream);
+                    Ok(DohConnection::H1)
+                },
+            )
+            .await
+    }
+
+    async fn over_h1(&self, message: &[u8]) -> io::Result<Vec<u8>> {
+        let head = format!(
+            "POST {} HTTP/1.1\r\n\
+             host: {}\r\n\
+             accept: application/dns-message\r\n\
+             content-type: application/dns-message\r\n\
+             content-length: {}\r\n\r\n",
+            self.path,
+            self.authority,
+            message.len(),
+        );
+        let parked = crate::locked(&self.idle).pop();
+        let (mut stream, reused) = match parked {
+            Some(stream) => (stream, true),
+            None => (self.dialer.connect().await?, false),
+        };
+        let outcome = self.exchange(&mut stream, &head, message).await;
+        let (body, reusable) = match outcome {
+            Ok(answered) => answered,
+            // A kept connection the resolver closed meanwhile: once more on
+            // a fresh one.
+            Err(_) if reused => {
+                stream = self.dialer.connect().await?;
+                self.exchange(&mut stream, &head, message).await?
+            }
+            Err(error) => return Err(error),
+        };
+        if reusable {
+            park(&self.idle, stream);
         }
+        Ok(body)
     }
 
     /// One request on one connection. Reusable when the response framed its
@@ -503,7 +644,15 @@ impl<B: TunnelBypass> DohUpstream<B> {
     }
 }
 
-impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
+/// Keeps a connection for the next query, up to the idle ceiling.
+fn park(idle: &std::sync::Mutex<Vec<UpstreamTls>>, stream: UpstreamTls) {
+    let mut idle = crate::locked(idle);
+    if idle.len() < DOH_IDLE_CONNECTIONS {
+        idle.push(stream);
+    }
+}
+
+impl<B: TunnelBypass + 'static> DnsUpstream for DohUpstream<B> {
     fn kind(&self) -> Upstream {
         Upstream::DoH
     }
@@ -511,37 +660,24 @@ impl<B: TunnelBypass> DnsUpstream for DohUpstream<B> {
     #[allow(clippy::manual_async_fn)]
     fn query(&self, message: &[u8]) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
         async move {
-            let head = format!(
-                "POST {} HTTP/1.1\r\n\
-                 host: {}\r\n\
-                 accept: application/dns-message\r\n\
-                 content-type: application/dns-message\r\n\
-                 content-length: {}\r\n\r\n",
-                self.path,
-                self.authority,
-                message.len(),
-            );
             tokio::time::timeout(self.timeout, async {
-                let parked = crate::locked(&self.idle).pop();
-                let (mut stream, reused) = match parked {
-                    Some(stream) => (stream, true),
-                    None => (self.dialer.connect().await?, false),
-                };
-                let outcome = self.exchange(&mut stream, &head, message).await;
-                let (body, reusable) = match outcome {
-                    Ok(answered) => answered,
-                    // A kept connection the resolver closed meanwhile: once
-                    // more on a fresh one, which is what every query cost before.
-                    Err(_) if reused => {
-                        stream = self.dialer.connect().await?;
-                        self.exchange(&mut stream, &head, message).await?
+                let mut retried = false;
+                loop {
+                    let sender = match self.connection().await? {
+                        DohConnection::H2(sender) => sender,
+                        DohConnection::H1 => return self.over_h1(message).await,
+                    };
+                    match exchange_h2(sender, &self.authority, &self.path, message).await {
+                        // The connection ended under the query: once more on
+                        // the next one.
+                        Err(error)
+                            if error.kind() == io::ErrorKind::ConnectionAborted && !retried =>
+                        {
+                            retried = true;
+                        }
+                        outcome => return outcome,
                     }
-                    Err(error) => return Err(error),
-                };
-                if reusable {
-                    self.park(stream);
                 }
-                Ok(body)
             })
             .await
             .map_err(timed_out)?
@@ -877,12 +1013,12 @@ mod tests {
             DirectSockets,
         )
         .unwrap();
-        assert_eq!(upstream.authority, "dns.example:8443");
-        assert_eq!(upstream.path, "/resolve");
+        assert_eq!(&*upstream.authority, "dns.example:8443");
+        assert_eq!(&*upstream.path, "/resolve");
         assert_eq!(upstream.dialer.server_name, "dns.example");
 
         let bare = DohUpstream::new("https://dns.example", address(443), DirectSockets).unwrap();
-        assert_eq!(bare.path, "/");
+        assert_eq!(&*bare.path, "/");
     }
 
     /// URI parsing keeps an IPv6 host separate from its port.
@@ -902,8 +1038,8 @@ mod tests {
         ] {
             let upstream = DohUpstream::new(url, address(8443), DirectSockets).unwrap();
             assert_eq!(upstream.dialer.server_name, server_name, "{url}");
-            assert_eq!(upstream.authority, authority, "{url}");
-            assert_eq!(upstream.path, "/dns-query", "{url}");
+            assert_eq!(&*upstream.authority, authority, "{url}");
+            assert_eq!(&*upstream.path, "/dns-query", "{url}");
         }
     }
 
@@ -1047,6 +1183,47 @@ mod tests {
             frames.recv().await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    /// RFC 8484 section 4.1: a POST of the message, the reply as the body;
+    /// section 5.2: on HTTP/2, so queries share a connection.
+    #[tokio::test]
+    async fn a_query_crosses_http2_as_one_stream_and_a_dead_connection_is_noticed() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::POST);
+            assert_eq!(request.uri().path(), "/dns-query");
+            let mut body = request.into_body();
+            let mut asked = Vec::new();
+            while let Some(chunk) = body.data().await {
+                asked.extend_from_slice(&chunk.unwrap());
+            }
+            let response = http::Response::builder().status(200).body(()).unwrap();
+            let mut answer = respond.send_response(response, false).unwrap();
+            asked[2] |= 0x80;
+            asked.push(b'H');
+            answer.send_data(bytes::Bytes::from(asked), true).unwrap();
+            // Serve until the client hangs up.
+            while let Some(next) = connection.accept().await {
+                drop(next);
+            }
+        });
+
+        let sender = h2_over(client_io).await.unwrap();
+        let query = crate::testing::dns::query("h2.example", 9);
+        let reply = exchange_h2(sender.clone(), "dns.example", "/dns-query", &query)
+            .await
+            .unwrap();
+        assert_eq!(*reply.last().unwrap(), b'H');
+        assert_eq!(&reply[..2], &query[..2]);
+        assert!(sender.is_alive());
+
+        drop(sender);
+        server.abort();
+        let _ = server.await;
+        tokio::task::yield_now().await;
     }
 
     #[tokio::test]
