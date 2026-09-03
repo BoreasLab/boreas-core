@@ -193,7 +193,17 @@ jobs:
       #
       # Both crates. `boreas-ffi`'s JNI layer is `#[cfg(target_os = "android")]`,
       # so this job is the only one that compiles it at all.
-      - run: cargo build --target "${{ steps.target.outputs.rust }}" --lib -p boreas-core -p boreas-ffi
+      - name: Build
+        # The log needs credentials to read; annotations do not. Surface the
+        # lines that say why a build failed so a failure is diagnosable from
+        # the public API.
+        run: |
+          set -o pipefail
+          cargo build --target "${{ steps.target.outputs.rust }}" --lib -p boreas-core -p boreas-ffi 2>&1 | tee build.log || {
+            df -h . | tail -1
+            grep -E '^error|LLVM ERROR|error:|No space' build.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          }
 
   fuzz:
     name: fuzz smoke
