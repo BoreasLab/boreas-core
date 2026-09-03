@@ -207,8 +207,11 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> T
     async fn send(&mut self, message: &[u8]) -> io::Result<()> {
         let length = u16::try_from(message.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "query exceeds 65535"))?;
-        self.io.write_all(&length.to_be_bytes()).await?;
-        self.io.write_all(message).await?;
+        // One write: one TLS record and one segment per query, not two.
+        let mut framed = Vec::with_capacity(2 + message.len());
+        framed.extend_from_slice(&length.to_be_bytes());
+        framed.extend_from_slice(message);
+        self.io.write_all(&framed).await?;
         self.io.flush().await
     }
 

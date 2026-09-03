@@ -78,3 +78,22 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// DNS messages as a stub resolver would send them.
+pub mod dns {
+    /// A recursion-desired `A`/`IN` query for `name` under `id`.
+    pub fn query(name: &str, id: u16) -> Vec<u8> {
+        let mut out = id.to_be_bytes().to_vec();
+        out.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+        out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+        out.extend_from_slice(&[0; 6]); // an, ns, ar
+        for label in name.split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&1u16.to_be_bytes()); // A
+        out.extend_from_slice(&1u16.to_be_bytes()); // IN
+        out
+    }
+}
