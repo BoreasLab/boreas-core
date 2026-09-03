@@ -10,7 +10,13 @@
 //! proxy framing must never be parsed as HTTP/3, while leftover control and
 //! QPACK streams are drained by id to maintain flow control.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use quiche::h3::NameValue;
@@ -196,6 +202,9 @@ impl Handshake {
     pub fn drive(self, shutdown: CancellationToken) -> QuicConnection {
         let (commands, receiver) = mpsc::channel(COMMAND_DEPTH);
         let wake = Arc::new(Notify::new());
+        let datagram_budget = Arc::new(AtomicUsize::new(
+            self.conn.dgram_max_writable_len().unwrap_or(0),
+        ));
         let driver = Driver {
             conn: self.conn,
             socket: self.socket,
@@ -205,11 +214,15 @@ impl Handshake {
             streams: HashMap::new(),
             commands: receiver,
             datagrams: None,
+            datagram_budget: Arc::clone(&datagram_budget),
             wake: Arc::clone(&wake),
             shutdown,
         };
         tokio::spawn(driver.run());
-        QuicConnection { commands }
+        QuicConnection {
+            commands,
+            datagram_budget,
+        }
     }
 
     /// Drives pre-driver I/O until `ready`, connection close, or timeout.
@@ -296,6 +309,8 @@ async fn flush(
 #[derive(Clone)]
 pub struct QuicConnection {
     commands: mpsc::Sender<Command>,
+    /// The largest DATAGRAM frame the peer takes right now; zero without.
+    datagram_budget: Arc<AtomicUsize>,
 }
 
 enum Command {
@@ -346,6 +361,12 @@ impl QuicConnection {
     pub fn is_alive(&self) -> bool {
         !self.commands.is_closed()
     }
+
+    /// The largest DATAGRAM frame the peer takes right now, or `None` when
+    /// it takes none.
+    pub fn datagram_budget(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(self.datagram_budget.load(Ordering::Relaxed))
+    }
 }
 
 struct Driver {
@@ -358,6 +379,7 @@ struct Driver {
     commands: mpsc::Receiver<Command>,
     /// Inbound datagram sink after a receiver claims it.
     datagrams: Option<mpsc::Sender<Vec<u8>>>,
+    datagram_budget: Arc<AtomicUsize>,
     wake: Arc<Notify>,
     shutdown: CancellationToken,
 }
@@ -457,6 +479,10 @@ impl Driver {
     }
 
     fn service(&mut self, chunk: &mut [u8]) {
+        self.datagram_budget.store(
+            self.conn.dgram_max_writable_len().unwrap_or(0),
+            Ordering::Relaxed,
+        );
         // Drain the transport queue; a slow claimant loses packets rather than
         // blocking streams on the same connection.
         if let Some(sink) = &self.datagrams {

@@ -245,9 +245,16 @@ impl UdpMessage<'_> {
     }
 }
 
-/// Splits a datagram into bounded messages with the full header on each one.
-fn fragment(session: u32, packet: u16, address: &str, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let budget = MAX_DATAGRAM_FRAME.checked_sub(UdpMessage::header_len(address))?;
+/// Splits a datagram into messages of at most `frame` bytes, the full header
+/// on each one.
+fn fragment(
+    session: u32,
+    packet: u16,
+    address: &str,
+    payload: &[u8],
+    frame: usize,
+) -> Option<Vec<Vec<u8>>> {
+    let budget = frame.checked_sub(UdpMessage::header_len(address))?;
     if budget == 0 {
         return None;
     }
@@ -520,7 +527,14 @@ impl DatagramSink for UdpSession {
             let packet = self
                 .next_packet
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u16;
-            let Some(fragments) = fragment(self.id, packet, &address, payload) else {
+            // What the peer takes now, never above the reference size.
+            let frame = self
+                .connection
+                .datagram_budget()
+                .map_or(MAX_DATAGRAM_FRAME, |budget| {
+                    budget.get().min(MAX_DATAGRAM_FRAME)
+                });
+            let Some(fragments) = fragment(self.id, packet, &address, payload, frame) else {
                 return Err(EgressError::DatagramTooLarge {
                     required: payload.len(),
                 });
@@ -783,7 +797,8 @@ mod tests {
     fn every_fragment_fits_the_frame_and_carries_the_address_again() {
         let address = "a-rather-long-name.example.com:443";
         let payload = vec![0xabu8; 4000];
-        let fragments = fragment(7, 9, address, &payload).expect("4000 bytes fragments");
+        let fragments =
+            fragment(7, 9, address, &payload, MAX_DATAGRAM_FRAME).expect("4000 bytes fragments");
 
         assert!(fragments.len() > 1, "a 4000-byte payload does not fit one");
         assert!(
@@ -806,7 +821,8 @@ mod tests {
 
     #[test]
     fn a_datagram_that_fits_is_not_fragmented() {
-        let fragments = fragment(1, 0, "198.51.100.7:53", b"query").expect("it fits");
+        let fragments =
+            fragment(1, 0, "198.51.100.7:53", b"query", MAX_DATAGRAM_FRAME).expect("it fits");
         assert_eq!(fragments.len(), 1);
         assert_eq!(UdpMessage::read(&fragments[0]).unwrap().fragments, 1);
     }
@@ -815,7 +831,7 @@ mod tests {
     fn reassembly_needs_every_fragment_and_tolerates_their_order() {
         let address = "198.51.100.7:53";
         let payload: Vec<u8> = (0..3000).map(|byte| byte as u8).collect();
-        let fragments = fragment(1, 4, address, &payload).unwrap();
+        let fragments = fragment(1, 4, address, &payload, MAX_DATAGRAM_FRAME).unwrap();
         let read = |bytes: &Vec<u8>| -> Vec<u8> { bytes.clone() };
 
         let mut forward = Defragmenter::default();
@@ -844,8 +860,8 @@ mod tests {
     #[test]
     fn a_new_packet_discards_the_partial_one_before_it() {
         let address = "198.51.100.7:53";
-        let first = fragment(1, 10, address, &vec![1u8; 3000]).unwrap();
-        let second = fragment(1, 11, address, &vec![2u8; 3000]).unwrap();
+        let first = fragment(1, 10, address, &vec![1u8; 3000], MAX_DATAGRAM_FRAME).unwrap();
+        let second = fragment(1, 11, address, &vec![2u8; 3000], MAX_DATAGRAM_FRAME).unwrap();
 
         let mut defrag = Defragmenter::default();
         assert!(defrag.push(&UdpMessage::read(&first[0]).unwrap()).is_none());
