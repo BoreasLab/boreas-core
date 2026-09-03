@@ -166,6 +166,10 @@ pub enum NdkError {
     NoCompiler(PathBuf, ApiLevel),
     #[error("the NDK has no {0}")]
     NoRuntime(PathBuf),
+    #[error("NDK {NDK_VERSION} is not under {0}; install it: sdkmanager \"ndk;{NDK_VERSION}\"")]
+    NotInstalled(PathBuf),
+    #[error("no NDK: set ANDROID_HOME, or ANDROID_NDK_HOME to one you installed")]
+    Unset,
 }
 
 /// NDK installation with a present CMake toolchain file.
@@ -279,6 +283,83 @@ impl Ndk {
         } else {
             Err(NdkError::NoRuntime(path))
         }
+    }
+}
+
+/// The NDK this pipeline builds with. A version, not the runner's newest: one
+/// image update moved `ANDROID_NDK_LATEST_HOME` from r28 to r29 and every
+/// Android job went red with no change in this repository.
+pub const NDK_VERSION: &str = "28.2.13676358";
+
+/// The pinned NDK under `sdk` when an SDK is known, or the first present
+/// `named` NDK when none is. An SDK without the pin is an error rather than a
+/// fallback, so a build never drifts onto whatever else is installed.
+pub fn select_ndk(
+    sdk: Option<&Path>,
+    named: &[Option<PathBuf>],
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, NdkError> {
+    if let Some(sdk) = sdk {
+        let pinned = sdk.join("ndk").join(NDK_VERSION);
+        return if exists(&pinned) {
+            Ok(pinned)
+        } else {
+            Err(NdkError::NotInstalled(sdk.join("ndk")))
+        };
+    }
+    named
+        .iter()
+        .flatten()
+        .find(|path| exists(path))
+        .cloned()
+        .ok_or(NdkError::Unset)
+}
+
+#[cfg(test)]
+mod selection {
+    use super::*;
+
+    fn present(paths: &'static [&'static str]) -> impl Fn(&Path) -> bool {
+        move |path| paths.iter().any(|p| Path::new(p) == path)
+    }
+
+    #[test]
+    fn the_pin_under_the_sdk_beats_a_newer_named_ndk() {
+        let named = [Some(PathBuf::from("/sdk/ndk/29.0.0"))];
+        let chosen = select_ndk(
+            Some(Path::new("/sdk")),
+            &named,
+            present(&["/sdk/ndk/28.2.13676358", "/sdk/ndk/29.0.0"]),
+        );
+        assert_eq!(chosen, Ok(PathBuf::from("/sdk/ndk/28.2.13676358")));
+    }
+
+    #[test]
+    fn an_sdk_without_the_pin_is_refused_rather_than_drifting() {
+        let named = [Some(PathBuf::from("/sdk/ndk/29.0.0"))];
+        let chosen = select_ndk(
+            Some(Path::new("/sdk")),
+            &named,
+            present(&["/sdk/ndk/29.0.0"]),
+        );
+        assert_eq!(
+            chosen,
+            Err(NdkError::NotInstalled(PathBuf::from("/sdk/ndk")))
+        );
+    }
+
+    #[test]
+    fn without_an_sdk_the_first_present_named_ndk_serves() {
+        let named = [
+            None,
+            Some(PathBuf::from("/gone")),
+            Some(PathBuf::from("/mine")),
+        ];
+        assert_eq!(
+            select_ndk(None, &named, present(&["/mine"])),
+            Ok(PathBuf::from("/mine"))
+        );
+        assert_eq!(select_ndk(None, &named, present(&[])), Err(NdkError::Unset));
     }
 }
 

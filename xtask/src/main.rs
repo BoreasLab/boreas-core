@@ -23,7 +23,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use android::{Abi, ApiLevel, BuildEnvironment, HostTag, Ndk};
+use android::{Abi, ApiLevel, BuildEnvironment, HostTag, Ndk, NdkError, select_ndk};
 use release::{Event, Publish, Sha, Stamp, Version};
 
 type Fallible = Result<String, Box<dyn Error>>;
@@ -183,12 +183,16 @@ fn android_stage(name: &str, into: &Path) -> Fallible {
     Ok(rendered)
 }
 
-/// Selects the newest NDK path available in runner variables.
-fn ndk_root() -> Result<PathBuf, String> {
-    ["ANDROID_NDK_LATEST_HOME", "ANDROID_NDK_HOME", "ANDROID_NDK"]
-        .into_iter()
-        .find_map(|name| std::env::var_os(name).map(PathBuf::from))
-        .ok_or_else(|| "no NDK: set ANDROID_NDK_LATEST_HOME or ANDROID_NDK_HOME".to_owned())
+/// The pinned NDK under the SDK when there is one; a named NDK otherwise.
+fn ndk_root() -> Result<PathBuf, NdkError> {
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    let sdk = var("ANDROID_HOME").or_else(|| var("ANDROID_SDK_ROOT"));
+    let named = [
+        var("ANDROID_NDK_HOME"),
+        var("ANDROID_NDK_LATEST_HOME"),
+        var("ANDROID_NDK"),
+    ];
+    select_ndk(sdk.as_deref(), &named, |path| path.is_dir())
 }
 
 // ----------------------------------------------------------------- release
