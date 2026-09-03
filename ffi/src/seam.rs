@@ -6,7 +6,10 @@
 use std::{ffi::c_void, future::Future, io, net::SocketAddr, sync::Arc};
 
 use boreas_core::{AsyncDevice, Mtu, TunnelBypass};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::{
+    net::{TcpSocket, TcpStream, UdpSocket},
+    sync::mpsc,
+};
 
 /// A host socket handle excluded from the tunnel.
 ///
@@ -165,9 +168,11 @@ const fn libc_eio() -> i32 {
 
 /// Adapts [`BoreasDevice`] to [`AsyncDevice`].
 ///
-/// The blocking read and its join handle remain in `self` across polls. A
-/// dropped future therefore consumes no packet, and a blocking callback cannot
-/// outlive the context guard held by its task.
+/// Two blocking tasks own the host's callbacks, one per direction, joined to
+/// the reactor by bounded channels of recycled buffers. The reactor never waits
+/// on the host, reads overlap writes, and a packet in flight allocates nothing.
+/// The tasks start on first use so a device that never ran releases its
+/// context synchronously, and runtime shutdown joins them within its grace.
 struct Context(BoreasDevice);
 
 impl Drop for Context {
@@ -178,11 +183,30 @@ impl Drop for Context {
     }
 }
 
+/// Buffers per direction; a burst can hold this many packets in flight.
+const DEPTH: usize = 64;
+
 pub struct Device {
     ops: BoreasDevice,
-    context: Arc<Context>,
     mtu: Mtu,
-    pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
+    /// Packets from the reader. An `Err` ends the device.
+    inbound: mpsc::Receiver<io::Result<Vec<u8>>>,
+    /// Emptied buffers back to the reader.
+    refill: mpsc::Sender<Vec<u8>>,
+    /// Packets to the writer.
+    outbound: mpsc::Sender<Vec<u8>>,
+    /// Emptied buffers back from the writer.
+    spare: mpsc::Receiver<Vec<u8>>,
+    /// The tasks' halves, until first use starts them.
+    unstarted: Option<Unstarted>,
+    context: Arc<Context>,
+}
+
+struct Unstarted {
+    refill: mpsc::Receiver<Vec<u8>>,
+    outbound: mpsc::Receiver<Vec<u8>>,
+    spare: mpsc::Sender<Vec<u8>>,
+    inbound: mpsc::Sender<io::Result<Vec<u8>>>,
 }
 
 impl Device {
@@ -191,24 +215,119 @@ impl Device {
     pub fn new(ops: BoreasDevice) -> Option<Self> {
         ops.recv?;
         ops.send?;
+        // Before the MTU check: a refused device still releases its context.
+        let context = Arc::new(Context(ops));
+        let mtu = Mtu::new(ops.mtu).ok()?;
+
+        let (inbound_tx, inbound) = mpsc::channel(DEPTH);
+        let (refill, refill_rx) = mpsc::channel(DEPTH);
+        let (outbound, outbound_rx) = mpsc::channel(DEPTH);
+        let (spare_tx, spare) = mpsc::channel(DEPTH);
+        for _ in 0..DEPTH {
+            let _ = refill.try_send(Vec::with_capacity(usize::from(mtu.get())));
+            let _ = spare_tx.try_send(Vec::with_capacity(usize::from(mtu.get())));
+        }
+
         Some(Self {
             ops,
-            context: Arc::new(Context(ops)),
-            mtu: Mtu::new(ops.mtu).ok()?,
-            pending: None,
+            mtu,
+            inbound,
+            refill,
+            outbound,
+            spare,
+            unstarted: Some(Unstarted {
+                refill: refill_rx,
+                outbound: outbound_rx,
+                spare: spare_tx,
+                inbound: inbound_tx,
+            }),
+            context,
         })
     }
+
+    /// Starts both tasks once, on the runtime that polls this device.
+    fn start(&mut self) {
+        let Some(halves) = self.unstarted.take() else {
+            return;
+        };
+        let Unstarted {
+            refill,
+            outbound,
+            spare,
+            inbound,
+        } = halves;
+        let mtu = self.mtu;
+        let reader = Arc::clone(&self.context);
+        let writer = Arc::clone(&self.context);
+        let inbound_from_writer = inbound.clone();
+        tokio::task::spawn_blocking(move || read_loop(&reader, mtu, refill, &inbound));
+        tokio::task::spawn_blocking(move || {
+            write_loop(&writer, outbound, &spare, &inbound_from_writer);
+        });
+    }
+}
+
+/// Reads until the host fails or the reactor is gone.
+fn read_loop(
+    context: &Context,
+    mtu: Mtu,
+    mut refill: mpsc::Receiver<Vec<u8>>,
+    inbound: &mpsc::Sender<io::Result<Vec<u8>>>,
+) {
+    while let Some(mut buf) = refill.blocking_recv() {
+        buf.resize(usize::from(mtu.get()), 0);
+        // Zero is "no packet yet": ask again with the same buffer, so an idle
+        // device costs no channel traffic.
+        let read = loop {
+            // SAFETY: the host's callbacks are safe from any thread, and
+            // `context` keeps them live for as long as this thread runs.
+            match unsafe { context.0.read_into(&mut buf) } {
+                Ok(0) => continue,
+                Ok(read) => break read,
+                Err(error) => {
+                    let _ = inbound.blocking_send(Err(error));
+                    return;
+                }
+            }
+        };
+        buf.truncate(read);
+        if inbound.blocking_send(Ok(buf)).is_err() {
+            return;
+        }
+    }
+}
+
+/// Writes until the host fails or the reactor is gone. A failure is reported
+/// on the inbound channel, which the reactor is always polling.
+fn write_loop(
+    context: &Context,
+    mut outbound: mpsc::Receiver<Vec<u8>>,
+    spare: &mpsc::Sender<Vec<u8>>,
+    inbound: &mpsc::Sender<io::Result<Vec<u8>>>,
+) {
+    while let Some(mut buf) = outbound.blocking_recv() {
+        // SAFETY: as in `read_loop`.
+        if let Err(error) = unsafe { context.0.write_all(&buf) } {
+            let _ = inbound.blocking_send(Err(error));
+            return;
+        }
+        buf.clear();
+        // A full spare queue means the reactor is allocating faster than this
+        // thread returns buffers; dropping one here bounds the total.
+        let _ = spare.try_send(buf);
+    }
+}
+
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "the device threads have exited")
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // Aborting the handle stops only the join. The host callback still runs
-        // until `close` ends it; `Context` keeps `release` behind that callback.
-        if let Some(pending) = self.pending.take() {
-            pending.abort();
-        }
-        // SAFETY: the host's contract is that this is safe to call while a
-        // read is blocked, which is precisely the case it exists for.
+        // The channels close with `self`, which ends both threads once the host
+        // returns. `close` is what makes a blocked `recv` return.
+        // SAFETY: the host's contract is that this is safe while a read is
+        // blocked, which is precisely the case it exists for.
         unsafe { self.ops.close_reads() };
     }
 }
@@ -223,60 +342,32 @@ impl AsyncDevice for Device {
         &'a mut self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = io::Result<usize>> + Send + 'a {
-        // Keep the blocking task and its bytes in `self` until the join resolves;
-        // a cancelled future must not consume a packet invisibly.
+        // Cancel-safe: `recv` hands over a packet only when it completes, and
+        // the copy and refill happen in the same poll.
         async move {
-            loop {
-                if self.pending.is_none() {
-                    let ops = self.ops;
-                    // Keep the host context alive for the callback.
-                    let context = Arc::clone(&self.context);
-                    let capacity = buf.len();
-                    self.pending = Some(tokio::task::spawn_blocking(move || {
-                        let _context = context;
-                        let mut owned = vec![0u8; capacity];
-                        // SAFETY: the host's contract is that its callbacks
-                        // are safe from any thread, which is what a blocking
-                        // pool gives them, and `_context` keeps them live.
-                        let read = unsafe { ops.read_into(&mut owned) }?;
-                        owned.truncate(read);
-                        Ok(owned)
-                    }));
-                }
-
-                let joined = self
-                    .pending
-                    .as_mut()
-                    .expect("the read was just started")
-                    .await;
-                // The join resolved, so the callback and its context are done.
-                self.pending = None;
-
-                let bytes = joined.map_err(io::Error::other)??;
-                // Zero means that the host has no packet yet. There is no
-                // zero-length IP packet, so retry without charging a rejection.
-                if bytes.is_empty() {
-                    continue;
-                }
-                buf[..bytes.len()].copy_from_slice(&bytes);
-                return Ok(bytes.len());
+            self.start();
+            let bytes = self.inbound.recv().await.ok_or_else(closed)??;
+            if bytes.len() > buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "packet exceeds the receive buffer",
+                ));
             }
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            let len = bytes.len();
+            let _ = self.refill.try_send(bytes);
+            Ok(len)
         }
     }
 
     #[allow(clippy::manual_async_fn)]
     fn send<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = io::Result<()>> + Send + 'a {
-        let ops = self.ops;
-        let context = Arc::clone(&self.context);
-        let packet = buf.to_vec();
         async move {
-            tokio::task::spawn_blocking(move || {
-                let _context = context;
-                // SAFETY: as in `recv` above.
-                unsafe { ops.write_all(&packet) }
-            })
-            .await
-            .map_err(io::Error::other)?
+            self.start();
+            let mut owned = self.spare.try_recv().unwrap_or_default();
+            owned.clear();
+            owned.extend_from_slice(buf);
+            self.outbound.send(owned).await.map_err(|_| closed())
         }
     }
 }

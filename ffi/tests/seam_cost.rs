@@ -45,8 +45,8 @@ const WARM_UP: usize = 256;
 const PACKETS: u64 = 20_000;
 /// Allocations per packet, receive plus send, rounded to whole allocations so
 /// runtime housekeeping cannot fail the law. The seam that spawned a blocking
-/// task per call measured 4; one that recycles its buffers owes none.
-const BUDGET: u64 = 4;
+/// task per call measured 4; the one that recycles its buffers owes none.
+const BUDGET: u64 = 0;
 
 struct Host {
     closed: AtomicBool,
