@@ -10,6 +10,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::{
@@ -186,29 +187,90 @@ impl StreamEgress for TunnelledDialer {
         target: &'a Target,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncStream>, EgressError>> {
         Box::pin(async move {
-            let address = resolve(target).await?;
-            // Refuse at the port ceiling before opening a socket.
-            let lease = self
-                .ports
-                .take()
-                .ok_or(EgressError::Io(std::io::ErrorKind::AddrInUse))?;
-            let socket = match address {
-                SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-                SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-            };
-            // Allow reuse while a recently closed connection is in TIME-WAIT;
-            // the reserved range is small under ordinary browsing.
-            socket.set_reuseaddr(true)?;
-            socket.bind(local_for(address, lease.port))?;
-            let stream = crate::within(crate::Wait::TcpConnect, socket.connect(address)).await?;
-            // Avoid delaying short requests for bytes that will not arrive.
-            stream.set_nodelay(true)?;
-            Ok(Box::new(Originated {
-                stream,
-                _lease: lease,
-            }) as Box<dyn AsyncStream>)
+            // RFC 8305: every address gets a try, each a quarter second after
+            // the last, and the first to connect wins. One dead AAAA no
+            // longer costs the whole connect budget.
+            let mut attempts = tokio::task::JoinSet::new();
+            for (index, address) in resolve_all(target).await?.into_iter().enumerate() {
+                let ports = Arc::clone(&self.ports);
+                attempts.spawn(async move {
+                    tokio::time::sleep(ATTEMPT_DELAY * index as u32).await;
+                    dial(&ports, address).await
+                });
+            }
+            let mut last = EgressError::Io(std::io::ErrorKind::NotFound);
+            while let Some(joined) = attempts.join_next().await {
+                match joined {
+                    // Dropping the set aborts the attempts still running;
+                    // their leases return with them.
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(error)) => last = error,
+                    Err(_) => {}
+                }
+            }
+            Err(last)
         })
     }
+}
+
+/// RFC 8305 section 5: the next attempt starts this long after the previous.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// One connection attempt from a leased port.
+async fn dial(
+    ports: &Arc<Ports>,
+    address: SocketAddr,
+) -> Result<Box<dyn AsyncStream>, EgressError> {
+    // Refuse at the port ceiling before opening a socket.
+    let lease = ports
+        .take()
+        .ok_or(EgressError::Io(std::io::ErrorKind::AddrInUse))?;
+    let socket = match address {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // Allow reuse while a recently closed connection is in TIME-WAIT; the
+    // reserved range is small under ordinary browsing.
+    socket.set_reuseaddr(true)?;
+    socket.bind(local_for(address, lease.port))?;
+    let stream = crate::within(crate::Wait::TcpConnect, socket.connect(address)).await?;
+    // Avoid delaying short requests for bytes that will not arrive.
+    stream.set_nodelay(true)?;
+    Ok(Box::new(Originated {
+        stream,
+        _lease: lease,
+    }) as Box<dyn AsyncStream>)
+}
+
+/// Every address for `target`, families interleaved (RFC 8305 section 4).
+async fn resolve_all(target: &Target) -> Result<Vec<SocketAddr>, EgressError> {
+    match target {
+        Target::Ip(address) => Ok(vec![*address]),
+        Target::Domain { host, port } => {
+            let all: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), *port))
+                .await?
+                .collect();
+            if all.is_empty() {
+                return Err(EgressError::Io(std::io::ErrorKind::NotFound));
+            }
+            Ok(interleaved(all))
+        }
+    }
+}
+
+/// IPv6 first, then the families alternate, each in resolver order.
+fn interleaved(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addresses.into_iter().partition(SocketAddr::is_ipv6);
+    let (mut v6, mut v4) = (v6.into_iter(), v4.into_iter());
+    let mut out = Vec::new();
+    loop {
+        match (v6.next(), v4.next()) {
+            (None, None) => break,
+            (six, four) => out.extend(six.into_iter().chain(four)),
+        }
+    }
+    out
 }
 
 fn local_for(address: SocketAddr, port: u16) -> SocketAddr {
@@ -319,6 +381,42 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    /// RFC 8305 section 4: IPv6 first, then the families alternate.
+    #[test]
+    fn addresses_are_interleaved_by_family_with_ipv6_first() {
+        let v4 = |last: u8| SocketAddr::from(([192, 0, 2, last], 443));
+        let v6 = |last: u16| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, last], 443));
+        assert_eq!(
+            interleaved(vec![v4(1), v4(2), v6(1), v4(3), v6(2)]),
+            vec![v6(1), v4(1), v6(2), v4(2), v4(3)]
+        );
+        assert_eq!(interleaved(vec![v4(1)]), vec![v4(1)]);
+        assert!(interleaved(Vec::new()).is_empty());
+    }
+
+    /// A name whose first address refuses is still reached through its next.
+    #[tokio::test]
+    async fn a_dead_first_address_does_not_fail_the_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dialer = TunnelledDialer::new(OriginationPorts::new(46_000, 46_010).unwrap());
+        // `localhost` commonly resolves to ::1 first, where nothing listens.
+        let target = Target::Domain {
+            host: crate::DomainName::new("localhost").unwrap(),
+            port,
+        };
+        let connected = tokio::time::timeout(Duration::from_secs(5), dialer.connect(&target))
+            .await
+            .expect("well inside the budget");
+        assert!(connected.is_ok(), "{:?}", connected.err());
+        let (_accepted, from) = listener.accept().await.unwrap();
+        assert!(
+            OriginationPorts::new(46_000, 46_010)
+                .unwrap()
+                .contains(from.port())
+        );
+    }
 
     #[test]
     fn the_range_refuses_what_no_connection_could_bind() {

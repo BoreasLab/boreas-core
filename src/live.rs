@@ -33,6 +33,14 @@ impl<C: Clone + Send + Sync + 'static> Live<C> {
         }
     }
 
+    /// The connection that is up right now, if one is; never dials.
+    pub(crate) fn peek(&self) -> Option<C> {
+        match &*crate::locked(&self.state) {
+            State::Up(connection) => Some(connection.clone()),
+            State::Opening(_) | State::Down => None,
+        }
+    }
+
     /// The live connection, or the one `open` yields. `alive` tells a
     /// connection still worth handing out from one to replace.
     pub(crate) async fn get<F>(&self, alive: impl Fn(&C) -> bool, open: F) -> io::Result<C>

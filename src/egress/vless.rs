@@ -23,6 +23,7 @@ use crate::{
     Association, AsyncStream, BoxFuture, Codec, DatagramFidelity, DatagramSink, DatagramSource,
     Decode, Decoded, DomainName, EgressError, Framed, NatBehavior, PathProperties, ProxyError,
     ProxyTransport, StreamEgress, Target, Writes,
+    live::Live,
     wire::{Reader, Writer},
 };
 
@@ -207,6 +208,22 @@ const INBOUND_DEPTH: usize = 64;
 /// Shared writer for one destination stream.
 type SharedSink = Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
 
+/// One destination's stream: its writer, and whether its reader has ended.
+#[derive(Clone)]
+struct DestinationStream {
+    sink: SharedSink,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DestinationStream {
+    fn is_alive(&self) -> bool {
+        !self.ended.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Destinations remembered before the ended ones are forgotten.
+const MAX_DESTINATIONS: usize = 64;
+
 /// VLESS UDP association with one stream per destination and one inbound queue.
 ///
 /// The destination is in the request header, so frames on a stream inherit its
@@ -214,8 +231,9 @@ type SharedSink = Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
 struct VlessDatagrams<T> {
     transport: Arc<T>,
     user: UserId,
-    /// Lazily opened writers, keyed by destination.
-    streams: Mutex<HashMap<Target, SharedSink>>,
+    /// A stream per destination, each dialled on its own task, so one
+    /// destination's dial holds up no other and a dead stream is replaced.
+    streams: std::sync::Mutex<HashMap<Target, Arc<Live<DestinationStream>>>>,
     inbound: mpsc::Sender<(Vec<u8>, Target)>,
     /// Cancels reader tasks when the association is dropped.
     shutdown: CancellationToken,
@@ -229,31 +247,47 @@ impl<T> Drop for VlessDatagrams<T> {
 
 impl<T: ProxyTransport + 'static> VlessDatagrams<T> {
     /// Returns the stream for `target`, opening one if needed.
-    ///
-    /// The lock covers dialing so concurrent first sends share one stream.
     async fn stream(&self, target: &Target) -> Result<SharedSink, EgressError> {
-        let mut held = self.streams.lock().await;
-        if let Some(stream) = held.get(target) {
-            return Ok(Arc::clone(stream));
-        }
+        let live = {
+            let mut streams = crate::locked(&self.streams);
+            if streams.len() >= MAX_DESTINATIONS {
+                streams.retain(|_, live| live.peek().is_none_or(|stream| stream.is_alive()));
+            }
+            Arc::clone(
+                streams
+                    .entry(target.clone())
+                    .or_insert_with(|| Arc::new(Live::new())),
+            )
+        };
+        let (transport, user, target) = (Arc::clone(&self.transport), self.user, target.clone());
+        let (inbound, shutdown) = (self.inbound.clone(), self.shutdown.clone());
+        let stream = live
+            .get(DestinationStream::is_alive, async move {
+                let stream = transport
+                    .dial()
+                    .await
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let mut request = Vec::with_capacity(64);
+                encode_datagram_request(&user, &target, &mut request);
+                let (reader, mut writer) = tokio::io::split(stream);
+                writer.write_all(&request).await?;
+                writer.flush().await?;
 
-        let stream = self.transport.dial().await?;
-        let mut request = Vec::with_capacity(64);
-        encode_datagram_request(&self.user, target, &mut request);
-        let (reader, mut writer) = tokio::io::split(stream);
-        writer.write_all(&request).await?;
-        writer.flush().await?;
-
-        tokio::spawn(read_datagrams(
-            reader,
-            target.clone(),
-            self.inbound.clone(),
-            self.shutdown.clone(),
-        ));
-
-        let writer: SharedSink = Arc::new(Mutex::new(Box::new(writer)));
-        held.insert(target.clone(), Arc::clone(&writer));
-        Ok(writer)
+                let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                tokio::spawn({
+                    let ended = Arc::clone(&ended);
+                    async move {
+                        read_datagrams(reader, target, inbound, shutdown).await;
+                        ended.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                });
+                Ok(DestinationStream {
+                    sink: Arc::new(Mutex::new(Box::new(writer))),
+                    ended,
+                })
+            })
+            .await?;
+        Ok(stream.sink)
     }
 }
 
@@ -395,7 +429,7 @@ impl<T: ProxyTransport + 'static> StreamEgress for VlessEgress<T> {
             let sink = Arc::new(VlessDatagrams {
                 transport: Arc::clone(&self.transport),
                 user: self.config.user,
-                streams: Mutex::new(HashMap::new()),
+                streams: std::sync::Mutex::new(HashMap::new()),
                 inbound: inbound_tx,
                 shutdown: CancellationToken::new(),
             });
