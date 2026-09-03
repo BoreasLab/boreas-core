@@ -140,9 +140,16 @@ fn a_packet_crosses_the_seam_within_its_allocation_budget() {
     let nanos = elapsed.as_nanos() as f64 / PACKETS as f64;
     println!("seam: {nanos:.0} ns/packet, {per_packet:.2} allocations/packet");
 
+    // `send` completes when the packet is queued; the writer task delivers
+    // it. Wait for the tail rather than assume the writer kept pace.
+    let expected = (WARM_UP as u64 + PACKETS) * PACKET as u64;
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while host.sent.load(Ordering::Relaxed) < expected && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert_eq!(
         host.sent.load(Ordering::Relaxed),
-        (WARM_UP as u64 + PACKETS) * PACKET as u64,
+        expected,
         "every packet received was sent back whole"
     );
     // Integer totals: half a packet's worth of slack is the rounding.
