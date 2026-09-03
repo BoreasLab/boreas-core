@@ -145,8 +145,9 @@ fn a_packet_crosses_the_seam_within_its_allocation_budget() {
         (WARM_UP as u64 + PACKETS) * PACKET as u64,
         "every packet received was sent back whole"
     );
+    // Integer totals: half a packet's worth of slack is the rounding.
     assert!(
-        per_packet.round() as u64 <= BUDGET,
+        allocations <= BUDGET * PACKETS + PACKETS / 2,
         "{per_packet:.2} allocations per packet exceeds the budget of {BUDGET}"
     );
 }
