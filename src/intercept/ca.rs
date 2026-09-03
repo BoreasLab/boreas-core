@@ -18,11 +18,12 @@
 //! stale values would silently suppress filtering, while relearning is cheap.
 
 use std::{
-    collections::{HashMap, VecDeque},
     fmt,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
+
+use crate::fifo::BoundedFifo;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -310,60 +311,29 @@ impl fmt::Debug for CertificateAuthority {
     }
 }
 
-/// Bounded FIFO cache of forged leaves.
-struct LeafCache {
-    by_host: HashMap<String, Arc<CertifiedKey>>,
-    order: VecDeque<String>,
-    capacity: NonZeroUsize,
-}
-
-impl LeafCache {
-    fn new(capacity: NonZeroUsize) -> Self {
-        Self {
-            by_host: HashMap::new(),
-            order: VecDeque::new(),
-            capacity,
-        }
-    }
-
-    /// Returns or creates a leaf, evicting the oldest entry at capacity.
-    fn get_or_insert(
-        &mut self,
-        host: &str,
-        make: impl FnOnce() -> Option<Arc<CertifiedKey>>,
-    ) -> Option<Arc<CertifiedKey>> {
-        if let Some(existing) = self.by_host.get(host) {
-            return Some(Arc::clone(existing));
-        }
-        let leaf = make()?;
-        if self.by_host.len() >= self.capacity.get()
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.by_host.remove(&oldest);
-        }
-        self.by_host.insert(host.to_owned(), Arc::clone(&leaf));
-        self.order.push_back(host.to_owned());
-        Some(leaf)
-    }
-}
-
 /// rustls resolver that maps SNI to a cached forged leaf.
 pub struct MitmResolver {
     authority: Arc<CertificateAuthority>,
-    cache: Mutex<LeafCache>,
+    /// Bounded: a busy session forges one leaf per host it intercepts.
+    cache: Mutex<BoundedFifo<String, Arc<CertifiedKey>>>,
 }
 
 impl MitmResolver {
     pub fn new(authority: Arc<CertificateAuthority>, cache_capacity: NonZeroUsize) -> Self {
         Self {
             authority,
-            cache: Mutex::new(LeafCache::new(cache_capacity)),
+            cache: Mutex::new(BoundedFifo::new(cache_capacity)),
         }
     }
 
+    /// A failed mint is not memoized, so a transient failure is retried.
     pub fn leaf(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let mut cache = crate::locked(&self.cache);
-        cache.get_or_insert(host, || self.authority.leaf_for(host).ok())
+        if let Some(hit) = cache.get(host) {
+            return Some(hit);
+        }
+        let leaf = self.authority.leaf_for(host).ok()?;
+        Some(cache.get_or_insert_with(host.to_owned(), || leaf))
     }
 }
 

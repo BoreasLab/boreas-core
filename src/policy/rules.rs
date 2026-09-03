@@ -20,7 +20,7 @@
 //! rather than hidden behind a partial implementation.
 
 use std::{
-    collections::HashMap,
+    num::NonZeroUsize,
     sync::{Arc, RwLock},
 };
 
@@ -31,16 +31,20 @@ use adblock::{
 };
 use hyper::{Request, Uri, body::Incoming, header};
 
-use crate::{CosmeticSource, FilterVerdict, HidingRules, RequestFilter};
+use crate::{CosmeticSource, FilterVerdict, HidingRules, RequestFilter, fifo::BoundedFifo};
 
 /// A compiled index shared by the URL and HTML tiers.
 pub struct RuleEngine {
     engine: Engine,
     /// Memoized host-scoped hiding rules. Lookup walks hostname suffixes and
     /// compiles a selector stylesheet, so the result is a function of the host
-    /// and is reused for later documents.
-    cosmetic: RwLock<HashMap<String, Option<Arc<HidingRules>>>>,
+    /// and is reused for later documents. Bounded, or a long session would
+    /// hold a stylesheet for every host it ever saw.
+    cosmetic: RwLock<BoundedFifo<String, Option<Arc<HidingRules>>>>,
 }
+
+/// Distinct document hosts remembered. A miss recompiles from the index.
+const COSMETIC_MEMO_HOSTS: NonZeroUsize = NonZeroUsize::new(256).expect("nonzero");
 
 impl std::fmt::Debug for RuleEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,7 +68,7 @@ impl RuleEngine {
     fn from_filter_set(set: FilterSet) -> Self {
         Self {
             engine: Engine::new_with_filter_set(set),
-            cosmetic: RwLock::new(HashMap::new()),
+            cosmetic: RwLock::new(BoundedFifo::new(COSMETIC_MEMO_HOSTS)),
         }
     }
 
@@ -170,16 +174,16 @@ impl CosmeticSource for RuleEngine {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(host)
         {
-            return cached.clone();
+            return cached;
         }
         let host = host.to_ascii_lowercase();
         if let Some(cached) = self
             .cosmetic
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get(&host)
+            .get(host.as_str())
         {
-            return cached.clone();
+            return cached;
         }
         // The document root supplies the URL while the engine scopes resources
         // by hostname.
@@ -190,8 +194,7 @@ impl CosmeticSource for RuleEngine {
         self.cosmetic
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(host, compiled.clone());
-        compiled
+            .get_or_insert_with(host, || compiled)
     }
 }
 
@@ -364,6 +367,16 @@ example.com#@#.ad-banner
             engine.rules("nothing.example").is_none(),
             "a miss memoizes too"
         );
+    }
+
+    #[test]
+    fn the_cosmetic_memo_forgets_rather_than_grows() {
+        let engine = engine();
+        for n in 0..=COSMETIC_MEMO_HOSTS.get() {
+            engine.rules(&format!("host{n}.example"));
+        }
+        let held = engine.cosmetic.read().unwrap().len();
+        assert_eq!(held, COSMETIC_MEMO_HOSTS.get());
     }
 
     #[test]
