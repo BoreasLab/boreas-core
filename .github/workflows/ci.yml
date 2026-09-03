@@ -9,9 +9,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes the run in progress; a push to
+# main does not. Every commit on main gets its own verdict, which a run
+# cancelled by the next commit never gave, and commits land faster than the
+# slowest job finishes.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -240,10 +244,20 @@ jobs:
       # A smoke run, not a campaign: each target gets one minute, which is
       # enough to catch a reachable panic on the untrusted paths and cheap
       # enough to gate every pull request. Longer campaigns run out of band.
+      #
+      # Built once, then run side by side: libFuzzer is single-threaded and
+      # the runner has cores to spare, so four minutes of smoke take one.
       - run: |
+          cargo fuzz build
           for target in reassembler clamp_mss datapath dns; do
-            cargo fuzz run "$target" -- -max_total_time=60
+            cargo fuzz run "$target" -- -max_total_time=60 > "fuzz-$target.log" 2>&1 &
           done
+          failed=0
+          for job in $(jobs -p); do
+            wait "$job" || failed=1
+          done
+          cat fuzz-*.log
+          exit "$failed"
         working-directory: .
 
   deny:
