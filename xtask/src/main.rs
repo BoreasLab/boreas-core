@@ -107,8 +107,11 @@ fn android_env(name: &str) -> Fallible {
     let ndk = Ndk::open(root, host)?;
     let compiler = ndk.compiler(abi, ApiLevel::MIN)?;
 
-    let wrapper = repo_root()
-        .join("target/xtask/android")
+    // Not under `target/`: CI restores that directory from a cache after this
+    // runs, and a wrapper restored from another image names an NDK that is
+    // not there. The temp dir is the job's own and stable for its life.
+    let wrapper = std::env::temp_dir()
+        .join("boreas-xtask/android")
         .join(format!("{}.cmake", abi.gradle));
     std::fs::create_dir_all(wrapper.parent().expect("has a parent"))?;
     std::fs::write(&wrapper, ndk.cmake_wrapper(abi, ApiLevel::MIN))?;
