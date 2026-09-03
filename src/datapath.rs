@@ -15,8 +15,8 @@ use crate::{
     FlowPlan, FlowTableError, Fragment, IcmpClass, IngressAction, IngressPacket, Inspection,
     InternalEndpoint, Mtu, OriginationPorts, PacketError, PathProperties, PlanError, Pooled,
     PushOutcome, Reassembler, Replan, SendOutcome, SteeringReason, Transport, TransportPath,
-    UdpFlowTable, WriteError, admit, clamp_mss, forbids_fragmentation, plan_flow, replan,
-    route_planned, spend_hop, udp_datagram_len, write_time_exceeded, write_too_big, write_udp,
+    UdpFlowTable, WriteError, admit, clamp_mss, plan_flow, replan, route_planned, spend_hop,
+    udp_datagram_len, write_time_exceeded, write_too_big, write_udp,
 };
 
 /// Packet source or transmit destination side.
@@ -503,13 +503,15 @@ impl Datapath {
                 let clamp = match plan.transport {
                     // MSS clamping applies only to the initial SYN.
                     TransportPath::PacketFastPath { inner_mtu } => {
-                        // Report oversized DF packets locally so the sender learns
-                        // the inner MTU. RFC 1122 Sec. 3.2.2 and RFC 4443 Sec. 2.4(e)
-                        // prohibit answering ICMP errors with errors.
+                        // Report oversized packets locally so the sender learns
+                        // the inner MTU, whether or not DF is set: this hop
+                        // cannot fragment, and a host told the MTU fragments
+                        // its own DF-clear packets from then on. RFC 1122
+                        // Sec. 3.2.2 and RFC 4443 Sec. 2.4(e) prohibit
+                        // answering ICMP errors with errors.
                         if from == Side::Tunnel
                             && packet.transport != Transport::Icmp(IcmpClass::Error)
                             && buf.len() > usize::from(inner_mtu.get())
-                            && forbids_fragmentation(buf)
                         {
                             self.report_too_big(buf, inner_mtu, now);
                             return Ok(());
@@ -1718,22 +1720,31 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))
     }
 
+    /// A packet that fits crosses; one that does not is answered whether or
+    /// not it permits fragmenting, since this hop cannot fragment and the
+    /// sender, told the MTU, fragments its own from then on.
     #[test]
-    fn a_packet_that_fits_or_permits_fragmenting_is_forwarded_as_before() {
+    fn a_packet_that_fits_is_forwarded_and_an_oversized_one_is_answered_either_way() {
         let now = Instant::now();
-        for (label, packet) in [
-            ("fits the tunnel", sized_udp(1400, true)),
-            ("permits fragmenting", sized_udp(1500, false)),
-        ] {
-            let mut path = fast_path();
-            path.on_tun_packet(&packet, now).unwrap();
-            let out = path.poll_transmit().unwrap_or_else(|| panic!("{label}"));
-            assert_eq!(out.to, Side::Egress, "{label} must still cross");
-            assert!(
-                !matches!(path.poll_event(), Some(FlowEvent::PathReported(_))),
-                "{label} is not something to report"
-            );
-        }
+        let mut path = fast_path();
+        path.on_tun_packet(&sized_udp(1400, true), now).unwrap();
+        let out = path.poll_transmit().expect("fits the tunnel");
+        assert_eq!(out.to, Side::Egress, "must still cross");
+        assert!(!matches!(
+            path.poll_event(),
+            Some(FlowEvent::PathReported(_))
+        ));
+
+        let mut path = fast_path();
+        path.on_tun_packet(&sized_udp(1500, false), now).unwrap();
+        let reply = path
+            .poll_transmit()
+            .expect("permits fragmenting, still answered");
+        assert_eq!(reply.to, Side::Tunnel);
+        assert!(matches!(
+            path.poll_event(),
+            Some(FlowEvent::PathReported(_))
+        ));
     }
 
     #[test]

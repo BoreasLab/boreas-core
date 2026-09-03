@@ -540,18 +540,45 @@ fn momentary(_: &io::Error) -> bool {
     false
 }
 
+/// A send the device or network has not taken by then is a dropped packet,
+/// so a wedged host callback cannot hold up reads and shutdown.
+const SEND_BUDGET: Duration = Duration::from_secs(5);
+
 /// Writes to the device; a packet it refuses for the moment is counted.
 async fn to_device<D: AsyncDevice>(
     device: &mut D,
     bytes: &[u8],
     counters: &mut Counters,
 ) -> io::Result<()> {
-    match device.send(bytes).await {
-        Err(error) if transient(&error) => {
+    match tokio::time::timeout(SEND_BUDGET, device.send(bytes)).await {
+        Ok(Err(error)) if transient(&error) => {
             counters.device_errors += 1;
             Ok(())
         }
-        outcome => outcome,
+        Ok(outcome) => outcome,
+        Err(_) => {
+            counters.device_errors += 1;
+            Ok(())
+        }
+    }
+}
+
+/// Writes to the network; a datagram it refuses for the moment is counted.
+async fn to_network<N: AsyncNetwork>(
+    network: &mut N,
+    bytes: &[u8],
+    counters: &mut Counters,
+) -> io::Result<()> {
+    match tokio::time::timeout(SEND_BUDGET, network.send(bytes)).await {
+        Ok(Err(error)) if transient(&error) => {
+            counters.network_errors += 1;
+            Ok(())
+        }
+        Ok(outcome) => outcome,
+        Err(_) => {
+            counters.network_errors += 1;
+            Ok(())
+        }
     }
 }
 
@@ -899,10 +926,7 @@ async fn drain<D: AsyncDevice, N: AsyncNetwork, E: PacketEgress>(
     loop {
         for emit in emits.drain(..) {
             match emit {
-                EgressEmit::ToNetwork(bytes) => match network.send(&bytes).await {
-                    Err(error) if transient(&error) => counters.network_errors += 1,
-                    outcome => outcome?,
-                },
+                EgressEmit::ToNetwork(bytes) => to_network(network, &bytes, counters).await?,
                 EgressEmit::ToTunnel(bytes) => {
                     if datapath.on_egress_owned(bytes, Instant::now()).is_err() {
                         counters.packets_rejected += 1;

@@ -464,10 +464,7 @@ impl<B: TunnelBypass + 'static> StreamEgress for Socks5Egress<B> {
             let relay = relay_address(relay, self.config.proxy);
             let socket = self.bypass.udp(relay).await?;
             // RFC 1928 section 7 ties association lifetime to the control stream.
-            let shared = Arc::new(Relay {
-                socket,
-                _control: control,
-            });
+            let shared = Arc::new(Relay { socket, control });
             Ok(Association {
                 source: Box::new(Socks5Source {
                     relay: Arc::clone(&shared),
@@ -497,8 +494,26 @@ fn relay_address(bound: SocketAddr, proxy: SocketAddr) -> SocketAddr {
 /// UDP relay and its lifetime-bound control connection.
 struct Relay {
     socket: tokio::net::UdpSocket,
-    /// Held open for the association lifetime.
-    _control: tokio::net::TcpStream,
+    /// Held open for the association lifetime; its end is the relay's.
+    control: tokio::net::TcpStream,
+}
+
+/// Resolves when the proxy closes the control connection (RFC 1928
+/// section 7), which ends the UDP association with it.
+async fn control_ended(control: &tokio::net::TcpStream) {
+    let mut byte = [0u8; 1];
+    loop {
+        if control.readable().await.is_err() {
+            return;
+        }
+        match control.try_read(&mut byte) {
+            // Nothing is expected on the control stream; bytes are ignored.
+            Ok(1..) => {}
+            Ok(0) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return,
+        }
+    }
 }
 
 impl DatagramSink for Relay {
@@ -539,7 +554,12 @@ impl DatagramSource for Socks5Source {
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, Result<(usize, Target), EgressError>> {
         Box::pin(async move {
-            let read = self.relay.socket.recv(&mut self.framed).await?;
+            let read = tokio::select! {
+                read = self.relay.socket.recv(&mut self.framed) => read?,
+                () = control_ended(&self.relay.control) => {
+                    return Err(EgressError::Io(std::io::ErrorKind::ConnectionAborted));
+                }
+            };
             let (from, payload) = decode_datagram(&self.framed[..read])?;
             if payload.len() > buf.len() {
                 return Err(EgressError::DatagramTooLarge {
