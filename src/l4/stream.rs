@@ -22,7 +22,7 @@ use smoltcp::{
     iface::{Config, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{RecvError, SendError, Socket, SocketBuffer, State},
-    time::Instant as SmolInstant,
+    time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address},
 };
 
@@ -184,11 +184,22 @@ struct Listener {
     port: u16,
 }
 
+/// Probe an idle peer this often (RFC 1122 section 4.2.3.6), and abort a
+/// connection whose peer has said nothing for this long: an unanswered
+/// SYN-ACK, unacknowledged data, or a missed probe.
+const KEEPALIVE: SmolDuration = SmolDuration::from_secs(30);
+const TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
+
 pub struct LocalStack {
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
     ports: Vec<u16>,
+    /// Every TCP port is terminated: a SYN to a port without a listener
+    /// gets one, kept only while a SYN wants it.
+    every_port: bool,
+    /// SYNs pushed since the last poll to ports outside `ports`.
+    wanted: HashMap<u16, usize>,
     listeners: Vec<Listener>,
     limits: TerminationLimits,
     established: HashMap<SocketHandle, (InternalEndpoint, InternalEndpoint)>,
@@ -246,6 +257,8 @@ impl LocalStack {
             iface,
             sockets: SocketSet::new(Vec::new()),
             ports: ports.to_vec(),
+            every_port: false,
+            wanted: HashMap::new(),
             listeners: Vec::new(),
             limits,
             established: HashMap::new(),
@@ -257,7 +270,25 @@ impl LocalStack {
         Ok(stack)
     }
 
+    /// Terminates every TCP port, not only the configured ones. A flow
+    /// egress carries arbitrary TCP; a fixed listener set answers the rest
+    /// with RST.
+    pub fn terminate_every_port(&mut self) {
+        self.every_port = true;
+    }
+
     pub fn push(&mut self, packet: Pooled) {
+        if self.every_port
+            && let Some(port) = syn_destination(&packet)
+            && !self.ports.contains(&port)
+        {
+            let wanted = self.wanted.entry(port).or_insert(0);
+            *wanted += 1;
+            let wanted = *wanted;
+            if self.listening(port) < wanted {
+                self.add_listener(port);
+            }
+        }
         self.device.inbound.push_back(packet);
     }
 
@@ -289,6 +320,7 @@ impl LocalStack {
         while self.iface.poll(now, &mut self.device, &mut self.sockets)
             == PollResult::SocketStateChanged
         {}
+        self.wanted.clear();
         self.harvest();
         self.replenish_listeners();
     }
@@ -372,11 +404,13 @@ impl LocalStack {
     }
 
     fn harvest(&mut self) {
-        // A listener leaving `Listen` has become a connection.
+        // A listener stays one through the handshake; only a completed
+        // handshake is a connection (RFC 9293 section 3.10.1). One that
+        // timed out in SYN-RECEIVED is closed and goes back to the budget.
         let mut converted = Vec::new();
         self.listeners.retain(|listener| {
             let socket = self.sockets.get::<Socket>(listener.handle);
-            if socket.state() == State::Listen {
+            if matches!(socket.state(), State::Listen | State::SynReceived) {
                 return true;
             }
             converted.push(listener.handle);
@@ -384,7 +418,8 @@ impl LocalStack {
         });
         for handle in converted {
             let socket = self.sockets.get::<Socket>(handle);
-            // An immediately terminal socket never became a usable stream.
+            // A socket that closed before it was established never became a
+            // usable stream.
             let (Some(client), Some(server)) = (socket.remote_endpoint(), socket.local_endpoint())
             else {
                 self.sockets.remove(handle);
@@ -414,25 +449,58 @@ impl LocalStack {
         }
     }
 
+    /// Listeners on `port` still waiting for a SYN.
+    fn listening(&self, port: u16) -> usize {
+        self.listeners
+            .iter()
+            .filter(|l| {
+                l.port == port && self.sockets.get::<Socket>(l.handle).state() == State::Listen
+            })
+            .count()
+    }
+
     fn replenish_listeners(&mut self) {
-        for &port in &self.ports {
-            let live = self.listeners.iter().filter(|l| l.port == port).count();
-            for _ in live..self.limits.backlog.get() {
-                if self.socket_count() >= self.limits.max_sockets.get() {
+        for index in 0..self.ports.len() {
+            let port = self.ports[index];
+            for _ in self.listening(port)..self.limits.backlog.get() {
+                if !self.add_listener(port) {
                     return;
                 }
-                let rx = SocketBuffer::new(vec![0u8; self.limits.socket_buffer.get()]);
-                let tx = SocketBuffer::new(vec![0u8; self.limits.socket_buffer.get()]);
-                let mut socket = Socket::new(rx, tx);
-                // An addressless listener accepts any destination under any-IP.
-                if socket.listen(port).is_err() {
-                    return;
-                }
-                let handle = self.sockets.add(socket);
-                self.listeners.push(Listener { handle, port });
             }
         }
     }
+
+    /// One more listener on `port`, unless the budget is spent.
+    fn add_listener(&mut self, port: u16) -> bool {
+        if self.socket_count() >= self.limits.max_sockets.get() {
+            return false;
+        }
+        let rx = SocketBuffer::new(vec![0u8; self.limits.socket_buffer.get()]);
+        let tx = SocketBuffer::new(vec![0u8; self.limits.socket_buffer.get()]);
+        let mut socket = Socket::new(rx, tx);
+        socket.set_keep_alive(Some(KEEPALIVE));
+        socket.set_timeout(Some(TIMEOUT));
+        // An addressless listener accepts any destination under any-IP.
+        if socket.listen(port).is_err() {
+            return false;
+        }
+        let handle = self.sockets.add(socket);
+        self.listeners.push(Listener { handle, port });
+        true
+    }
+}
+
+/// The destination port of a TCP SYN, read straight off the headers; any
+/// other packet, or one behind IPv6 extension headers, is `None`.
+fn syn_destination(packet: &[u8]) -> Option<u16> {
+    let tcp_at = match packet.first()? >> 4 {
+        4 if packet.get(9) == Some(&6) => usize::from(packet[0] & 0x0f) * 4,
+        6 if packet.get(6) == Some(&6) => 40,
+        _ => return None,
+    };
+    let header = packet.get(tcp_at..tcp_at + 14)?;
+    // SYN set, ACK clear: an open, not the last step of one.
+    (header[13] & 0x12 == 0x02).then(|| u16::from_be_bytes([header[2], header[3]]))
 }
 
 fn endpoint(address: IpAddr, port: u16) -> InternalEndpoint {
@@ -664,9 +732,11 @@ pub(crate) mod tests {
         assert_eq!(&client_buf[..read], response);
     }
 
+    /// A SYN is not a connection (RFC 9293 section 3.10.1): nothing is
+    /// published until the handshake completes, the backlog stays whole
+    /// meanwhile, and a handshake nobody finishes gives its socket back.
     #[test]
-    fn a_half_open_connection_reports_not_yet_rather_than_closed() {
-        // The accepted SYN-RECEIVED socket is live but cannot move bytes yet.
+    fn a_half_open_connection_is_not_accepted_and_times_out() {
         let base = Instant::now();
         let mut server = stack(&[HTTPS], limits(64, 4), base);
         let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, HTTPS);
@@ -678,19 +748,38 @@ pub(crate) mod tests {
             server.push(pooled);
         }
         server.poll(base);
-        let accepted = server.poll_accept().expect("the listener committed");
+        assert_eq!(server.poll_accept(), None, "half open is not open");
+        assert_eq!(server.listening(HTTPS), 4, "the backlog is whole");
+        assert_eq!(server.socket_count(), 5, "plus the one handshaking");
 
-        let mut buf = [0u8; 16];
+        server.poll(base + Duration::from_secs(61));
+        assert_eq!(server.socket_count(), 4, "the handshake gave up its socket");
+        assert_eq!(server.poll_accept(), None);
+    }
+
+    /// Behind a flow egress every TCP port is a destination; a SYN to a port
+    /// with no listener gets one for itself instead of an RST.
+    #[test]
+    fn every_port_mode_listens_for_the_port_a_syn_names() {
+        const SSH: u16 = 22;
+        let base = Instant::now();
+        let mut fixed = stack(&[HTTPS], limits(64, 4), base);
+        let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 10), 49152, SERVER, SSH);
+        pump(&mut fixed, &mut client, base, 0, 6);
         assert_eq!(
-            server.recv(accepted.id, &mut buf),
-            Err(StreamError::WouldBlock),
-            "a handshaking socket has nothing yet, not nothing ever"
+            fixed.poll_accept(),
+            None,
+            "a fixed listener set refuses port 22"
         );
-        assert_eq!(
-            server.send(accepted.id, b"early"),
-            Err(StreamError::WouldBlock),
-            "and it cannot be written to yet either"
-        );
+
+        let mut every = stack(&[HTTPS], limits(64, 4), base);
+        every.terminate_every_port();
+        let mut client = Client::connect(Ipv4Addr::new(192, 0, 2, 11), 49153, SERVER, SSH);
+        pump(&mut every, &mut client, base, 0, 6);
+        let accepted = every.poll_accept().expect("port 22 was listened for");
+        assert_eq!(accepted.server, v4(SERVER, SSH));
+        assert_eq!(every.listening(SSH), 0, "and nothing lingers for it");
+        assert_eq!(every.listening(HTTPS), 4);
     }
 
     #[test]

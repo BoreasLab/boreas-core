@@ -674,6 +674,7 @@ impl Tunnel {
         let (termination, authority) = if plan.terminates {
             let (built, authority) = start_termination(
                 filtering,
+                plan.accepts,
                 &link,
                 &ceilings,
                 Arc::clone(&assembly.flows),
@@ -737,8 +738,10 @@ impl Tunnel {
 
 const CHANNEL_DEPTH: usize = 256;
 
+#[allow(clippy::too_many_arguments)]
 fn start_termination(
     filtering: Filtering,
+    accepts: Accepts,
     link: &Link,
     ceilings: &Ceilings,
     flows: Arc<dyn StreamEgress>,
@@ -746,7 +749,7 @@ fn start_termination(
     tasks: &TaskTracker,
     supervision: &crate::Supervision,
 ) -> Result<(crate::Termination, Option<Arc<CertificateAuthority>>), StartError> {
-    let stack = LocalStack::new(
+    let mut stack = LocalStack::new(
         link.mtu,
         crate::DEFAULT_INSPECTED_PORTS,
         TerminationLimits {
@@ -758,6 +761,10 @@ fn start_termination(
         Instant::now(),
     )
     .map_err(StartError::Termination)?;
+    // A flow egress terminates every TCP connection, whatever its port.
+    if accepts == Accepts::Flows {
+        stack.terminate_every_port();
+    }
 
     let (packets_tx, packets_rx) = mpsc::channel(CHANNEL_DEPTH);
     let (replies_tx, replies_rx) = mpsc::channel(CHANNEL_DEPTH);

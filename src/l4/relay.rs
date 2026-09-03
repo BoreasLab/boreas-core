@@ -129,6 +129,10 @@ pub async fn run_relay(
         }
 
         let client = datagram.client;
+        // At the ceiling, ended associations of other clients count too.
+        if !live.contains_key(&client) && live.len() >= limits.max_associations.get() {
+            live.retain(|_, sender| !sender.is_closed());
+        }
         let sender = match live.get(&client) {
             Some(sender) => sender,
             None if live.len() >= limits.max_associations.get() => {
@@ -518,6 +522,50 @@ mod tests {
             total.associations_refused, 3,
             "one mapping was admitted and three were refused: {total:?}"
         );
+    }
+
+    /// A client that idled out is not still counted against the ceiling
+    /// when another client arrives.
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_association_frees_its_slot_for_another_client() {
+        let echo = Arc::new(Echo::default());
+        let pool = pool();
+        let (out_tx, out_rx) = mpsc::channel(8);
+        let (in_tx, _in_rx) = mpsc::channel(64);
+        let (count_tx, mut count_rx) = mpsc::channel(64);
+        let supervision = crate::Supervision::new();
+        let relay = tokio::spawn(run_relay(
+            Arc::new(EchoEgress(Arc::clone(&echo))),
+            Arc::clone(&pool),
+            out_rx,
+            in_tx,
+            RelayLimits {
+                max_associations: NonZeroUsize::new(1).unwrap(),
+                idle_timeout: Duration::from_secs(1),
+            },
+            count_tx,
+            supervision.clone(),
+        ));
+
+        let send = |port: u16| Outbound {
+            client: client(port),
+            target: target(),
+            payload: pool.take(b"x").unwrap(),
+        };
+        out_tx.send(send(49152)).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        out_tx.send(send(49153)).await.unwrap();
+
+        drop(out_tx);
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("clean shutdown")
+            .unwrap();
+        let mut total = RelayCounts::default();
+        while let Ok(report) = count_rx.try_recv() {
+            total.add(report);
+        }
+        assert_eq!(total.associations_refused, 0, "{total:?}");
     }
 
     struct NeverAnswers;
